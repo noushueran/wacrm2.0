@@ -224,6 +224,44 @@ describe("update_contact_field — custom fields", () => {
   });
 });
 
+describe("send_webhook — SSRF guard (GHSA-8jqh-598v-rfxc)", () => {
+  it("refuses a private / link-local destination and never calls fetch", async () => {
+    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    h.state.owned = { id: "c1" };
+    h.state.automations = [automationWithUpdateStep()];
+    // Aimed at the cloud metadata endpoint — the classic SSRF target.
+    h.state.steps = [webhookStep("http://169.254.169.254/latest/meta-data/")];
+
+    await runAutomationsForTrigger({
+      accountId: ACCOUNT,
+      triggerType: "new_message_received",
+      contactId: "c1",
+      context: {},
+    });
+
+    // The automation matched and its steps were loaded (so we genuinely
+    // reached the send_webhook case)...
+    expect(h.state.fromCalls).toContain("automation_steps");
+    // ...yet the guard blocked it before any outbound request left the box.
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+});
+
+function webhookStep(url: string) {
+  return {
+    id: "s1",
+    automation_id: "a1",
+    step_type: "send_webhook",
+    position: 0,
+    parent_step_id: null,
+    step_config: { url, headers: { "Metadata-Flavor": "Google" }, body_template: "{}" },
+  };
+}
+
 function automationWithUpdateStep() {
   return {
     id: "a1",
