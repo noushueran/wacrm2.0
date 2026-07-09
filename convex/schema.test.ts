@@ -135,3 +135,107 @@ test("Task 1 — an out-of-union value is rejected by the schema validator", asy
     ),
   ).rejects.toThrow();
 });
+
+test("Task 2 — messageTemplates + apiKeys round-trip through the schema's validators", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  const templateId = await t.run(async (ctx) =>
+    ctx.db.insert("messageTemplates", {
+      accountId,
+      name: "welcome",
+      category: "Utility",
+      language: "en_US",
+      bodyText: "Hello {{1}}, welcome to {{2}}!",
+      status: "APPROVED",
+      // Typed `sampleValues` object (migration 014) — exercises the
+      // nested v.object/v.array validators, not just a bare v.any().
+      sampleValues: {
+        body: ["Priya", "Acme"],
+        header: ["Acme Support"],
+      },
+      metaTemplateId: "meta-template-123",
+      qualityScore: "GREEN",
+      headerHandle: "4::aW1hZ2U6cGxhY2Vob2xkZXI=",
+      headerMediaUrl: "https://example.com/header.png",
+      lastSubmittedAt: Date.now(),
+    }),
+  );
+
+  const apiKeyId = await t.run(async (ctx) =>
+    ctx.db.insert("apiKeys", {
+      accountId,
+      name: "CI integration",
+      keyPrefix: "wacrm_live_a1b2c3d4",
+      keyHash: "fixture-sha256-hash-of-the-plaintext-key",
+      scopes: ["contacts:read", "messages:write"],
+    }),
+  );
+
+  const template = await t.run(async (ctx) => ctx.db.get(templateId));
+  const apiKey = await t.run(async (ctx) => ctx.db.get(apiKeyId));
+
+  expect(template).not.toBeNull();
+  expect(template!.accountId).toBe(accountId);
+  expect(template!.category).toBe("Utility");
+  expect(template!.status).toBe("APPROVED");
+  expect(template!.sampleValues?.body).toEqual(["Priya", "Acme"]);
+  expect(template!.sampleValues?.header).toEqual(["Acme Support"]);
+  expect(template!.metaTemplateId).toBe("meta-template-123");
+  expect(template!.headerMediaUrl).toBe("https://example.com/header.png");
+
+  expect(apiKey).not.toBeNull();
+  expect(apiKey!.accountId).toBe(accountId);
+  expect(apiKey!.scopes).toEqual(["contacts:read", "messages:write"]);
+  expect(apiKey!.keyHash).toBe("fixture-sha256-hash-of-the-plaintext-key");
+
+  // Also exercise the declared unique-enforcing indexes, not just the
+  // field validators.
+  const byNameLang = await t.run(async (ctx) =>
+    ctx.db
+      .query("messageTemplates")
+      .withIndex("by_account_name_lang", (q) =>
+        q
+          .eq("accountId", accountId)
+          .eq("name", "welcome")
+          .eq("language", "en_US"),
+      )
+      .collect(),
+  );
+  expect(byNameLang.map((r) => r._id)).toEqual([templateId]);
+
+  const byKeyHash = await t.run(async (ctx) =>
+    ctx.db
+      .query("apiKeys")
+      .withIndex("by_key_hash", (q) =>
+        q.eq("keyHash", "fixture-sha256-hash-of-the-plaintext-key"),
+      )
+      .collect(),
+  );
+  expect(byKeyHash.map((r) => r._id)).toEqual([apiKeyId]);
+});
+
+test("Task 2 — an out-of-union value is rejected by the schema validator", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  await expect(
+    t.run(async (ctx) =>
+      ctx.db.insert("broadcasts", {
+        accountId,
+        name: "Spring sale",
+        templateName: "spring_sale",
+        templateLanguage: "en_US",
+        // Not one of the `status` union's literals — proves the schema
+        // rejects it rather than silently accepting any string.
+        status: "not-a-real-status" as unknown as "draft",
+        totalRecipients: 0,
+        sentCount: 0,
+        deliveredCount: 0,
+        readCount: 0,
+        repliedCount: 0,
+        failedCount: 0,
+      }),
+    ),
+  ).rejects.toThrow();
+});
