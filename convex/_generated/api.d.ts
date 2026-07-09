@@ -35,6 +35,8 @@ import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as tags from "../tags.js";
 import type * as templates from "../templates.js";
+import type * as webhookEndpoints from "../webhookEndpoints.js";
+import type * as whatsappConfig from "../whatsappConfig.js";
 
 import type {
   ApiFromModules,
@@ -70,6 +72,8 @@ declare const fullApi: ApiFromModules<{
   reactions: typeof reactions;
   tags: typeof tags;
   templates: typeof templates;
+  webhookEndpoints: typeof webhookEndpoints;
+  whatsappConfig: typeof whatsappConfig;
 }>;
 
 /**
