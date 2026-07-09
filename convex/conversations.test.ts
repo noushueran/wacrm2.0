@@ -653,3 +653,87 @@ test("assign/setStatus/markRead all throw NOT_FOUND for a conversation belonging
   // really about cross-account isolation, not broken mutations.
   await asAlice.mutation(api.conversations.markRead, { conversationId });
 });
+
+// ============================================================
+// assign -> notifications (Phase 5, Task 2) — wired to
+// `insertNotification` (`convex/notifications.ts`), the Convex
+// counterpart to migration 027's `notify_conversation_assigned` trigger.
+// ============================================================
+
+test("assign creates a notification for the assignee", async () => {
+  const t = convexTest(schema, modules);
+  const {
+    asUser: asAlice,
+    accountId: aliceAccountId,
+    userId: aliceUserId,
+  } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const carolUserId = await seedTeammate(t, {
+    accountId: aliceAccountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const asCarol = t.withIdentity({ subject: `${carolUserId}|session-Carol` });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+    name: "Jonas",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId,
+  });
+
+  await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: carolUserId,
+  });
+
+  const carolsNotifications = await asCarol.query(api.notifications.list, {});
+  expect(carolsNotifications).toHaveLength(1);
+  const notification = carolsNotifications[0]!;
+  expect(notification.type).toBe("conversation_assigned");
+  expect(notification.userId).toBe(carolUserId);
+  expect(notification.conversationId).toBe(conversationId);
+  expect(notification.contactId).toBe(contactId);
+  expect(notification.actorUserId).toBe(aliceUserId);
+  expect(notification.title).toBe("New conversation assigned");
+  expect(notification.body).toContain("Jonas");
+  expect(notification.body).toContain("Alice");
+  expect(notification.readAt).toBeUndefined();
+
+  // Not visible in the assigner's own notifications — it's Carol's.
+  const alicesNotifications = await asAlice.query(api.notifications.list, {});
+  expect(alicesNotifications).toHaveLength(0);
+});
+
+test("assign does not notify when an agent assigns a conversation to themselves", async () => {
+  const t = convexTest(schema, modules);
+  const {
+    asUser: asAlice,
+    accountId: aliceAccountId,
+    userId: aliceUserId,
+  } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId,
+  });
+
+  await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: aliceUserId,
+  });
+
+  const alicesNotifications = await asAlice.query(api.notifications.list, {});
+  expect(alicesNotifications).toHaveLength(0);
+});

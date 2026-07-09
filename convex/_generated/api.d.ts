@@ -9,6 +9,7 @@
  */
 
 import type * as accounts from "../accounts.js";
+import type * as apiKeys from "../apiKeys.js";
 import type * as auth from "../auth.js";
 import type * as broadcasts from "../broadcasts.js";
 import type * as contactNotes from "../contactNotes.js";
@@ -19,6 +20,7 @@ import type * as dashboard from "../dashboard.js";
 import type * as deals from "../deals.js";
 import type * as http from "../http.js";
 import type * as invitations from "../invitations.js";
+import type * as lib_apiKey from "../lib/apiKey.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_dashboardDate from "../lib/dashboardDate.js";
 import type * as lib_inviteToken from "../lib/inviteToken.js";
@@ -26,7 +28,9 @@ import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
 import type * as members from "../members.js";
 import type * as messages from "../messages.js";
+import type * as notifications from "../notifications.js";
 import type * as pipelines from "../pipelines.js";
+import type * as presence from "../presence.js";
 import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as tags from "../tags.js";
@@ -40,6 +44,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
+  apiKeys: typeof apiKeys;
   auth: typeof auth;
   broadcasts: typeof broadcasts;
   contactNotes: typeof contactNotes;
@@ -50,6 +55,7 @@ declare const fullApi: ApiFromModules<{
   deals: typeof deals;
   http: typeof http;
   invitations: typeof invitations;
+  "lib/apiKey": typeof lib_apiKey;
   "lib/auth": typeof lib_auth;
   "lib/dashboardDate": typeof lib_dashboardDate;
   "lib/inviteToken": typeof lib_inviteToken;
@@ -57,7 +63,9 @@ declare const fullApi: ApiFromModules<{
   "lib/roles": typeof lib_roles;
   members: typeof members;
   messages: typeof messages;
+  notifications: typeof notifications;
   pipelines: typeof pipelines;
+  presence: typeof presence;
   quickReplies: typeof quickReplies;
   reactions: typeof reactions;
   tags: typeof tags;

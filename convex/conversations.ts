@@ -1,6 +1,7 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
+import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
@@ -172,12 +173,19 @@ export const findOrCreateForContact = accountMutation({
  * arbitrary/foreign user id is rejected the same way a missing/foreign
  * conversation is, so a cross-account probe can't distinguish "no such
  * user" from "not your teammate".
+ *
+ * Also notifies the assignee (`convex/notifications.ts`'s
+ * `insertNotification`) — the Convex counterpart to migration 027's
+ * `notify_conversation_assigned` trigger. Skipped for self-assignment
+ * (mirrors the trigger's own `auth.uid() = NEW.assigned_agent_id`
+ * guard): nothing to notify an agent about when they assigned the
+ * conversation to themselves.
  */
 export const assign = accountMutation({
   args: { conversationId: v.id("conversations"), userId: v.id("users") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnConversation(ctx, args.conversationId);
+    const conversation = await requireOwnConversation(ctx, args.conversationId);
 
     const membership = await ctx.db
       .query("memberships")
@@ -194,6 +202,34 @@ export const assign = accountMutation({
       status: "pending",
       updatedAt: Date.now(),
     });
+
+    if (args.userId !== ctx.userId) {
+      const [contact, actorMembership] = await Promise.all([
+        ctx.db.get(conversation.contactId),
+        ctx.db
+          .query("memberships")
+          .withIndex("by_user_account", (q) =>
+            q.eq("userId", ctx.userId).eq("accountId", ctx.accountId),
+          )
+          .first(),
+      ]);
+      // COALESCE(NULLIF(name, ''), phone) / COALESCE(actor, 'Someone') —
+      // same fallback chain as migration 027's trigger body text.
+      const contactName = contact?.name || contact?.phone || "a contact";
+      const actorName = actorMembership?.fullName || "Someone";
+
+      await insertNotification(ctx, {
+        accountId: ctx.accountId,
+        userId: args.userId,
+        type: "conversation_assigned",
+        conversationId: args.conversationId,
+        contactId: conversation.contactId,
+        actorUserId: ctx.userId,
+        title: "New conversation assigned",
+        body: `${actorName} assigned you a conversation with ${contactName}`,
+      });
+    }
+
     return args.conversationId;
   },
 });
