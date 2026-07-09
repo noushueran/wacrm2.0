@@ -11,6 +11,8 @@
 import type * as accounts from "../accounts.js";
 import type * as auth from "../auth.js";
 import type * as http from "../http.js";
+import type * as lib_auth from "../lib/auth.js";
+import type * as lib_authFixtures from "../lib/authFixtures.js";
 import type * as lib_roles from "../lib/roles.js";
 
 import type {
@@ -23,6 +25,8 @@ declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
   auth: typeof auth;
   http: typeof http;
+  "lib/auth": typeof lib_auth;
+  "lib/authFixtures": typeof lib_authFixtures;
   "lib/roles": typeof lib_roles;
 }>;
 
