@@ -333,6 +333,76 @@ test("listByPipeline throws NOT_FOUND for a pipeline belonging to a different ac
 });
 
 // ============================================================
+// listByContact
+// ============================================================
+
+test("listByContact returns only the given contact's deals, each with its stage embedded", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { pipelineId, stages } = await seedPipelineWithStages(t, asUser);
+  const contactA = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+    name: "Jonas",
+  });
+  const contactB = await asUser.mutation(api.contacts.create, {
+    phone: "222",
+    name: "Other",
+  });
+
+  const dealA = await asUser.mutation(api.deals.create, {
+    ...baseDeal,
+    contactId: contactA,
+    pipelineId,
+    stageId: stages[0]!._id,
+  });
+  await asUser.mutation(api.deals.create, {
+    ...baseDeal,
+    contactId: contactB,
+    pipelineId,
+    stageId: stages[0]!._id,
+  });
+
+  const result = await asUser.query(api.deals.listByContact, {
+    contactId: contactA,
+  });
+
+  expect(result.map((d) => d._id)).toEqual([dealA]);
+  expect(result[0]!.stage).not.toBeNull();
+  expect(result[0]!.stage!._id).toBe(stages[0]!._id);
+});
+
+test("listByContact throws NOT_FOUND for a contact belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await expect(
+    asBob.query(api.deals.listByContact, { contactId: aliceContactId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "contact" } });
+
+  // Positive control.
+  const alicesView = await asAlice.query(api.deals.listByContact, {
+    contactId: aliceContactId,
+  });
+  expect(alicesView).toEqual([]);
+});
+
+// ============================================================
 // move — rejects a foreign-pipeline stage; cross-account denial
 // ============================================================
 

@@ -1,6 +1,6 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
@@ -102,6 +102,38 @@ export const listByPipeline = accountQuery({
       .order("desc")
       .filter((q) => q.eq(q.field("accountId"), ctx.accountId))
       .collect();
+  },
+});
+
+export const listByContact = accountQuery({
+  args: { contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    await requireOwnContact(ctx, args.contactId);
+
+    // `by_contact` isn't itself account-scoped (see schema.ts), so the
+    // match is additionally filtered to `ctx.accountId` — defense-in-
+    // depth that doesn't actually change behavior today (the ownership
+    // check above already proves `contactId` is this caller's own, so
+    // no other account's deal could share it), matching
+    // `listByPipeline`'s own treatment of its non-account-scoped
+    // `by_pipeline` index.
+    const deals = await ctx.db
+      .query("deals")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .order("desc")
+      .filter((q) => q.eq(q.field("accountId"), ctx.accountId))
+      .collect();
+
+    // The inbox's deals-for-this-contact panel wants each deal's stage
+    // (e.g. name/position) alongside it rather than issuing a second
+    // round-trip per deal, so it's embedded here the same way
+    // `contacts.ts`'s `embedTags` does for tags.
+    return await Promise.all(
+      deals.map(async (deal) => ({
+        ...deal,
+        stage: await ctx.db.get(deal.stageId),
+      })),
+    );
   },
 });
 

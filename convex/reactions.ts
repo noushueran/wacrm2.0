@@ -34,6 +34,28 @@ async function requireOwnMessage(
 }
 
 /**
+ * Loads a conversation and throws `NOT_FOUND` unless it belongs to the
+ * caller's own account — the same error for "doesn't exist" and
+ * "exists but isn't yours" on purpose (mirrors `requireOwnMessage`
+ * above, and `messages.ts`'s own `requireOwnConversation`). Duplicated
+ * here rather than imported, matching this codebase's one-helper-
+ * per-file style (see `deals.ts`'s `requireOwnContact` for the same
+ * reasoning). Used only by `forConversation` below, which needs to
+ * prove ownership of a conversation directly rather than reaching it
+ * through a message.
+ */
+async function requireOwnConversation(
+  ctx: { db: QueryCtx["db"]; accountId: Id<"accounts"> },
+  conversationId: Id<"conversations">,
+) {
+  const conversation = await ctx.db.get(conversationId);
+  if (!conversation || conversation.accountId !== ctx.accountId) {
+    throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+  }
+  return conversation;
+}
+
+/**
  * Finds the (message, actor) reaction row via `by_message_actor` — the
  * lookup both `set` (patch-vs-insert) and `remove` need. `actorId` is
  * optional (a reaction can be identified by `actorType` alone when no
@@ -119,6 +141,24 @@ export const forMessage = accountQuery({
     return await ctx.db
       .query("messageReactions")
       .withIndex("by_message", (q) => q.eq("messageId", args.messageId))
+      .collect();
+  },
+});
+
+/**
+ * Bulk counterpart to `forMessage` — the inbox thread view loads every
+ * reaction for the whole conversation in one round-trip rather than one
+ * query per message.
+ */
+export const forConversation = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    await requireOwnConversation(ctx, args.conversationId);
+    return await ctx.db
+      .query("messageReactions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
       .collect();
   },
 });

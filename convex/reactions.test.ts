@@ -410,3 +410,108 @@ test("set/remove/forMessage all throw NOT_FOUND for a message belonging to a dif
     actorId: bobUserId,
   });
 });
+
+// ============================================================
+// forConversation
+// ============================================================
+
+test("forConversation returns only the given conversation's reactions", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const otherConversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+  });
+  const messageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "first",
+  });
+  const otherMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "second",
+  });
+  const otherConversationMessageId = await asUser.mutation(
+    api.messages.append,
+    {
+      conversationId: otherConversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "elsewhere",
+    },
+  );
+
+  await asUser.mutation(api.reactions.set, {
+    messageId,
+    emoji: "👍",
+    actorType: "agent",
+    actorId: userId,
+  });
+  await asUser.mutation(api.reactions.set, {
+    messageId: otherMessageId,
+    emoji: "😀",
+    actorType: "agent",
+    actorId: userId,
+  });
+  await asUser.mutation(api.reactions.set, {
+    messageId: otherConversationMessageId,
+    emoji: "🎉",
+    actorType: "agent",
+    actorId: userId,
+  });
+
+  const result = await asUser.query(api.reactions.forConversation, {
+    conversationId,
+  });
+
+  expect(result).toHaveLength(2);
+  expect(result.map((r) => r.emoji).sort()).toEqual(["👍", "😀"].sort());
+  for (const row of result) {
+    expect(row.conversationId).toBe(conversationId);
+  }
+});
+
+test("forConversation throws NOT_FOUND for a conversation belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    asBob.query(api.reactions.forConversation, { conversationId }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  // Positive control.
+  const alicesView = await asAlice.query(api.reactions.forConversation, {
+    conversationId,
+  });
+  expect(alicesView).toEqual([]);
+});
