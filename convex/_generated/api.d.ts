@@ -23,8 +23,10 @@ import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
 import type * as messages from "../messages.js";
 import type * as pipelines from "../pipelines.js";
+import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as tags from "../tags.js";
+import type * as templates from "../templates.js";
 
 import type {
   ApiFromModules,
@@ -48,8 +50,10 @@ declare const fullApi: ApiFromModules<{
   "lib/roles": typeof lib_roles;
   messages: typeof messages;
   pipelines: typeof pipelines;
+  quickReplies: typeof quickReplies;
   reactions: typeof reactions;
   tags: typeof tags;
+  templates: typeof templates;
 }>;
 
 /**
