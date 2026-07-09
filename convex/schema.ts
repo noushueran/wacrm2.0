@@ -819,6 +819,19 @@ export default defineSchema({
     lastAdvancedAt: v.optional(v.number()),
     endedAt: v.optional(v.number()),
     endReason: v.optional(v.string()),
+    // Phase 6, Task 4 addition — no Postgres counterpart (the original
+    // stale-run cutoff was computed on the fly by a cron sweep,
+    // `/api/flows/cron`, comparing `last_advanced_at` against
+    // `fallback_policy.on_timeout_hours` on every poll). The Convex
+    // engine has no cron: each active run instead gets its OWN
+    // `ctx.scheduler.runAfter(...)` callback (`flowsEngine.timeout`)
+    // scheduled directly, and this field is the id of that pending
+    // scheduled function — needed so the engine can `ctx.scheduler.cancel`
+    // the stale one before scheduling a fresh one on every genuine
+    // advance (otherwise a customer who replies quickly would still get
+    // timed out later by the ORIGINAL schedule). Cleared (patched to
+    // `undefined`) whenever the run ends for any reason.
+    fallbackTimeoutId: v.optional(v.id("_scheduled_functions")),
   })
     .index("by_account_contact", ["accountId", "contactId"])
     .index("by_flow", ["flowId"])
