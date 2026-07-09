@@ -12,11 +12,13 @@ import type * as accounts from "../accounts.js";
 import type * as auth from "../auth.js";
 import type * as contacts from "../contacts.js";
 import type * as conversations from "../conversations.js";
+import type * as deals from "../deals.js";
 import type * as http from "../http.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
 import type * as messages from "../messages.js";
+import type * as pipelines from "../pipelines.js";
 import type * as reactions from "../reactions.js";
 import type * as tags from "../tags.js";
 
@@ -31,11 +33,13 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   contacts: typeof contacts;
   conversations: typeof conversations;
+  deals: typeof deals;
   http: typeof http;
   "lib/auth": typeof lib_auth;
   "lib/phone": typeof lib_phone;
   "lib/roles": typeof lib_roles;
   messages: typeof messages;
+  pipelines: typeof pipelines;
   reactions: typeof reactions;
   tags: typeof tags;
 }>;
