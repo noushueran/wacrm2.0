@@ -15,7 +15,8 @@
 // bug (same lesson as the invite-link flow).
 // ============================================================
 
-import { useCallback, useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import { Copy, KeyRound, Loader2, Plus, Trash2 } from 'lucide-react';
 
@@ -40,19 +41,12 @@ import {
   SCOPE_DESCRIPTIONS,
   type ApiScope,
 } from '@/lib/api-keys/scopes';
+import { toUiApiKey, type ApiKeyView as ApiKey } from '@/lib/convex/adapters';
 import { useTranslations } from 'next-intl';
 import { SettingsPanelHead } from './settings-panel-head';
 
-interface ApiKey {
-  id: string;
-  name: string;
-  key_prefix: string;
-  scopes: string[];
-  last_used_at: string | null;
-  expires_at: string | null;
-  revoked_at: string | null;
-  created_at: string;
-}
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 function fmtDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -73,51 +67,25 @@ export function ApiKeysSettings() {
   const { canEditSettings } = useAuth();
   const t = useTranslations('Settings.apiKeys');
 
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [loading, setLoading] = useState(true);
+  const keysResult = useQuery(api.apiKeys.list);
+  const keys = useMemo(() => (keysResult ?? []).map(toUiApiKey), [keysResult]);
+  const loading = keysResult === undefined;
+
+  const revokeApiKey = useMutation(api.apiKeys.revoke);
+
   const [createOpen, setCreateOpen] = useState(false);
   const [revoking, setRevoking] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch('/api/account/api-keys', { cache: 'no-store' });
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || t('loadFailed'));
-        return;
-      }
-      const data = (await res.json()) as { keys: ApiKey[] };
-      setKeys(data.keys);
-    } catch (err) {
-      console.error('[ApiKeysSettings] load error:', err);
-      toast.error(t('networkError'));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   async function handleRevoke(key: ApiKey) {
     setRevoking(key.id);
     try {
-      const res = await fetch(`/api/account/api-keys/${key.id}`, {
-        method: 'DELETE',
-      });
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || t('revokeFailed'));
-        return;
-      }
+      await revokeApiKey({ apiKeyId: key.id as Id<'apiKeys'> });
       toast.success(t('revokeSuccess', { name: key.name }));
-      // Reflect the revoke locally without a refetch.
-      setKeys((prev) =>
-        prev.map((k) =>
-          k.id === key.id ? { ...k, revoked_at: new Date().toISOString() } : k
-        )
-      );
+      // No local-state patch needed — `keysResult` above is a reactive
+      // Convex query, so the revoked row's `revokedAt` (hence
+      // `keyStatus()` below) updates on its own once the mutation
+      // commits, the same way `tag-manager.tsx`'s list never
+      // hand-patches after `removeTag`.
     } catch (err) {
       console.error('[ApiKeysSettings] revoke error:', err);
       toast.error(t('networkError'));
@@ -267,11 +235,7 @@ export function ApiKeysSettings() {
         </Card>
       )}
 
-      <CreateKeyDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        onCreated={load}
-      />
+      <CreateKeyDialog open={createOpen} onOpenChange={setCreateOpen} />
     </section>
   );
 }
@@ -283,13 +247,12 @@ export function ApiKeysSettings() {
 function CreateKeyDialog({
   open,
   onOpenChange,
-  onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreated: () => void;
 }) {
   const t = useTranslations('Settings.apiKeys');
+  const createApiKey = useMutation(api.apiKeys.create);
   const [name, setName] = useState('');
   const [scopes, setScopes] = useState<ApiScope[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -317,18 +280,11 @@ function CreateKeyDialog({
     }
     setSubmitting(true);
     try {
-      const res = await fetch('/api/account/api-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: trimmed, scopes }),
-      });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        toast.error(payload.error || t('createError'));
-        return;
-      }
-      setCreatedKey(payload.plaintext as string);
-      onCreated();
+      const result = await createApiKey({ name: trimmed, scopes });
+      setCreatedKey(result.plaintext);
+      // No manual list refresh needed — `ApiKeysSettings`'s `keys` above
+      // comes from a reactive `useQuery(api.apiKeys.list)`, which picks
+      // up the new row on its own once the mutation commits.
     } catch (err) {
       console.error('[CreateKeyDialog] create error:', err);
       toast.error(t('networkError'));

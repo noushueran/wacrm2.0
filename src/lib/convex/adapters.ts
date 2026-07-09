@@ -19,6 +19,7 @@ import type {
   QuickReply,
   Tag,
   TemplateButton,
+  WhatsAppConfig,
 } from "@/types";
 
 // ============================================================
@@ -426,6 +427,84 @@ export function toUiQuickReply(doc: Doc<"quickReplies">): QuickReply {
     updated_at: doc.updatedAt
       ? new Date(doc.updatedAt).toISOString()
       : new Date(doc._creationTime).toISOString(),
+  };
+}
+
+// ============================================================
+// Settings vertical adapters (Phase 8, Task 3) — WhatsApp Cloud API
+// config (`whatsappConfig`) and public-API keys (`apiKeys`). Same
+// rename + epoch-ms -> ISO-string convention as every adapter above.
+// `webhookEndpoints` has no adapter here: nothing under
+// `src/components/settings/` manages webhook endpoints today (grepped
+// — the only hits are the `/api/v1/webhooks` REST route handlers and
+// the delivery engine), so there is no UI shape to map to yet. Add one
+// alongside a settings panel if that ever gets built.
+// ============================================================
+
+/** `whatsappConfig.get` returns the FULL raw doc — unlike `aiConfig.get`,
+ *  it does not strip `accessToken` before returning (see that query's
+ *  own doc comment: this module is "data layer only"). `access_token`
+ *  on the mapped `WhatsAppConfig` UI type is therefore never populated
+ *  from `doc.accessToken` here regardless — nothing in
+ *  `whatsapp-config.tsx` reads this field for display; the form's own
+ *  local input state (always masked unless actively being edited) is
+ *  what renders, and an unedited save resends `doc.accessToken`
+ *  verbatim by reading the raw `useQuery` result directly, not through
+ *  this adapter. A fixed placeholder satisfies the (required,
+ *  non-optional) UI field without ever surfacing whatever the row
+ *  actually holds. */
+export function toUiWhatsappConfig(doc: Doc<"whatsappConfig">): WhatsAppConfig {
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    phone_number_id: doc.phoneNumberId,
+    waba_id: doc.wabaId,
+    access_token: "••••••••••••••••",
+    verify_token: doc.verifyToken,
+    status: doc.status,
+    connected_at: doc.connectedAt
+      ? new Date(doc.connectedAt).toISOString()
+      : undefined,
+    registered_at: doc.registeredAt
+      ? new Date(doc.registeredAt).toISOString()
+      : undefined,
+    subscribed_apps_at: doc.subscribedAppsAt
+      ? new Date(doc.subscribedAppsAt).toISOString()
+      : undefined,
+    last_registration_error: doc.lastRegistrationError,
+  };
+}
+
+/** `apiKeys.list`'s per-item shape — `Doc<"apiKeys">` minus the
+ *  never-leaves-the-server `keyHash` (see that query's own doc
+ *  comment). `src/types` has no `ApiKey` entry — even the pre-Convex
+ *  Supabase-era `api-keys-settings.tsx` scoped an equivalent shape
+ *  locally rather than adding one there — so this UI-facing type lives
+ *  here instead of being imported from `@/types` like every adapter
+ *  above. */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
+  return {
+    id: doc._id,
+    name: doc.name,
+    key_prefix: doc.keyPrefix,
+    scopes: doc.scopes,
+    last_used_at: doc.lastUsedAt
+      ? new Date(doc.lastUsedAt).toISOString()
+      : null,
+    expires_at: doc.expiresAt ? new Date(doc.expiresAt).toISOString() : null,
+    revoked_at: doc.revokedAt ? new Date(doc.revokedAt).toISOString() : null,
+    created_at: new Date(doc._creationTime).toISOString(),
   };
 }
 
