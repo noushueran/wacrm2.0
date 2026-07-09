@@ -1,8 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
-import { Loader2, Plus, Trash2, Pencil, RefreshCw, BookOpen } from 'lucide-react';
+import { Loader2, Plus, Trash2, BookOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -15,145 +16,111 @@ import {
   CardDescription,
 } from '@/components/ui/card';
 import { useTranslations } from 'next-intl';
+import { toUiAiKnowledgeDoc } from '@/lib/convex/adapters';
 
-interface DocSummary {
-  id: string;
-  title: string;
-  updated_at: string;
-}
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
-/** Editor target: 'new' when creating, a doc id when editing, null when closed. */
-type EditTarget = 'new' | string | null;
-
+/**
+ * RAG knowledge base CRUD (Phase 8, Task 3 / P8-T3). `list`/`create`/
+ * `remove` are ALL admin-gated server-side (`convex/aiKnowledge.ts`'s
+ * own doc comment: knowledge content shapes what the AI tells
+ * customers, so it gets the same write-level trust as
+ * `aiConfig.upsert`, not a plain-member read) — unlike the pre-Convex
+ * REST route, there is no lesser "any member can view" tier. The list
+ * query is therefore only ever called (via the `"skip"` sentinel, same
+ * idiom as `contact-detail-view.tsx`'s `tags.list`/`customFields.list`)
+ * when `canEdit` is true, and the parent (`ai-config.tsx`) only mounts
+ * this card for admins+ in the first place.
+ *
+ * `create` schedules chunk+embed ingestion server-side
+ * (`ctx.scheduler.runAfter(0, internal.aiKnowledge.ingest, ...)`) — this
+ * component only ever submits title/content, never chunks or embeds
+ * anything itself.
+ *
+ * No `update`/`reindex` mutation exists in Convex (only `list`/
+ * `create`/`remove`, plus internal-only `ingest`/`retrieve` actions
+ * meant for the scheduler and the auto-reply/draft paths), so the old
+ * "Edit existing doc" and "Reindex all" affordances have no Convex
+ * counterpart and are dropped here — editing a document today means
+ * delete + re-add. A row's title can still be expanded into a read-only
+ * content preview, sourced from `list`'s own result (which already
+ * carries full `content`, not just `title` — no extra fetch needed, and
+ * none is possible: `aiKnowledge.getDocument` is `internalQuery`-only).
+ */
 export function AiKnowledgeCard({
-  accountId,
   canEdit,
   hasEmbeddingsKey,
 }: {
-  accountId: string | null;
   canEdit: boolean;
   hasEmbeddingsKey: boolean;
 }) {
-  const [docs, setDocs] = useState<DocSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [editing, setEditing] = useState<EditTarget>(null);
+  const t = useTranslations('Settings.aiKnowledge');
+
+  const docsResult = useQuery(api.aiKnowledge.list, canEdit ? {} : 'skip');
+  const docs = useMemo(
+    () => (docsResult ?? []).map(toUiAiKnowledgeDoc),
+    [docsResult],
+  );
+  const loading = canEdit && docsResult === undefined;
+
+  const createDoc = useMutation(api.aiKnowledge.create);
+  const removeDoc = useMutation(api.aiKnowledge.remove);
+
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [saving, setSaving] = useState(false);
-  const [reindexing, setReindexing] = useState(false);
-  const loadedAccountIdRef = useRef<string | null>(null);
-  const t = useTranslations('Settings.aiKnowledge');
-
-  const fetchDocs = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/ai/knowledge');
-      const data = await res.json();
-      if (res.ok) setDocs(data.documents ?? []);
-      else toast.error(data.error ?? t('loadFailed'));
-    } catch {
-      toast.error(t('loadFailed'));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!accountId || loadedAccountIdRef.current === accountId) return;
-    loadedAccountIdRef.current = accountId;
-    void fetchDocs();
-  }, [accountId, fetchDocs]);
+  const [removingId, setRemovingId] = useState<string | null>(null);
 
   const openNew = () => {
-    setEditing('new');
+    setCreating(true);
     setTitle('');
     setContent('');
   };
 
-  const openEdit = async (id: string) => {
-    try {
-      const res = await fetch(`/api/ai/knowledge/${id}`);
-      const data = await res.json();
-      if (!res.ok) {
-        toast.error(data.error ?? t('openFailed'));
-        return;
-      }
-      setEditing(id);
-      setTitle(data.title ?? '');
-      setContent(data.content ?? '');
-    } catch {
-      toast.error(t('openFailed'));
-    }
-  };
-
-  const cancelEdit = () => {
-    setEditing(null);
+  const cancelCreate = () => {
+    setCreating(false);
     setTitle('');
     setContent('');
   };
 
-  const save = async () => {
+  const handleCreate = async () => {
     if (!title.trim() || !content.trim()) {
       toast.error(t('titleContentRequired'));
       return;
     }
     setSaving(true);
     try {
-      const isNew = editing === 'new';
-      const res = await fetch(
-        isNew ? '/api/ai/knowledge' : `/api/ai/knowledge/${editing}`,
-        {
-          method: isNew ? 'POST' : 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title.trim(), content: content.trim() }),
-        },
-      );
-      const data = await res.json();
-      if (res.ok) {
-        // A 200 with `warning` means saved but indexing degraded.
-        if (data.warning) toast.warning(data.warning);
-        else toast.success(isNew ? t('saveSuccessNew') : t('saveSuccessUpdate'));
-        cancelEdit();
-        await fetchDocs();
-      } else {
-        toast.error(data.error ?? t('saveFailed'));
-      }
-    } catch {
+      await createDoc({ title: title.trim(), content: content.trim() });
+      // A 200 with `warning` (degraded indexing) had no Convex-side
+      // signal to surface even in the old REST route's success path —
+      // `create` schedules `ingest` fire-and-forget, so this mutation
+      // resolving just means the document row itself was written.
+      toast.success(t('saveSuccessNew'));
+      cancelCreate();
+      // No manual list refresh needed — `docsResult` above is a
+      // reactive `useQuery`, same as `tag-manager.tsx`'s list.
+    } catch (err) {
+      console.error('[AiKnowledgeCard] create error:', err);
       toast.error(t('saveFailed'));
     } finally {
       setSaving(false);
     }
   };
 
-  const remove = async (id: string) => {
+  const handleRemove = async (id: string) => {
+    setRemovingId(id);
     try {
-      const res = await fetch(`/api/ai/knowledge/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        toast.success(t('removeSuccess'));
-        setDocs((d) => d.filter((x) => x.id !== id));
-      } else {
-        const data = await res.json();
-        toast.error(data.error ?? t('removeFailed'));
-      }
-    } catch {
+      await removeDoc({ documentId: id as Id<'aiKnowledgeDocuments'> });
+      toast.success(t('removeSuccess'));
+      setExpandedId((cur) => (cur === id ? null : cur));
+    } catch (err) {
+      console.error('[AiKnowledgeCard] remove error:', err);
       toast.error(t('removeFailed'));
-    }
-  };
-
-  const reindex = async () => {
-    setReindexing(true);
-    try {
-      const res = await fetch('/api/ai/knowledge/reindex', { method: 'POST' });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        toast.success(t('reindexSuccess', { count: data.reindexed }));
-      } else {
-        toast.error(data.error ?? t('reindexFailed'));
-      }
-    } catch {
-      toast.error(t('reindexFailed'));
     } finally {
-      setReindexing(false);
+      setRemovingId(null);
     }
   };
 
@@ -176,7 +143,7 @@ export function AiKnowledgeCard({
           </div>
         ) : (
           <>
-            {docs.length === 0 && editing === null && (
+            {docs.length === 0 && !creating && (
               <p className="text-sm text-muted-foreground">
                 {t('noDocs')}
               </p>
@@ -187,39 +154,49 @@ export function AiKnowledgeCard({
                 {docs.map((doc) => (
                   <li
                     key={doc.id}
-                    className="flex items-center justify-between gap-2 px-3 py-2"
+                    className="flex flex-col gap-2 px-3 py-2"
                   >
-                    <span className="min-w-0 truncate text-sm text-foreground">
-                      {doc.title}
-                    </span>
-                    {canEdit && (
-                      <span className="flex shrink-0 gap-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedId((cur) => (cur === doc.id ? null : doc.id))
+                        }
+                        className="min-w-0 flex-1 truncate text-left text-sm text-foreground hover:underline"
+                      >
+                        {doc.title}
+                      </button>
+                      {canEdit && (
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-8 w-8 p-0"
-                          onClick={() => void openEdit(doc.id)}
-                          title="Edit"
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 text-destructive hover:text-destructive"
-                          onClick={() => void remove(doc.id)}
+                          className="h-8 w-8 shrink-0 p-0 text-destructive hover:text-destructive"
+                          onClick={() => void handleRemove(doc.id)}
+                          disabled={removingId === doc.id}
                           title="Delete"
                         >
-                          <Trash2 className="h-4 w-4" />
+                          {removingId === doc.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
                         </Button>
-                      </span>
+                      )}
+                    </div>
+                    {expandedId === doc.id && (
+                      <Textarea
+                        readOnly
+                        value={doc.content}
+                        rows={6}
+                        className="resize-none text-xs"
+                      />
                     )}
                   </li>
                 ))}
               </ul>
             )}
 
-            {editing !== null ? (
+            {creating ? (
               <div className="space-y-3 rounded-md border border-border p-3">
                 <div className="space-y-2">
                   <Label htmlFor="kb-title">{t('editDocTitle')}</Label>
@@ -243,10 +220,10 @@ export function AiKnowledgeCard({
                   />
                 </div>
                 <div className="flex justify-end gap-2">
-                  <Button variant="ghost" onClick={cancelEdit} disabled={saving}>
+                  <Button variant="ghost" onClick={cancelCreate} disabled={saving}>
                     {t('cancel')}
                   </Button>
-                  <Button onClick={save} disabled={saving}>
+                  <Button onClick={handleCreate} disabled={saving}>
                     {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                     {t('saveDoc')}
                   </Button>
@@ -258,22 +235,6 @@ export function AiKnowledgeCard({
                   <Button variant="outline" size="sm" onClick={openNew}>
                     <Plus className="mr-2 h-4 w-4" /> {t('addDoc')}
                   </Button>
-                  {hasEmbeddingsKey && docs.length > 0 && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={reindex}
-                      disabled={reindexing}
-                      title={t('reindexTooltip')}
-                    >
-                      {reindexing ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      ) : (
-                        <RefreshCw className="mr-2 h-4 w-4" />
-                      )}
-                      {t('reindex')}
-                    </Button>
-                  )}
                 </div>
               )
             )}

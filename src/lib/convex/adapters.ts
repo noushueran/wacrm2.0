@@ -1,5 +1,5 @@
 import { ConvexError } from "convex/values";
-import type { Doc } from "../../../convex/_generated/dataModel";
+import type { Doc, Id } from "../../../convex/_generated/dataModel";
 import type {
   Broadcast,
   BroadcastRecipient,
@@ -505,6 +505,91 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
     expires_at: doc.expiresAt ? new Date(doc.expiresAt).toISOString() : null,
     revoked_at: doc.revokedAt ? new Date(doc.revokedAt).toISOString() : null,
     created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+// ============================================================
+// AI settings vertical adapters (Phase 8, Task 3 / P8-T3) — AI
+// auto-reply config (`aiConfigs`) and the RAG knowledge base
+// (`aiKnowledgeDocuments`).
+// ============================================================
+
+/** `aiConfig.get`'s return shape, mapped almost unchanged — it is
+ *  already a flat camelCase POJO, NOT a raw `Doc<"aiConfigs">`: that
+ *  query deliberately never selects `apiKey`/`embeddingsApiKey` into
+ *  its return value at all (see its own doc comment), only the derived
+ *  `hasKey`/`hasEmbeddingsKey` booleans below. There is no `src/types`
+ *  entry for this — the pre-Convex `AiConfig` (`src/lib/ai/types.ts`)
+ *  is the server-only DECRYPTED shape with a plaintext `apiKey`, the
+ *  wrong shape entirely for a UI adapter to even reference — so, like
+ *  `ApiKeyView` above, this UI-facing type is declared here instead.
+ *  `handoffAgentId` is narrowed to a plain `string` (not `Id<"users">`)
+ *  to match every other adapter's convention of exposing id fields as
+ *  plain strings on their UI-facing type (e.g. `Contact.user_id`). */
+export interface AiConfigView {
+  provider: "openai" | "anthropic";
+  model: string;
+  systemPrompt: string | null;
+  isActive: boolean;
+  autoReplyEnabled: boolean;
+  autoReplyMaxPerConversation: number;
+  handoffAgentId: string | null;
+  hasKey: boolean;
+  hasEmbeddingsKey: boolean;
+}
+
+export function toUiAiConfig(config: {
+  provider: "openai" | "anthropic";
+  model: string;
+  systemPrompt: string | undefined;
+  isActive: boolean;
+  autoReplyEnabled: boolean;
+  autoReplyMaxPerConversation: number;
+  handoffAgentId: Id<"users"> | undefined;
+  hasKey: boolean;
+  hasEmbeddingsKey: boolean;
+}): AiConfigView {
+  return {
+    provider: config.provider,
+    model: config.model,
+    systemPrompt: config.systemPrompt ?? null,
+    isActive: config.isActive,
+    autoReplyEnabled: config.autoReplyEnabled,
+    autoReplyMaxPerConversation: config.autoReplyMaxPerConversation,
+    handoffAgentId: config.handoffAgentId ?? null,
+    hasKey: config.hasKey,
+    hasEmbeddingsKey: config.hasEmbeddingsKey,
+  };
+}
+
+/** `aiKnowledge.list`'s per-item shape — a full `Doc<"aiKnowledgeDocuments">`
+ *  (that query does no field-stripping, unlike `aiConfig.get`, since the
+ *  whole knowledge CRUD surface is already admin-gated end to end — see
+ *  `convex/aiKnowledge.ts`'s own doc comment on `list`). `content` is
+ *  included alongside `title` because the settings UI's read-only
+ *  content preview reuses this same `list` result — there is no
+ *  separate client-callable per-document query to fetch it from
+ *  instead (`aiKnowledge.getDocument` is `internalQuery`-only, for the
+ *  `ingest` action). `updated_at` falls back to `_creationTime` for the
+ *  same defensive reason as `toUiQuickReply.updated_at` above (`create`
+ *  always sets it, but the schema still models it `optional`). */
+export interface AiKnowledgeDocView {
+  id: string;
+  title: string;
+  content: string;
+  updated_at: string;
+}
+
+export function toUiAiKnowledgeDoc(
+  doc: Doc<"aiKnowledgeDocuments">,
+): AiKnowledgeDocView {
+  return {
+    id: doc._id,
+    title: doc.title,
+    content: doc.content,
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : new Date(doc._creationTime).toISOString(),
   };
 }
 

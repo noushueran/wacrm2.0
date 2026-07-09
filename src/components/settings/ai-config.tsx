@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
-import { Loader2, Sparkles, CheckCircle2, Trash2, Eye, EyeOff } from 'lucide-react';
+import { Loader2, Sparkles, CheckCircle2, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
-import { canEditSettings } from '@/lib/auth/roles';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -28,14 +28,21 @@ import { SettingsPanelHead } from './settings-panel-head';
 import { AiKnowledgeCard } from './ai-knowledge';
 import { AI_PROVIDER_DEFAULT_MODEL } from '@/lib/ai/defaults';
 import type { AiProvider } from '@/lib/ai/types';
-import type { AccountMember } from '@/types';
-import { fetchAccountMembers, memberLabel } from '@/lib/account/members';
+import {
+  toUiAiConfig,
+  toUiMemberProfile,
+  isConvexErrorCode,
+} from '@/lib/convex/adapters';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 const MASKED_KEY = '••••••••••••••••';
 
 // Radix Select can't use an empty-string item value, so the "leave
-// unassigned" choice gets a sentinel that maps to null in the payload.
+// unassigned" choice gets a sentinel that maps to `undefined` in the
+// mutation payload.
 const HANDOFF_QUEUE = '__queue__';
 
 const PROVIDER_LABEL: Record<AiProvider, string> = {
@@ -48,81 +55,94 @@ const KEY_PLACEHOLDER: Record<AiProvider, string> = {
   anthropic: 'sk-ant-...',
 };
 
+/**
+ * AI auto-reply config (Phase 8, Task 3 / P8-T3) — `aiConfigs`, one row
+ * per account. `api.aiConfig.get` never returns the encrypted
+ * `apiKey`/`embeddingsApiKey` columns, only derived `hasKey`/
+ * `hasEmbeddingsKey` booleans (see that query's own doc comment), so
+ * the masked placeholder below is always a fixed string, never
+ * anything read back from the server. Saving goes through
+ * `api.aiConfig.upsert`, which encrypts a freshly-typed key
+ * server-side and REUSES the stored ciphertext whenever a key field is
+ * omitted (untouched) — see that mutation's doc comment — so the form
+ * only ever sends a plaintext key when the admin actually retyped one,
+ * same as the pre-Convex REST route.
+ *
+ * No `aiConfig.remove` mutation exists in Convex (only `get`/`upsert`/
+ * the internal `loadDecrypted`), so the old "Remove configuration"
+ * button — which called a Supabase-backed DELETE route — has no Convex
+ * counterpart and is dropped here rather than left wired to a route
+ * that would silently no-op against the Convex-sourced config this form
+ * now reads. "Enable AI assistant" (`isActive`) remains the way to turn
+ * the assistant off.
+ */
 export function AiConfig() {
-  const { accountId, accountRole, profileLoading } = useAuth();
-  const canEdit = accountRole ? canEditSettings(accountRole) : false;
+  const { canEditSettings: canEdit, profileLoading } = useAuth();
   const t = useTranslations('Settings.aiConfig');
 
-  const [loading, setLoading] = useState(true);
+  const configDoc = useQuery(api.aiConfig.get);
+  const loading = configDoc === undefined;
+  const configured = configDoc != null;
+  const config = useMemo(
+    () => (configDoc ? toUiAiConfig(configDoc) : null),
+    [configDoc],
+  );
+
+  const upsertConfig = useMutation(api.aiConfig.upsert);
+
+  // The handoff-target picker's teammate list, via reactive
+  // `api.members.list` (any member may read it) mapped through the
+  // shared `toUiMemberProfile` adapter — same pattern as the inbox
+  // assign dropdown (`message-thread.tsx`).
+  const memberDocs = useQuery(api.members.list);
+  const members = useMemo(
+    () => (memberDocs ?? []).map(toUiMemberProfile),
+    [memberDocs],
+  );
+
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [removing, setRemoving] = useState(false);
 
-  const [configured, setConfigured] = useState(false);
   const [provider, setProvider] = useState<AiProvider>('openai');
   const [model, setModel] = useState(AI_PROVIDER_DEFAULT_MODEL.openai);
   const [apiKey, setApiKey] = useState('');
   const [keyEdited, setKeyEdited] = useState(false);
   const [showKey, setShowKey] = useState(false);
-  const [hasStoredKey, setHasStoredKey] = useState(false);
   const [embeddingsKey, setEmbeddingsKey] = useState('');
   const [embeddingsKeyEdited, setEmbeddingsKeyEdited] = useState(false);
-  const [hasStoredEmbeddingsKey, setHasStoredEmbeddingsKey] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
   const [maxPerConversation, setMaxPerConversation] = useState(3);
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
-  const [members, setMembers] = useState<AccountMember[]>([]);
 
-  // Guard keyed on the account (not a bare boolean) so an in-place
-  // account switch — ownership transfer, multi-account membership —
-  // refetches instead of showing the previous account's config. Mirrors
-  // the loadedAccountIdRef pattern in whatsapp-config.tsx.
-  const loadedAccountIdRef = useRef<string | null>(null);
+  const hasStoredKey = config?.hasKey ?? false;
+  const hasStoredEmbeddingsKey = config?.hasEmbeddingsKey ?? false;
 
-  const fetchConfig = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/ai/config');
-      const data = await res.json();
-      if (!res.ok) {
-        toast.error(data.error ?? t('loadFailed'));
-        return;
-      }
-      if (data.configured) {
-        setConfigured(true);
-        setProvider(data.provider);
-        setModel(data.model);
-        setSystemPrompt(data.system_prompt ?? '');
-        setIsActive(data.is_active);
-        setAutoReplyEnabled(data.auto_reply_enabled);
-        setMaxPerConversation(data.auto_reply_max_per_conversation ?? 3);
-        setHandoffAgentId(data.handoff_agent_id ?? '');
-        setHasStoredKey(Boolean(data.has_key));
-        setApiKey(data.has_key ? MASKED_KEY : '');
-        setKeyEdited(false);
-        setHasStoredEmbeddingsKey(Boolean(data.has_embeddings_key));
-        setEmbeddingsKey(data.has_embeddings_key ? MASKED_KEY : '');
-        setEmbeddingsKeyEdited(false);
-      }
-    } catch {
-      toast.error(t('loadFailed'));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
+  // Hydrate the form from the Convex-sourced row exactly once — mirrors
+  // whatsapp-config.tsx's `hydratedRef`: a reactive re-delivery of
+  // `configDoc` (e.g. right after this component's own `handleSave`
+  // mutates it) must NOT stomp the re-masking `handleSave` already does
+  // itself below.
+  const hydratedRef = useRef(false);
   useEffect(() => {
-    if (!accountId || loadedAccountIdRef.current === accountId) return;
-    loadedAccountIdRef.current = accountId;
-    void fetchConfig();
-    // Members populate the handoff-target picker. Best-effort — on an
-    // older deployment without the endpoint the picker just shows the
-    // queue option.
-    void fetchAccountMembers().then(setMembers);
-  }, [accountId, fetchConfig]);
+    if (configDoc === undefined) return; // still loading
+    if (hydratedRef.current) return;
+    hydratedRef.current = true;
+
+    if (config) {
+      setProvider(config.provider);
+      setModel(config.model);
+      setSystemPrompt(config.systemPrompt ?? '');
+      setIsActive(config.isActive);
+      setAutoReplyEnabled(config.autoReplyEnabled);
+      setMaxPerConversation(config.autoReplyMaxPerConversation ?? 3);
+      setHandoffAgentId(config.handoffAgentId ?? '');
+      setApiKey(config.hasKey ? MASKED_KEY : '');
+      setEmbeddingsKey(config.hasEmbeddingsKey ? MASKED_KEY : '');
+    }
+  }, [configDoc, config]);
 
   // Swap the model default when the provider changes, unless the user
   // typed a custom model.
@@ -135,23 +155,14 @@ export function AiConfig() {
     if (isDefaultModel) setModel(AI_PROVIDER_DEFAULT_MODEL[next]);
   };
 
-  const keyPayload = () => (keyEdited ? apiKey.trim() : undefined);
-
-  // undefined = leave unchanged; '' typed = null (clear); text = set.
+  // undefined = omit the arg (upsert reuses the stored key / leaves the
+  // embeddings key untouched); a non-blank freshly-typed value = set it.
+  const keyPayload = () =>
+    keyEdited && apiKey.trim() ? apiKey.trim() : undefined;
   const embeddingsKeyPayload = () =>
-    embeddingsKeyEdited ? embeddingsKey.trim() || null : undefined;
-
-  const buildBody = () => ({
-    provider,
-    model: model.trim(),
-    api_key: keyPayload(),
-    embeddings_api_key: embeddingsKeyPayload(),
-    system_prompt: systemPrompt.trim() || null,
-    is_active: isActive,
-    auto_reply_enabled: autoReplyEnabled,
-    auto_reply_max_per_conversation: maxPerConversation,
-    handoff_agent_id: handoffAgentId || null,
-  });
+    embeddingsKeyEdited && embeddingsKey.trim()
+      ? embeddingsKey.trim()
+      : undefined;
 
   const handleTest = async () => {
     setTesting(true);
@@ -186,55 +197,49 @@ export function AiConfig() {
     }
     setSaving(true);
     try {
-      const res = await fetch('/api/ai/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildBody()),
+      await upsertConfig({
+        provider,
+        model: model.trim(),
+        systemPrompt: systemPrompt.trim() || undefined,
+        isActive,
+        autoReplyEnabled,
+        autoReplyMaxPerConversation: maxPerConversation,
+        handoffAgentId: handoffAgentId
+          ? (handoffAgentId as Id<'users'>)
+          : undefined,
+        apiKey: keyPayload(),
+        embeddingsApiKey: embeddingsKeyPayload(),
       });
-      const data = await res.json();
-      if (res.ok) {
-        toast.success(t('saveSuccess'));
-        await fetchConfig();
+
+      toast.success(t('saveSuccess'));
+      // Re-mask locally rather than relying on a reactive re-hydration
+      // (blocked by `hydratedRef` above) — a successful save always
+      // leaves a key stored (fresh or reused), and leaves the
+      // embeddings key stored iff one was just set or one already
+      // existed before this save.
+      setKeyEdited(false);
+      setApiKey(MASKED_KEY);
+      const embeddingsKeyNowStored =
+        (embeddingsKeyEdited && embeddingsKey.trim().length > 0) ||
+        hasStoredEmbeddingsKey;
+      setEmbeddingsKeyEdited(false);
+      setEmbeddingsKey(embeddingsKeyNowStored ? MASKED_KEY : '');
+    } catch (err) {
+      if (isConvexErrorCode(err, 'API_KEY_REQUIRED')) {
+        toast.error(t('missingApiKey'));
       } else {
-        toast.error(data.error ?? t('saveFailed'));
+        console.error('[AiConfig] save error:', err);
+        toast.error(t('saveFailed'));
       }
-    } catch {
-      toast.error(t('saveFailed'));
     } finally {
       setSaving(false);
     }
   };
 
-  const handleRemove = async () => {
-    setRemoving(true);
-    try {
-      const res = await fetch('/api/ai/config', { method: 'DELETE' });
-      if (res.ok) {
-        toast.success(t('removeSuccess'));
-        setConfigured(false);
-        setHasStoredKey(false);
-        setApiKey('');
-        setKeyEdited(false);
-        setIsActive(false);
-        setAutoReplyEnabled(false);
-        setSystemPrompt('');
-        setHandoffAgentId('');
-      } else {
-        const data = await res.json();
-        toast.error(data.error ?? t('removeFailed'));
-      }
-    } catch {
-      toast.error(t('removeFailed'));
-    } finally {
-      setRemoving(false);
-    }
-  };
-
   if (loading || profileLoading) {
     return (
-      <div className="flex items-center justify-center py-16 text-muted-foreground">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> {t('loadFailed')} {/* Re-using label or a global one, wait, loading is better. Let's use useTranslations from overview or just hardcode Loading... actually I should add loading to aiConfig */}
-        {/* Wait, I didn't add loading to aiConfig. I'll just use loading. */}
+      <div className="flex items-center justify-center py-16">
+        <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     );
   }
@@ -477,7 +482,7 @@ export function AiConfig() {
                   </SelectItem>
                   {members.map((m) => (
                     <SelectItem key={m.user_id} value={m.user_id}>
-                      {memberLabel(m)}
+                      {m.full_name}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -486,35 +491,18 @@ export function AiConfig() {
           </CardContent>
         </Card>
 
-        <AiKnowledgeCard
-          accountId={accountId}
-          canEdit={canEdit}
-          hasEmbeddingsKey={
-            embeddingsKeyEdited
-              ? embeddingsKey.trim().length > 0
-              : hasStoredEmbeddingsKey
-          }
-        />
+        {canEdit && (
+          <AiKnowledgeCard
+            canEdit={canEdit}
+            hasEmbeddingsKey={
+              embeddingsKeyEdited
+                ? embeddingsKey.trim().length > 0
+                : hasStoredEmbeddingsKey
+            }
+          />
+        )}
 
-        <div className="flex items-center justify-between">
-          {configured ? (
-            <Button
-              variant="ghost"
-              onClick={handleRemove}
-              disabled={!canEdit || removing}
-              className="text-destructive hover:text-destructive"
-            >
-              {removing ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="mr-2 h-4 w-4" />
-              )}
-              {t('remove')}
-            </Button>
-          ) : (
-            <span />
-          )}
-
+        <div className="flex justify-end">
           <Button onClick={handleSave} disabled={disabled}>
             {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             {t('save')}
