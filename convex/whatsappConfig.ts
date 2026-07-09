@@ -1,4 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 
 // ============================================================
@@ -95,5 +96,26 @@ export const upsert = accountMutation({
       ...args,
       updatedAt: Date.now(),
     });
+  },
+});
+
+/**
+ * Server-only counterpart to `get`, for the engine primitives in
+ * `convex/metaSend.ts` — same "one row per account" `by_account` lookup,
+ * but keyed on a caller-supplied `accountId` instead of `ctx.accountId`,
+ * since an `internalAction`'s send has no user session to derive one
+ * from (mirrors `convex/apiKeys.ts`'s `lookupByHash`: an `internalQuery`
+ * never exposed to any client, called only via
+ * `ctx.runQuery(internal.whatsappConfig.getForAccount, { accountId })`).
+ * Returns `null`, never throws, for "never configured" — same contract
+ * as `get`.
+ */
+export const getForAccount = internalQuery({
+  args: { accountId: v.id("accounts") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .first();
   },
 });
