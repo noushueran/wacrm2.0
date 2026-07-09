@@ -1,95 +1,74 @@
-import { createServerClient } from '@supabase/ssr'
-import { NextResponse, type NextRequest } from 'next/server'
+import {
+  convexAuthNextjsMiddleware,
+  createRouteMatcher,
+  nextjsMiddlewareRedirect,
+} from "@convex-dev/auth/nextjs/server";
+import { NextResponse } from "next/server";
 
-export async function middleware(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request })
+// Auth pages — a signed-in user has no business here.
+const isAuthPage = createRouteMatcher(["/login", "/signup", "/forgot-password"]);
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
-          supabaseResponse = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
-          )
-        },
-      },
+// Protected app surface — same set the old Supabase middleware guarded
+// (`protectedPaths`). `(.*)` also covers each section's nested routes.
+const isProtectedRoute = createRouteMatcher([
+  "/dashboard(.*)",
+  "/inbox(.*)",
+  "/contacts(.*)",
+  "/pipelines(.*)",
+  "/broadcasts(.*)",
+  "/automations(.*)",
+  "/settings(.*)",
+]);
+
+// Non-webhook WhatsApp API routes that require a session (webhooks are
+// authenticated by Meta's signature, not our cookie).
+const isProtectedWhatsappApi = createRouteMatcher(["/api/whatsapp/(.*)"]);
+
+// `convexAuthNextjsMiddleware` also transparently proxies the
+// `/api/auth` action route (sign-in / sign-out / token refresh) to the
+// Convex backend before our handler runs, and refreshes the session
+// cookie — replacing the manual Supabase `getUser()` + cookie-rotation
+// dance the previous middleware did.
+export default convexAuthNextjsMiddleware(async (request, { convexAuth }) => {
+  const authed = await convexAuth.isAuthenticated();
+  const { pathname } = request.nextUrl;
+
+  // Already signed in and on an auth page → send to the app. Preserve the
+  // invite deep-link: a forwarded invite opened by an already-signed-in
+  // user goes straight to /join/<token> to accept in one click, instead
+  // of being dropped on /dashboard.
+  if (isAuthPage(request) && authed) {
+    const inviteToken = request.nextUrl.searchParams.get("invite");
+    if (inviteToken && (pathname === "/login" || pathname === "/signup")) {
+      return nextjsMiddlewareRedirect(
+        request,
+        `/join/${encodeURIComponent(inviteToken)}`,
+      );
     }
-  )
-
-  const { data: { user } } = await supabase.auth.getUser()
-
-  // getUser() transparently refreshes an expired access token, which
-  // ROTATES the refresh token and writes the new cookies onto
-  // `supabaseResponse` via setAll() above. Any response we return in
-  // place of `supabaseResponse` (every redirect / JSON branch below)
-  // is a fresh object that does NOT carry those Set-Cookie headers, so
-  // the rotated token never reaches the browser. The next request then
-  // replays the old, now-consumed refresh token, the refresh fails, and
-  // the session wedges — the user gets a broken reload after idling and
-  // can only recover by manually clearing cookies (issue #288). Copy the
-  // refreshed cookies onto whatever response we hand back to fix that.
-  const withRefreshedCookies = <T extends NextResponse>(response: T): T => {
-    supabaseResponse.cookies.getAll().forEach((cookie) => {
-      response.cookies.set(cookie)
-    })
-    return response
+    return nextjsMiddlewareRedirect(request, "/dashboard");
   }
 
-  // Auth pages - redirect to dashboard if already logged in.
-  // Exception: when an invite token is in the query string we
-  // send the already-signed-in user to /join/<token> instead so
-  // they can accept the invitation in one click. Without this,
-  // a forwarded invite link to someone who's already signed in
-  // would silently drop them on /dashboard.
-  if (user && (
-    request.nextUrl.pathname === '/login' ||
-    request.nextUrl.pathname === '/signup' ||
-    request.nextUrl.pathname === '/forgot-password'
-  )) {
-    const url = request.nextUrl.clone()
-    const inviteToken = request.nextUrl.searchParams.get('invite')
-    if (
-      inviteToken &&
-      (request.nextUrl.pathname === '/login' ||
-        request.nextUrl.pathname === '/signup')
-    ) {
-      url.pathname = `/join/${encodeURIComponent(inviteToken)}`
-      url.search = ''
-    } else {
-      url.pathname = '/dashboard'
-      url.search = ''
-    }
-    return withRefreshedCookies(NextResponse.redirect(url))
+  // Protected page while signed out → login.
+  if (isProtectedRoute(request) && !authed) {
+    return nextjsMiddlewareRedirect(request, "/login");
   }
 
-  // Protected pages - redirect to login if not authenticated
-  const protectedPaths = ['/dashboard', '/inbox', '/contacts', '/pipelines', '/broadcasts', '/automations', '/settings']
-  if (!user && protectedPaths.some(path => request.nextUrl.pathname.startsWith(path))) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    return withRefreshedCookies(NextResponse.redirect(url))
+  // Protected WhatsApp API while signed out → 401 (not a redirect; these
+  // are fetched by client code that expects JSON).
+  if (
+    isProtectedWhatsappApi(request) &&
+    !pathname.includes("/webhook") &&
+    !authed
+  ) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
-  // API routes that need auth (not webhooks)
-  if (!user && request.nextUrl.pathname.startsWith('/api/whatsapp/') &&
-      !request.nextUrl.pathname.includes('/webhook')) {
-    return withRefreshedCookies(
-      NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    )
-  }
-
-  return supabaseResponse
-}
+});
 
 export const config = {
+  // Unchanged from the Supabase middleware: run on everything except
+  // static assets. This still matches `/api/auth`, which the Convex Auth
+  // middleware needs in order to proxy auth actions.
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
-}
+};

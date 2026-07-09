@@ -3,6 +3,7 @@ import { NextIntlClientProvider } from 'next-intl';
 import { getLocale, getMessages } from 'next-intl/server';
 import { Inter } from "next/font/google";
 import Script from "next/script";
+import { ConvexAuthNextjsServerProvider } from "@convex-dev/auth/nextjs/server";
 import "./globals.css";
 import { ConvexClientProvider } from "./ConvexClientProvider";
 import { ThemeProvider } from "@/hooks/use-theme";
@@ -87,11 +88,28 @@ export default async function RootLayout({
   const messages = await getMessages();
 
   return (
-    <html
-      lang={locale}
-      data-theme={DEFAULT_THEME}
-      data-mode={DEFAULT_MODE}
-      className={`${inter.variable} h-full antialiased`}
+    // `ConvexAuthNextjsServerProvider` reads the auth cookies on the
+    // server and hands the resulting session state down to the client
+    // provider (`ConvexAuthNextjsProvider` in `ConvexClientProvider`) so
+    // SSR, the client, and `src/middleware.ts` all agree on who's signed
+    // in. It must sit ABOVE `<html>` (the documented Convex Auth Next.js
+    // root-layout shape) so the whole tree is inside the auth context.
+    //
+    // `storageNamespace` normally defaults to `NEXT_PUBLIC_CONVEX_URL`,
+    // and the library throws `Missing environment variable` if that var
+    // is unset. Supplying an explicit fallback keeps a missing var from
+    // white-screening the app (it short-circuits that internal
+    // `requireEnv`); when the var IS present we pass it through so token
+    // storage keys stay per-deployment exactly as the default would make
+    // them.
+    <ConvexAuthNextjsServerProvider
+      storageNamespace={process.env.NEXT_PUBLIC_CONVEX_URL || "wacrm"}
+    >
+      <html
+        lang={locale}
+        data-theme={DEFAULT_THEME}
+        data-mode={DEFAULT_MODE}
+        className={`${inter.variable} h-full antialiased`}
       // The `theme-boot` script below rewrites `data-theme` and
       // `data-mode` on <html> from localStorage before React hydrates,
       // so for any non-default choice the client DOM intentionally
@@ -116,6 +134,7 @@ export default async function RootLayout({
           </ThemeProvider>
         </NextIntlClientProvider>
       </body>
-    </html>
+      </html>
+    </ConvexAuthNextjsServerProvider>
   );
 }

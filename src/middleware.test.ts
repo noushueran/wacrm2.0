@@ -1,113 +1,114 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse, type NextFetchEvent } from "next/server";
 
-// --- Scenario knobs the mock reads -----------------------------------------
-// `mockUser`         — what getUser() resolves to (a refreshed session ⇒ user,
-//                      or null for the logged-out path).
-// `refreshedCookies` — cookies Supabase writes via setAll() during getUser(),
-//                      i.e. the freshly *rotated* auth token. The whole point
-//                      of the test is that these must survive onto whatever
-//                      response the middleware returns — including redirects.
-let mockUser: { id: string } | null = null;
-let refreshedCookies: Array<{
-  name: string;
-  value: string;
-  options: Record<string, unknown>;
-}> = [];
+// --- Scenario knob ----------------------------------------------------------
+// `mockAuthed` is what `convexAuth.isAuthenticated()` resolves to. The real
+// token/cookie handling lives inside `convexAuthNextjsMiddleware` (exercised
+// by Convex Auth's own suite); here we mock the wrapper so we can unit-test
+// *our* routing decisions — who gets redirected where — in isolation.
+let mockAuthed = false;
 
-vi.mock("@supabase/ssr", () => ({
-  createServerClient: (
-    _url: string,
-    _key: string,
-    opts: {
-      cookies: { setAll: (c: typeof refreshedCookies) => void };
-    },
-  ) => ({
-    auth: {
-      // Mirrors real auth-js: an expired access token is transparently
-      // refreshed inside getUser(), which rotates the refresh token and
-      // pushes the new cookies through setAll() before resolving.
-      getUser: async () => {
-        if (refreshedCookies.length) opts.cookies.setAll(refreshedCookies);
-        return { data: { user: mockUser } };
+vi.mock("@convex-dev/auth/nextjs/server", () => ({
+  // Invoke our handler with a mock `convexAuth`, mirroring the real
+  // wrapper's fallback of `NextResponse.next()` when the handler returns
+  // nothing.
+  convexAuthNextjsMiddleware: (
+    handler: (
+      request: NextRequest,
+      ctx: {
+        event: unknown;
+        convexAuth: {
+          isAuthenticated: () => Promise<boolean>;
+          getToken: () => Promise<string | undefined>;
+        };
       },
-    },
-  }),
+    ) => Promise<NextResponse | undefined> | NextResponse | undefined,
+  ) => {
+    return async (request: NextRequest) => {
+      const result = await handler(request, {
+        event: {},
+        convexAuth: {
+          isAuthenticated: async () => mockAuthed,
+          getToken: async () => (mockAuthed ? "token" : undefined),
+        },
+      });
+      return result ?? NextResponse.next();
+    };
+  },
+  // Minimal path-to-regexp stand-in: treats `(.*)` as "any chars" and
+  // anchors the whole pathname (so "/login" doesn't match "/login/x").
+  createRouteMatcher: (patterns: string[]) => {
+    const regexes = patterns.map(
+      (p) => new RegExp("^" + p.replace(/\(\.\*\)/g, ".*") + "$"),
+    );
+    return (request: NextRequest) =>
+      regexes.some((re) => re.test(new URL(request.url).pathname));
+  },
+  nextjsMiddlewareRedirect: (request: NextRequest, route: string) => {
+    const url = new URL(request.url);
+    const parsed = new URL(route, "http://dummy");
+    url.pathname = parsed.pathname;
+    url.search = parsed.search;
+    return NextResponse.redirect(url);
+  },
 }));
 
 // Imported after the mock is registered.
-const { middleware } = await import("./middleware");
+const { default: middleware } = await import("./middleware");
+
+// The default export is typed as `NextMiddleware` (2 args, possibly-null
+// result). At runtime our mock ignores the event and always returns a
+// response, so pass a dummy event and narrow away null/undefined.
+const fakeEvent = {} as unknown as NextFetchEvent;
+async function run(url: string) {
+  const res = await middleware(new NextRequest(url), fakeEvent);
+  if (!res) throw new Error("middleware returned no response");
+  return res;
+}
 
 beforeEach(() => {
-  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://test.supabase.co";
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-key";
-  mockUser = null;
-  refreshedCookies = [];
+  mockAuthed = false;
 });
 
 afterEach(() => vi.clearAllMocks());
 
-const ROTATED = {
-  name: "sb-test-auth-token",
-  value: "rotated-refresh-token",
-  options: { path: "/", httpOnly: true },
-};
-
-describe("middleware — refreshed auth cookies survive redirects", () => {
-  it("carries the rotated token when redirecting a signed-in user off /login", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
-
-    const res = await middleware(
-      new NextRequest("https://app.test/login"),
-    );
-
-    // Redirect to /dashboard…
+describe("middleware — Convex Auth route gating", () => {
+  it("redirects a signed-in user off /login to /dashboard", async () => {
+    mockAuthed = true;
+    const res = await run("https://app.test/login");
     expect(res.status).toBe(307);
     expect(res.headers.get("location")).toContain("/dashboard");
-    // …and the rotated cookie MUST ride along, otherwise the browser keeps
-    // replaying the now-consumed refresh token and the session wedges until
-    // the user manually clears cookies.
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
-  });
-
-  it("carries the rotated token when redirecting an unauth user to /login", async () => {
-    mockUser = null;
-    // Even on the logged-out path getUser() may emit cookie writes (e.g.
-    // clearing a dead session); those must not be dropped on the redirect.
-    refreshedCookies = [{ ...ROTATED, value: "cleared" }];
-
-    const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
-    );
-
-    expect(res.status).toBe(307);
-    expect(res.headers.get("location")).toContain("/login");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe("cleared");
   });
 
   it("redirects a signed-in user with an invite token to /join/<token>", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
-
-    const res = await middleware(
-      new NextRequest("https://app.test/login?invite=abc123"),
-    );
-
+    mockAuthed = true;
+    const res = await run("https://app.test/login?invite=abc123");
     expect(res.headers.get("location")).toContain("/join/abc123");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+  });
+
+  it("redirects an unauthenticated user off a protected page to /login", async () => {
+    mockAuthed = false;
+    const res = await run("https://app.test/dashboard");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
   });
 
   it("passes through (no redirect) for a signed-in user on a protected page", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
-
-    const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
-    );
-
-    // No redirect — the normal NextResponse.next() already carries cookies.
+    mockAuthed = true;
+    const res = await run("https://app.test/dashboard");
     expect(res.headers.get("location")).toBeNull();
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
+  });
+
+  it("401s an unauthenticated non-webhook WhatsApp API request", async () => {
+    mockAuthed = false;
+    const res = await run("https://app.test/api/whatsapp/send");
+    expect(res.status).toBe(401);
+  });
+
+  it("does not 401 the WhatsApp webhook (Meta-authenticated, not cookie)", async () => {
+    mockAuthed = false;
+    const res = await run("https://app.test/api/whatsapp/webhook");
+    expect(res.status).not.toBe(401);
+    expect(res.headers.get("location")).toBeNull();
   });
 });

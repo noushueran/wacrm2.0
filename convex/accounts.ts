@@ -58,3 +58,53 @@ export const currentUser = query({
     return { user, accountId: membership.accountId, role: membership.role };
   },
 });
+
+/**
+ * The exact projection the client-side `useAuth()` hook
+ * (src/hooks/use-auth.tsx) needs to build its `user` / `profile` /
+ * `account` context — flattened so the hook never joins client-side.
+ *
+ * Sourced from the caller's `memberships` row (the denormalized
+ * `fullName`/`email`/`avatarUrl`/`role` snapshot) plus the `accounts`
+ * row, with the `users` document as a fallback for name/email/avatar.
+ *
+ * Returns `null` when unauthenticated OR authenticated-but-not-yet-
+ * bootstrapped (no membership); the hook treats that second case as the
+ * cue to call `bootstrapAccount` once. Every string field is narrowed to
+ * `| null` (never `undefined`) so the hook's `Profile` mapping type-checks.
+ */
+export const me = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) return null;
+
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    if (!membership) return null;
+
+    const account = await ctx.db.get(membership.accountId);
+    // A membership without its account is a data-integrity impossibility
+    // in normal flow, but guard so the hook gets a clean `null` rather
+    // than a partial object it can't map.
+    if (!account) return null;
+
+    const user = await ctx.db.get(userId);
+
+    return {
+      userId,
+      name: membership.fullName ?? user?.name ?? null,
+      email: membership.email ?? user?.email ?? null,
+      avatarUrl: membership.avatarUrl ?? user?.image ?? null,
+      accountId: membership.accountId,
+      accountRole: membership.role,
+      account: {
+        id: account._id,
+        name: account.name,
+        defaultCurrency: account.defaultCurrency,
+      },
+    };
+  },
+});

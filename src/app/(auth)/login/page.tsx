@@ -4,7 +4,8 @@ import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useTranslations } from "next-intl";
-import { createClient } from "@/lib/supabase/client";
+import { useAuthActions } from "@convex-dev/auth/react";
+import { ConvexError } from "convex/values";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -16,6 +17,17 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { MessageSquare, UsersRound } from "lucide-react";
+
+// A ConvexError carries a structured `.data` payload that survives the
+// client boundary (a plain Error is sanitized to "Server Error"), so
+// prefer it; otherwise fall back to the Error message, then a generic.
+function authErrorMessage(err: unknown): string {
+  if (err instanceof ConvexError) {
+    return typeof err.data === "string" ? err.data : JSON.stringify(err.data);
+  }
+  if (err instanceof Error) return err.message;
+  return "Something went wrong. Please try again.";
+}
 
 // `useSearchParams` opts the component out of static prerendering
 // unless it sits under a Suspense boundary. We split the form into
@@ -43,24 +55,26 @@ function LoginPageInner() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const router = useRouter();
-  const supabase = createClient();
+  const { signIn } = useAuthActions();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
 
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (error) {
-      setError(error.message);
+    try {
+      await signIn("password", { email, password, flow: "signIn" });
+    } catch (err) {
+      // A ConvexError's `.data` survives the client boundary intact; a
+      // plain Error (e.g. bad credentials from the auth backend) is
+      // sanitized to its message.
+      setError(authErrorMessage(err));
       setLoading(false);
       return;
     }
 
+    // Navigate away on success; the middleware now sees the session
+    // cookie set by `signIn`. Don't reset `loading` — we're leaving.
     if (inviteToken) {
       router.push(`/join/${encodeURIComponent(inviteToken)}`);
     } else {

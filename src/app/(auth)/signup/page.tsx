@@ -2,8 +2,11 @@
 
 import { Suspense, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useAuthActions } from "@convex-dev/auth/react";
+import { useMutation } from "convex/react";
+import { ConvexError } from "convex/values";
+import { api } from "../../../../convex/_generated/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,7 +17,19 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { MessageSquare, CheckCircle, UsersRound } from "lucide-react";
+import { MessageSquare, UsersRound } from "lucide-react";
+
+// A ConvexError carries a structured `.data` payload that survives the
+// client boundary (a plain Error is sanitized to "Server Error"); prefer
+// it, then the Error message, then a generic string. The password-length
+// rule in `convex/auth.ts` throws exactly such a ConvexError.
+function authErrorMessage(err: unknown): string {
+  if (err instanceof ConvexError) {
+    return typeof err.data === "string" ? err.data : JSON.stringify(err.data);
+  }
+  if (err instanceof Error) return err.message;
+  return "Something went wrong. Please try again.";
+}
 
 // `useSearchParams` opts the component out of static prerendering
 // unless wrapped in Suspense — same pattern as /login.
@@ -28,12 +43,11 @@ export default function SignupPage() {
 
 function SignupPageInner() {
   const searchParams = useSearchParams();
-  // When the user lands here from `/join/<token>` we carry the
-  // invite token in the query so it survives the signup → email
-  // verification → redirect round-trip. `emailRedirectTo` below
-  // points back at /join/<token> so the user lands on the redeem
-  // step after verifying instead of being dropped on /dashboard.
+  // Carried through from `/join/<token>`. An invited user shouldn't get
+  // their own bootstrapped account — after sign-up we send them to the
+  // redeem step so they join the inviter's account instead.
   const inviteToken = searchParams.get("invite");
+  const router = useRouter();
 
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
@@ -41,8 +55,9 @@ function SignupPageInner() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [success, setSuccess] = useState(false);
-  const supabase = createClient();
+
+  const { signIn } = useAuthActions();
+  const bootstrapAccount = useMutation(api.accounts.bootstrapAccount);
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -53,79 +68,48 @@ function SignupPageInner() {
       return;
     }
 
-    if (password.length < 6) {
-      setError("Password must be at least 6 characters");
+    // Match `convex/auth.ts`'s Password `validatePasswordRequirements`
+    // (>= 8) so the user gets an inline message before the round-trip.
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters");
       return;
     }
 
     setLoading(true);
 
-    // If we have an invite token, point Supabase's verification
-    // email back at the join page so the user can accept after
-    // verifying. Without a token, Supabase uses its default
-    // redirect (the app root).
-    const emailRedirectTo = inviteToken
-      ? `${window.location.origin}/join/${encodeURIComponent(inviteToken)}`
-      : undefined;
-
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: fullName,
-        },
-        ...(emailRedirectTo ? { emailRedirectTo } : {}),
-      },
-    });
-
-    if (error) {
-      setError(error.message);
+    try {
+      // Convex Auth's Password provider has no email-verification step
+      // configured, so `signUp` creates the user AND signs them in in one
+      // shot — `name` is persisted onto the user doc (see convex/auth.ts).
+      await signIn("password", {
+        email,
+        password,
+        flow: "signUp",
+        name: fullName,
+      });
+    } catch (err) {
+      setError(authErrorMessage(err));
       setLoading(false);
       return;
     }
 
-    setSuccess(true);
-    setLoading(false);
-  };
+    if (inviteToken) {
+      // Join the inviter's account rather than bootstrapping a new one.
+      router.push(`/join/${encodeURIComponent(inviteToken)}`);
+      return;
+    }
 
-  if (success) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background px-4">
-        <Card className="w-full max-w-md border-border bg-card">
-          <CardHeader className="items-center text-center">
-            <div className="mb-2 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10">
-              <CheckCircle className="h-6 w-6 text-primary" />
-            </div>
-            <CardTitle className="text-xl text-foreground">
-              Check your email
-            </CardTitle>
-            <CardDescription className="text-muted-foreground">
-              We&apos;ve sent a confirmation link to{" "}
-              <span className="text-foreground">{email}</span>. Please check your
-              inbox and click the link to verify your account.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Link
-              href={
-                inviteToken
-                  ? `/login?invite=${encodeURIComponent(inviteToken)}`
-                  : "/login"
-              }
-            >
-              <Button
-                variant="outline"
-                className="w-full border-border text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                Back to sign in
-              </Button>
-            </Link>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
+    try {
+      // Give the brand-new user their own account (owner). Idempotent, and
+      // the dashboard's AuthProvider also bootstraps as a backstop.
+      await bootstrapAccount({});
+    } catch (err) {
+      console.error("[signup] bootstrapAccount failed:", err);
+    }
+
+    // Don't reset `loading` — we're navigating away.
+    router.push("/dashboard");
+  };
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -143,7 +127,7 @@ function SignupPageInner() {
           </CardTitle>
           <CardDescription className="text-muted-foreground">
             {inviteToken
-              ? "Verify your email, then accept the invitation to join your team."
+              ? "Create your account, then accept the invitation to join your team."
               : "Get started with CRM Template for WhatsApp"}
           </CardDescription>
         </CardHeader>
@@ -192,7 +176,7 @@ function SignupPageInner() {
               <Input
                 id="password"
                 type="password"
-                placeholder="At least 6 characters"
+                placeholder="At least 8 characters"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required

@@ -1,6 +1,6 @@
 "use client";
 
-import { ConvexAuthProvider } from "@convex-dev/auth/react";
+import { ConvexAuthNextjsProvider } from "@convex-dev/auth/nextjs";
 import { ConvexReactClient } from "convex/react";
 
 // Module-level singleton — created once per browser tab/module load, not
@@ -10,20 +10,38 @@ import { ConvexReactClient } from "convex/react";
 // pattern this codebase already follows for `ThemeProvider`
 // (src/hooks/use-theme.tsx).
 //
-// `ConvexAuthProvider` wraps `ConvexProviderWithAuth` internally (see
-// `@convex-dev/auth/react`'s `index.js`), so it's a drop-in replacement
-// for the plain `ConvexProvider` that also makes `Authenticated`/
-// `Unauthenticated`/`AuthLoading` (from `convex/react`) and
-// `useAuthActions`/`useConvexAuth` (from `@convex-dev/auth/react`) work
-// anywhere under this provider. Existing Supabase-authed pages don't
-// import any of these, so they're unaffected — see `/convex-demo`
-// (src/app/convex-demo/page.tsx) for the first consumer.
-const convex = new ConvexReactClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+// `ConvexAuthNextjsProvider` (from `@convex-dev/auth/nextjs`) is the
+// Next.js-SSR-aware client provider — it renders `ConvexProviderWithAuth`
+// wired to the auth-token context that `ConvexAuthNextjsServerProvider`
+// (mounted in `src/app/layout.tsx`) establishes from the request cookies.
+// That cookie handshake is what `src/middleware.ts`'s
+// `convexAuthNextjsMiddleware` reads to gate protected routes, so the
+// plain `ConvexAuthProvider` (from `@convex-dev/auth/react`) is NOT
+// interchangeable here — the middleware would never see the session.
+// It still makes `Authenticated`/`Unauthenticated`/`AuthLoading` (from
+// `convex/react`) and `useAuthActions`/`useConvexAuth` work everywhere
+// below it, so `/convex-demo` and `useAuth` (src/hooks/use-auth.tsx) are
+// unaffected by the swap.
+//
+// The `|| <placeholder>` guard keeps a missing `NEXT_PUBLIC_CONVEX_URL`
+// from throwing at module load — the old `!` non-null assertion turned
+// an unset var into a hard `new ConvexReactClient(undefined)` crash that
+// white-screened the entire app before anything rendered. With the
+// fallback the client just fails to connect (no data) instead of taking
+// down the whole tree. Construction is lazy — no socket opens until the
+// first subscription — so a placeholder URL is inert during SSR/build.
+const convex = new ConvexReactClient(
+  process.env.NEXT_PUBLIC_CONVEX_URL || "https://placeholder.convex.cloud",
+);
 
 export function ConvexClientProvider({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  return <ConvexAuthProvider client={convex}>{children}</ConvexAuthProvider>;
+  return (
+    <ConvexAuthNextjsProvider client={convex}>
+      {children}
+    </ConvexAuthNextjsProvider>
+  );
 }

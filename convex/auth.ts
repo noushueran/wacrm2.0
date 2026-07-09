@@ -7,6 +7,21 @@ import { ConvexError } from "convex/values";
 export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({
   providers: [
     Password({
+      // Persist the sign-up form's full name onto the `users` document so
+      // `accounts.bootstrapAccount` can snapshot it onto the membership and
+      // `accounts.me` can surface it as `profile.full_name`. The default
+      // Password `profile` captures only `email`; `name` is sent by the
+      // sign-up flow (`flow: "signUp"`) and absent on sign-in, so it's
+      // narrowed defensively.
+      profile(params) {
+        // Spread `name` in only when present — the profile return type is
+        // a map of Convex `Value`s, which excludes `undefined`, so a bare
+        // `name: undefined` on sign-in would fail to type-check.
+        return {
+          email: params.email as string,
+          ...(typeof params.name === "string" ? { name: params.name } : {}),
+        };
+      },
       validatePasswordRequirements: (password: string) => {
         if (password.length < 8) {
           // A plain `Error` here gets sanitized to an opaque "Server
