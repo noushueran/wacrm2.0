@@ -52,11 +52,27 @@ async function insertMembership(
   });
 }
 
+// These tests drive `accountQuery`/`accountMutation` through
+// `convex/contacts.ts` — a real, deployed endpoint — rather than a
+// test-only fixture. (This suite used to call `convex/lib/
+// authFixtures.ts`'s `whoAmI`/`requireAtLeast`, which existed only
+// because convex-test can invoke a customFunctions builder solely
+// through a real `FunctionReference`; that module carried no business
+// logic of its own and is now deleted, since `contacts.ts` is exactly
+// such a reference. One assertion doesn't carry over 1:1 — "the
+// wrapper injects the caller's own userId/accountId/role" — because
+// `contacts.list`/`contacts.create` don't echo ctx back the way
+// `whoAmI` did; that check now lives in `convex/contacts.test.ts`
+// instead, proven by reading back what a real `contacts.create` write
+// persisted, which is strictly stronger evidence than an echo.)
+
 test("accountQuery throws UNAUTHENTICATED when there is no identity", async () => {
   const t = convexTest(schema, modules);
 
   const error: unknown = await t
-    .query(api.lib.authFixtures.whoAmI, {})
+    .query(api.contacts.list, {
+      paginationOpts: { numItems: 10, cursor: null },
+    })
     .catch((e: unknown) => e);
 
   expect(error).toBeInstanceOf(ConvexError);
@@ -69,7 +85,7 @@ test("accountMutation throws UNAUTHENTICATED when there is no identity", async (
   const t = convexTest(schema, modules);
 
   await expect(
-    t.mutation(api.lib.authFixtures.requireAtLeast, { min: "admin" }),
+    t.mutation(api.contacts.create, { phone: "123" }),
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
 });
 
@@ -82,22 +98,10 @@ test("accountQuery throws NO_ACCOUNT when the identity has no membership", async
   const asNomad = t.withIdentity({ subject: `${userId}|session-nomad` });
 
   await expect(
-    asNomad.query(api.lib.authFixtures.whoAmI, {}),
+    asNomad.query(api.contacts.list, {
+      paginationOpts: { numItems: 10, cursor: null },
+    }),
   ).rejects.toMatchObject({ data: { code: "NO_ACCOUNT" } });
-});
-
-test("accountQuery injects the caller's userId, accountId, and role from their membership", async () => {
-  const t = convexTest(schema, modules);
-  const userId = await insertUser(t, {
-    name: "Priya",
-    email: "priya@example.com",
-  });
-  const accountId = await insertMembership(t, userId, "admin");
-  const asPriya = t.withIdentity({ subject: `${userId}|session-priya` });
-
-  const result = await asPriya.query(api.lib.authFixtures.whoAmI, {});
-
-  expect(result).toEqual({ userId, accountId, role: "admin" });
 });
 
 test("requireRole allows a caller whose role exactly matches the minimum", async () => {
@@ -109,9 +113,10 @@ test("requireRole allows a caller whose role exactly matches the minimum", async
   await insertMembership(t, userId, "agent");
   const asAgent = t.withIdentity({ subject: `${userId}|session-agent` });
 
+  // contacts.create's minimum is exactly "agent".
   await expect(
-    asAgent.mutation(api.lib.authFixtures.requireAtLeast, { min: "agent" }),
-  ).resolves.toEqual({ ok: true });
+    asAgent.mutation(api.contacts.create, { phone: "555-0100" }),
+  ).resolves.not.toBeNull();
 });
 
 test("requireRole allows a caller whose role exceeds the minimum", async () => {
@@ -124,8 +129,8 @@ test("requireRole allows a caller whose role exceeds the minimum", async () => {
   const asOwner = t.withIdentity({ subject: `${userId}|session-owner` });
 
   await expect(
-    asOwner.mutation(api.lib.authFixtures.requireAtLeast, { min: "admin" }),
-  ).resolves.toEqual({ ok: true });
+    asOwner.mutation(api.contacts.create, { phone: "555-0101" }),
+  ).resolves.not.toBeNull();
 });
 
 test("requireRole throws FORBIDDEN for a caller below the minimum", async () => {
@@ -138,6 +143,6 @@ test("requireRole throws FORBIDDEN for a caller below the minimum", async () => 
   const asViewer = t.withIdentity({ subject: `${userId}|session-viewer` });
 
   await expect(
-    asViewer.mutation(api.lib.authFixtures.requireAtLeast, { min: "admin" }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+    asViewer.mutation(api.contacts.create, { phone: "555-0102" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });

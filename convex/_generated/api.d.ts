@@ -10,10 +10,12 @@
 
 import type * as accounts from "../accounts.js";
 import type * as auth from "../auth.js";
+import type * as contacts from "../contacts.js";
 import type * as http from "../http.js";
 import type * as lib_auth from "../lib/auth.js";
-import type * as lib_authFixtures from "../lib/authFixtures.js";
+import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
+import type * as tags from "../tags.js";
 
 import type {
   ApiFromModules,
@@ -24,10 +26,12 @@ import type {
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
   auth: typeof auth;
+  contacts: typeof contacts;
   http: typeof http;
   "lib/auth": typeof lib_auth;
-  "lib/authFixtures": typeof lib_authFixtures;
+  "lib/phone": typeof lib_phone;
   "lib/roles": typeof lib_roles;
+  tags: typeof tags;
 }>;
 
 /**
