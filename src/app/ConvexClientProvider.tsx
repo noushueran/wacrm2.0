@@ -1,6 +1,7 @@
 "use client";
 
-import { ConvexProvider, ConvexReactClient } from "convex/react";
+import { ConvexAuthProvider } from "@convex-dev/auth/react";
+import { ConvexReactClient } from "convex/react";
 
 // Module-level singleton — created once per browser tab/module load, not
 // per render. Next.js App Router pattern for Client Component context
@@ -9,8 +10,14 @@ import { ConvexProvider, ConvexReactClient } from "convex/react";
 // pattern this codebase already follows for `ThemeProvider`
 // (src/hooks/use-theme.tsx).
 //
-// Plain `ConvexProvider` only — no auth wiring here. Task 3 swaps this for
-// `ConvexAuthProvider` (or wraps it) once auth is introduced.
+// `ConvexAuthProvider` wraps `ConvexProviderWithAuth` internally (see
+// `@convex-dev/auth/react`'s `index.js`), so it's a drop-in replacement
+// for the plain `ConvexProvider` that also makes `Authenticated`/
+// `Unauthenticated`/`AuthLoading` (from `convex/react`) and
+// `useAuthActions`/`useConvexAuth` (from `@convex-dev/auth/react`) work
+// anywhere under this provider. Existing Supabase-authed pages don't
+// import any of these, so they're unaffected — see `/convex-demo`
+// (src/app/convex-demo/page.tsx) for the first consumer.
 const convex = new ConvexReactClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
 
 export function ConvexClientProvider({
@@ -18,5 +25,5 @@ export function ConvexClientProvider({
 }: {
   children: React.ReactNode;
 }) {
-  return <ConvexProvider client={convex}>{children}</ConvexProvider>;
+  return <ConvexAuthProvider client={convex}>{children}</ConvexAuthProvider>;
 }
