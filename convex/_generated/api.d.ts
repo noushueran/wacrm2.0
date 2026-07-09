@@ -20,6 +20,7 @@ import type * as dashboard from "../dashboard.js";
 import type * as deals from "../deals.js";
 import type * as files from "../files.js";
 import type * as http from "../http.js";
+import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
 import type * as lib_apiKey from "../lib/apiKey.js";
 import type * as lib_auth from "../lib/auth.js";
@@ -48,6 +49,7 @@ import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as tags from "../tags.js";
 import type * as templates from "../templates.js";
+import type * as webhookDelivery from "../webhookDelivery.js";
 import type * as webhookEndpoints from "../webhookEndpoints.js";
 import type * as whatsappConfig from "../whatsappConfig.js";
 
@@ -70,6 +72,7 @@ declare const fullApi: ApiFromModules<{
   deals: typeof deals;
   files: typeof files;
   http: typeof http;
+  ingest: typeof ingest;
   invitations: typeof invitations;
   "lib/apiKey": typeof lib_apiKey;
   "lib/auth": typeof lib_auth;
@@ -98,6 +101,7 @@ declare const fullApi: ApiFromModules<{
   reactions: typeof reactions;
   tags: typeof tags;
   templates: typeof templates;
+  webhookDelivery: typeof webhookDelivery;
   webhookEndpoints: typeof webhookEndpoints;
   whatsappConfig: typeof whatsappConfig;
 }>;

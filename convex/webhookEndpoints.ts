@@ -1,4 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
@@ -131,5 +132,82 @@ export const remove = accountMutation({
     ctx.requireRole("admin");
     await requireOwnWebhookEndpoint(ctx, args.endpointId);
     await ctx.db.delete(args.endpointId);
+  },
+});
+
+// ============================================================
+// Server-only counterparts (Phase 6, Task 2) for
+// `convex/webhookDelivery.ts`'s `dispatch` action — none of which have
+// a user session, so each takes its scoping id(s) as an explicit
+// argument instead of deriving them from `ctx.accountId`/a membership
+// row, mirroring `whatsappConfig.getForAccount`'s relationship to
+// `whatsappConfig.get`.
+// ============================================================
+
+/**
+ * Every ACTIVE endpoint of `accountId` subscribed to `event` — same
+ * `by_account` scan `list` above uses, but (unlike `list`) INCLUDES
+ * `secret` (the delivery action needs it to sign the payload) and is
+ * pre-filtered to `isActive && events.includes(event)`. There is no
+ * Convex index on the `events` array field (see schema.ts), so the
+ * subscription check is a plain in-memory `.filter` over this account's
+ * own rows — the same "collect, then filter in JS for an array-
+ * membership check Convex can't express as an index lookup" treatment
+ * `contacts.filterByTags` already uses.
+ */
+export const listActiveForEvent = internalQuery({
+  args: { accountId: v.id("accounts"), event: v.string() },
+  handler: async (ctx, args) => {
+    const endpoints = await ctx.db
+      .query("webhookEndpoints")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    return endpoints.filter(
+      (endpoint) => endpoint.isActive && endpoint.events.includes(args.event),
+    );
+  },
+});
+
+/**
+ * Bumps `lastDeliveryAt` and clears the failure streak after a
+ * successful delivery — the Convex counterpart to `deliver.ts`'s own
+ * "Success: clear the failure streak" update.
+ */
+export const recordDeliverySuccess = internalMutation({
+  args: { endpointId: v.id("webhookEndpoints") },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.endpointId, {
+      failureCount: 0,
+      lastDeliveryAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Bumps `failureCount` by one and, once it reaches `maxFailures`,
+ * auto-disables the endpoint (`isActive: false`) so a dead sink stops
+ * being hit — the Convex counterpart to `deliver.ts`'s
+ * `record_webhook_failure` SQL function (same "atomic increment +
+ * auto-disable at threshold" semantics; `maxFailures` is passed in by
+ * the caller, mirroring that function's own `max_failures` parameter,
+ * rather than hard-coding `MAX_CONSECUTIVE_FAILURES` here — that
+ * constant lives in `webhookDelivery.ts`, the direct Convex counterpart
+ * of `deliver.ts` where the original constant lives). Unlike Postgres
+ * (where a read-modify-write could lose a concurrent increment, hence
+ * the original's atomic RPC), Convex mutations already serialize
+ * conflicting writes to the same document via OCC — a plain
+ * read-then-patch here can't lose an increment the way a naive
+ * read-modify-write could under MVCC.
+ */
+export const recordDeliveryFailure = internalMutation({
+  args: { endpointId: v.id("webhookEndpoints"), maxFailures: v.number() },
+  handler: async (ctx, args) => {
+    const endpoint = await ctx.db.get(args.endpointId);
+    if (!endpoint) return;
+    const failureCount = endpoint.failureCount + 1;
+    await ctx.db.patch(args.endpointId, {
+      failureCount,
+      isActive: failureCount >= args.maxFailures ? false : endpoint.isActive,
+    });
   },
 });

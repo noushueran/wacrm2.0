@@ -57,7 +57,7 @@ async function requireOwnConversation(
  * field/effect means; this is a straight extraction so the two entry
  * points can't drift.
  */
-interface AppendMessageArgs {
+export interface AppendMessageArgs {
   accountId: Id<"accounts">;
   conversationId: Id<"conversations">;
   senderType: "customer" | "agent" | "bot";
@@ -75,10 +75,19 @@ interface AppendMessageArgs {
   templateName?: string;
   messageId?: string;
   interactivePayload?: unknown;
+  // Inbound-only in practice (the customer's reply to a `interactive`
+  // message we sent) — schema.ts's `interactiveReplyId` column existed
+  // since Task 1 but neither `append` nor `appendInternal` ever
+  // threaded it through until now (Phase 6, Task 2 needs it for
+  // `ingest.ingestInbound`). Added here, not just on `ingestInbound`'s
+  // own call site, so `append`/`appendInternal` stay identical in what
+  // they can insert — see this file's own "so the two entry points
+  // can't drift" comment on `insertMessageAndUpdateConversation`.
+  interactiveReplyId?: string;
   aiGenerated?: boolean;
 }
 
-async function insertMessageAndUpdateConversation(
+export async function insertMessageAndUpdateConversation(
   ctx: { db: MutationCtx["db"] },
   args: AppendMessageArgs,
   conversation: Doc<"conversations">,
@@ -93,6 +102,7 @@ async function insertMessageAndUpdateConversation(
     templateName,
     messageId,
     interactivePayload,
+    interactiveReplyId,
     aiGenerated,
   } = args;
 
@@ -106,6 +116,7 @@ async function insertMessageAndUpdateConversation(
     templateName,
     messageId,
     interactivePayload,
+    interactiveReplyId,
     aiGenerated,
     status: "sent",
   });
@@ -179,6 +190,7 @@ export const append = accountMutation({
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
+    interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
@@ -239,6 +251,7 @@ export const appendInternal = internalMutation({
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
+    interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
