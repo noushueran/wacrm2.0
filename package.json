@@ -39,7 +39,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@auth/core": "0.41.2",
     "@base-ui/react": "^1.6.0",
+    "@convex-dev/auth": "0.0.94",
     "@dagrejs/dagre": "^3.0.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
