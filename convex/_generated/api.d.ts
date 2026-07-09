@@ -16,6 +16,7 @@ import type * as http from "../http.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
+import type * as messages from "../messages.js";
 import type * as tags from "../tags.js";
 
 import type {
@@ -33,6 +34,7 @@ declare const fullApi: ApiFromModules<{
   "lib/auth": typeof lib_auth;
   "lib/phone": typeof lib_phone;
   "lib/roles": typeof lib_roles;
+  messages: typeof messages;
   tags: typeof tags;
 }>;
 
