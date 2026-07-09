@@ -13,12 +13,13 @@ import {
   RotateCcw,
   Upload,
 } from 'lucide-react';
-import { createClient } from '@/lib/supabase/client';
+import { useMutation, useQuery } from 'convex/react';
 import {
   uploadAccountMedia,
   MEDIA_MAX_BYTES_BY_KIND,
 } from '@/lib/storage/upload-media';
 import { useAuth } from '@/hooks/use-auth';
+import { toUiTemplate } from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -52,6 +53,9 @@ import {
   extractVariableIndices,
   TEMPLATE_LIMITS,
 } from '@/lib/whatsapp/template-validators';
+
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 const CATEGORIES = ['Marketing', 'Utility', 'Authentication'] as const;
 type HeaderFormat = 'none' | 'text' | 'image' | 'video' | 'document';
@@ -126,11 +130,17 @@ function emptyButton(type: TemplateButton['type']): TemplateButton {
 
 export function TemplateManager() {
   const t = useTranslations('Settings.templates');
-  const supabase = createClient();
-  const { user, loading: authLoading } = useAuth();
+  const { user } = useAuth();
 
-  const [loading, setLoading] = useState(true);
-  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
+  const templatesResult = useQuery(api.templates.list);
+  const templates = useMemo(
+    () => (templatesResult ?? []).map(toUiTemplate),
+    [templatesResult],
+  );
+  const loading = templatesResult === undefined;
+
+  const removeTemplate = useMutation(api.templates.remove);
+
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -176,34 +186,6 @@ export function TemplateManager() {
       return { ...prev, body_samples: next };
     });
   }, [bodyVarCount]);
-
-  useEffect(() => {
-    if (authLoading) return;
-    if (!user) {
-      setLoading(false);
-      return;
-    }
-    fetchTemplates(user.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, user?.id]);
-
-  async function fetchTemplates(userId: string) {
-    try {
-      setLoading(true);
-      const { data, error } = await supabase
-        .from('message_templates')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      setTemplates(data || []);
-    } catch (err) {
-      console.error('Failed to fetch templates:', err);
-      toast.error(t('toastLoadFailed'));
-    } finally {
-      setLoading(false);
-    }
-  }
 
   function buildSubmitPayload() {
     const sample_values: TemplateSampleValues = {};
@@ -257,6 +239,12 @@ export function TemplateManager() {
     setDialogOpen(true);
   }
 
+  // TODO(P8-T4): Meta-coupled — deferred, exactly like the inbox send.
+  // Submitting/resubmitting a template still POSTs/PATCHes the
+  // Supabase-backed /api/whatsapp/templates/{submit,[id]} routes (Meta
+  // Graph API call + Supabase `message_templates` upsert). Leave as-is
+  // until that flow is migrated onto Convex — the Convex-backed
+  // `templates` list above won't reflect this write until then.
   async function handleSubmit() {
     // AUTHENTICATION is blocked by the persistent banner + disabled
     // submit button; this is a defensive second line of defense.
@@ -278,9 +266,6 @@ export function TemplateManager() {
           data?.error || `${isEdit ? 'Edit' : 'Submit'} failed (HTTP ${res.status})`,
         );
       }
-      // Refresh first, then close — re-opening the dialog
-      // immediately should not show a stale list.
-      if (user) await fetchTemplates(user.id);
       toast.success(
         data.dry_run
           ? isEdit
@@ -301,6 +286,12 @@ export function TemplateManager() {
     }
   }
 
+  // TODO(P8-T4): Meta-coupled — deferred, exactly like the inbox send.
+  // Sync still POSTs the Supabase-backed /api/whatsapp/templates/sync
+  // route (paginated Meta Graph API read + Supabase `message_templates`
+  // upsert). Leave as-is until that flow is migrated onto Convex — the
+  // Convex-backed `templates` list above won't reflect this write until
+  // then.
   async function handleSyncFromMeta() {
     if (!user) return;
     setSyncing(true);
@@ -334,7 +325,6 @@ export function TemplateManager() {
           { duration: 10000 },
         );
       }
-      await fetchTemplates(user.id);
     } catch (err) {
       console.error('Template sync error:', err);
       toast.error(err instanceof Error ? err.message : t('toastSyncError'));
@@ -348,18 +338,14 @@ export function TemplateManager() {
     if (!target || deletingId) return;
     setDeletingId(target.id);
     try {
-      // Route handler scopes the Meta delete via hsm_id (so sibling
-      // language variants survive) and falls through to remove the
-      // local row. Local-only rows skip the Meta call.
-      const res = await fetch(`/api/whatsapp/templates/${target.id}`, {
-        method: 'DELETE',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data?.error || `Delete failed (HTTP ${res.status})`);
-      }
+      // Convex-only delete. Unlike the old route (which scoped a Meta
+      // delete via hsm_id before removing the local row), this only
+      // removes the local catalog row — a template with a
+      // meta_template_id set is left behind on Meta's side until the
+      // Meta-coupled delete path is migrated (TODO(P8-T4), same as
+      // submit/sync above).
+      await removeTemplate({ templateId: target.id as Id<'messageTemplates'> });
       toast.success(t('toastDeleteSuccess'));
-      setTemplates((prev) => prev.filter((t) => t.id !== target.id));
       setTemplateToDelete(null);
     } catch (err) {
       console.error('Delete error:', err);
@@ -1081,9 +1067,12 @@ export function TemplateManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Confirm-delete dialog. Surfacing the meta_template_id case
-          separately so users understand a real Meta delete is happening,
-          not just a local cleanup. */}
+      {/* Confirm-delete dialog. Copy still distinguishes the
+          meta_template_id case (deleteMetaDesc vs deleteLocalDesc below)
+          — but see the TODO(P8-T4) in confirmDelete above: the Convex
+          rewire only removes the local catalog row, so that copy is
+          currently aspirational for rows with a meta_template_id until
+          the Meta-side delete is migrated too. */}
       <Dialog
         open={templateToDelete !== null}
         onOpenChange={(open) => {

@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
+import { useMutation, useQuery } from "convex/react";
 import { Loader2, MessageSquare, Pencil, Plus, Trash2, Zap } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,7 +24,11 @@ import {
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
 } from "@/lib/whatsapp/interactive";
+import { toUiQuickReply } from "@/lib/convex/adapters";
 import type { QuickReply, QuickReplyKind } from "@/types";
+
+import { api } from "../../../convex/_generated/api";
+import type { Id } from "../../../convex/_generated/dataModel";
 
 interface DraftState {
   id?: string;
@@ -43,25 +48,19 @@ function emptyDraft(): DraftState {
 }
 
 export function QuickRepliesManager() {
-  const [items, setItems] = useState<QuickReply[]>([]);
-  const [loading, setLoading] = useState(true);
+  const quickRepliesResult = useQuery(api.quickReplies.list);
+  const items = useMemo(
+    () => (quickRepliesResult ?? []).map(toUiQuickReply),
+    [quickRepliesResult],
+  );
+  const loading = quickRepliesResult === undefined;
+
+  const createQuickReply = useMutation(api.quickReplies.create);
+  const updateQuickReply = useMutation(api.quickReplies.update);
+  const removeQuickReply = useMutation(api.quickReplies.remove);
+
   const [draft, setDraft] = useState<DraftState | null>(null);
   const [saving, setSaving] = useState(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch("/api/quick-replies", { cache: "no-store" });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) setItems((data.quick_replies as QuickReply[]) ?? []);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   const openCreate = () => setDraft(emptyDraft());
   const openEdit = (qr: QuickReply) =>
@@ -82,45 +81,48 @@ export function QuickRepliesManager() {
     }
     const payload =
       draft.kind === "interactive"
-        ? { title: draft.title, kind: "interactive", interactive_payload: draft.interactive_payload }
-        : { title: draft.title, kind: "text", content_text: draft.content_text };
+        ? {
+            title: draft.title,
+            kind: "interactive" as const,
+            interactivePayload: draft.interactive_payload,
+          }
+        : {
+            title: draft.title,
+            kind: "text" as const,
+            contentText: draft.content_text,
+          };
 
     setSaving(true);
     try {
-      const res = await fetch(
-        draft.id ? `/api/quick-replies/${draft.id}` : "/api/quick-replies",
-        {
-          method: draft.id ? "PATCH" : "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        toast.error(data.error ?? "Couldn't save the quick reply.");
-        return;
+      if (draft.id) {
+        await updateQuickReply({
+          quickReplyId: draft.id as Id<"quickReplies">,
+          ...payload,
+        });
+      } else {
+        await createQuickReply(payload);
       }
       toast.success(draft.id ? "Quick reply updated." : "Quick reply created.");
       setDraft(null);
-      await load();
-    } catch {
+    } catch (err) {
+      console.error("Save error:", err);
       toast.error("Couldn't save the quick reply.");
     } finally {
       setSaving(false);
     }
-  }, [draft, load]);
+  }, [draft, createQuickReply, updateQuickReply]);
 
   const remove = useCallback(
     async (id: string) => {
       if (!window.confirm("Delete this quick reply?")) return;
-      const res = await fetch(`/api/quick-replies/${id}`, { method: "DELETE" });
-      if (!res.ok) {
+      try {
+        await removeQuickReply({ quickReplyId: id as Id<"quickReplies"> });
+      } catch (err) {
+        console.error("Delete error:", err);
         toast.error("Couldn't delete the quick reply.");
-        return;
       }
-      await load();
     },
-    [load],
+    [removeQuickReply],
   );
 
   return (

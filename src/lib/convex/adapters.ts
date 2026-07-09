@@ -12,10 +12,13 @@ import type {
   InteractiveMessagePayload,
   Message,
   MessageReaction,
+  MessageTemplate,
   Pipeline,
   PipelineStage,
   Profile,
+  QuickReply,
   Tag,
+  TemplateButton,
 } from "@/types";
 
 // ============================================================
@@ -351,6 +354,78 @@ export function toUiBroadcastRecipient(
     whatsapp_message_id: doc.whatsappMessageId,
     created_at: new Date(doc._creationTime).toISOString(),
     contact,
+  };
+}
+
+// ============================================================
+// Quick replies + message templates vertical adapters (Phase 8, Task 3)
+// — reusable inbox-composer snippets (`quickReplies`) and the local
+// catalog of Meta message-template variants (`messageTemplates`). Same
+// rename + `_creationTime`/epoch-ms -> ISO-string convention as every
+// adapter above. Submitting to / syncing from Meta itself stays on the
+// existing Supabase-backed `/api/whatsapp/templates/*` routes
+// (TODO(P8-T4) in `template-manager.tsx`) — these two adapters only
+// cover `templates.list`/`templates.remove` and the full
+// `quickReplies.*` CRUD, neither of which has any Meta coupling.
+// ============================================================
+
+/** `MessageTemplate` (unlike `Broadcast`/`Conversation`/`Deal` above) has
+ *  no `updated_at` field on the UI type at all — only `created_at` — so
+ *  `messageTemplates.updatedAt` (write-side bookkeeping the Meta
+ *  webhook/resubmit paths touch) is intentionally left unmapped here,
+ *  same "don't add fields the type doesn't have" restraint as
+ *  `toUiBroadcast` above. `buttons` is `v.optional(v.any())` on the
+ *  Convex side, so it gets the same `as` cast every untyped-JSON field
+ *  gets elsewhere in this file; `sampleValues`'s `{ body?, header? }`
+ *  shape already matches `TemplateSampleValues` structurally, so no cast
+ *  is needed there. */
+export function toUiTemplate(doc: Doc<"messageTemplates">): MessageTemplate {
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    name: doc.name,
+    category: doc.category,
+    language: doc.language,
+    header_type: doc.headerType,
+    header_content: doc.headerContent,
+    header_handle: doc.headerHandle,
+    header_media_url: doc.headerMediaUrl,
+    body_text: doc.bodyText,
+    footer_text: doc.footerText,
+    buttons: doc.buttons as TemplateButton[] | undefined,
+    sample_values: doc.sampleValues,
+    status: doc.status,
+    meta_template_id: doc.metaTemplateId,
+    rejection_reason: doc.rejectionReason,
+    quality_score: doc.qualityScore,
+    submission_error: doc.submissionError,
+    last_submitted_at: doc.lastSubmittedAt
+      ? new Date(doc.lastSubmittedAt).toISOString()
+      : undefined,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `quickReplies.updatedAt` is optional per schema but is unconditionally
+ *  set by both `create` and `update` (see `convex/quickReplies.ts`) — the
+ *  `_creationTime` fallback below is defensive only, same "don't trust
+ *  the schema's `optional` over the write path" convention as
+ *  `toUiConversation.updated_at` above. */
+export function toUiQuickReply(doc: Doc<"quickReplies">): QuickReply {
+  return {
+    id: doc._id,
+    account_id: doc.accountId,
+    user_id: doc.createdByUserId ?? "",
+    title: doc.title,
+    kind: doc.kind,
+    content_text: doc.contentText,
+    interactive_payload: doc.interactivePayload as
+      | InteractiveMessagePayload
+      | undefined,
+    created_at: new Date(doc._creationTime).toISOString(),
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : new Date(doc._creationTime).toISOString(),
   };
 }
 
