@@ -1,43 +1,60 @@
 /**
- * WhatsApp access-token decryption — Convex port of the AES-256-GCM
- * (+ legacy AES-256-CBC) decrypt half of `src/lib/whatsapp/encryption.ts`,
- * reimplemented against the Web Crypto API (`crypto.subtle`) instead of
- * Node's `node:crypto`, for the same reason `convex/lib/inviteToken.ts`
- * and `convex/lib/apiKey.ts` do this: `convex/metaSend.ts`'s actions
- * run in Convex's default (V8-isolate) runtime, and reaching for
+ * WhatsApp access-token / AI-provider-key encryption — Convex port of
+ * the AES-256-GCM (+ legacy AES-256-CBC, decrypt-only) cipher in
+ * `src/lib/whatsapp/encryption.ts`, reimplemented against the Web
+ * Crypto API (`crypto.subtle`) instead of Node's `node:crypto`, for the
+ * same reason `convex/lib/inviteToken.ts` and `convex/lib/apiKey.ts` do
+ * this: Convex functions built on `accountQuery`/`accountMutation`/
+ * `internalQuery`/`internalMutation` (like `convex/metaSend.ts`'s
+ * actions, and `convex/aiConfig.ts`'s mutation/query below) run in
+ * Convex's default (V8-isolate) function runtime, and reaching for
  * `"use node"` should be a last resort — Web Crypto's AES-GCM/AES-CBC
- * support (`crypto.subtle.decrypt`) covers this cleanly, no `"use node"`
- * needed. Wire format this reads (see the original file's header for
- * the full rationale):
+ * support (`crypto.subtle.encrypt`/`.decrypt`) covers this cleanly, no
+ * `"use node"` needed (and `"use node"` files may only export
+ * `action`s, never a `query`/`mutation`, which `aiConfig.upsert` must
+ * be). Wire format both directions use (see the original file's header
+ * for the full rationale):
  *
  *   GCM (current):  `<iv-hex>:<ciphertext-hex>:<authTag-hex>` (3 parts)
- *   CBC (legacy):    `<iv-hex>:<ciphertext-hex>`               (2 parts)
+ *   CBC (legacy):    `<iv-hex>:<ciphertext-hex>`               (2 parts,
+ *                     decrypt-only — `encrypt` below never produces this)
  *
- * Only `decrypt` (+ the `isLegacyFormat` structural check) is ported —
- * `encrypt` deliberately is NOT: per `convex/whatsappConfig.ts`'s own
- * header comment, encrypting `accessToken` at rest stays an
- * application-layer (Next.js API route) concern that happens BEFORE
- * `whatsappConfig.upsert` is ever called; Convex only ever needs to
- * read a token back out, in `metaSend.ts`.
+ * `decrypt` (+ the `isLegacyFormat` structural check) was the original
+ * Phase 6 port. `encrypt` was NOT ported then: per
+ * `convex/whatsappConfig.ts`'s own header comment, encrypting
+ * `accessToken` at rest stays an application-layer (Next.js API route)
+ * concern that happens BEFORE `whatsappConfig.upsert` is ever called,
+ * so that module only ever needed to read a token back out (in
+ * `metaSend.ts`). `convex/aiConfig.ts` (Phase 7) is different: its
+ * `upsert` mutation receives a caller's PLAINTEXT BYO provider key
+ * directly over the wire and must encrypt it itself before the row is
+ * ever written — there is no app-layer route in front of it — so
+ * `encrypt` is ported here too, sharing this file's key/IV helpers with
+ * `decrypt`.
  *
  * The one real wire-format difference from Node's `crypto` module:
- * Node's GCM decipher takes the auth tag separately via `setAuthTag()`,
- * while Web Crypto's `subtle.decrypt` expects it appended to the END of
- * the ciphertext bytes it's given — `ciphertext || tag`. `decrypt`
- * below concatenates the two before calling `subtle.decrypt` so a
- * ciphertext produced by the ORIGINAL Node-side `encrypt()` decrypts
- * identically here — verified in `whatsappEncryption.test.ts` against
- * fixtures generated with the real `node:crypto` module (proving actual
- * cross-runtime compatibility), not just a Web-Crypto round-trip of
- * itself.
+ * Node's GCM cipher/decipher take the auth tag separately
+ * (`cipher.getAuthTag()` / `decipher.setAuthTag()`), while Web Crypto's
+ * `subtle.encrypt`/`.decrypt` always treat it as appended to the END of
+ * the ciphertext bytes — `ciphertext || tag`. `encrypt` below SPLITS
+ * that combined output back into separate ciphertext/tag hex segments
+ * (so the stored string matches what Node's `cipher.getAuthTag()` would
+ * have produced separately); `decrypt` does the reverse, concatenating
+ * the two before calling `subtle.decrypt` — so a ciphertext produced by
+ * the ORIGINAL Node-side `encrypt()` decrypts identically here, AND a
+ * ciphertext produced by THIS file's `encrypt()` decrypts identically
+ * under the ORIGINAL Node-side `decrypt()` — verified in
+ * `whatsappEncryption.test.ts` against fixtures generated with the real
+ * `node:crypto` module (proving actual cross-runtime compatibility),
+ * not just a Web-Crypto round-trip of itself.
  *
  * `ENCRYPTION_KEY` is the same 64-hex-char (32-byte) shared secret the
  * Next.js app reads via `process.env.ENCRYPTION_KEY` (see
  * `vitest.config.ts`'s dummy value, shared by every test project). The
  * deployed Convex project must have the IDENTICAL value configured
- * (`npx convex env set ENCRYPTION_KEY ...`) or decrypting real
- * `whatsappConfig` rows will fail — see this task's report for this
- * cross-deployment-config caveat.
+ * (`npx convex env set ENCRYPTION_KEY ...`) or encrypting/decrypting
+ * real `whatsappConfig`/`aiConfigs` rows will fail — see this task's
+ * report for this cross-deployment-config caveat.
  */
 
 const GCM_IV_LENGTH = 12;
@@ -86,24 +103,71 @@ function encryptionKeyBytes(): Uint8Array<ArrayBuffer> {
   return hexToBytes(key);
 }
 
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (const byte of bytes) {
+    out += byte.toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function randomBytes(length: number): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
 async function importAesKey(
   bytes: Uint8Array<ArrayBuffer>,
   algorithm: "AES-GCM" | "AES-CBC",
+  keyUsages: KeyUsage[],
 ): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
     bytes,
     { name: algorithm },
     false,
-    ["decrypt"],
+    keyUsages,
   );
 }
 
 /**
- * Decrypt a `whatsappConfig.accessToken` ciphertext. Auto-detects GCM
- * (current, 3 colon-separated parts) vs legacy CBC (2 parts) by
- * counting parts, exactly like the original `decrypt()` — so a
- * pre-GCM-migration row (if one is ever carried over) still decrypts.
+ * Encrypt a plaintext string into the GCM wire format `decrypt` below
+ * (and the Node-side `src/lib/whatsapp/encryption.ts`) both understand —
+ * `<iv-hex>:<ciphertext-hex>:<authTag-hex>`. Used by
+ * `convex/aiConfig.ts`'s `upsert` to encrypt a caller-supplied BYO
+ * provider key (`apiKey`/`embeddingsApiKey`) before it's ever written to
+ * `aiConfigs`. Always produces GCM, never legacy CBC — mirrors the
+ * Node `encrypt()`'s own "New `encrypt()` output is always GCM" comment.
+ * A fresh random IV is drawn every call (`crypto.getRandomValues`), so
+ * encrypting the same plaintext twice never produces the same
+ * ciphertext — see this file's header for how the auth tag is split
+ * back out of Web Crypto's combined `ciphertext || tag` output.
+ */
+export async function encrypt(text: string): Promise<string> {
+  const iv = randomBytes(GCM_IV_LENGTH);
+  const key = await importAesKey(encryptionKeyBytes(), "AES-GCM", [
+    "encrypt",
+  ]);
+  const combined = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, tagLength: AUTH_TAG_LENGTH * 8 },
+      key,
+      new TextEncoder().encode(text),
+    ),
+  );
+  const ciphertext = combined.slice(0, combined.length - AUTH_TAG_LENGTH);
+  const tag = combined.slice(combined.length - AUTH_TAG_LENGTH);
+  return `${bytesToHex(iv)}:${bytesToHex(ciphertext)}:${bytesToHex(tag)}`;
+}
+
+/**
+ * Decrypt a ciphertext produced by `encrypt` above — used for both
+ * `whatsappConfig.accessToken` (Phase 6) and `aiConfigs.apiKey`/
+ * `embeddingsApiKey` (Phase 7). Auto-detects GCM (current, 3
+ * colon-separated parts) vs legacy CBC (2 parts) by counting parts,
+ * exactly like the original `decrypt()` — so a pre-GCM-migration row
+ * (if one is ever carried over) still decrypts.
  */
 export async function decrypt(encryptedText: string): Promise<string> {
   const parts = encryptedText.split(":");
@@ -126,7 +190,9 @@ export async function decrypt(encryptedText: string): Promise<string> {
     // Web Crypto expects the auth tag appended to the ciphertext,
     // unlike Node's separate `setAuthTag()` — see this file's header.
     const combined = concatBytes(ciphertext, tag);
-    const key = await importAesKey(encryptionKeyBytes(), "AES-GCM");
+    const key = await importAesKey(encryptionKeyBytes(), "AES-GCM", [
+      "decrypt",
+    ]);
     const plaintext = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv, tagLength: AUTH_TAG_LENGTH * 8 },
       key,
@@ -144,7 +210,9 @@ export async function decrypt(encryptedText: string): Promise<string> {
       );
     }
     const ciphertext = hexToBytes(ctHex);
-    const key = await importAesKey(encryptionKeyBytes(), "AES-CBC");
+    const key = await importAesKey(encryptionKeyBytes(), "AES-CBC", [
+      "decrypt",
+    ]);
     const plaintext = await crypto.subtle.decrypt(
       { name: "AES-CBC", iv },
       key,

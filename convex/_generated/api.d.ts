@@ -9,6 +9,8 @@
  */
 
 import type * as accounts from "../accounts.js";
+import type * as aiConfig from "../aiConfig.js";
+import type * as aiUsage from "../aiUsage.js";
 import type * as apiKeys from "../apiKeys.js";
 import type * as auth from "../auth.js";
 import type * as automationsEngine from "../automationsEngine.js";
@@ -63,6 +65,8 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
+  aiConfig: typeof aiConfig;
+  aiUsage: typeof aiUsage;
   apiKeys: typeof apiKeys;
   auth: typeof auth;
   automationsEngine: typeof automationsEngine;
