@@ -10,6 +10,7 @@
 
 import type * as accounts from "../accounts.js";
 import type * as aiConfig from "../aiConfig.js";
+import type * as aiKnowledge from "../aiKnowledge.js";
 import type * as aiUsage from "../aiUsage.js";
 import type * as apiKeys from "../apiKeys.js";
 import type * as auth from "../auth.js";
@@ -26,6 +27,8 @@ import type * as flowsEngine from "../flowsEngine.js";
 import type * as http from "../http.js";
 import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
+import type * as lib_ai_chunk from "../lib/ai/chunk.js";
+import type * as lib_ai_embeddings from "../lib/ai/embeddings.js";
 import type * as lib_apiKey from "../lib/apiKey.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_automations_stepsTree from "../lib/automations/stepsTree.js";
@@ -66,6 +69,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
   aiConfig: typeof aiConfig;
+  aiKnowledge: typeof aiKnowledge;
   aiUsage: typeof aiUsage;
   apiKeys: typeof apiKeys;
   auth: typeof auth;
@@ -82,6 +86,8 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   ingest: typeof ingest;
   invitations: typeof invitations;
+  "lib/ai/chunk": typeof lib_ai_chunk;
+  "lib/ai/embeddings": typeof lib_ai_embeddings;
   "lib/apiKey": typeof lib_apiKey;
   "lib/auth": typeof lib_auth;
   "lib/automations/stepsTree": typeof lib_automations_stepsTree;
