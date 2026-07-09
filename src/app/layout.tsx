@@ -4,6 +4,7 @@ import { getLocale, getMessages } from 'next-intl/server';
 import { Inter } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
+import { ConvexClientProvider } from "./ConvexClientProvider";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ThemedToaster } from "@/components/themed-toaster";
 import {
@@ -110,7 +111,7 @@ export default async function RootLayout({
       <body className="min-h-full bg-background text-foreground font-sans">
         <NextIntlClientProvider messages={messages} locale={locale}>
           <ThemeProvider>
-            {children}
+            <ConvexClientProvider>{children}</ConvexClientProvider>
             <ThemedToaster />
           </ThemeProvider>
         </NextIntlClientProvider>
