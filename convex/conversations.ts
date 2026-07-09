@@ -1,16 +1,18 @@
-import { accountQuery } from "./lib/auth";
+import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
-import type { Doc } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
-// Conversation queries — the Inbox list + single-thread read. Every
-// function here is built on `accountQuery` (never the raw `query`),
-// mirroring the account-isolation pattern `contacts.ts` establishes:
-// `ctx.accountId` always comes from the caller's own `memberships`
-// row, never a client-supplied argument (there is no `accountId`
-// field in either args validator below).
+// Conversations — the Inbox list/thread read (`list`/`get`) plus the
+// mutations that drive its write side (Phase 2, Task 3):
+// `findOrCreateForContact`, `assign`, `setStatus`, `markRead`. Every
+// function here is built on `accountQuery`/`accountMutation` (never the
+// raw `query`/`mutation`), mirroring the account-isolation pattern
+// `contacts.ts` establishes: `ctx.accountId` always comes from the
+// caller's own `memberships` row, never a client-supplied argument
+// (there is no `accountId` field in any args validator below).
 // ============================================================
 
 /**
@@ -97,5 +99,138 @@ export const get = accountQuery({
       throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
     }
     return await embedContact(ctx, conversation);
+  },
+});
+
+// ============================================================
+// Conversation mutations (Phase 2, Task 3) — creating a thread for a
+// contact, assigning it, changing its status, and marking it read.
+// Every mutation asserts ownership of its target conversation via
+// `requireOwnConversation` before writing.
+// ============================================================
+
+/**
+ * Loads a conversation and throws `NOT_FOUND` unless it belongs to the
+ * caller's own account — the same error for "doesn't exist" and
+ * "exists but isn't yours" on purpose (mirrors `get` above and
+ * `messages.ts`'s own `requireOwnConversation`). Duplicated from
+ * `messages.ts` rather than imported, matching this codebase's
+ * one-helper-per-file style (see `embedTags`'s own comment above for
+ * the same reasoning) — `messages.ts` needs this to guard message
+ * reads/writes, this file needs it to guard the mutations below.
+ */
+async function requireOwnConversation(
+  ctx: { db: QueryCtx["db"]; accountId: Id<"accounts"> },
+  conversationId: Id<"conversations">,
+) {
+  const conversation = await ctx.db.get(conversationId);
+  if (!conversation || conversation.accountId !== ctx.accountId) {
+    throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+  }
+  return conversation;
+}
+
+/**
+ * Returns the existing thread for a contact, or opens a new one.
+ * `by_contact` isn't itself account-scoped (see schema.ts), so the
+ * match is additionally filtered to `ctx.accountId` — defense-in-depth
+ * that doesn't actually change behavior today (a contact only ever
+ * belongs to one account, and the ownership check above already proves
+ * it's this caller's own, so no other account's conversation could
+ * share its `contactId`), matching `contacts.ts`'s own "re-check the
+ * target row's accountId, don't rely solely on the index" philosophy.
+ */
+export const findOrCreateForContact = accountMutation({
+  args: { contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    const contact = await ctx.db.get(args.contactId);
+    if (!contact || contact.accountId !== ctx.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "contact" });
+    }
+
+    const existing = await ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .filter((q) => q.eq(q.field("accountId"), ctx.accountId))
+      .first();
+    if (existing) return existing._id;
+
+    return await ctx.db.insert("conversations", {
+      accountId: ctx.accountId,
+      contactId: args.contactId,
+      status: "open",
+      unreadCount: 0,
+    });
+  },
+});
+
+/**
+ * Assigns a conversation to an account teammate and bumps it to
+ * "pending" — the agent now owns following up. `userId` must itself be
+ * a member of this same account (checked via `by_user_account`); an
+ * arbitrary/foreign user id is rejected the same way a missing/foreign
+ * conversation is, so a cross-account probe can't distinguish "no such
+ * user" from "not your teammate".
+ */
+export const assign = accountMutation({
+  args: { conversationId: v.id("conversations"), userId: v.id("users") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnConversation(ctx, args.conversationId);
+
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", args.userId).eq("accountId", ctx.accountId),
+      )
+      .first();
+    if (!membership) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "member" });
+    }
+
+    await ctx.db.patch(args.conversationId, {
+      assignedToUserId: args.userId,
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+    return args.conversationId;
+  },
+});
+
+export const setStatus = accountMutation({
+  args: {
+    conversationId: v.id("conversations"),
+    status: v.union(
+      v.literal("open"),
+      v.literal("pending"),
+      v.literal("closed"),
+    ),
+  },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnConversation(ctx, args.conversationId);
+    await ctx.db.patch(args.conversationId, {
+      status: args.status,
+      updatedAt: Date.now(),
+    });
+    return args.conversationId;
+  },
+});
+
+/**
+ * Zeroes `unreadCount` — the Inbox calls this the moment an agent opens
+ * a thread. No `updatedAt` bump here: unlike `assign`/`setStatus`,
+ * reading a thread isn't a change to the conversation's own state an
+ * agent would expect reflected in "last updated" (matches the task
+ * brief's own spec for this mutation).
+ */
+export const markRead = accountMutation({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnConversation(ctx, args.conversationId);
+    await ctx.db.patch(args.conversationId, { unreadCount: 0 });
+    return args.conversationId;
   },
 });

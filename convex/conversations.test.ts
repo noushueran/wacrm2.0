@@ -79,6 +79,38 @@ async function seedConversation(
   );
 }
 
+/**
+ * Adds a second membership row to an *existing* account — unlike
+ * `seedAccountMember`, which always mints a brand-new account.
+ * `assign`'s tests need a real teammate `userId` on the *same* account
+ * as the conversation being assigned, which `seedAccountMember` alone
+ * can't produce.
+ */
+async function seedTeammate(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    name: string;
+    email: string;
+    role: AccountRole;
+  },
+) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: opts.name,
+      email: opts.email,
+    });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId: opts.accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return userId;
+  });
+}
+
 const onePage = { paginationOpts: { numItems: 50, cursor: null } };
 
 // ============================================================
@@ -352,4 +384,272 @@ test("embeds contact: null when the conversation's contact has been deleted", as
 
   const viaList = await asUser.query(api.conversations.list, onePage);
   expect(viaList.page[0]!.contact).toBeNull();
+});
+
+// ============================================================
+// findOrCreateForContact — idempotent get-or-insert
+// ============================================================
+
+test("findOrCreateForContact returns the same conversation id on a second call, without creating a duplicate row", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  const first = await asUser.mutation(
+    api.conversations.findOrCreateForContact,
+    { contactId },
+  );
+  const second = await asUser.mutation(
+    api.conversations.findOrCreateForContact,
+    { contactId },
+  );
+
+  expect(second).toBe(first);
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!._id).toBe(first);
+  expect(rows[0]!.accountId).toBe(accountId);
+  expect(rows[0]!.status).toBe("open");
+  expect(rows[0]!.unreadCount).toBe(0);
+});
+
+test("findOrCreateForContact throws NOT_FOUND for a contact belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.findOrCreateForContact, {
+      contactId: aliceContactId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "contact" } });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", aliceContactId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+});
+
+// ============================================================
+// assign — target must be a real member of the same account
+// ============================================================
+
+test("assign rejects a userId that is not a member of the account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { userId: bobUserId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    asAlice.mutation(api.conversations.assign, {
+      conversationId,
+      userId: bobUserId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "member" } });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.assignedToUserId).toBeUndefined();
+  expect(row!.status).toBe("open");
+});
+
+test("assign sets assignedToUserId and status:pending for a real member of the account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const carolUserId = await seedTeammate(t, {
+    accountId: aliceAccountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId,
+    status: "open",
+  });
+
+  const beforeAssign = Date.now();
+  const result = await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: carolUserId,
+  });
+  expect(result).toBe(conversationId);
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.assignedToUserId).toBe(carolUserId);
+  expect(row!.status).toBe("pending");
+  expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeAssign);
+});
+
+// ============================================================
+// setStatus
+// ============================================================
+
+test("setStatus updates the conversation's status and bumps updatedAt", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    status: "open",
+  });
+
+  const beforeUpdate = Date.now();
+  const result = await asUser.mutation(api.conversations.setStatus, {
+    conversationId,
+    status: "closed",
+  });
+  expect(result).toBe(conversationId);
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.status).toBe("closed");
+  expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeUpdate);
+});
+
+// ============================================================
+// markRead
+// ============================================================
+
+test("markRead zeroes unreadCount", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "Hello?",
+  });
+  const before = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(before!.unreadCount).toBe(1);
+
+  const result = await asUser.mutation(api.conversations.markRead, {
+    conversationId,
+  });
+  expect(result).toBe(conversationId);
+
+  const after = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(after!.unreadCount).toBe(0);
+});
+
+// ============================================================
+// cross-account denial — every new mutation added by this task
+// ============================================================
+
+test("assign/setStatus/markRead all throw NOT_FOUND for a conversation belonging to a different account, and leave it untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob, userId: bobUserId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.assign, {
+      conversationId,
+      userId: bobUserId,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.setStatus, {
+      conversationId,
+      status: "closed",
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.markRead, { conversationId }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  // Untouched by every rejected attempt above.
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.status).toBe("open");
+  expect(row!.assignedToUserId).toBeUndefined();
+  expect(row!.unreadCount).toBe(0);
+
+  // Alice herself can still act on it — proves the throws above are
+  // really about cross-account isolation, not broken mutations.
+  await asAlice.mutation(api.conversations.markRead, { conversationId });
 });
