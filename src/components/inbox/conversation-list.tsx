@@ -1,12 +1,11 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { createClient } from "@/lib/supabase/client";
-import {
-  CONVERSATION_SELECT,
-  matchesContactFilters,
-  normalizeConversations,
-} from "@/lib/inbox/conversations";
+import { useState, useCallback, useMemo } from "react";
+import { useQuery } from "convex/react";
+import type { PaginationStatus } from "convex/react";
+import { api } from "../../../convex/_generated/api";
+import { matchesContactFilters } from "@/lib/inbox/conversations";
+import { toUiTag } from "@/lib/convex/adapters";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag } from "@/types";
 import { Search, ChevronDown, X } from "lucide-react";
@@ -25,15 +24,14 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 interface ConversationListProps {
   activeConversationId: string | null;
   onSelect: (conversation: Conversation) => void;
+  /** Reactive, already-adapted page of conversations — owned by the
+   *  page's `usePaginatedQuery(api.conversations.list, ...)`. */
   conversations: Conversation[];
-  onConversationsLoaded: (conversations: Conversation[]) => void;
-  /**
-   * Increment to force the fetch effect below to refire. The parent
-   * bumps this on realtime reconnect / tab visibility → visible so the
-   * list catches up on any events sent while the WS was disconnected
-   * or the tab was throttled. Optional so existing callers keep working.
-   */
-  resyncToken?: number;
+  /** Fetches the next (older) page. Powers the "Load more" button. */
+  loadMore: (numItems: number) => void;
+  /** Pagination status from the page's `usePaginatedQuery` — drives the
+   *  initial spinner and the "Load more" button's visibility. */
+  status: PaginationStatus;
 }
 
 const STATUS_COLORS: Record<ConversationStatus, string> = {
@@ -50,11 +48,11 @@ export function ConversationList({
   activeConversationId,
   onSelect,
   conversations,
-  onConversationsLoaded,
-  resyncToken = 0,
+  loadMore,
+  status,
 }: ConversationListProps) {
   const t = useTranslations("Inbox.conversationList");
-  
+
   const FILTER_OPTIONS: { label: string; value: InboxFilter }[] = useMemo(() => [
     { label: t("filterAll"), value: "all" },
     { label: t("filterUnread"), value: "unread" },
@@ -65,80 +63,18 @@ export function ConversationList({
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<InboxFilter>("all");
-  const [loading, setLoading] = useState(true);
   // Contact-based filters (issue #272). Tags use OR logic (a conversation
   // matches if its contact carries any selected tag), consistent with
   // Broadcast audience filtering. Company is an exact match on the field.
-  const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
 
-  // Keep the latest callback in a ref so the fetch effect below can
-  // have a stable, empty-dep identity. Previously the fetch useCallback
-  // depended on `onConversationsLoaded`, which depends on the parent's
-  // `deepLinkConvId` — so every URL change (including one the parent
-  // triggered via router.replace after a click) caused a fresh
-  // conversations fetch. That extra refetch was the trigger for the
-  // deep-link auto-select running a second time and wiping the active
-  // thread's messages.
-  // Mutation lives in an effect (not render) per React 19's refs rule;
-  // the fetch runs once on mount so it's fine to read the slightly
-  // older value — the very next render updates the ref for any
-  // subsequent async completion.
-  const onConversationsLoadedRef = useRef(onConversationsLoaded);
-  useEffect(() => {
-    onConversationsLoadedRef.current = onConversationsLoaded;
-  });
-
-  useEffect(() => {
-    const supabase = createClient();
-    let cancelled = false;
-
-    (async () => {
-      const { data, error } = await supabase
-        .from("conversations")
-        .select(CONVERSATION_SELECT)
-        .order("last_message_at", { ascending: false });
-
-      if (cancelled) return;
-
-      if (error) {
-        // Supabase errors have non-enumerable properties — log fields explicitly
-        console.error("Failed to fetch conversations:", {
-          message: error.message,
-          details: error.details,
-          hint: error.hint,
-          code: error.code,
-        });
-        setLoading(false);
-        return;
-      }
-
-      onConversationsLoadedRef.current(normalizeConversations(data ?? []));
-      setLoading(false);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-    // `resyncToken` is included so the parent can force a refetch when
-    // the realtime channel reconnects or the tab regains focus — catches
-    // up on any events sent while the WS was disconnected or throttled.
-  }, [resyncToken]);
-
-  // Tag definitions for the filter picker — loaded once so labels/colours
-  // stay stable regardless of which conversations happen to be loaded.
-  useEffect(() => {
-    const supabase = createClient();
-    let cancelled = false;
-    (async () => {
-      const { data } = await supabase.from("tags").select("*").order("name");
-      if (!cancelled && data) setTags(data as Tag[]);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Tag definitions for the filter picker — a reactive account-wide
+  // query rather than the conversations' own embedded `contact.tags`,
+  // so the picker always lists every tag (not just ones currently in
+  // use by a loaded conversation).
+  const tagDocs = useQuery(api.tags.list);
+  const tags = (tagDocs ?? []).map(toUiTag);
 
   // Company options are derived from the loaded conversations — there's no
   // separate companies table, and only companies with a live conversation
@@ -397,7 +333,7 @@ export function ConversationList({
           space — the list then overflows and gets clipped by the
           parent's overflow-hidden with no scrollbar (issue #229). */}
       <ScrollArea className="min-h-0 flex-1">
-        {loading ? (
+        {status === "LoadingFirstPage" ? (
           <div className="flex items-center justify-center py-12">
             <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
           </div>
@@ -416,6 +352,28 @@ export function ConversationList({
                 t={t}
               />
             ))}
+            {/* Load more — Convex cursor pagination. Not gated on the
+                active filters: the page's query is unfiltered by
+                status (server-side `status` filtering is a separate,
+                unused arg), so "load more" always means "fetch the
+                next page of conversations by recency," same as before
+                filters are applied client-side. */}
+            {status === "CanLoadMore" && (
+              <div className="flex justify-center py-3">
+                <button
+                  type="button"
+                  onClick={() => loadMore(30)}
+                  className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                >
+                  Load more
+                </button>
+              </div>
+            )}
+            {status === "LoadingMore" && (
+              <div className="flex items-center justify-center py-3">
+                <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+              </div>
+            )}
           </div>
         )}
       </ScrollArea>

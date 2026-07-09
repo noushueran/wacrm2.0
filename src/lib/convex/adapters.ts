@@ -4,7 +4,13 @@ import type {
   Contact,
   ContactCustomValue,
   ContactNote,
+  Conversation,
   CustomField,
+  Deal,
+  InteractiveMessagePayload,
+  Message,
+  MessageReaction,
+  PipelineStage,
   Tag,
 } from "@/types";
 
@@ -95,6 +101,142 @@ export function toUiContactNote(doc: Doc<"contactNotes">): ContactNote {
     user_id: doc.createdByUserId ?? "",
     note_text: doc.noteText,
     created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+// ============================================================
+// Inbox vertical adapters (Phase 8, Task 2b-2) — conversations,
+// messages, reactions, deals. Same rename + `_creationTime`/epoch-ms ->
+// ISO-string convention as every adapter above; field names verified
+// against `convex/schema.ts` (not the task brief's paraphrase, which
+// got at least one field name wrong — see `toUiContactNote`'s `add`
+// caller in contact-sidebar.tsx for the same lesson: the mutation's
+// arg is `body`, not `noteText`).
+// ============================================================
+
+/** Convex has no `contact` join built into `Doc<"conversations">` —
+ *  callers must pass the embedded contact themselves (from
+ *  `conversations.list`/`get`, both of which already embed it server-
+ *  side via `embedContact`). `contact: null` maps to `undefined` (not
+ *  `null`) because the UI `Conversation.contact` field is `Contact |
+ *  undefined`, not `Contact | null`. */
+export function toUiConversation(
+  doc: Doc<"conversations"> & {
+    contact: (Doc<"contacts"> & { tags?: Doc<"tags">[] }) | null;
+  },
+): Conversation {
+  const createdAt = new Date(doc._creationTime).toISOString();
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    contact_id: doc.contactId,
+    status: doc.status,
+    assigned_agent_id: doc.assignedToUserId,
+    last_message_text: doc.lastMessageText,
+    last_message_at: doc.lastMessageAt
+      ? new Date(doc.lastMessageAt).toISOString()
+      : undefined,
+    unread_count: doc.unreadCount,
+    created_at: createdAt,
+    // No on-UPDATE trigger in Convex — `updatedAt` is only set once a
+    // write path (setStatus/assign/markRead's own patch, etc.) touches
+    // it. Backfill from `created_at` until then, same convention as
+    // `toUiContact.updated_at` above.
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : createdAt,
+    contact: doc.contact ? toUiContact(doc.contact) : undefined,
+    ai_autoreply_disabled: doc.aiAutoreplyDisabled,
+    ai_reply_count: doc.aiReplyCount,
+    ai_handoff_summary: doc.aiHandoffSummary,
+  };
+}
+
+export function toUiMessage(doc: Doc<"messages">): Message {
+  return {
+    id: doc._id,
+    conversation_id: doc.conversationId,
+    sender_type: doc.senderType,
+    sender_id: doc.senderId,
+    content_type: doc.contentType,
+    content_text: doc.contentText,
+    media_url: doc.mediaUrl,
+    template_name: doc.templateName,
+    // Meta wamid — the UI type names this `message_id` (there is no
+    // separate `whatsapp_message_id` field on `Message`; checked
+    // src/types/index.ts).
+    message_id: doc.messageId,
+    status: doc.status,
+    // No dedicated timestamp column on `messages` (see schema.ts) —
+    // `_creationTime` IS the send/receive instant, same "don't
+    // duplicate created_at" reasoning as every other adapter here.
+    created_at: new Date(doc._creationTime).toISOString(),
+    reply_to_message_id: doc.replyToMessageId,
+    interactive_reply_id: doc.interactiveReplyId,
+    interactive_payload: doc.interactivePayload as
+      | InteractiveMessagePayload
+      | undefined,
+    ai_generated: doc.aiGenerated,
+  };
+}
+
+export function toUiReaction(doc: Doc<"messageReactions">): MessageReaction {
+  return {
+    id: doc._id,
+    message_id: doc.messageId,
+    conversation_id: doc.conversationId,
+    actor_type: doc.actorType,
+    actor_id: doc.actorId,
+    emoji: doc.emoji,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** Convex has no `createdAt` field on `pipelineStages` either — same
+ *  "don't duplicate created_at" reasoning as every timestamp above. */
+export function toUiPipelineStage(doc: Doc<"pipelineStages">): PipelineStage {
+  return {
+    id: doc._id,
+    pipeline_id: doc.pipelineId,
+    name: doc.name,
+    position: doc.position,
+    color: doc.color,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `stage` must be passed by the caller — `deals.listByContact` already
+ *  embeds it server-side (one extra `ctx.db.get(deal.stageId)` per deal,
+ *  same pattern as `embedContact` above), so this adapter never fetches
+ *  it itself. */
+export function toUiDeal(
+  doc: Doc<"deals"> & { stage: Doc<"pipelineStages"> | null },
+): Deal {
+  const createdAt = new Date(doc._creationTime).toISOString();
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    pipeline_id: doc.pipelineId,
+    stage_id: doc.stageId,
+    // `Deal.contact_id` is `string | null` (not `| undefined`) —
+    // migration 004 made this column nullable, and the UI type mirrors
+    // that with an explicit `null` rather than optional.
+    contact_id: doc.contactId ?? null,
+    conversation_id: doc.conversationId,
+    assigned_to: doc.assignedToUserId,
+    title: doc.title,
+    value: doc.value,
+    currency: doc.currency,
+    notes: doc.notes,
+    expected_close_date: doc.expectedCloseDate
+      ? new Date(doc.expectedCloseDate).toISOString()
+      : undefined,
+    status: doc.status,
+    created_at: createdAt,
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : createdAt,
+    stage: doc.stage ? toUiPipelineStage(doc.stage) : undefined,
   };
 }
 
