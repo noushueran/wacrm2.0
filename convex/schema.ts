@@ -105,6 +105,10 @@ export default defineSchema({
     aiAutoreplyDisabled: v.optional(v.boolean()),
     aiReplyCount: v.optional(v.number()),
     aiHandoffSummary: v.optional(v.string()),
+    // Postgres maintains this via an on-UPDATE trigger; added here for
+    // uniform trigger parity across every such table (P1 review) — the
+    // dashboard's inbox sort and the v1 API contract both expose it.
+    updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"]),
@@ -166,13 +170,17 @@ export default defineSchema({
 
   // One row per (message, actor) reaction. `conversationId` is denormalized
   // here exactly like Postgres denormalized it (migration 009: "so Supabase
-  // Realtime can filter on it with a plain eq"). `actorId` is a bare,
+  // Realtime can filter on it with a plain eq"). `accountId` is likewise
+  // denormalized off `messageId`/`conversationId` (P1 review — not a
+  // Postgres column) for the same uniform account-scoping reason as
+  // `pipelineStages` below. `actorId` is a bare,
   // FK-less identifier in Postgres and is genuinely polymorphic in the
   // app: a `users` id when `actorType === "agent"` (`/api/whatsapp/react`)
   // or a `contacts` id when `actorType === "customer"` (the inbound
   // webhook) — so it stays an untyped optional string rather than a
   // `v.id(...)` of either table.
   messageReactions: defineTable({
+    accountId: v.id("accounts"),
     messageId: v.id("messages"),
     conversationId: v.id("conversations"),
     actorType: v.union(v.literal("customer"), v.literal("agent")),
@@ -181,7 +189,8 @@ export default defineSchema({
   })
     .index("by_message_actor", ["messageId", "actorType", "actorId"])
     .index("by_message", ["messageId"])
-    .index("by_conversation", ["conversationId"]),
+    .index("by_conversation", ["conversationId"])
+    .index("by_account", ["accountId"]),
 
   // A named deal pipeline (e.g. "Sales"), owned by an account.
   pipelines: defineTable({
@@ -191,12 +200,20 @@ export default defineSchema({
   }).index("by_account", ["accountId"]),
 
   // An ordered stage within a pipeline (e.g. "Qualified", "Won").
+  // `accountId` is denormalized off `pipelineId` (P1 review) — Postgres
+  // itself never had this column (tenancy was transitive via
+  // `pipeline_id`), but it's added here for the same uniform
+  // account-scoped querying every other table gets (matches
+  // `messages`/`contactTags`/`broadcastRecipients`).
   pipelineStages: defineTable({
+    accountId: v.id("accounts"),
     pipelineId: v.id("pipelines"),
     name: v.string(),
     position: v.number(),
     color: v.string(),
-  }).index("by_pipeline", ["pipelineId"]),
+  })
+    .index("by_pipeline", ["pipelineId"])
+    .index("by_account", ["accountId"]),
 
   // A deal/opportunity tracked against a pipeline stage. `assignedToUserId`
   // is the old `assigned_to` column (migration 002) — it referenced
@@ -219,6 +236,9 @@ export default defineSchema({
     expectedCloseDate: v.optional(v.number()),
     status: v.union(v.literal("open"), v.literal("won"), v.literal("lost")),
     assignedToUserId: v.optional(v.id("users")),
+    // Same on-UPDATE-trigger parity as `conversations.updatedAt` above
+    // (P1 review) — the deals board sorts on it too.
+    updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
     .index("by_pipeline", ["pipelineId"])
@@ -235,14 +255,18 @@ export default defineSchema({
     fieldOptions: v.optional(v.any()),
   }).index("by_account", ["accountId"]),
 
-  // One value of one custom field on one contact.
+  // One value of one custom field on one contact. `accountId` is
+  // denormalized off `contactId` (P1 review) for the same uniform
+  // account-scoping reason as `pipelineStages` above.
   contactCustomValues: defineTable({
+    accountId: v.id("accounts"),
     contactId: v.id("contacts"),
     customFieldId: v.id("customFields"),
     value: v.optional(v.string()),
   })
     .index("by_contact_field", ["contactId", "customFieldId"])
-    .index("by_contact", ["contactId"]),
+    .index("by_contact", ["contactId"])
+    .index("by_account", ["accountId"]),
 
   // A free-text note an account member left on a contact.
   contactNotes: defineTable({
@@ -331,6 +355,8 @@ export default defineSchema({
     headerMediaUrl: v.optional(v.string()),
     submissionError: v.optional(v.string()),
     lastSubmittedAt: v.optional(v.number()),
+    // Same on-UPDATE-trigger parity as `conversations.updatedAt` (P1 review).
+    updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
     .index("by_account_name_lang", ["accountId", "name", "language"])
@@ -365,6 +391,8 @@ export default defineSchema({
     readCount: v.number(),
     repliedCount: v.number(),
     failedCount: v.number(),
+    // Same on-UPDATE-trigger parity as `conversations.updatedAt` (P1 review).
+    updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
 
   // One row per (broadcast, contact) send. `contactId` is optional:
@@ -410,6 +438,8 @@ export default defineSchema({
     kind: v.union(v.literal("text"), v.literal("interactive")),
     contentText: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
+    // Same on-UPDATE-trigger parity as `conversations.updatedAt` (P1 review).
+    updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
 
   // One WhatsApp Cloud API connection per account. `createdByUserId`
@@ -433,6 +463,8 @@ export default defineSchema({
     registeredAt: v.optional(v.number()),
     subscribedAppsAt: v.optional(v.number()),
     lastRegistrationError: v.optional(v.string()),
+    // Same on-UPDATE-trigger parity as `conversations.updatedAt` (P1 review).
+    updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
     .index("by_phone_number_id", ["phoneNumberId"]),
@@ -536,9 +568,13 @@ export default defineSchema({
   //   - Migration 017 added `account_id` (NOT NULL) to `automations`,
   //     `automationLogs`, `automationPendingExecutions`, `flows`, and
   //     `flowRuns` — but NOT to `automationSteps`, `flowNodes`, or
-  //     `flowRunEvents`, which stay tenant-scoped only transitively via
-  //     their parent FK (same pattern as `pipelineStages`/
-  //     `contactCustomValues` in Task 1). It also swapped `flowRuns`'s
+  //     `flowRunEvents` in Postgres, which stayed tenant-scoped only
+  //     transitively via their parent FK (same pattern as
+  //     `pipelineStages`/`contactCustomValues` in Task 1). The Phase 1
+  //     final review denormalizes `accountId` onto all five of those
+  //     tables in Convex anyway (see each table below), matching the
+  //     direct-index treatment already given to `messages`/`contactTags`/
+  //     `broadcastRecipients`. Migration 017 also swapped `flowRuns`'s
   //     "one active run per contact" partial unique index from
   //     `(user_id, contact_id)` to `(account_id, contact_id)`.
   //   - Migration 016 widened `flow_nodes.node_type`'s CHECK to add
@@ -586,6 +622,9 @@ export default defineSchema({
   // agree on exactly these 13 values, so there's no hidden 14th like
   // `flowNodes.nodeType` had with `send_media`.
   automationSteps: defineTable({
+    // Denormalized off `automationId` (P1 review) — see the section
+    // header comment above for why Postgres never had this column.
+    accountId: v.id("accounts"),
     automationId: v.id("automations"),
     parentStepId: v.optional(v.id("automationSteps")),
     branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
@@ -606,7 +645,9 @@ export default defineSchema({
     ),
     stepConfig: v.optional(v.any()),
     position: v.number(),
-  }).index("by_automation", ["automationId"]),
+  })
+    .index("by_automation", ["automationId"])
+    .index("by_account", ["accountId"]),
 
   // An audit row written once per automation execution (one per
   // triggering event, not per step — `stepsExecuted` is the per-step
@@ -705,6 +746,9 @@ export default defineSchema({
   // react-flow canvas (migration 010's own comment); the v1 list
   // editor always writes 0.
   flowNodes: defineTable({
+    // Denormalized off `flowId` (P1 review) — see the section header
+    // comment above for why Postgres never had this column.
+    accountId: v.id("accounts"),
     flowId: v.id("flows"),
     nodeKey: v.string(),
     nodeType: v.union(
@@ -723,7 +767,9 @@ export default defineSchema({
     config: v.optional(v.any()),
     positionX: v.number(),
     positionY: v.number(),
-  }).index("by_flow_node_key", ["flowId", "nodeKey"]),
+  })
+    .index("by_flow_node_key", ["flowId", "nodeKey"])
+    .index("by_account", ["accountId"]),
 
   // Per-contact runtime state machine for a flow. Postgres's
   // `started_at` (`NOT NULL DEFAULT NOW()`, never subsequently
@@ -775,6 +821,9 @@ export default defineSchema({
   // straight off the CHECK in migration 010; no later migration alters
   // it (unlike `flowNodes.nodeType`).
   flowRunEvents: defineTable({
+    // Denormalized off `flowRunId` (P1 review) — see the section header
+    // comment above for why Postgres never had this column.
+    accountId: v.id("accounts"),
     flowRunId: v.id("flowRuns"),
     eventType: v.union(
       v.literal("started"),
@@ -789,7 +838,9 @@ export default defineSchema({
     ),
     nodeKey: v.optional(v.string()),
     payload: v.optional(v.any()),
-  }).index("by_run", ["flowRunId"]),
+  })
+    .index("by_run", ["flowRunId"])
+    .index("by_account", ["accountId"]),
 
   // ============================================================
   // AI (Phase 1, Task 4 — final schema task). Source: supabase/migrations
@@ -819,13 +870,13 @@ export default defineSchema({
   // `v.string()`/optional rather than a structured type.
   // `autoReplyMaxPerConversation`'s Postgres CHECK (BETWEEN 1 AND 20)
   // has no Convex equivalent — enforced in the future settings mutation
-  // instead. `updatedAt` is deliberately NOT modeled even though
-  // Postgres maintains it with an on-UPDATE trigger: unlike
-  // `aiKnowledgeDocuments.updatedAt` below, no route or component ever
-  // selects, orders by, or displays it (checked src/lib/ai/config.ts,
-  // src/app/api/ai/config/route.ts, src/components/settings/
-  // ai-config.tsx) — modeling it would be dead weight per the Global
-  // Constraints' "where the app updates/reads it" rule.
+  // instead. `updatedAt` WAS deliberately left unmodeled in the original
+  // Task 4 pass (no route or component selected/ordered by it — checked
+  // src/lib/ai/config.ts, src/app/api/ai/config/route.ts,
+  // src/components/settings/ai-config.tsx). The Phase 1 final review
+  // overrides that: every table with a Postgres on-UPDATE trigger now
+  // gets `updatedAt` in Convex for uniform parity, so it's added below
+  // alongside `whatsappConfig`/`quickReplies`/etc.
   aiConfigs: defineTable({
     accountId: v.id("accounts"),
     createdByUserId: v.optional(v.id("users")),
@@ -843,6 +894,7 @@ export default defineSchema({
     // Migration 033: where auto-reply hands a conversation off when the
     // model bails. Unset/null leaves it unassigned (shared queue).
     handoffAgentId: v.optional(v.id("users")),
+    updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
 
   // Append-only per-LLM-call token usage log (cost visibility on the

@@ -369,6 +369,7 @@ test("Task 3 — an out-of-union value is rejected by the schema validator", asy
   await expect(
     t.run(async (ctx) =>
       ctx.db.insert("automationSteps", {
+        accountId,
         automationId,
         // Not one of the 13-value `stepType` union's literals. Unlike
         // most unions in this file, this one has no backing Postgres
