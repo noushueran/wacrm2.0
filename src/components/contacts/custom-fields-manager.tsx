@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
-import { useAuth } from '@/hooks/use-auth';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import type { CustomField } from '@/types';
+import { isConvexErrorCode, toUiCustomField } from '@/lib/convex/adapters';
 import {
   Dialog,
   DialogContent,
@@ -16,6 +16,9 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Loader2, Plus, Trash2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 interface CustomFieldsManagerProps {
   open: boolean;
@@ -51,77 +54,47 @@ export function CustomFieldsManager({
 /**
  * Create / rename / delete account-wide custom contact field definitions.
  * Per-contact values are edited elsewhere (contact detail → Custom Fields);
- * this only manages the field catalogue. Admin+ gated by the caller — the
- * `custom_fields` RLS also rejects non-admin writes as defense in depth.
+ * this only manages the field catalogue. Admin+ gated by the caller (the
+ * dashboard only renders this behind `canEditSettings`); `customFields.ts`'s
+ * `ctx.requireRole("admin")` is the real backstop, same role floor the old
+ * `custom_fields` RLS enforced.
  */
 export function CustomFieldsPanel() {
   const t = useTranslations('Contacts.customFields');
-  const supabase = createClient();
-  const { user, accountId } = useAuth();
 
-  const [fields, setFields] = useState<CustomField[]>([]);
-  const [loading, setLoading] = useState(true);
+  const fieldsResult = useQuery(api.customFields.list);
+  const fields = useMemo(
+    () => (fieldsResult ?? []).map(toUiCustomField),
+    [fieldsResult],
+  );
+  const loading = fieldsResult === undefined;
+
+  const createField = useMutation(api.customFields.create);
+  const renameField = useMutation(api.customFields.rename);
+  const removeField = useMutation(api.customFields.remove);
+
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const fetchFields = useCallback(async () => {
-    if (!accountId) return;
-    setLoading(true);
-    const { data } = await supabase
-      .from('custom_fields')
-      .select('*')
-      .order('field_name');
-    setFields((data as CustomField[] | null) ?? []);
-    setLoading(false);
-  }, [supabase, accountId]);
-
-  // Load the field list on mount once the account is known. The setters
-  // inside fetchFields run after the Supabase await — not synchronously in
-  // the effect body — so the cascade the lint rule warns about doesn't apply.
-  useEffect(() => {
-    if (accountId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      fetchFields();
-    }
-  }, [accountId, fetchFields]);
-
-  /** Case-insensitive name clash within the loaded list. */
-  function isDuplicate(name: string, exceptId?: string): boolean {
-    const lower = name.toLowerCase();
-    return fields.some(
-      (f) => f.id !== exceptId && f.field_name.toLowerCase() === lower
-    );
-  }
-
   async function handleCreate() {
     const name = newName.trim();
     if (!name) return;
-    if (!accountId || !user) {
-      toast.error(t('toastNoAccount'));
-      return;
-    }
-    if (isDuplicate(name)) {
-      toast.error(t('toastDuplicate', { name }));
-      return;
-    }
 
     setCreating(true);
-    const { error } = await supabase.from('custom_fields').insert({
-      field_name: name,
-      field_type: 'text',
-      user_id: user.id,
-      account_id: accountId,
-    });
-    setCreating(false);
-
-    if (error) {
-      toast.error(t('toastCreateFailed'));
-      return;
+    try {
+      await createField({ fieldName: name, fieldType: 'text' });
+      toast.success(t('toastCreated', { name }));
+      setNewName('');
+    } catch (err) {
+      if (isConvexErrorCode(err, 'DUPLICATE_FIELD')) {
+        toast.error(t('toastDuplicate', { name }));
+      } else {
+        toast.error(t('toastCreateFailed'));
+      }
+    } finally {
+      setCreating(false);
     }
-    toast.success(t('toastCreated', { name }));
-    setNewName('');
-    await fetchFields();
   }
 
   /** Returns true on success so the row can keep the new name, false so it
@@ -132,22 +105,24 @@ export function CustomFieldsPanel() {
   ): Promise<boolean> {
     const name = nextName.trim();
     if (!name || name === field.field_name) return true;
-    if (isDuplicate(name, field.id)) {
-      toast.error(t('toastDuplicate', { name }));
-      return false;
-    }
+
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .update({ field_name: name })
-      .eq('id', field.id);
-    setBusyId(null);
-    if (error) {
-      toast.error(t('toastRenameFailed'));
+    try {
+      await renameField({
+        fieldId: field.id as Id<'customFields'>,
+        fieldName: name,
+      });
+      return true;
+    } catch (err) {
+      if (isConvexErrorCode(err, 'DUPLICATE_FIELD')) {
+        toast.error(t('toastDuplicate', { name }));
+      } else {
+        toast.error(t('toastRenameFailed'));
+      }
       return false;
+    } finally {
+      setBusyId(null);
     }
-    await fetchFields();
-    return true;
   }
 
   async function handleDelete(field: CustomField) {
@@ -159,17 +134,14 @@ export function CustomFieldsPanel() {
       return;
     }
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .delete()
-      .eq('id', field.id);
-    setBusyId(null);
-    if (error) {
+    try {
+      await removeField({ fieldId: field.id as Id<'customFields'> });
+      toast.success(t('toastDeleted', { name: field.field_name }));
+    } catch {
       toast.error(t('toastDeleteFailed'));
-      return;
+    } finally {
+      setBusyId(null);
     }
-    toast.success(t('toastDeleted', { name: field.field_name }));
-    await fetchFields();
   }
 
   return (

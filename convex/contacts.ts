@@ -114,6 +114,25 @@ export const list = accountQuery({
   },
 });
 
+/**
+ * Single-contact read by id, with embedded tags — the same shape as an
+ * item from `list`/`filterByTags`. Added for Phase 8 Task 2a (the
+ * contacts UI rewire): `ContactDetailView` and the contact-form's
+ * duplicate-phone banner both need to resolve one contact from a bare
+ * `Id<"contacts">` (e.g. the `contactId` on a `DUPLICATE_PHONE`
+ * ConvexError), and no other query here supports that (`list`/
+ * `filterByTags` are page/multi-result reads only). `NOT_FOUND` for
+ * "doesn't exist" and "exists but isn't yours" alike, same as every
+ * other read in this file.
+ */
+export const get = accountQuery({
+  args: { contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    const contact = await requireOwnContact(ctx, args.contactId);
+    return await embedTags(ctx, contact);
+  },
+});
+
 export const filterByTags = accountQuery({
   args: {
     tagIds: v.array(v.id("tags")),

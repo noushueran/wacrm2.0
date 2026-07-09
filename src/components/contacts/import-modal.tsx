@@ -1,22 +1,14 @@
 'use client';
 
 import { useMemo, useRef, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useMutation, useQuery } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
-import {
-  dedupeByPhone,
-  isUniqueViolation,
-  normalizeKey,
-} from '@/lib/contacts/dedupe';
+import { dedupeByPhone } from '@/lib/contacts/dedupe';
 import {
   parseContactCsv,
   type ParsedContactRow,
 } from '@/lib/contacts/parse-contact-csv';
-import {
-  assignImportedContactTags,
-  resolveImportTagIds,
-  type ContactTagAssignment,
-} from '@/lib/contacts/resolve-import-tags';
+import { isConvexErrorCode, toUiTag } from '@/lib/convex/adapters';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import {
@@ -39,8 +31,17 @@ import {
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
+
 const DEFAULT_TAG_COLOR = '#3b82f6';
 const PREVIEW_LIMIT = 5;
+// Convex has no bulk-insert mutation — `contacts.create` is one row per
+// call — so imports fan out in small concurrent batches rather than the
+// Supabase-era single chunked `.insert([...50 rows])` call. Convex
+// mutations are serialized server-side, so concurrent calls are safe;
+// this is purely a client-side throughput knob.
+const IMPORT_CONCURRENCY = 10;
 
 function truncateFilename(name: string, max = 48): string {
   if (name.length <= max) return name;
@@ -115,6 +116,104 @@ function ImportPreviewTags({
   );
 }
 
+// ============================================================
+// Tag-name resolution, Convex-flavored. This is a deliberate,
+// local-to-this-component reimplementation of
+// `src/lib/contacts/resolve-import-tags.ts`'s `resolveImportTagIds`/
+// `assignImportedContactTags` — that module is NOT touched here because
+// `src/lib/api/v1/contacts.ts` (the REST API v1 route, Phase 8 Task 4,
+// out of scope) still depends on its Supabase-client-based signature.
+// ============================================================
+
+interface ExistingTagLike {
+  id: Id<'tags'>;
+  name: string;
+}
+
+async function resolveTagIds(params: {
+  existingTags: ExistingTagLike[];
+  tagNames: string[];
+  canCreateTags: boolean;
+  createTag: (args: { name: string; color: string }) => Promise<Id<'tags'>>;
+}): Promise<{ tagIdByKey: Map<string, Id<'tags'>>; skippedNames: string[] }> {
+  const { existingTags, tagNames, canCreateTags, createTag } = params;
+
+  const uniqueNames: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of tagNames) {
+    const name = raw.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueNames.push(name);
+  }
+  if (uniqueNames.length === 0) return { tagIdByKey: new Map(), skippedNames: [] };
+
+  const tagIdByKey = new Map<string, Id<'tags'>>();
+  for (const tag of existingTags) {
+    const key = tag.name.trim().toLowerCase();
+    if (!tagIdByKey.has(key)) tagIdByKey.set(key, tag.id);
+  }
+
+  const skippedNames: string[] = [];
+  const toCreate: string[] = [];
+  for (const name of uniqueNames) {
+    const key = name.toLowerCase();
+    if (tagIdByKey.has(key)) continue;
+    if (canCreateTags) toCreate.push(name);
+    else skippedNames.push(name);
+  }
+
+  for (const name of toCreate) {
+    try {
+      const id = await createTag({ name, color: DEFAULT_TAG_COLOR });
+      tagIdByKey.set(name.toLowerCase(), id);
+    } catch {
+      // Another request may have created the same name first (or the
+      // mutation failed for some other reason) — treat as skipped
+      // rather than failing the whole import.
+      skippedNames.push(name);
+    }
+  }
+
+  return { tagIdByKey, skippedNames };
+}
+
+interface ContactTagAssignment {
+  contactId: Id<'contacts'>;
+  tagNames: string[];
+}
+
+async function assignTagsToImportedContacts(
+  assignments: ContactTagAssignment[],
+  tagIdByKey: Map<string, Id<'tags'>>,
+  assignTag: (args: {
+    contactId: Id<'contacts'>;
+    tagId: Id<'tags'>;
+  }) => Promise<unknown>,
+): Promise<number> {
+  const pairs: { contactId: Id<'contacts'>; tagId: Id<'tags'> }[] = [];
+  for (const { contactId, tagNames } of assignments) {
+    const assignedTagIds = new Set<Id<'tags'>>();
+    for (const name of tagNames) {
+      const tagId = tagIdByKey.get(name.trim().toLowerCase());
+      if (!tagId || assignedTagIds.has(tagId)) continue;
+      assignedTagIds.add(tagId);
+      pairs.push({ contactId, tagId });
+    }
+  }
+  if (pairs.length === 0) return 0;
+
+  let assigned = 0;
+  for (let i = 0; i < pairs.length; i += IMPORT_CONCURRENCY) {
+    const chunk = pairs.slice(i, i + IMPORT_CONCURRENCY);
+    await Promise.all(chunk.map((pair) => assignTag(pair)));
+    assigned += chunk.length;
+  }
+  return assigned;
+}
+
 interface ImportModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -127,9 +226,15 @@ export function ImportModal({
   onImported,
 }: ImportModalProps) {
   const t = useTranslations('Contacts.importModal');
-  const supabase = createClient();
-  const { accountId, canEditSettings } = useAuth();
+  const { canEditSettings } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const tagsResult = useQuery(api.tags.list);
+  const tags = useMemo(() => (tagsResult ?? []).map(toUiTag), [tagsResult]);
+
+  const createContact = useMutation(api.contacts.create);
+  const createTag = useMutation(api.tags.create);
+  const assignTag = useMutation(api.contacts.assignTag);
 
   const [file, setFile] = useState<File | null>(null);
   const [parsedRows, setParsedRows] = useState<ParsedContactRow[]>([]);
@@ -188,14 +293,9 @@ export function ImportModal({
     setHasTagsColumn(csvHasTags);
     setHasCompanyColumn(csvHasCompany);
 
-    if (csvHasTags && accountId) {
-      const { data: tags } = await supabase
-        .from('tags')
-        .select('name, color')
-        .eq('account_id', accountId);
-
+    if (csvHasTags) {
       const colors = new Map<string, string>();
-      for (const tag of tags ?? []) {
+      for (const tag of tags) {
         const key = tag.name.trim().toLowerCase();
         if (!colors.has(key)) colors.set(key, tag.color);
       }
@@ -210,14 +310,6 @@ export function ImportModal({
     setImporting(true);
 
     try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) throw new Error('Not authenticated');
-      if (!accountId)
-        throw new Error('Your profile is not linked to an account.');
-
       let imported = 0;
       let skipped = 0;
       let failed = 0;
@@ -226,116 +318,71 @@ export function ImportModal({
       const { unique, duplicates: inFileDupes } = dedupeByPhone(parsedRows);
       skipped += inFileDupes;
 
-      // 2) Skip numbers already in this account. One read of the
-      //    generated `phone_normalized` column (migration 022) → Set.
-      const { data: existingRows } = await supabase
-        .from('contacts')
-        .select('phone_normalized')
-        .eq('account_id', accountId);
-      const existing = new Set(
-        (existingRows ?? [])
-          .map(
-            (r) => (r as { phone_normalized: string | null }).phone_normalized
-          )
-          .filter((p): p is string => !!p)
-      );
-
-      const toInsert = unique.filter((row) => {
-        if (existing.has(normalizeKey(row.phone))) {
-          skipped++;
-          return false;
-        }
-        return true;
-      });
-
-      // 3) Resolve tag names → ids (admin+ may auto-create missing tags).
+      // 2) Resolve tag names -> ids (admin+ may auto-create missing tags).
       //    Skip the round-trip when the import carries no tag names.
-      const allTagNames = toInsert.flatMap((row) => row.tagNames);
-      let tagIdByKey = new Map<string, string>();
+      //    Unlike the Supabase-era flow, there is no bulk "existing
+      //    phone_normalized" pre-check query to skip obvious dupes before
+      //    inserting — `contacts.create` already dedupes per row
+      //    server-side (`by_account_phone`), so every unique row is
+      //    attempted and a `DUPLICATE_PHONE` error is counted as skipped.
+      const allTagNames = unique.flatMap((row) => row.tagNames);
+      let tagIdByKey = new Map<string, Id<'tags'>>();
       let skippedNames: string[] = [];
       if (allTagNames.length > 0) {
-        ({ tagIdByKey, skippedNames } = await resolveImportTagIds(supabase, {
-          accountId,
-          userId: user.id,
+        ({ tagIdByKey, skippedNames } = await resolveTagIds({
+          existingTags: tags.map((tag) => ({
+            id: tag.id as Id<'tags'>,
+            name: tag.name,
+          })),
           tagNames: allTagNames,
           canCreateTags: canEditSettings,
+          createTag: (args) => createTag(args),
         }));
       }
 
       const tagAssignments: ContactTagAssignment[] = [];
 
-      // 4) Batch insert the genuinely-new rows in chunks of 50. The DB
-      //    unique index is the backstop: a 23505 (race, or a format
-      //    that normalizes equal) counts as skipped, not failed.
-      const chunkSize = 50;
-
-      for (let i = 0; i < toInsert.length; i += chunkSize) {
-        const chunk = toInsert.slice(i, i + chunkSize);
-        const rows = chunk.map((row) => ({
-          user_id: user.id,
-          account_id: accountId,
-          phone: row.phone,
-          name: row.name || null,
-          email: row.email || null,
-          company: row.company || null,
-        }));
-
-        const { data, error } = await supabase
-          .from('contacts')
-          .insert(rows)
-          .select('id');
-
-        if (error) {
-          // Retry individually so one bad/duplicate row doesn't sink
-          // the whole chunk.
-          for (let j = 0; j < rows.length; j++) {
-            const row = rows[j];
-            const source = chunk[j];
-            const { data: singleData, error: singleErr } = await supabase
-              .from('contacts')
-              .insert(row)
-              .select('id')
-              .single();
-
-            if (!singleErr && singleData) {
-              imported++;
-              if (source.tagNames.length > 0) {
-                tagAssignments.push({
-                  contactId: singleData.id,
-                  tagNames: source.tagNames,
-                });
-              }
-            } else if (isUniqueViolation(singleErr)) {
-              skipped++;
-            } else {
-              failed++;
+      // 3) Create contacts in small concurrent batches (Convex has no
+      //    bulk-insert mutation; mutations are serialized server-side so
+      //    concurrent calls are safe).
+      for (let i = 0; i < unique.length; i += IMPORT_CONCURRENCY) {
+        const chunk = unique.slice(i, i + IMPORT_CONCURRENCY);
+        const results = await Promise.allSettled(
+          chunk.map((row) =>
+            createContact({
+              phone: row.phone,
+              name: row.name,
+              email: row.email,
+              company: row.company,
+            }),
+          ),
+        );
+        results.forEach((res, idx) => {
+          const row = chunk[idx];
+          if (res.status === 'fulfilled') {
+            imported++;
+            if (row.tagNames.length > 0) {
+              tagAssignments.push({
+                contactId: res.value,
+                tagNames: row.tagNames,
+              });
             }
+          } else if (isConvexErrorCode(res.reason, 'DUPLICATE_PHONE')) {
+            skipped++;
+          } else {
+            failed++;
           }
-        } else {
-          const inserted = data ?? [];
-          imported += inserted.length;
-          // inserted[j] ↔ chunk[j] only holds because a single INSERT
-          // preserves RETURNING order. If this path is ever split into
-          // parallel inserts, zip by phone or returned id instead.
-          for (let j = 0; j < inserted.length; j++) {
-            const source = chunk[j];
-            if (!source || source.tagNames.length === 0) continue;
-            tagAssignments.push({
-              contactId: inserted[j].id,
-              tagNames: source.tagNames,
-            });
-          }
-        }
+        });
       }
 
-      // 5) Wire tags onto the contacts we just created. Failure here must
+      // 4) Wire tags onto the contacts we just created. Failure here must
       //    not mask a successful contact import.
       let tagsAssigned = 0;
       try {
-        tagsAssigned = await assignImportedContactTags(
-          supabase,
+        tagsAssigned = await assignTagsToImportedContacts(
           tagAssignments,
-          tagIdByKey
+          tagIdByKey,
+          (args) => assignTag(args),
         );
       } catch {
         toast.warning(t('toastTagsWarning'));

@@ -677,6 +677,65 @@ test("filterByTags paginates with offset/limit while total reflects every match"
   for (const item of page2.items) expect(page1Ids.has(item._id)).toBe(false);
 });
 
+// ============================================================
+// get (single-contact read, added for the Phase 8 Task 2a UI rewire —
+// ContactDetailView and the contact-form duplicate-phone banner both
+// resolve one contact from a bare id).
+// ============================================================
+
+test("get returns the contact with embedded tags for the caller's own account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+    name: "Alice's Contact",
+  });
+  const tagId = await asUser.mutation(api.tags.create, {
+    name: "VIP",
+    color: "#f00",
+  });
+  await asUser.mutation(api.contacts.assignTag, { contactId, tagId });
+
+  const result = await asUser.query(api.contacts.get, { contactId });
+  expect(result._id).toBe(contactId);
+  expect(result.name).toBe("Alice's Contact");
+  expect(result.tags).toHaveLength(1);
+  expect(result.tags[0]._id).toBe(tagId);
+});
+
+test("get throws NOT_FOUND when the contact belongs to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  const error: unknown = await asBob
+    .query(api.contacts.get, { contactId: aliceContactId })
+    .catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(ConvexError);
+  expect((error as { data: unknown }).data).toEqual({
+    code: "NOT_FOUND",
+    entity: "contact",
+  });
+});
+
 test("filterByTags returns nothing for an empty tagIds list", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {

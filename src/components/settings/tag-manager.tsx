@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import { Loader2, Plus, Tag as TagIcon, X } from 'lucide-react';
-import { createClient } from '@/lib/supabase/client';
-import { useAuth } from '@/hooks/use-auth';
+import { toUiTag } from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -26,6 +26,9 @@ import { cn } from '@/lib/utils';
 import { useTranslations } from 'next-intl';
 import type { Tag } from '@/types';
 
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
+
 const PRESET_COLORS = [
   { name: 'red', value: '#ef4444' },
   { name: 'orange', value: '#f97316' },
@@ -41,49 +44,30 @@ const PRESET_COLORS = [
  * Tags card — colour-coded contact labels. Creation is an inline row
  * (name + colour swatch + Add); deletion goes through a confirmation
  * dialog since it detaches the tag from every contact.
+ *
+ * Account-wide, not per-creator: the Supabase-era version filtered by
+ * `user_id` here (showing only tags the current user created), but
+ * Convex's `tags` table has no creator/user field at all — tags are an
+ * account-wide label set, matching what the Contacts page's tag filter
+ * already showed. `tags.list` reflects that; this view now shows every
+ * tag in the account, same as the Contacts page.
  */
 export function TagManager() {
   const t = useTranslations('Settings.tagsAndFields');
-  const supabase = createClient();
-  const { user, accountId, loading: authLoading } = useAuth();
 
-  const [loading, setLoading] = useState(true);
-  const [tags, setTags] = useState<Tag[]>([]);
+  const tagsResult = useQuery(api.tags.list);
+  const tags = useMemo(() => (tagsResult ?? []).map(toUiTag), [tagsResult]);
+  const loading = tagsResult === undefined;
+
+  const createTag = useMutation(api.tags.create);
+  const removeTag = useMutation(api.tags.remove);
+
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [tagToDelete, setTagToDelete] = useState<Tag | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [newTagName, setNewTagName] = useState('');
   const [selectedColor, setSelectedColor] = useState(PRESET_COLORS[3].value);
-
-  useEffect(() => {
-    if (authLoading) return;
-    if (!user) {
-      setLoading(false);
-      return;
-    }
-    fetchTags(user.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, user?.id]);
-
-  async function fetchTags(userId: string) {
-    try {
-      setLoading(true);
-      const { data, error } = await supabase
-        .from('tags')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: true });
-
-      if (error) throw error;
-      setTags(data || []);
-    } catch (err) {
-      console.error('Failed to fetch tags:', err);
-      toast.error(t('failedToLoadTags'));
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function handleCreate() {
     if (!newTagName.trim()) {
@@ -93,26 +77,11 @@ export function TagManager() {
 
     try {
       setSaving(true);
-      if (!user || !accountId) {
-        toast.error(t('notAuthenticated'));
-        return;
-      }
-
-      // account_id is mandatory on every account-scoped insert (NOT
-      // NULL + RLS, no DB default).
-      const { error } = await supabase.from('tags').insert({
-        user_id: user.id,
-        account_id: accountId,
-        name: newTagName.trim(),
-        color: selectedColor,
-      });
-
-      if (error) throw error;
+      await createTag({ name: newTagName.trim(), color: selectedColor });
 
       toast.success(t('tagCreated'));
       setNewTagName('');
       setSelectedColor(PRESET_COLORS[3].value);
-      await fetchTags(user.id);
     } catch (err) {
       console.error('Create error:', err);
       toast.error(t('failedToCreateTag'));
@@ -131,15 +100,9 @@ export function TagManager() {
 
     try {
       setDeleting(true);
-      const { error } = await supabase
-        .from('tags')
-        .delete()
-        .eq('id', tagToDelete.id);
-
-      if (error) throw error;
+      await removeTag({ tagId: tagToDelete.id as Id<'tags'> });
 
       toast.success(t('tagDeleted'));
-      setTags((prev) => prev.filter((t) => t.id !== tagToDelete.id));
       setDeleteDialogOpen(false);
       setTagToDelete(null);
     } catch (err) {

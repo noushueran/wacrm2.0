@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useEffect, useMemo, useState } from 'react';
+import { useMutation, usePaginatedQuery, useQuery } from 'convex/react';
 import { toast } from 'sonner';
-import type { Contact, Tag, ContactTag } from '@/types';
+import type { Contact, Tag } from '@/types';
+import { toUiContact, toUiTag } from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -58,30 +59,28 @@ import { useCan } from '@/hooks/use-can';
 import { GatedButton } from '@/components/ui/gated-button';
 import { useTranslations } from 'next-intl';
 
-const PAGE_SIZE = 25;
+import { api } from '../../../../convex/_generated/api';
+import type { Id } from '../../../../convex/_generated/dataModel';
 
-interface ContactWithTags extends Contact {
-  tags?: Tag[];
-}
+const PAGE_SIZE = 25;
 
 export default function ContactsPage() {
   const t = useTranslations('Contacts.page');
-  const supabase = createClient();
   const canEdit = useCan('send-messages');
   const canEditSettings = useCan('edit-settings');
 
-  const [contacts, setContacts] = useState<ContactWithTags[]>([]);
-  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
+  // Offset-based pagination — only meaningful while a tag filter is
+  // active (`filterByTags` supports limit/offset). The untagged view
+  // below uses `usePaginatedQuery`'s cursor-based "load more" instead;
+  // Convex's paginated query has no "jump to page N" concept.
   const [page, setPage] = useState(0);
-  const [totalCount, setTotalCount] = useState(0);
   // Tag filter — contacts shown must have ANY of these tags (OR).
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
 
   // Modals
   const [formOpen, setFormOpen] = useState(false);
   const [editContact, setEditContact] = useState<Contact | null>(null);
-  const [editContactTags, setEditContactTags] = useState<ContactTag[]>([]);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailContactId, setDetailContactId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
@@ -94,148 +93,91 @@ export default function ContactsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
 
-  // All tags for display
-  const [tagsMap, setTagsMap] = useState<Record<string, Tag>>({});
+  const usingTagFilter = selectedTagIds.length > 0;
+  const trimmedSearch = search.trim() || undefined;
 
-  // Guards against out-of-order fetch responses: each fetchContacts run
-  // claims a sequence number and only the latest is allowed to commit its
-  // results. Without this, rapidly toggling tag filters could let a slower
-  // earlier request resolve last and render stale rows.
-  const fetchSeq = useRef(0);
-
-  const fetchTags = useCallback(async () => {
-    const { data } = await supabase.from('tags').select('*');
-    if (data) {
-      const map: Record<string, Tag> = {};
-      data.forEach((t) => (map[t.id] = t));
-      setTagsMap(map);
-      // Drop any filter selections whose tag no longer exists (e.g. a tag
-      // deleted elsewhere) so it can't linger invisibly in the query.
-      setSelectedTagIds((prev) => {
-        const pruned = prev.filter((id) => map[id]);
-        return pruned.length === prev.length ? prev : pruned;
-      });
-    }
-  }, [supabase]);
-
-  const fetchContacts = useCallback(async () => {
-    const seq = ++fetchSeq.current;
-    setLoading(true);
-    // The visible rows are about to change — drop any selection that
-    // referred to the old page/search results so the bulk bar can't
-    // act on rows the user can no longer see.
-    setSelected(new Set());
-
-    const from = page * PAGE_SIZE;
-    const to = from + PAGE_SIZE - 1;
-    const term = search.trim();
-
-    let contactRows: Contact[];
-    let count: number;
-
-    if (selectedTagIds.length > 0) {
-      // Tag filter active — resolve it server-side (join + distinct +
-      // windowed total count + pagination) so a tag covering many
-      // contacts can't silently truncate the result or overflow an IN
-      // clause. See migration 025_filter_contacts_by_tags.
-      const { data, error } = await supabase.rpc('filter_contacts_by_tags', {
-        p_tag_ids: selectedTagIds,
-        p_search: term || null,
-        p_limit: PAGE_SIZE,
-        p_offset: from,
-      });
-      if (seq !== fetchSeq.current) return; // superseded by a newer fetch
-      if (error) {
-        toast.error(t('toastFailedLoad'));
-        setLoading(false);
-        return;
-      }
-      const rows = (data ?? []) as { contact: Contact; total_count: number }[];
-      contactRows = rows.map((r) => r.contact);
-      count = rows.length > 0 ? Number(rows[0].total_count) : 0;
-    } else {
-      let query = supabase
-        .from('contacts')
-        .select('*', { count: 'exact' })
-        .order('created_at', { ascending: false })
-        .range(from, to);
-
-      if (term) {
-        const like = `%${term}%`;
-        query = query.or(`name.ilike.${like},phone.ilike.${like},email.ilike.${like}`);
-      }
-
-      const { data, count: exactCount, error } = await query;
-      if (seq !== fetchSeq.current) return; // superseded by a newer fetch
-      if (error) {
-        toast.error(t('toastFailedLoad'));
-        setLoading(false);
-        return;
-      }
-      contactRows = data ?? [];
-      count = exactCount ?? 0;
-    }
-
-    setTotalCount(count);
-
-    if (contactRows.length === 0) {
-      setContacts([]);
-      setLoading(false);
-      return;
-    }
-
-    // Fetch tags for these contacts
-    const contactIds = contactRows.map((c) => c.id);
-    const { data: contactTags } = await supabase
-      .from('contact_tags')
-      .select('contact_id, tag_id')
-      .in('contact_id', contactIds);
-    if (seq !== fetchSeq.current) return; // superseded by a newer fetch
-
-    const tagsByContact: Record<string, string[]> = {};
-    contactTags?.forEach((ct) => {
-      if (!tagsByContact[ct.contact_id]) tagsByContact[ct.contact_id] = [];
-      tagsByContact[ct.contact_id].push(ct.tag_id);
+  // All tags — for the filter popover, the per-row tag chips, and the
+  // active-filter chips. Reactive: a tag created/renamed/deleted in
+  // Settings updates here without a manual refetch.
+  const tagsResult = useQuery(api.tags.list);
+  const allTags = useMemo(
+    () =>
+      (tagsResult ?? [])
+        .map(toUiTag)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [tagsResult],
+  );
+  const tagsMap = useMemo(() => {
+    const map: Record<string, Tag> = {};
+    allTags.forEach((tag) => {
+      map[tag.id] = tag;
     });
+    return map;
+  }, [allTags]);
 
-    const enriched: ContactWithTags[] = contactRows.map((c) => ({
-      ...c,
-      tags: (tagsByContact[c.id] ?? [])
-        .map((tid) => tagsMap[tid])
-        .filter(Boolean),
-    }));
-
-    setContacts(enriched);
-    setLoading(false);
-  }, [supabase, page, search, selectedTagIds, tagsMap, t]);
-
-  // Load-once-on-mount-ish data fetches. Each setter inside runs
-  // inside an async promise completion (Supabase await), not
-  // synchronously in the effect body, so the cascade the lint rule
-  // warns about doesn't apply here.
+  // Drop any filter selections whose tag no longer exists (e.g. deleted
+  // elsewhere) — mirrors the Supabase-era `fetchTags`'s pruning, now
+  // driven by the reactive tag list instead of a one-time fetch.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchTags();
-  }, [fetchTags]);
+    if (tagsResult === undefined) return;
+    setSelectedTagIds((prev) => {
+      const validIds = new Set(allTags.map((tag) => tag.id));
+      const pruned = prev.filter((id) => validIds.has(id));
+      return pruned.length === prev.length ? prev : pruned;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reacting to the tag list itself, not re-running on every selectedTagIds change
+  }, [allTags, tagsResult]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchContacts();
-  }, [fetchContacts]);
+  // Base (no tag filter) list — cursor-paginated, reactive.
+  const paginated = usePaginatedQuery(
+    api.contacts.list,
+    usingTagFilter ? 'skip' : { search: trimmedSearch },
+    { initialNumItems: PAGE_SIZE },
+  );
+
+  // Tag-filtered list — offset-paginated (the only read here that
+  // supports full name/phone/email search, since `contacts.list`'s
+  // search index only covers `name`; see convex/contacts.ts).
+  const filtered = useQuery(
+    api.contacts.filterByTags,
+    usingTagFilter
+      ? {
+          tagIds: selectedTagIds.map((id) => id as Id<'tags'>),
+          search: trimmedSearch,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+        }
+      : 'skip',
+  );
+
+  const rawContacts = usingTagFilter
+    ? (filtered?.items ?? [])
+    : paginated.results;
+  const contacts = useMemo(
+    () => rawContacts.map(toUiContact),
+    [rawContacts],
+  );
+  const loading = usingTagFilter
+    ? filtered === undefined
+    : paginated.status === 'LoadingFirstPage';
+
+  // Total count: exact while tag-filtered (`filterByTags` returns a real
+  // total); an approximation — "how many have loaded so far" — for the
+  // base cursor-paginated list, since `contacts.list` has no count query.
+  const totalCount = usingTagFilter ? (filtered?.total ?? 0) : contacts.length;
+
+  const removeContact = useMutation(api.contacts.remove);
 
   function openAddForm() {
     setEditContact(null);
-    setEditContactTags([]);
     setFormOpen(true);
   }
 
-  async function openEditForm(contact: Contact) {
-    const { data } = await supabase
-      .from('contact_tags')
-      .select('*')
-      .eq('contact_id', contact.id);
+  function openEditForm(contact: Contact) {
+    // `contact.tags` is already embedded (contacts.list/filterByTags both
+    // embed tags server-side) — no separate join-table fetch needed the
+    // way the Supabase version required.
     setEditContact(contact);
-    setEditContactTags(data ?? []);
     setFormOpen(true);
   }
 
@@ -253,16 +195,11 @@ export default function ContactsPage() {
     if (!deleteTarget) return;
     setDeleting(true);
 
-    const { error } = await supabase
-      .from('contacts')
-      .delete()
-      .eq('id', deleteTarget.id);
-
-    if (error) {
-      toast.error(t('toastFailedDelete'));
-    } else {
+    try {
+      await removeContact({ contactId: deleteTarget.id as Id<'contacts'> });
       toast.success(t('toastDeleted'));
-      fetchContacts();
+    } catch {
+      toast.error(t('toastFailedDelete'));
     }
 
     setDeleting(false);
@@ -300,29 +237,28 @@ export default function ContactsPage() {
     if (ids.length === 0) return;
     setDeleting(true);
 
-    const { error } = await supabase.from('contacts').delete().in('id', ids);
+    // Convex has no bulk-delete mutation — issue N parallel `remove`
+    // calls (safe: mutations are serialized server-side) and report
+    // partial success/failure precisely, rather than treating the whole
+    // batch as pass/fail the way the single Postgres `.in(...)` call did.
+    const results = await Promise.allSettled(
+      ids.map((id) => removeContact({ contactId: id as Id<'contacts'> })),
+    );
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    const failedCount = results.length - succeeded;
 
-    if (error) {
+    if (succeeded > 0) {
+      toast.success(t('toastBulkDeleted', { count: succeeded }));
+    }
+    if (failedCount > 0) {
       toast.error(t('toastBulkFailedDelete'));
-    } else {
-      toast.success(t('toastBulkDeleted', { count: ids.length }));
-      setSelected(new Set());
-      fetchContacts();
     }
 
+    setSelected(new Set());
     setDeleting(false);
     setBulkDeleteOpen(false);
   }
 
-  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
-  const hasNext = page < totalPages - 1;
-  const hasPrev = page > 0;
-
-  // Tag filter helpers. Every change resets to page 0 — the result set
-  // shrinks/grows so page N may no longer be valid (mirrors the search box).
-  const allTags = Object.values(tagsMap).sort((a, b) =>
-    a.name.localeCompare(b.name)
-  );
   const hasActiveFilters = search.trim().length > 0 || selectedTagIds.length > 0;
 
   function toggleTagFilter(tagId: string) {
@@ -332,12 +268,19 @@ export default function ContactsPage() {
         : [...prev, tagId]
     );
     setPage(0);
+    setSelected(new Set());
   }
 
   function clearTagFilters() {
     setSelectedTagIds([]);
     setPage(0);
+    setSelected(new Set());
   }
+
+  // Tag-filtered pagination only (the base list uses "load more" below).
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+  const hasNext = usingTagFilter && page < totalPages - 1;
+  const hasPrev = usingTagFilter && page > 0;
 
   return (
     <div className="space-y-6">
@@ -394,6 +337,7 @@ export default function ContactsPage() {
                 // Reset pagination when the query changes — the result
                 // set shrinks/grows, page N may no longer be valid.
                 setPage(0);
+                setSelected(new Set());
               }}
               placeholder={t('searchPlaceholder')}
               className="pl-8 bg-card border-border text-foreground placeholder:text-muted-foreground"
@@ -693,39 +637,67 @@ export default function ContactsPage() {
         </Table>
       </div>
 
-      {/* Pagination */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-between">
-          <p className="text-xs text-muted-foreground">
-            {t('showingPagination', {
-              start: page * PAGE_SIZE + 1,
-              end: Math.min((page + 1) * PAGE_SIZE, totalCount),
-              total: totalCount
-            })}
-          </p>
-          <div className="flex items-center gap-1">
+      {/* Pagination — offset Prev/Next while tag-filtered (filterByTags
+          gives an exact total); cursor "Load more" for the base list
+          (usePaginatedQuery has no page-jump concept). */}
+      {usingTagFilter ? (
+        totalPages > 1 && (
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-muted-foreground">
+              {t('showingPagination', {
+                start: page * PAGE_SIZE + 1,
+                end: Math.min((page + 1) * PAGE_SIZE, totalCount),
+                total: totalCount
+              })}
+            </p>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="outline"
+                size="icon-sm"
+                disabled={!hasPrev}
+                onClick={() => {
+                  setPage((p) => p - 1);
+                  setSelected(new Set());
+                }}
+                className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
+              >
+                <ChevronLeft className="size-4" />
+              </Button>
+              <span className="text-xs text-muted-foreground px-2">
+                {t('pageCount', { page: page + 1, total: totalPages })}
+              </span>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                disabled={!hasNext}
+                onClick={() => {
+                  setPage((p) => p + 1);
+                  setSelected(new Set());
+                }}
+                className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
+              >
+                <ChevronRight className="size-4" />
+              </Button>
+            </div>
+          </div>
+        )
+      ) : (
+        paginated.status === 'CanLoadMore' && (
+          <div className="flex justify-center">
             <Button
               variant="outline"
-              size="icon-sm"
-              disabled={!hasPrev}
-              onClick={() => setPage((p) => p - 1)}
-              className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
+              onClick={() => paginated.loadMore(PAGE_SIZE)}
+              className="border-border text-muted-foreground hover:bg-muted"
             >
-              <ChevronLeft className="size-4" />
-            </Button>
-            <span className="text-xs text-muted-foreground px-2">
-              {t('pageCount', { page: page + 1, total: totalPages })}
-            </span>
-            <Button
-              variant="outline"
-              size="icon-sm"
-              disabled={!hasNext}
-              onClick={() => setPage((p) => p + 1)}
-              className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-            >
-              <ChevronRight className="size-4" />
+              {t('loadMore')}
             </Button>
           </div>
+        )
+      )}
+      {!usingTagFilter && paginated.status === 'LoadingMore' && (
+        <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" />
+          {t('loadingMore')}
         </div>
       )}
 
@@ -734,11 +706,7 @@ export default function ContactsPage() {
         open={formOpen}
         onOpenChange={setFormOpen}
         contact={editContact}
-        contactTags={editContactTags}
-        onSaved={() => {
-          fetchContacts();
-          fetchTags();
-        }}
+        onSaved={() => {}}
         onViewExisting={(id) => {
           setFormOpen(false);
           openDetail(id);
@@ -750,14 +718,14 @@ export default function ContactsPage() {
         open={detailOpen}
         onOpenChange={setDetailOpen}
         contactId={detailContactId}
-        onUpdated={fetchContacts}
+        onUpdated={() => {}}
       />
 
       {/* Import Modal */}
       <ImportModal
         open={importOpen}
         onOpenChange={setImportOpen}
-        onImported={fetchContacts}
+        onImported={() => {}}
       />
 
       {/* Custom Fields Manager (admin+) */}
