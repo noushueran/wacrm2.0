@@ -15,6 +15,7 @@
 // ============================================================
 
 import { useState } from 'react';
+import { useMutation } from 'convex/react';
 import { toast } from 'sonner';
 import { Copy, Loader2, MessageCircle, Sparkles } from 'lucide-react';
 
@@ -38,15 +39,15 @@ import {
 } from '@/components/ui/select';
 import { useTranslations } from 'next-intl';
 import { useAuth } from '@/hooks/use-auth';
+import { convexErrorMessage } from '@/lib/convex/adapters';
+
+import { api } from '../../../convex/_generated/api';
 
 type InviteRole = 'admin' | 'agent' | 'viewer';
 
 interface InviteMemberDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Called after a successful create so the parent re-fetches the
-   *  pending-invitations list. */
-  onCreated: () => void;
 }
 
 const EXPIRY_OPTIONS = [
@@ -72,11 +73,11 @@ interface CreatedInvite {
 export function InviteMemberDialog({
   open,
   onOpenChange,
-  onCreated,
 }: InviteMemberDialogProps) {
   const t = useTranslations('Settings.invite');
   const tRoles = useTranslations('Settings.roles');
   const { account } = useAuth();
+  const createInvitation = useMutation(api.invitations.create);
   const [role, setRole] = useState<InviteRole>('agent');
   const [expiry, setExpiry] = useState<string>('7');
   const [label, setLabel] = useState('');
@@ -94,8 +95,8 @@ export function InviteMemberDialog({
   async function handleCreate() {
     // Mirror the server's max-length check so we don't ship an
     // obviously-too-long label across the wire just to bounce off
-    // a 400. The Input also has a `maxLength={MAX_LABEL_LEN}` cap
-    // but a paste can land an over-limit string into state before
+    // a validation error. The Input also has a `maxLength={MAX_LABEL_LEN}`
+    // cap but a paste can land an over-limit string into state before
     // the limit kicks in on the next keystroke — this is the safety
     // net for that path.
     const trimmedLabel = label.trim();
@@ -105,31 +106,31 @@ export function InviteMemberDialog({
     }
     setSubmitting(true);
     try {
-      const res = await fetch('/api/account/invitations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          role,
-          expiresInDays: Number(expiry),
-          label: trimmedLabel || undefined,
-        }),
+      const expiresInDays = Number(expiry);
+      const { token } = await createInvitation({
+        role,
+        expiresInDays,
+        label: trimmedLabel || undefined,
       });
 
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || 'Failed to create invitation');
-        return;
-      }
-
-      const data = (await res.json()) as {
-        url: string;
-        expiresInDays: number;
-      };
-
       setResult({
-        url: data.url,
+        // Built client-side from the plaintext token the mutation
+        // returns exactly once (`convex/invitations.ts`'s `create`
+        // never persists it). `window.location.origin` is the
+        // browser's own equivalent of the old API route's
+        // `getBaseUrl(request)` host-header resolution chain — the
+        // browser always knows its own origin, so none of that
+        // X-Forwarded-Host/ALLOWED_INVITE_HOSTS plumbing is needed
+        // here.
+        url: `${window.location.origin}/join/${token}`,
         role,
-        expiresInDays: data.expiresInDays,
+        // `expiresInDays` is one of the three fixed, already-valid
+        // `EXPIRY_OPTIONS` values below — the server clamps too, but
+        // never differently for these, so the local value stays
+        // accurate without round-tripping it back from the mutation
+        // (which only returns an absolute `expiresAt` epoch, not the
+        // day count).
+        expiresInDays,
         // Snapshot the account name into the result so the wa.me
         // share message has team context. Falls back to a generic
         // string if `account` hasn't loaded yet (shouldn't happen
@@ -137,10 +138,13 @@ export function InviteMemberDialog({
         // profile — but stay safe).
         accountName: account?.name ?? 'our wacrm account',
       });
-      onCreated();
+      // No manual list refresh needed — `MembersTab`'s pending-invites
+      // list comes from a reactive `useQuery(api.invitations.list)`,
+      // which picks up the new row on its own once this mutation
+      // commits (same pattern as `api-keys-settings.tsx`'s create).
     } catch (err) {
       console.error('[InviteMemberDialog] create error:', err);
-      toast.error('Could not reach the server. Try again?');
+      toast.error(convexErrorMessage(err));
     } finally {
       setSubmitting(false);
     }

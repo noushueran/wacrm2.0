@@ -20,6 +20,31 @@
 // invitee should confirm what account/role they're accepting.
 // Auto-redeem would also race with the signup flow returning to
 // this page after email verification.
+//
+// Convex notes
+//   - `api.invitations.peek`/`redeem` key their lookup on a `tokenHash`,
+//     never the plaintext token (see `convex/invitations.ts`'s own doc
+//     comments on both) — the plaintext never needs to reach Convex.
+//     `hashInviteToken` (from `convex/lib/inviteToken.ts`) is a plain
+//     Web Crypto function (no Node-only dependency, no `"use node"`),
+//     so it runs client-side here exactly as that module's own doc
+//     comment anticipates: "used ... by callers, e.g. a future
+//     /join/<token> route, to turn a plaintext token from a URL into
+//     the tokenHash". There is no server-only hashing gap — this IS
+//     the intended integration point.
+//   - The AuthProvider (`src/hooks/use-auth.tsx`) only wraps the
+//     `(dashboard)` route group, so this page reads Convex Auth
+//     directly (`useConvexAuth`/`useAuthActions`) instead of `useAuth`
+//     — same reasoning this file previously gave for hitting Supabase
+//     directly "the same way /login and /signup do" (both of which
+//     are Convex-Auth-based too now).
+//   - Convex queries are reactive, not one-shot fetches: there is no
+//     discrete "the peek request failed, show a Try again button"
+//     state the way a REST `fetch()` rejection gave us — a genuine
+//     connectivity blip just leaves `peek` at `undefined` (folded into
+//     the loading spinner below) until the client's subscription
+//     reconnects on its own. The old `server_error` peek-failure
+//     reason and its dedicated retry button are dropped accordingly.
 // ============================================================
 
 import { useCallback, useEffect, useState } from 'react';
@@ -34,6 +59,8 @@ import {
   ShieldCheck,
   UsersRound,
 } from 'lucide-react';
+import { useConvexAuth, useMutation, useQuery } from 'convex/react';
+import { useAuthActions } from '@convex-dev/auth/react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -51,27 +78,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { createClient } from '@/lib/supabase/client';
+import { convexErrorData, convexErrorMessage } from '@/lib/convex/adapters';
 
-interface PeekOk {
-  ok: true;
-  account_name: string;
-  role: 'admin' | 'agent' | 'viewer';
-  expires_at: string;
-}
-interface PeekFail {
-  ok: false;
-  reason: 'not_found' | 'used' | 'expired' | 'server_error';
-}
-type PeekResult = PeekOk | PeekFail;
+import { api } from '../../../../convex/_generated/api';
+import { hashInviteToken } from '../../../../convex/lib/inviteToken';
 
-const ROLE_LABEL: Record<PeekOk['role'], string> = {
+type PeekFailReason = 'not_found' | 'used' | 'expired';
+
+const ROLE_LABEL: Record<'admin' | 'agent' | 'viewer', string> = {
   admin: 'Admin',
   agent: 'Agent',
   viewer: 'Viewer',
 };
 
-const FAIL_COPY: Record<PeekFail['reason'], { title: string; body: string }> = {
+const FAIL_COPY: Record<PeekFailReason, { title: string; body: string }> = {
   not_found: {
     title: 'Invite not found',
     body: 'This link doesn’t match a valid invitation. Double-check the URL or ask the person who invited you to send a new one.',
@@ -84,141 +104,96 @@ const FAIL_COPY: Record<PeekFail['reason'], { title: string; body: string }> = {
     title: 'Invite expired',
     body: 'This invitation has expired. Ask the account admin to send a new one — they take a few seconds to generate.',
   },
-  server_error: {
-    title: 'Something went wrong',
-    body: 'We couldn’t verify this invitation right now. Try refreshing the page in a moment.',
-  },
+};
+
+// Redeem-time failure codes (`convex/invitations.ts`'s `redeem`) that mean
+// "this signed-in identity can't accept this invite" — the invitee needs
+// to sign out and use a different email, not just retry. Mirrors the old
+// REST route's SQLSTATE-23505 -> HTTP 409 -> conflict-modal mapping, split
+// into one message per Convex error code instead of one shared Postgres
+// exception string.
+const CONFLICT_MESSAGES: Record<string, string> = {
+  ALREADY_MEMBER: 'You are already a member of this account.',
+  NOT_SOLE_OWNER:
+    'You are already in another account. Sign out and sign up with a different email to join this one.',
+  ACCOUNT_HAS_DATA:
+    'Your current account already has data in it. Sign out and sign up with a different email to join this one.',
 };
 
 export default function JoinPage() {
   const params = useParams<{ token: string }>();
   const token = params?.token;
 
-  const [peek, setPeek] = useState<PeekResult | null>(null);
-  // Local auth probe — the AuthProvider lives inside the (dashboard)
-  // route group, so it doesn't reach this page. We hit Supabase
-  // directly the same way `/login` and `/signup` do.
-  const [authedUserId, setAuthedUserId] = useState<string | null | undefined>(
-    undefined, // undefined = unknown / still loading; null = signed out
-  );
-  const [accepting, setAccepting] = useState(false);
-  // `redeem_invitation` returns 409 when the caller's current account
-  // has domain data, or they're already a member of a shared account.
-  // A transient toast wasn't enough — the user has no actionable next
-  // step. Surface a blocking modal that walks them through it.
-  const [conflictMessage, setConflictMessage] = useState<string | null>(null);
-  const [signingOut, setSigningOut] = useState(false);
-
-  // Extracted so the "Try again" button on the server_error card
-  // can re-run the same logic without remounting the component.
-  const loadPeekAndAuth = useCallback(async () => {
-    if (!token) return;
-    setPeek(null);
-    setAuthedUserId(undefined);
-    try {
-      const [peekRes, authRes] = await Promise.all([
-        fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
-          cache: 'no-store',
-        }),
-        createClient().auth.getUser(),
-      ]);
-      const peekBody = (await peekRes.json()) as PeekResult;
-      setPeek(peekBody);
-      setAuthedUserId(authRes.data.user?.id ?? null);
-    } catch (err) {
-      console.error('[join] peek error:', err);
-      setPeek({ ok: false, reason: 'server_error' });
-      setAuthedUserId(null);
-    }
-  }, [token]);
-
-  // Fetch peek + auth state on mount. The peek endpoint is
-  // rate-limited per-IP (30/min) so double-mounting in React 19
-  // strict mode dev is harmless. We also use the `cancelled` flag
-  // to drop setState calls if the component unmounts mid-fetch.
+  // SHA-256 of the plaintext token, computed client-side via Web Crypto.
+  // `peek`/`redeem` both key their lookup off this hash, never the
+  // plaintext (see convex/invitations.ts's doc comments on both).
+  const [tokenHash, setTokenHash] = useState<string | null>(null);
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-    (async () => {
-      try {
-        const [peekRes, authRes] = await Promise.all([
-          fetch(`/api/invitations/${encodeURIComponent(token)}/peek`, {
-            cache: 'no-store',
-          }),
-          createClient().auth.getUser(),
-        ]);
-        const peekBody = (await peekRes.json()) as PeekResult;
-        if (cancelled) return;
-        setPeek(peekBody);
-        setAuthedUserId(authRes.data.user?.id ?? null);
-      } catch (err) {
-        console.error('[join] peek error:', err);
-        if (cancelled) return;
-        setPeek({ ok: false, reason: 'server_error' });
-        setAuthedUserId(null);
-      }
-    })();
+    hashInviteToken(token).then((hash) => {
+      if (!cancelled) setTokenHash(hash);
+    });
     return () => {
       cancelled = true;
     };
   }, [token]);
 
+  const peek = useQuery(
+    api.invitations.peek,
+    tokenHash ? { tokenHash } : 'skip',
+  );
+  const { isAuthenticated, isLoading: authLoading } = useConvexAuth();
+  const { signOut } = useAuthActions();
+  const redeemInvitation = useMutation(api.invitations.redeem);
+
+  const [accepting, setAccepting] = useState(false);
+  // `redeem` throws ALREADY_MEMBER / NOT_SOLE_OWNER / ACCOUNT_HAS_DATA
+  // when the caller's current identity can't accept this invite. A
+  // transient toast wasn't enough — the user has no actionable next
+  // step. Surface a blocking modal that walks them through it.
+  const [conflictMessage, setConflictMessage] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+
   const handleAccept = useCallback(async () => {
-    if (!token) return;
+    if (!tokenHash) return;
     setAccepting(true);
     try {
-      const res = await fetch(
-        `/api/invitations/${encodeURIComponent(token)}/redeem`,
-        { method: 'POST' },
-      );
-      if (!res.ok) {
-        const payload = (await res.json().catch(() => ({}))) as {
-          error?: string;
-        };
-        // 409 = caller already has data / is in another shared
-        // account. The redeem RPC's error message is descriptive
-        // enough to show directly; we open a modal so the user has
-        // a clear next-action (sign out → use different email)
-        // rather than a 3-second toast.
-        if (res.status === 409) {
-          setConflictMessage(
-            payload.error ||
-              'You are already in another account. Sign in with a different email to join this one.',
-          );
-        } else {
-          toast.error(payload.error || 'Failed to accept invitation');
-        }
-        setAccepting(false);
-        return;
-      }
+      await redeemInvitation({ tokenHash });
       toast.success('Welcome to the team');
-      // Full reload (not router.push) so AuthProvider re-fetches
-      // the profile with the new account_id and account_role.
+      // Full reload (not router.push) so every Convex Auth session /
+      // query subscription re-initializes against the new account.
       window.location.href = '/dashboard';
     } catch (err) {
       console.error('[join] redeem error:', err);
-      toast.error('Could not reach the server');
+      const code = convexErrorData(err)?.code;
+      if (typeof code === 'string' && code in CONFLICT_MESSAGES) {
+        setConflictMessage(CONFLICT_MESSAGES[code]);
+      } else {
+        toast.error(convexErrorMessage(err));
+      }
       setAccepting(false);
     }
-  }, [token]);
+  }, [tokenHash, redeemInvitation]);
 
   const handleSignOutAndRetry = useCallback(async () => {
     setSigningOut(true);
     try {
-      await createClient().auth.signOut();
-      // Hard reload so the new auth state propagates everywhere
-      // (middleware, AuthProvider). Preserves the invite token in
-      // the URL so the rebuilt page renders the signed-out CTA path.
+      await signOut();
+      // Hard reload so the new (signed-out) auth state propagates
+      // everywhere (middleware, AuthProvider). Preserves the invite
+      // token in the URL so the rebuilt page renders the signed-out
+      // CTA path.
       window.location.reload();
     } catch (err) {
       console.error('[join] sign-out error:', err);
       toast.error('Could not sign out. Try refreshing the page.');
       setSigningOut(false);
     }
-  }, []);
+  }, [signOut]);
 
   // ----- Loading state (peek pending OR auth not yet resolved) -----
-  if (peek === null || authedUserId === undefined) {
+  if (peek === undefined || authLoading) {
     return (
       <Card className="w-full max-w-md border-border bg-card">
         <CardContent className="flex flex-col items-center gap-3 py-12">
@@ -244,47 +219,19 @@ export default function JoinPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-2">
-          {/* For server_error the failure is transient — the network
-              flapped or the peek endpoint hiccupped. Try-again is
-              the right primary action; the "create account" /
-              "sign in" links stay as secondary options. Other
-              failure reasons (not_found / used / expired) are
-              terminal for this token, so no retry — just the
-              signup/sign-in escape hatches. */}
-          {peek.reason === 'server_error' ? (
-            <>
-              <Button
-                onClick={loadPeekAndAuth}
-                className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
-              >
-                Try again
-              </Button>
-              <Link href="/signup">
-                <Button
-                  variant="outline"
-                  className="w-full border-border text-muted-foreground hover:bg-muted hover:text-foreground"
-                >
-                  Create a new account instead
-                </Button>
-              </Link>
-            </>
-          ) : (
-            <>
-              <Link href="/signup">
-                <Button className="w-full bg-primary text-primary-foreground hover:bg-primary/90">
-                  Create a new account instead
-                </Button>
-              </Link>
-              <Link href="/login">
-                <Button
-                  variant="outline"
-                  className="w-full border-border text-muted-foreground hover:bg-muted hover:text-foreground"
-                >
-                  Sign in
-                </Button>
-              </Link>
-            </>
-          )}
+          <Link href="/signup">
+            <Button className="w-full bg-primary text-primary-foreground hover:bg-primary/90">
+              Create a new account instead
+            </Button>
+          </Link>
+          <Link href="/login">
+            <Button
+              variant="outline"
+              className="w-full border-border text-muted-foreground hover:bg-muted hover:text-foreground"
+            >
+              Sign in
+            </Button>
+          </Link>
         </CardContent>
       </Card>
     );
@@ -298,7 +245,7 @@ export default function JoinPage() {
       </div>
       <CardTitle className="text-xl text-foreground">
         You&apos;re invited to{' '}
-        <span className="text-primary">{peek.account_name}</span>
+        <span className="text-primary">{peek.accountName}</span>
       </CardTitle>
       <CardDescription className="text-muted-foreground">
         You&apos;ll join as{' '}
@@ -307,7 +254,7 @@ export default function JoinPage() {
           {ROLE_LABEL[peek.role]}
         </span>
         . Link valid until{' '}
-        {new Date(peek.expires_at).toLocaleDateString(undefined, {
+        {new Date(peek.expiresAt).toLocaleDateString(undefined, {
           year: 'numeric',
           month: 'short',
           day: 'numeric',
@@ -318,7 +265,7 @@ export default function JoinPage() {
   );
 
   // ----- Authed: show Accept button -----
-  if (authedUserId) {
+  if (isAuthenticated) {
     return (
       <>
         <Card className="w-full max-w-md border-border bg-card">
@@ -343,16 +290,17 @@ export default function JoinPage() {
             </Button>
             <p className="text-center text-xs text-muted-foreground">
               Accepting moves your login into{' '}
-              <span className="text-muted-foreground">{peek.account_name}</span>. Your
+              <span className="text-muted-foreground">{peek.accountName}</span>. Your
               empty personal account from signup will be cleaned up.
             </p>
           </CardContent>
         </Card>
 
-        {/* Conflict modal — opens when the redeem endpoint returns 409
-            (caller already in a shared account or has domain data).
-            Blocks the flow until the user picks a recovery action so
-            they aren't stuck retrying an inevitable failure. */}
+        {/* Conflict modal — opens when redeem throws ALREADY_MEMBER /
+            NOT_SOLE_OWNER / ACCOUNT_HAS_DATA (the caller's current
+            identity can't accept this invite). Blocks the flow until
+            the user picks a recovery action so they aren't stuck
+            retrying an inevitable failure. */}
         <Dialog
           open={conflictMessage !== null}
           onOpenChange={(open) => {
@@ -363,7 +311,7 @@ export default function JoinPage() {
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2 text-popover-foreground">
                 <AlertTriangle className="size-4 text-amber-400" />
-                Can&apos;t join {peek.account_name} with this account
+                Can&apos;t join {peek.accountName} with this account
               </DialogTitle>
               <DialogDescription className="text-muted-foreground">
                 {conflictMessage}
@@ -372,7 +320,7 @@ export default function JoinPage() {
             <div className="space-y-2 py-2 text-xs text-muted-foreground">
               <p>
                 To join{' '}
-                <span className="text-popover-foreground">{peek.account_name}</span>,
+                <span className="text-popover-foreground">{peek.accountName}</span>,
                 sign out and sign up again with a different email address.
                 The invite link stays valid as long as it hasn&apos;t
                 expired.

@@ -1,6 +1,8 @@
 import { ConvexError } from "convex/values";
 import type { Doc, Id } from "../../../convex/_generated/dataModel";
 import type {
+  AccountInvitation,
+  AccountMember,
   Broadcast,
   BroadcastRecipient,
   Contact,
@@ -13,6 +15,7 @@ import type {
   Message,
   MessageReaction,
   MessageTemplate,
+  Notification,
   Pipeline,
   PipelineStage,
   Profile,
@@ -129,6 +132,80 @@ export function toUiMemberProfile(
     email: doc.email ?? "",
     role: doc.role,
     account_id: doc.accountId,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+// ============================================================
+// Team + notifications vertical adapters (Phase 8, Task 3 / P8-T3) —
+// the Settings -> Members roster (`memberships`), outstanding invite
+// links (`accountInvitations`), and in-app notifications
+// (`notifications`). Same rename + `_creationTime`/epoch-ms ->
+// ISO-string convention as every adapter above. `AccountMember`/
+// `AccountInvitation` (unlike `Profile` above) already exist in
+// `src/types/index.ts` with exactly this shape — added ahead of this
+// task and unused until now — so these adapters target them directly
+// rather than introducing a parallel local type the way `ApiKeyView`/
+// `AiConfigView` below did for shapes with no existing `src/types` entry.
+// ============================================================
+
+/** `api.members.list`'s per-item shape (a full membership doc with
+ *  `email` re-nulled for non-admin callers — see that query's own doc
+ *  comment) mapped to the Members-tab roster's `AccountMember`. Unlike
+ *  `toUiMemberProfile` above (which targets the generic `Profile` shape
+ *  for the inbox assign-dropdown), this keeps `role` as the typed
+ *  `AccountRole` and adds `joined_at` — fields the roster UI reads
+ *  directly that `Profile` doesn't carry. `full_name` falls back to
+ *  `""` (NOT a hardcoded "Member" string like `toUiMemberProfile`
+ *  above) so the roster's own `member.full_name || t('unnamed')`
+ *  localized fallback still fires instead of being shadowed by an
+ *  English literal from this adapter. */
+export function toUiMember(
+  doc: Omit<Doc<"memberships">, "email"> & { email?: string | null },
+): AccountMember {
+  return {
+    user_id: doc.userId,
+    full_name: doc.fullName ?? doc.email ?? "",
+    email: doc.email ?? null,
+    avatar_url: doc.avatarUrl ?? null,
+    role: doc.role,
+    joined_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `api.invitations.list`'s per-item shape — an `accountInvitations` doc
+ *  with `tokenHash` already stripped server-side (see that query's own
+ *  doc comment: nothing in the UI needs it, only `peek`/`redeem` do). */
+export function toUiInvitation(
+  doc: Omit<Doc<"accountInvitations">, "tokenHash">,
+): AccountInvitation {
+  return {
+    id: doc._id,
+    account_id: doc.accountId,
+    role: doc.role,
+    created_by_user_id: doc.createdByUserId ?? null,
+    label: doc.label ?? null,
+    created_at: new Date(doc._creationTime).toISOString(),
+    expires_at: new Date(doc.expiresAt).toISOString(),
+    accepted_at: doc.acceptedAt ? new Date(doc.acceptedAt).toISOString() : null,
+    accepted_by_user_id: doc.acceptedByUserId ?? null,
+  };
+}
+
+/** `api.notifications.list`'s per-item shape — a raw `notifications`
+ *  doc (that query does no field-stripping — see its own doc comment). */
+export function toUiNotification(doc: Doc<"notifications">): Notification {
+  return {
+    id: doc._id,
+    account_id: doc.accountId,
+    user_id: doc.userId,
+    type: doc.type,
+    conversation_id: doc.conversationId,
+    contact_id: doc.contactId,
+    actor_user_id: doc.actorUserId,
+    title: doc.title,
+    body: doc.body,
+    read_at: doc.readAt ? new Date(doc.readAt).toISOString() : undefined,
     created_at: new Date(doc._creationTime).toISOString(),
   };
 }

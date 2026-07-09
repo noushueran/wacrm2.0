@@ -21,7 +21,8 @@
 //   the role anyway.
 // ============================================================
 
-import { useCallback, useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import {
   AlertTriangle,
@@ -75,23 +76,18 @@ import {
 import { InviteMemberDialog } from './invite-member-dialog';
 import { SettingsPanelHead } from './settings-panel-head';
 import { ROLE_META } from './role-meta';
+import {
+  toUiMember,
+  toUiInvitation,
+  convexErrorMessage,
+} from '@/lib/convex/adapters';
+import type {
+  AccountMember as Member,
+  AccountInvitation as Invitation,
+} from '@/types';
 
-interface Member {
-  user_id: string;
-  full_name: string;
-  email: string | null;
-  avatar_url: string | null;
-  role: AccountRole;
-  joined_at: string;
-}
-
-interface Invitation {
-  id: string;
-  role: 'admin' | 'agent' | 'viewer';
-  label: string | null;
-  created_at: string;
-  expires_at: string;
-}
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 // These roles are translated via `useTranslations("Settings.roles")` where they are used.
 const EDITABLE_ROLES: { value: AccountRole }[] = [
@@ -130,9 +126,24 @@ export function MembersTab() {
   const { user, canManageMembers } = useAuth();
   const { getPresence, getRow, now } = usePresence();
 
-  const [members, setMembers] = useState<Member[]>([]);
-  const [invitations, setInvitations] = useState<Invitation[]>([]);
-  const [loading, setLoading] = useState(true);
+  const membersResult = useQuery(api.members.list);
+  const members = useMemo(
+    () => (membersResult ?? []).map(toUiMember),
+    [membersResult],
+  );
+  // Non-admins never issue this query at all — mirrors the old
+  // `canManageMembers ? fetch(...) : Promise.resolve(null)` gate. The
+  // server-side `ctx.requireRole("admin")` would reject it anyway, but
+  // skipping client-side avoids a pointless FORBIDDEN round-trip.
+  const invitationsResult = useQuery(
+    api.invitations.list,
+    canManageMembers ? {} : 'skip',
+  );
+  const invitations = useMemo(
+    () => (invitationsResult ?? []).map(toUiInvitation),
+    [invitationsResult],
+  );
+  const loading = membersResult === undefined;
 
   const [inviteOpen, setInviteOpen] = useState(false);
   const [removingMember, setRemovingMember] = useState<Member | null>(null);
@@ -140,89 +151,26 @@ export function MembersTab() {
     null,
   );
 
-  const loadEverything = useCallback(async () => {
-    try {
-      const [mres, ires] = await Promise.all([
-        fetch('/api/account/members', { cache: 'no-store' }),
-        canManageMembers
-          ? fetch('/api/account/invitations', { cache: 'no-store' })
-          : Promise.resolve(null),
-      ]);
-
-      if (!mres.ok) {
-        const payload = await mres.json().catch(() => ({}));
-        toast.error(payload.error || 'Failed to load members');
-        return;
-      }
-      const mdata = (await mres.json()) as { members: Member[] };
-      setMembers(mdata.members);
-
-      if (ires) {
-        if (!ires.ok) {
-          const payload = await ires.json().catch(() => ({}));
-          toast.error(payload.error || 'Failed to load invitations');
-          return;
-        }
-        const idata = (await ires.json()) as { invitations: Invitation[] };
-        setInvitations(idata.invitations);
-      } else {
-        setInvitations([]);
-      }
-    } catch (err) {
-      console.error('[MembersTab] load error:', err);
-      toast.error('Could not reach the server');
-    } finally {
-      setLoading(false);
-    }
-  }, [canManageMembers]);
-
-  useEffect(() => {
-    void loadEverything();
-  }, [loadEverything]);
+  const setMemberRole = useMutation(api.members.setRole);
+  const removeMember = useMutation(api.members.remove);
+  const revokeInvitation = useMutation(api.invitations.revoke);
 
   async function handleRoleChange(member: Member, nextRole: AccountRole) {
     if (member.role === nextRole) return;
-    // Optimistic update — flip the dropdown immediately so the UI
-    // feels snappy. If the server PATCH fails we revert below so
-    // the dropdown doesn't lie about the persisted state.
-    const previousRole = member.role;
     setPendingMemberAction(member.user_id);
-    setMembers((prev) =>
-      prev.map((m) =>
-        m.user_id === member.user_id ? { ...m, role: nextRole } : m,
-      ),
-    );
     try {
-      const res = await fetch(`/api/account/members/${member.user_id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: nextRole }),
+      await setMemberRole({
+        userId: member.user_id as Id<'users'>,
+        role: nextRole,
       });
-      if (!res.ok) {
-        // Revert the optimistic flip. The toast on its own wasn't
-        // enough — the dropdown was left showing the new role
-        // forever, so the next interaction operated on a wrong
-        // baseline (re-trying the same change would no-op via the
-        // `member.role === nextRole` guard at the top).
-        setMembers((prev) =>
-          prev.map((m) =>
-            m.user_id === member.user_id ? { ...m, role: previousRole } : m,
-          ),
-        );
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || 'Failed to update role');
-        return;
-      }
       toast.success(t('updatedToast', { name: member.full_name || t('unnamed'), role: tRoles(nextRole) }));
+      // No optimistic patch/revert needed — `members` above comes from
+      // a reactive `useQuery(api.members.list)`, so the row's role
+      // updates on its own once the mutation commits (same pattern as
+      // `api-keys-settings.tsx`'s revoke).
     } catch (err) {
-      // Same revert on network failure.
-      setMembers((prev) =>
-        prev.map((m) =>
-          m.user_id === member.user_id ? { ...m, role: previousRole } : m,
-        ),
-      );
       console.error('[MembersTab] role change error:', err);
-      toast.error('Could not reach the server');
+      toast.error(convexErrorMessage(err));
     } finally {
       setPendingMemberAction(null);
     }
@@ -232,23 +180,12 @@ export function MembersTab() {
     if (!removingMember) return;
     setPendingMemberAction(removingMember.user_id);
     try {
-      const res = await fetch(
-        `/api/account/members/${removingMember.user_id}`,
-        { method: 'DELETE' },
-      );
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || 'Failed to remove member');
-        return;
-      }
+      await removeMember({ userId: removingMember.user_id as Id<'users'> });
       toast.success(t('removedToast', { name: removingMember.full_name || t('unnamed') }));
-      setMembers((prev) =>
-        prev.filter((m) => m.user_id !== removingMember.user_id),
-      );
       setRemovingMember(null);
     } catch (err) {
       console.error('[MembersTab] remove error:', err);
-      toast.error('Could not reach the server');
+      toast.error(convexErrorMessage(err));
     } finally {
       setPendingMemberAction(null);
     }
@@ -256,19 +193,13 @@ export function MembersTab() {
 
   async function handleRevoke(invite: Invitation) {
     try {
-      const res = await fetch(`/api/account/invitations/${invite.id}`, {
-        method: 'DELETE',
+      await revokeInvitation({
+        invitationId: invite.id as Id<'accountInvitations'>,
       });
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        toast.error(payload.error || 'Failed to revoke invitation');
-        return;
-      }
       toast.success(t('revokedToast'));
-      setInvitations((prev) => prev.filter((i) => i.id !== invite.id));
     } catch (err) {
       console.error('[MembersTab] revoke error:', err);
-      toast.error('Could not reach the server');
+      toast.error(convexErrorMessage(err));
     }
   }
 
@@ -560,11 +491,7 @@ export function MembersTab() {
         </div>
       </RequireRole>
 
-      <InviteMemberDialog
-        open={inviteOpen}
-        onOpenChange={setInviteOpen}
-        onCreated={loadEverything}
-      />
+      <InviteMemberDialog open={inviteOpen} onOpenChange={setInviteOpen} />
 
       <Dialog
         open={removingMember !== null}

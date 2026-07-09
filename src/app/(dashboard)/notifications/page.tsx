@@ -1,15 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
+import { useMutation, useQuery } from "convex/react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
-import { useAuth } from "@/hooks/use-auth";
 import type { Notification } from "@/types";
 import { Bell, CheckCheck, Loader2, UserPlus } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { toUiNotification, convexErrorMessage } from "@/lib/convex/adapters";
+
+import { api } from "../../../../convex/_generated/api";
+import type { Id } from "../../../../convex/_generated/dataModel";
 
 // Icon per notification type. Only one type exists today
 // (conversation_assigned) but this keeps future types a one-line add.
@@ -19,96 +22,35 @@ const TYPE_ICON: Record<Notification["type"], typeof Bell> = {
 
 export default function NotificationsPage() {
   const router = useRouter();
-  const { accountId } = useAuth();
-  const [notifications, setNotifications] = useState<Notification[] | null>(
-    null,
+
+  // Reactive — `api.notifications.list` is a live Convex subscription
+  // already scoped to the caller (ctx.userId/ctx.accountId inside the
+  // query), so this updates on its own whenever a notification is
+  // created or marked read. No realtime channel wiring needed.
+  const notificationsResult = useQuery(api.notifications.list);
+  const notifications = useMemo(
+    () => notificationsResult?.map(toUiNotification) ?? null,
+    [notificationsResult],
   );
-  const [error, setError] = useState<string | null>(null);
+
   const [markingAll, setMarkingAll] = useState(false);
 
-  const load = useCallback(async () => {
-    if (!accountId) return;
-    const supabase = createClient();
-    const { data, error: fetchErr } = await supabase
-      .from("notifications")
-      .select("*")
-      .eq("account_id", accountId)
-      .order("created_at", { ascending: false })
-      .limit(100);
-    if (fetchErr) {
-      setError(fetchErr.message);
-      return;
-    }
-    setNotifications((data ?? []) as Notification[]);
-  }, [accountId]);
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    load();
-  }, [load]);
-
-  // Realtime — new assignments appear without a refresh, and a
-  // "mark all read" fired from another tab/device stays in sync here.
-  useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("notifications-page")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "notifications" },
-        (payload) => {
-          if (payload.eventType === "INSERT") {
-            const row = payload.new as Notification;
-            setNotifications((prev) => {
-              if (!prev) return [row];
-              if (prev.some((n) => n.id === row.id)) return prev;
-              return [row, ...prev];
-            });
-          } else if (payload.eventType === "UPDATE") {
-            const row = payload.new as Notification;
-            setNotifications((prev) =>
-              prev?.map((n) => (n.id === row.id ? { ...n, ...row } : n)) ??
-              prev,
-            );
-          } else if (payload.eventType === "DELETE") {
-            const oldRow = payload.old as Partial<Notification>;
-            setNotifications(
-              (prev) => prev?.filter((n) => n.id !== oldRow.id) ?? prev,
-            );
-          }
-        },
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, []);
+  const markReadMutation = useMutation(api.notifications.markRead);
+  const markAllReadMutation = useMutation(api.notifications.markAllRead);
 
   const markRead = useCallback(
     async (id: string) => {
-      // Optimistic — the row is already visually "read" by the time the
-      // request lands, so the UI doesn't wait on the round-trip.
-      setNotifications(
-        (prev) =>
-          prev?.map((n) =>
-            n.id === id && !n.read_at
-              ? { ...n, read_at: new Date().toISOString() }
-              : n,
-          ) ?? prev,
-      );
-      const supabase = createClient();
-      const { error: updateErr } = await supabase
-        .from("notifications")
-        .update({ read_at: new Date().toISOString() })
-        .eq("id", id)
-        .is("read_at", null);
-      if (updateErr) {
-        toast.error("Failed to mark notification as read");
-        load();
+      try {
+        await markReadMutation({ notificationId: id as Id<"notifications"> });
+        // No optimistic patch needed — `notifications` above is a
+        // reactive query, so the row's `read_at` updates on its own
+        // once the mutation commits.
+      } catch (err) {
+        console.error("[NotificationsPage] mark-read error:", err);
+        toast.error(convexErrorMessage(err));
       }
     },
-    [load],
+    [markReadMutation],
   );
 
   const handleClick = useCallback(
@@ -126,32 +68,15 @@ export default function NotificationsPage() {
   const markAllRead = useCallback(async () => {
     if (unreadIds.length === 0) return;
     setMarkingAll(true);
-    const now = new Date().toISOString();
-    setNotifications(
-      (prev) => prev?.map((n) => (n.read_at ? n : { ...n, read_at: now })) ?? prev,
-    );
-    const supabase = createClient();
-    const { error: updateErr } = await supabase
-      .from("notifications")
-      .update({ read_at: now })
-      .is("read_at", null);
-    setMarkingAll(false);
-    if (updateErr) {
-      toast.error("Failed to mark all as read");
-      load();
+    try {
+      await markAllReadMutation({});
+    } catch (err) {
+      console.error("[NotificationsPage] mark-all-read error:", err);
+      toast.error(convexErrorMessage(err));
+    } finally {
+      setMarkingAll(false);
     }
-  }, [unreadIds.length, load]);
-
-  if (error) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-2">
-        <p className="text-sm text-destructive">{error}</p>
-        <Button variant="outline" onClick={() => window.location.reload()}>
-          Retry
-        </Button>
-      </div>
-    );
-  }
+  }, [unreadIds.length, markAllReadMutation]);
 
   if (notifications === null) {
     return (
