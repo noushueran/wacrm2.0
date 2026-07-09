@@ -187,6 +187,94 @@ test("the same phone number on a different account gets its own contact and conv
 });
 
 // ============================================================
+// Wamid idempotency — a retried Meta webhook delivery (same wamid)
+// must not create a duplicate message or double-bump unreadCount
+// (Phase 6 review fix)
+// ============================================================
+
+test("ingesting the same wamid twice is idempotent: one message row, unreadCount bumped once, second call reports duplicate", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const first = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15551234567",
+    name: "Jamie Customer",
+    message: {
+      type: "text",
+      text: "Hi, is anyone there?",
+      wamid: "wamid.RETRY",
+    },
+  });
+  expect(first.duplicate).toBe(false);
+
+  // Meta redelivers the identical webhook payload (same wamid) — it
+  // does this whenever it doesn't get a fast-enough ack, with no
+  // dedupe guarantee of its own.
+  const second = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15551234567",
+    name: "Jamie Customer",
+    message: {
+      type: "text",
+      text: "Hi, is anyone there?",
+      wamid: "wamid.RETRY",
+    },
+  });
+
+  expect(second.duplicate).toBe(true);
+  expect(second.messageId).toBe(first.messageId);
+  expect(second.contactId).toBe(first.contactId);
+  expect(second.conversationId).toBe(first.conversationId);
+  expect(second.wasCreated).toBe(false);
+  expect(second.isFirstInboundMessage).toBe(false);
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", first.conversationId),
+      )
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+
+  const conversation = await t.run((ctx) => ctx.db.get(first.conversationId));
+  expect(conversation!.unreadCount).toBe(1);
+});
+
+test("the same wamid on a different account is not treated as a duplicate (by_message_id isn't account-scoped, so the hit must be filtered)", async () => {
+  const t = convexTest(schema, modules);
+  const accountA = await seedAccount(t, "Acme");
+  const accountB = await seedAccount(t, "Globex");
+
+  const resultA = await t.mutation(internal.ingest.ingestInbound, {
+    accountId: accountA,
+    from: "15551234567",
+    message: { type: "text", text: "Hello from A", wamid: "wamid.SHARED" },
+  });
+  const resultB = await t.mutation(internal.ingest.ingestInbound, {
+    accountId: accountB,
+    from: "15551234567",
+    message: { type: "text", text: "Hello from B", wamid: "wamid.SHARED" },
+  });
+
+  expect(resultA.duplicate).toBe(false);
+  expect(resultB.duplicate).toBe(false);
+  expect(resultB.wasCreated).toBe(true);
+  expect(resultB.messageId).not.toBe(resultA.messageId);
+
+  const messagesB = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_account", (q) => q.eq("accountId", accountB))
+      .collect(),
+  );
+  expect(messagesB).toHaveLength(1);
+  expect(messagesB[0]!.messageId).toBe("wamid.SHARED");
+});
+
+// ============================================================
 // Media + interactive-reply fields thread through correctly
 // ============================================================
 

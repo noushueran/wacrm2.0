@@ -31,6 +31,19 @@ import type { Doc, Id } from "./_generated/dataModel";
 // flagging, no Meta media download — Tasks 3/4 read THIS mutation's
 // return value (`isFirstInboundMessage` in particular) to decide what
 // to do next; that fan-out is their concern, not this one's.
+//
+// Idempotent against Meta webhook retries (Phase 6 review fix —
+// stronger than the original Supabase app, which had no such guard):
+// Meta redelivers a webhook whenever it doesn't get a fast-enough ack,
+// with no dedupe guarantee of its own, so the SAME inbound message can
+// reach this mutation more than once carrying the same `wamid`. The
+// handler's first step checks for a prior message with that `wamid`
+// (scoped to `accountId`) and, if found, short-circuits before any
+// find-or-create/insert, returning the ALREADY-persisted row with
+// `duplicate: true` instead of writing a second copy or double-bumping
+// `unreadCount`. The Phase 8 webhook wiring reads `duplicate` to skip
+// the automations/flows fan-out on a retry, the same way it already
+// reads `isFirstInboundMessage` to decide whether to run it at all.
 // ============================================================
 
 export const ingestInbound = internalMutation({
@@ -72,6 +85,45 @@ export const ingestInbound = internalMutation({
   handler: async (ctx, args) => {
     const { accountId, from, name, message } = args;
     const phoneNormalized = normalizePhone(from);
+
+    // ---- (0) wamid idempotency — BEFORE any find-or-create/insert,
+    // guard against Meta webhook retries re-delivering the identical
+    // message (Meta redelivers whenever it doesn't get a fast-enough
+    // ack, and offers no dedupe guarantee of its own). `by_message_id`
+    // indexes `messageId` alone (see schema.ts) — not compound with
+    // `accountId` — the same query `flowsEngine.findMessageIdByWamid`
+    // runs — so a hit is only trusted once confirmed to belong to THIS
+    // account; a different account is a different WhatsApp Business
+    // number drawing wamids from its own namespace, so a same-string
+    // match across accounts is coincidental, not a real retry, and
+    // must fall through to the normal insert path below. A genuine
+    // retry can only ever hit a message an EARLIER run of this same
+    // mutation already inserted, so the contact + conversation it
+    // belongs to are guaranteed to already exist — short-circuiting
+    // here, before step (1), skips those lookups entirely rather than
+    // just skipping the final insert.
+    const existingMessage = await ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("messageId", message.wamid))
+      .first();
+    if (existingMessage && existingMessage.accountId === accountId) {
+      const existingConversation = await ctx.db.get(
+        existingMessage.conversationId,
+      );
+      if (!existingConversation) {
+        throw new Error(
+          "ingestInbound: conversation missing for existing message on wamid retry",
+        );
+      }
+      return {
+        contactId: existingConversation.contactId,
+        conversationId: existingMessage.conversationId,
+        messageId: existingMessage._id,
+        wasCreated: false,
+        isFirstInboundMessage: false,
+        duplicate: true,
+      };
+    }
 
     // ---- (1) find-or-create the contact, scoped to `accountId` ----
     // Same `by_account_phone` dedupe lookup `contacts.create` uses;
@@ -180,6 +232,7 @@ export const ingestInbound = internalMutation({
       messageId,
       wasCreated,
       isFirstInboundMessage,
+      duplicate: false,
     };
   },
 });
