@@ -1,18 +1,11 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import Link from "next/link";
-import { createClient } from "@/lib/supabase/client";
+import { useState, useEffect, useMemo } from "react";
+import { useMutation, usePaginatedQuery, useQuery } from "convex/react";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
-import type {
-  Contact,
-  Conversation,
-  Deal,
-  DealStatus,
-  PipelineStage,
-  Profile,
-} from "@/types";
+import type { Deal, DealStatus, PipelineStage } from "@/types";
+import { toUiContact, toUiMemberProfile } from "@/lib/convex/adapters";
 import {
   Sheet,
   SheetContent,
@@ -27,12 +20,14 @@ import {
   Check,
   X,
   Trash2,
-  MessageSquare,
   DollarSign,
   Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTranslations } from "next-intl";
+
+import { api } from "../../../convex/_generated/api";
+import type { Id } from "../../../convex/_generated/dataModel";
 
 interface DealFormProps {
   open: boolean;
@@ -54,8 +49,7 @@ export function DealForm({
   onSaved,
 }: DealFormProps) {
   const t = useTranslations("Pipelines.form");
-  const supabase = createClient();
-  const { accountId, defaultCurrency } = useAuth();
+  const { defaultCurrency } = useAuth();
 
   const [title, setTitle] = useState("");
   const [value, setValue] = useState("");
@@ -65,11 +59,6 @@ export function DealForm({
   const [assignedTo, setAssignedTo] = useState("");
   const [expectedCloseDate, setExpectedCloseDate] = useState("");
   const [notes, setNotes] = useState("");
-
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [linkedConversation, setLinkedConversation] =
-    useState<Conversation | null>(null);
 
   const [saving, setSaving] = useState(false);
   const [statusAction, setStatusAction] = useState<DealStatus | null>(null);
@@ -92,7 +81,11 @@ export function DealForm({
       setContactId(deal.contact_id ?? "");
       setStageId(deal.stage_id);
       setAssignedTo(deal.assigned_to ?? "");
-      setExpectedCloseDate(deal.expected_close_date ?? "");
+      // `expected_close_date` is an ISO string (see toUiDeal) — the
+      // date input only wants the "YYYY-MM-DD" prefix.
+      setExpectedCloseDate(
+        deal.expected_close_date ? deal.expected_close_date.slice(0, 10) : "",
+      );
       setNotes(deal.notes ?? "");
     } else {
       setTitle("");
@@ -107,49 +100,38 @@ export function DealForm({
   }, [open, deal, defaultStageId, stages, defaultCurrency]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
-  // Load supporting data once the sheet is open
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    (async () => {
-      const [c, p] = await Promise.all([
-        supabase.from("contacts").select("*").order("name"),
-        supabase.from("profiles").select("*").order("full_name"),
-      ]);
-      if (cancelled) return;
-      setContacts((c.data ?? []) as Contact[]);
-      setProfiles((p.data ?? []) as Profile[]);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open, supabase]);
+  // Contact picker — Convex has no non-paginated contacts list; 500
+  // covers realistic pickers (see task report for the cap caveat).
+  const contactsPaged = usePaginatedQuery(
+    api.contacts.list,
+    {},
+    { initialNumItems: 500 },
+  );
+  const contacts = useMemo(
+    () =>
+      contactsPaged.results
+        .map(toUiContact)
+        .sort((a, b) => (a.name || a.phone).localeCompare(b.name || b.phone)),
+    [contactsPaged.results],
+  );
 
-  // Fetch linked conversation for the selected contact (newest open one).
-  // Clearing on no-selection is sync with prop state; the populated
-  // case runs setLinkedConversation inside the async fetch callback.
-  useEffect(() => {
-    if (!open || !contactId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setLinkedConversation(null);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const { data } = await supabase
-        .from("conversations")
-        .select("*")
-        .eq("contact_id", contactId)
-        .order("last_message_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (cancelled) return;
-      setLinkedConversation((data as Conversation | null) ?? null);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open, contactId, supabase]);
+  // Assignee picker — the caller's own account roster. `p.user_id` (not
+  // `p.id`, which is the *membership* row's id) is what `assignedToUserId`
+  // actually references — see `toUiMemberProfile`'s own doc comment.
+  const membersResult = useQuery(api.members.list);
+  const profiles = useMemo(
+    () =>
+      (membersResult ?? [])
+        .map(toUiMemberProfile)
+        .sort((a, b) => a.full_name.localeCompare(b.full_name)),
+    [membersResult],
+  );
+
+  const createDeal = useMutation(api.deals.create);
+  const updateDeal = useMutation(api.deals.update);
+  const moveDeal = useMutation(api.deals.move);
+  const setDealStatus = useMutation(api.deals.setStatus);
+  const removeDeal = useMutation(api.deals.remove);
 
   async function handleSave() {
     if (!title.trim() || !contactId || !stageId) {
@@ -158,51 +140,61 @@ export function DealForm({
     }
     setSaving(true);
 
-    const payload = {
-      title: title.trim(),
-      value: parseFloat(value) || 0,
-      currency,
-      contact_id: contactId,
-      pipeline_id: pipelineId,
-      stage_id: stageId,
-      assigned_to: assignedTo || null,
-      notes: notes.trim() || null,
-      expected_close_date: expectedCloseDate || null,
-    };
-
-    if (deal) {
-      const { error } = await supabase
-        .from("deals")
-        .update(payload)
-        .eq("id", deal.id);
-      if (error) {
-        toast.error(t("toastFailedSave"));
-        setSaving(false);
-        return;
+    try {
+      if (deal) {
+        // `deals.update` deliberately excludes `stageId` (see
+        // convex/deals.ts: only `move` may change a deal's stage, so
+        // the cross-pipeline-consistency check it runs can't be
+        // bypassed). This dropdown still lets an edit reassign the
+        // stage directly (not just drag-and-drop on the board), so a
+        // changed selection is persisted via `move` alongside the rest
+        // of the edit.
+        const writes = [
+          updateDeal({
+            dealId: deal.id as Id<"deals">,
+            title: title.trim(),
+            value: parseFloat(value) || 0,
+            currency,
+            contactId: contactId as Id<"contacts">,
+            assignedToUserId: assignedTo
+              ? (assignedTo as Id<"users">)
+              : undefined,
+            notes: notes.trim() || undefined,
+            expectedCloseDate: expectedCloseDate
+              ? new Date(expectedCloseDate).getTime()
+              : undefined,
+          }),
+        ];
+        if (stageId !== deal.stage_id) {
+          writes.push(
+            moveDeal({
+              dealId: deal.id as Id<"deals">,
+              stageId: stageId as Id<"pipelineStages">,
+            }),
+          );
+        }
+        await Promise.all(writes);
+      } else {
+        await createDeal({
+          title: title.trim(),
+          value: parseFloat(value) || 0,
+          currency,
+          contactId: contactId as Id<"contacts">,
+          pipelineId: pipelineId as Id<"pipelines">,
+          stageId: stageId as Id<"pipelineStages">,
+          assignedToUserId: assignedTo
+            ? (assignedTo as Id<"users">)
+            : undefined,
+          notes: notes.trim() || undefined,
+          expectedCloseDate: expectedCloseDate
+            ? new Date(expectedCloseDate).getTime()
+            : undefined,
+        });
       }
-    } else {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) {
-        toast.error(t("toastNotSignedIn"));
-        setSaving(false);
-        return;
-      }
-      if (!accountId) {
-        toast.error(t("toastNotLinked"));
-        setSaving(false);
-        return;
-      }
-      const { error } = await supabase
-        .from("deals")
-        .insert({ ...payload, user_id: user.id, account_id: accountId, status: "open" });
-      if (error) {
-        toast.error(t("toastFailedCreate"));
-        setSaving(false);
-        return;
-      }
+    } catch {
+      toast.error(deal ? t("toastFailedSave") : t("toastFailedCreate"));
+      setSaving(false);
+      return;
     }
 
     setSaving(false);
@@ -214,17 +206,20 @@ export function DealForm({
   async function handleStatusChange(status: DealStatus) {
     if (!deal) return;
     setStatusAction(status);
-    const { error } = await supabase
-      .from("deals")
-      .update({ status })
-      .eq("id", deal.id);
-    setStatusAction(null);
-    if (error) {
+    try {
+      await setDealStatus({ dealId: deal.id as Id<"deals">, status });
+    } catch {
+      setStatusAction(null);
       toast.error(t("toastFailedStatus"));
       return;
     }
+    setStatusAction(null);
     toast.success(
-      status === "won" ? t("toastMarkedWon") : status === "lost" ? t("toastMarkedLost") : t("toastReopened"),
+      status === "won"
+        ? t("toastMarkedWon")
+        : status === "lost"
+          ? t("toastMarkedLost")
+          : t("toastReopened"),
     );
     onOpenChange(false);
     onSaved();
@@ -233,12 +228,14 @@ export function DealForm({
   async function handleDelete() {
     if (!deal) return;
     setDeleting(true);
-    const { error } = await supabase.from("deals").delete().eq("id", deal.id);
-    setDeleting(false);
-    if (error) {
+    try {
+      await removeDeal({ dealId: deal.id as Id<"deals"> });
+    } catch {
+      setDeleting(false);
       toast.error(t("toastFailedDelete"));
       return;
     }
+    setDeleting(false);
     toast.success(t("toastDeleted"));
     setConfirmDelete(false);
     onOpenChange(false);
@@ -283,16 +280,6 @@ export function DealForm({
                   </option>
                 ))}
               </select>
-
-              {linkedConversation && (
-                <Link
-                  href="/inbox"
-                  className="mt-1 inline-flex items-center gap-1.5 self-start rounded-md bg-primary/10 px-2 py-1 text-xs text-primary hover:bg-primary/20"
-                >
-                  <MessageSquare className="h-3 w-3" />
-                  {t("linkToConversation")}
-                </Link>
-              )}
             </div>
 
             <div className="grid grid-cols-[1fr_110px] gap-3">
@@ -359,7 +346,7 @@ export function DealForm({
               >
                 <option value="">{t("unassigned")}</option>
                 {profiles.map((p) => (
-                  <option key={p.id} value={p.id}>
+                  <option key={p.id} value={p.user_id}>
                     {p.full_name || p.email}
                   </option>
                 ))}

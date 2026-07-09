@@ -16,8 +16,9 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { createClient } from "@/lib/supabase/client";
+import { useMutation } from "convex/react";
 import type { Pipeline, PipelineStage } from "@/types";
+import { isConvexErrorCode } from "@/lib/convex/adapters";
 import {
   Dialog,
   DialogContent,
@@ -36,6 +37,9 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTranslations } from "next-intl";
+
+import { api } from "../../../convex/_generated/api";
+import type { Id } from "../../../convex/_generated/dataModel";
 
 const STAGE_COLORS = [
   "#3b82f6",
@@ -70,7 +74,6 @@ export function PipelineSettings({
   onCreateNewPipeline,
 }: PipelineSettingsProps) {
   const t = useTranslations("Pipelines.settings");
-  const supabase = createClient();
 
   const [name, setName] = useState(pipeline.name);
   const [localStages, setLocalStages] = useState<PipelineStage[]>(stages);
@@ -80,16 +83,20 @@ export function PipelineSettings({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  // Reset form state when the dialog opens or its prop inputs change
-  // — legitimate prop-driven sync.
-  /* eslint-disable react-hooks/set-state-in-effect */
+  // Snapshot `stages` into local editable state only when the dialog
+  // (re)opens or the pipeline switches — deliberately NOT on every
+  // `stages` change. `stages` is now a live Convex subscription
+  // (page.tsx's `useQuery`), and `handleAddStage`/`handleRemoveStage`
+  // below already splice `localStages` by hand; re-syncing from the prop
+  // on every server update would clobber an in-progress rename/reorder
+  // that hasn't been "Save"d yet.
   useEffect(() => {
     if (!open) return;
     setName(pipeline.name);
     setLocalStages([...stages].sort((a, b) => a.position - b.position));
     setShowDeleteConfirm(false);
-  }, [open, pipeline, stages]);
-  /* eslint-enable react-hooks/set-state-in-effect */
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately excludes `stages`; see comment above
+  }, [open, pipeline]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -104,35 +111,50 @@ export function PipelineSettings({
     setLocalStages(arrayMove(localStages, oldIndex, newIndex));
   }
 
+  const renameStage = useMutation(api.pipelines.renameStage);
+  const reorderStages = useMutation(api.pipelines.reorderStages);
+  const addStage = useMutation(api.pipelines.addStage);
+  const deleteStage = useMutation(api.pipelines.deleteStage);
+  const removePipeline = useMutation(api.pipelines.remove);
+
   async function handleSave() {
     setSaving(true);
 
-    // One upsert for all stages — batches N stage writes into a single
-    // round-trip. Previous implementation did N sequential UPDATEs which
-    // latency-scaled linearly with stage count.
-    const stageRows = localStages.map((s, i) => ({
-      id: s.id,
-      pipeline_id: s.pipeline_id,
-      name: s.name,
-      color: s.color,
-      position: i,
-    }));
+    try {
+      // Pipeline rename is intentionally not wired here —
+      // convex/pipelines.ts exposes no `update`/`rename` mutation for a
+      // pipeline's own `name` (only `renameStage`, for a STAGE's name).
+      // The name field below is read-only for the same reason. This
+      // persists per-stage name/color edits, plus every stage's current
+      // (possibly drag-reordered) position.
+      const renames = localStages
+        .filter((s) => {
+          const original = stages.find((os) => os.id === s.id);
+          return (
+            !original || original.name !== s.name || original.color !== s.color
+          );
+        })
+        .map((s) =>
+          renameStage({
+            stageId: s.id as Id<"pipelineStages">,
+            name: s.name,
+            color: s.color,
+          }),
+        );
 
-    const [renameRes, stagesRes] = await Promise.all([
-      supabase
-        .from("pipelines")
-        .update({ name: name.trim() })
-        .eq("id", pipeline.id),
-      supabase.from("pipeline_stages").upsert(stageRows, { onConflict: "id" }),
-    ]);
-
-    setSaving(false);
-
-    if (renameRes.error || stagesRes.error) {
+      await Promise.all([
+        ...renames,
+        reorderStages({
+          stageIds: localStages.map((s) => s.id as Id<"pipelineStages">),
+        }),
+      ]);
+    } catch {
+      setSaving(false);
       toast.error(t("toastFailedSave"));
       return;
     }
 
+    setSaving(false);
     onOpenChange(false);
     onPipelinesChanged();
     onStagesChanged();
@@ -142,41 +164,45 @@ export function PipelineSettings({
   async function handleAddStage() {
     const trimmed = newStageName.trim();
     if (!trimmed) return;
-    const { data, error } = await supabase
-      .from("pipeline_stages")
-      .insert({
-        pipeline_id: pipeline.id,
+    try {
+      const stageId = await addStage({
+        pipelineId: pipeline.id as Id<"pipelines">,
         name: trimmed,
         color: newStageColor,
-        position: localStages.length,
-      })
-      .select()
-      .single();
-    if (error || !data) {
+      });
+      setLocalStages([
+        ...localStages,
+        {
+          id: stageId,
+          pipeline_id: pipeline.id,
+          name: trimmed,
+          color: newStageColor,
+          position: localStages.length,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+      setNewStageName("");
+      setNewStageColor(
+        STAGE_COLORS[(localStages.length + 1) % STAGE_COLORS.length],
+      );
+    } catch {
       toast.error(t("toastFailedAddStage"));
-      return;
     }
-    setLocalStages([...localStages, data as PipelineStage]);
-    setNewStageName("");
-    setNewStageColor(STAGE_COLORS[(localStages.length + 1) % STAGE_COLORS.length]);
   }
 
   async function handleRemoveStage(stageId: string) {
-    // Refuse to delete if deals still reference the stage (FK would fail).
-    const { count } = await supabase
-      .from("deals")
-      .select("id", { count: "exact", head: true })
-      .eq("stage_id", stageId);
-    if (count && count > 0) {
-      toast.error(t("toastMoveOrDeleteDeals"));
-      return;
-    }
-    const { error } = await supabase
-      .from("pipeline_stages")
-      .delete()
-      .eq("id", stageId);
-    if (error) {
-      toast.error(t("toastFailedDeleteStage"));
+    // `deleteStage` itself refuses (STAGE_HAS_DEALS) when a deal still
+    // references this stage — same guard the Supabase-era pre-check
+    // used to run client-side, now authoritative server-side (see
+    // convex/pipelines.ts's own comment on `deleteStage`).
+    try {
+      await deleteStage({ stageId: stageId as Id<"pipelineStages"> });
+    } catch (err) {
+      toast.error(
+        isConvexErrorCode(err, "STAGE_HAS_DEALS")
+          ? t("toastMoveOrDeleteDeals")
+          : t("toastFailedDeleteStage"),
+      );
       return;
     }
     setLocalStages(localStages.filter((s) => s.id !== stageId));
@@ -184,16 +210,14 @@ export function PipelineSettings({
 
   async function handleDeletePipeline() {
     setDeleting(true);
-    // ON DELETE CASCADE handles deals + stages.
-    const { error } = await supabase
-      .from("pipelines")
-      .delete()
-      .eq("id", pipeline.id);
-    setDeleting(false);
-    if (error) {
+    try {
+      await removePipeline({ pipelineId: pipeline.id as Id<"pipelines"> });
+    } catch {
+      setDeleting(false);
       toast.error(t("toastFailedDeletePipeline"));
       return;
     }
+    setDeleting(false);
     onOpenChange(false);
     onPipelinesChanged();
     toast.success(t("toastDeleted"));
@@ -244,7 +268,9 @@ export function PipelineSettings({
                 <Input
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  className="border-border bg-muted text-foreground"
+                  disabled
+                  title="Renaming a pipeline isn't available yet"
+                  className="border-border bg-muted text-foreground disabled:opacity-70"
                 />
               </div>
 

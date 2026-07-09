@@ -10,6 +10,7 @@ import type {
   InteractiveMessagePayload,
   Message,
   MessageReaction,
+  Pipeline,
   PipelineStage,
   Profile,
   Tag,
@@ -210,6 +211,23 @@ export function toUiReaction(doc: Doc<"messageReactions">): MessageReaction {
     actor_type: doc.actorType,
     actor_id: doc.actorId,
     emoji: doc.emoji,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** Convex has no dedicated timestamp column on `pipelines` beyond
+ *  `_creationTime` either — same "don't duplicate created_at" reasoning
+ *  as every timestamp above. `stages` (embedded per-pipeline by
+ *  `pipelines.list`, see convex/pipelines.ts) is intentionally NOT part
+ *  of the `Pipeline` UI type (`src/types/index.ts` has no `stages`
+ *  field) — callers map a pipeline doc's own `.stages` through
+ *  `toUiPipelineStage` separately (see the pipelines page, which derives
+ *  the selected pipeline's stages this way instead of a second query). */
+export function toUiPipeline(doc: Doc<"pipelines">): Pipeline {
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    name: doc.name,
     created_at: new Date(doc._creationTime).toISOString(),
   };
 }
