@@ -111,7 +111,16 @@ export default defineSchema({
     updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
-    .index("by_contact", ["contactId"]),
+    .index("by_contact", ["contactId"])
+    // Phase 2, Task 1: the Inbox list orders conversations by recency of
+    // activity, not creation time — Convex indexes order by the indexed
+    // field(s) then `_creationTime`, so a plain `by_account` scan can't
+    // give `lastMessageAt`-desc ordering on its own. `lastMessageAt` is
+    // optional (a brand new conversation with no messages yet has none);
+    // Convex sorts a missing field before every present value, so in
+    // `.order("desc")` those rows deterministically fall to the end of
+    // the page rather than scattering randomly or erroring.
+    .index("by_account_last_message", ["accountId", "lastMessageAt"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
