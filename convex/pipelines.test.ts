@@ -426,3 +426,158 @@ test("deleteStage throws NOT_FOUND for a stage belonging to a different account,
   const gone = await t.run((ctx) => ctx.db.get(aliceStage!._id));
   expect(gone).toBeNull();
 });
+
+test("deleteStage throws STAGE_HAS_DEALS when a deal still references the stage, but still succeeds on a different, empty stage", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const pipelineId = await asUser.mutation(api.pipelines.create, {
+    name: "Sales",
+  });
+  const stages = await t.run((ctx) =>
+    ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", pipelineId))
+      .collect(),
+  );
+  stages.sort((a, b) => a.position - b.position);
+  const occupiedStage = stages[0]!;
+  const emptyStage = stages[1]!;
+
+  const dealId = await asUser.mutation(api.deals.create, {
+    title: "Big Fish",
+    value: 5000,
+    pipelineId,
+    stageId: occupiedStage._id,
+  });
+
+  await expect(
+    asUser.mutation(api.pipelines.deleteStage, {
+      stageId: occupiedStage._id,
+    }),
+  ).rejects.toMatchObject({ data: { code: "STAGE_HAS_DEALS" } });
+
+  // Both the stage and the deal survive the rejected delete.
+  expect(await t.run((ctx) => ctx.db.get(occupiedStage._id))).not.toBeNull();
+  expect(await t.run((ctx) => ctx.db.get(dealId))).not.toBeNull();
+
+  // A different, empty stage on the same pipeline still deletes fine —
+  // proves the guard is specific to stages with deals, not a general
+  // regression in `deleteStage`.
+  await asUser.mutation(api.pipelines.deleteStage, {
+    stageId: emptyStage._id,
+  });
+  expect(await t.run((ctx) => ctx.db.get(emptyStage._id))).toBeNull();
+});
+
+// ============================================================
+// remove — cascades deals + stages, mirrors Postgres ON DELETE CASCADE
+// ============================================================
+
+test("remove deletes every deal and stage under the pipeline, then the pipeline itself", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const pipelineId = await asUser.mutation(api.pipelines.create, {
+    name: "Sales",
+  });
+  const stages = await t.run((ctx) =>
+    ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", pipelineId))
+      .collect(),
+  );
+  const dealId = await asUser.mutation(api.deals.create, {
+    title: "Big Fish",
+    value: 5000,
+    pipelineId,
+    stageId: stages[0]!._id,
+  });
+
+  await asUser.mutation(api.pipelines.remove, { pipelineId });
+
+  expect(await t.run((ctx) => ctx.db.get(pipelineId))).toBeNull();
+  expect(await t.run((ctx) => ctx.db.get(dealId))).toBeNull();
+  for (const stage of stages) {
+    expect(await t.run((ctx) => ctx.db.get(stage._id))).toBeNull();
+  }
+});
+
+test("remove throws NOT_FOUND for a pipeline belonging to a different account, and leaves its deals/stages in place", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  const alicePipelineId = await asAlice.mutation(api.pipelines.create, {
+    name: "Sales",
+  });
+  const aliceStages = await t.run((ctx) =>
+    ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", alicePipelineId))
+      .collect(),
+  );
+  const aliceDealId = await asAlice.mutation(api.deals.create, {
+    title: "Big Fish",
+    value: 5000,
+    pipelineId: alicePipelineId,
+    stageId: aliceStages[0]!._id,
+  });
+
+  await expect(
+    asBob.mutation(api.pipelines.remove, { pipelineId: alicePipelineId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "pipeline" } });
+
+  expect(await t.run((ctx) => ctx.db.get(alicePipelineId))).not.toBeNull();
+  expect(await t.run((ctx) => ctx.db.get(aliceDealId))).not.toBeNull();
+  const stillThere = await t.run((ctx) =>
+    ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", alicePipelineId))
+      .collect(),
+  );
+  expect(stillThere).toHaveLength(5); // still just the seeded defaults
+
+  // Alice herself can still remove her own pipeline — proves the throw
+  // above is really about cross-account isolation, not a broken `remove`
+  // in general.
+  await asAlice.mutation(api.pipelines.remove, {
+    pipelineId: alicePipelineId,
+  });
+  expect(await t.run((ctx) => ctx.db.get(alicePipelineId))).toBeNull();
+});
+
+test("remove throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  // An agent can't create a pipeline either (both are admin-gated), so
+  // seed one directly, bypassing `pipelines.create` — mirrors
+  // `seedPipelineWithRawStages`'s own raw-insert approach above.
+  const pipelineId = await t.run((ctx) =>
+    ctx.db.insert("pipelines", { accountId, name: "Sales" }),
+  );
+
+  await expect(
+    asUser.mutation(api.pipelines.remove, { pipelineId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+
+  expect(await t.run((ctx) => ctx.db.get(pipelineId))).not.toBeNull();
+});

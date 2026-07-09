@@ -186,6 +186,56 @@ export const deleteStage = accountMutation({
   handler: async (ctx, args) => {
     ctx.requireRole("admin");
     await requireOwnStage(ctx, args.stageId);
+
+    // Refuse when a deal still references this stage — mirrors the UI's
+    // `handleRemoveStage` (`pipeline-settings.tsx`), which counts `deals`
+    // by `stage_id` and bails with a toast rather than deleting. Postgres
+    // itself declares `deals.stage_id` as a plain `REFERENCES
+    // pipeline_stages(id)` with no `ON DELETE` clause (default RESTRICT),
+    // so rejecting here — rather than orphaning or cascading — reproduces
+    // the actual current behavior, not a new policy invented for Convex.
+    const dealInStage = await ctx.db
+      .query("deals")
+      .withIndex("by_stage", (q) => q.eq("stageId", args.stageId))
+      .first();
+    if (dealInStage) {
+      throw new ConvexError({ code: "STAGE_HAS_DEALS" });
+    }
+
     await ctx.db.delete(args.stageId);
+  },
+});
+
+export const remove = accountMutation({
+  args: { pipelineId: v.id("pipelines") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    await requireOwnPipeline(ctx, args.pipelineId);
+
+    // Explicit cascade: Postgres declares both `pipeline_stages.pipeline_id`
+    // and `deals.pipeline_id` as `REFERENCES pipelines(id) ON DELETE
+    // CASCADE` (mirrors `pipeline-settings.tsx`'s `handleDeletePipeline`
+    // comment "ON DELETE CASCADE handles deals + stages"). Convex has no
+    // ON DELETE, so both child sets are walked and deleted by hand before
+    // the pipeline row itself goes — deals first, then stages, then the
+    // pipeline, same explicit-cascade pattern as `customFields.remove`'s
+    // values-before-field ordering.
+    const deals = await ctx.db
+      .query("deals")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", args.pipelineId))
+      .collect();
+    for (const deal of deals) {
+      await ctx.db.delete(deal._id);
+    }
+
+    const stages = await ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", args.pipelineId))
+      .collect();
+    for (const stage of stages) {
+      await ctx.db.delete(stage._id);
+    }
+
+    await ctx.db.delete(args.pipelineId);
   },
 });
