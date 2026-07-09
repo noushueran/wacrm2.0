@@ -791,5 +791,139 @@ export default defineSchema({
     payload: v.optional(v.any()),
   }).index("by_run", ["flowRunId"]),
 
-  // (other tables added in later Phase 1 tasks: AI [Task 4])
+  // ============================================================
+  // AI (Phase 1, Task 4 — final schema task). Source: supabase/migrations
+  // 029_ai_reply.sql (ai_configs create), 030_ai_knowledge.sql
+  // (ai_knowledge_documents + ai_knowledge_chunks create, plus
+  // ai_configs.embeddings_api_key), 031_ai_reply_slot_grant.sql (GRANT
+  // only — no schema change), 032_fix_ai_knowledge_membership.sql
+  // (SECURITY DEFINER -> INVOKER on the two match_ai_knowledge_* RPCs
+  // only — no schema change), 033_ai_reply_polish.sql
+  // (ai_configs.handoff_agent_id, ai_usage_log create; also
+  // messages.aiGenerated/conversations.aiHandoffSummary+aiAutoreply
+  // Disabled+aiReplyCount, which land on Task 1's tables and are already
+  // in schema.ts from that task, not repeated here). All four tables
+  // were swept across every migration (grep "ALTER TABLE
+  // ai_configs|ai_usage_log|ai_knowledge_documents|ai_knowledge_chunks")
+  // per Tasks 1-3's own precedent — beyond `ENABLE ROW LEVEL SECURITY`,
+  // the only real hits were the two `ai_configs` column adds (030, 033)
+  // already folded in below.
+  // ============================================================
+
+  // The account's AI reply assistant setup (bring-your-own-key), one row
+  // per account. UNIQUE(account_id) in Postgres -> `by_account` doubles
+  // as the enforcing index (same treatment as `whatsappConfig` in Task
+  // 2). `apiKey`/`embeddingsApiKey` are AES-256-GCM-encrypted ciphertext
+  // at rest (app-layer encrypt/decrypt, same as
+  // `whatsappConfig.accessToken`), so they stay plain
+  // `v.string()`/optional rather than a structured type.
+  // `autoReplyMaxPerConversation`'s Postgres CHECK (BETWEEN 1 AND 20)
+  // has no Convex equivalent — enforced in the future settings mutation
+  // instead. `updatedAt` is deliberately NOT modeled even though
+  // Postgres maintains it with an on-UPDATE trigger: unlike
+  // `aiKnowledgeDocuments.updatedAt` below, no route or component ever
+  // selects, orders by, or displays it (checked src/lib/ai/config.ts,
+  // src/app/api/ai/config/route.ts, src/components/settings/
+  // ai-config.tsx) — modeling it would be dead weight per the Global
+  // Constraints' "where the app updates/reads it" rule.
+  aiConfigs: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    provider: v.union(v.literal("openai"), v.literal("anthropic")),
+    model: v.string(),
+    apiKey: v.string(), // AES-256-GCM-encrypted BYO provider key
+    systemPrompt: v.optional(v.string()),
+    isActive: v.boolean(),
+    autoReplyEnabled: v.boolean(),
+    autoReplyMaxPerConversation: v.number(),
+    // Migration 030: optional OpenAI-compatible embeddings key —
+    // encrypted like `apiKey`; its presence turns on semantic KB
+    // retrieval (else lexical-only).
+    embeddingsApiKey: v.optional(v.string()),
+    // Migration 033: where auto-reply hands a conversation off when the
+    // model bails. Unset/null leaves it unassigned (shared queue).
+    handoffAgentId: v.optional(v.id("users")),
+  }).index("by_account", ["accountId"]),
+
+  // Append-only per-LLM-call token usage log (cost visibility on the
+  // account's BYO key). Source: migration 033. `conversationId` is
+  // nullable — Postgres: `REFERENCES conversations(id) ON DELETE SET
+  // NULL` — a draft not tied to one thread, or the conversation was
+  // deleted between generation and logging (src/lib/ai/usage.ts's own
+  // `LogAiUsageArgs.conversationId` comment). Dashboard reads are
+  // "by account, newest-first" (Postgres's own composite index was
+  // `(account_id, created_at DESC)`) — here that's `by_account` plus the
+  // default `_creationTime` ordering, per the Global Constraints' "rely
+  // on _creationTime" rule. Token counters are `v.number()`, not
+  // optional: NOT NULL DEFAULT 0 in Postgres and every insert supplies a
+  // real value (same treatment as `broadcasts`'s counters in Task 2).
+  aiUsageLog: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.optional(v.id("conversations")),
+    mode: v.union(v.literal("auto_reply"), v.literal("draft")),
+    provider: v.union(v.literal("openai"), v.literal("anthropic")),
+    model: v.string(),
+    promptTokens: v.number(),
+    completionTokens: v.number(),
+    totalTokens: v.number(),
+  }).index("by_account", ["accountId"]),
+
+  // One knowledge-base entry (title + body text) an account pastes in
+  // to ground the AI assistant's drafts/auto-replies. Source: migration
+  // 030. `updatedAt` IS modeled here (unlike `aiConfigs` above): the
+  // list/detail routes actually select + `order by` it
+  // (src/app/api/ai/knowledge/route.ts and .../[id]/route.ts) and the
+  // settings component types it as an always-present field.
+  aiKnowledgeDocuments: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    title: v.string(),
+    content: v.string(),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // A retrieval unit chunked from one `aiKnowledgeDocuments` row.
+  // `accountId` is denormalized off the document exactly as Postgres
+  // denormalized it ("so the match RPCs and RLS filter without a
+  // join") — the same reasoning Task 1 gave `messages.accountId`.
+  // `chunkIndex` is `v.number()`, not optional (NOT NULL DEFAULT 0,
+  // every insert supplies a real index — same treatment as
+  // `aiUsageLog`'s counters above).
+  //
+  // Two Postgres constructs have no direct Convex equivalent:
+  //   - The generated `fts tsvector GENERATED ALWAYS AS
+  //     (to_tsvector('simple', content)) STORED` column is DROPPED
+  //     entirely per the Global Constraints ("Generated columns: omit
+  //     them... use a `.searchIndex` on `content` instead") — replaced
+  //     by the `search_content` search index below, which will back a
+  //     `ctx.db.query(...).withSearchIndex(...)` in this table's own
+  //     function-phase (replacing the `match_ai_knowledge_fts` RPC).
+  //   - The pgvector `embedding vector(1536)` column becomes an
+  //     optional float array + the `by_embedding` vector index below,
+  //     replacing the `match_ai_knowledge_semantic` RPC (migrations 030
+  //     + 032 — 032 only changed the RPCs' SECURITY mode, not the
+  //     table). `embedding` stays optional: a chunk only gets one when
+  //     the account has an embeddings key configured (lexical-only
+  //     accounts leave every chunk's embedding unset, same as Postgres
+  //     leaving it NULL).
+  // Both new indexes only fully validate on `convex dev`'s deploy step
+  // (not this task's offline `vitest`/`tsc` pass) — see the task report.
+  aiKnowledgeChunks: defineTable({
+    documentId: v.id("aiKnowledgeDocuments"),
+    accountId: v.id("accounts"),
+    chunkIndex: v.number(),
+    content: v.string(),
+    embedding: v.optional(v.array(v.float64())),
+  })
+    .index("by_document", ["documentId"])
+    .index("by_account", ["accountId"])
+    .searchIndex("search_content", {
+      searchField: "content",
+      filterFields: ["accountId"],
+    })
+    .vectorIndex("by_embedding", {
+      vectorField: "embedding",
+      dimensions: 1536,
+      filterFields: ["accountId"],
+    }),
 });

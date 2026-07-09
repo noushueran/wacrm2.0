@@ -382,3 +382,99 @@ test("Task 3 — an out-of-union value is rejected by the schema validator", asy
     ),
   ).rejects.toThrow();
 });
+
+test("Task 4 — aiKnowledgeChunks + aiConfigs round-trip through the schema's validators", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  const documentId = await t.run(async (ctx) =>
+    ctx.db.insert("aiKnowledgeDocuments", {
+      accountId,
+      title: "Shipping policy",
+      content: "We ship worldwide within 3-5 business days.",
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const chunkId = await t.run(async (ctx) =>
+    ctx.db.insert("aiKnowledgeChunks", {
+      documentId,
+      accountId,
+      chunkIndex: 0,
+      content: "We ship worldwide within 3-5 business days.",
+      // Exercises the pgvector `vector(1536)` -> `v.array(v.float64())`
+      // conversion. A small vector is enough to prove the field
+      // validator accepts a float array; the vector index's actual ANN
+      // search / dimension enforcement only fully validates on `convex
+      // dev`'s deploy step (this offline test cannot exercise it — see
+      // the schema comment on `aiKnowledgeChunks`).
+      embedding: [0.1, 0.2, 0.3],
+    }),
+  );
+
+  const aiConfigId = await t.run(async (ctx) =>
+    ctx.db.insert("aiConfigs", {
+      accountId,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      apiKey: "ciphertext-fixture-not-a-real-key",
+      isActive: true,
+      autoReplyEnabled: false,
+      autoReplyMaxPerConversation: 3,
+    }),
+  );
+
+  const chunk = await t.run(async (ctx) => ctx.db.get(chunkId));
+  const aiConfig = await t.run(async (ctx) => ctx.db.get(aiConfigId));
+
+  expect(chunk).not.toBeNull();
+  expect(chunk!.documentId).toBe(documentId);
+  expect(chunk!.accountId).toBe(accountId);
+  expect(chunk!.chunkIndex).toBe(0);
+  expect(chunk!.embedding).toEqual([0.1, 0.2, 0.3]);
+
+  expect(aiConfig).not.toBeNull();
+  expect(aiConfig!.accountId).toBe(accountId);
+  expect(aiConfig!.provider).toBe("openai");
+  expect(aiConfig!.isActive).toBe(true);
+  expect(aiConfig!.autoReplyMaxPerConversation).toBe(3);
+
+  // Also exercise the declared regular indexes (not the search/vector
+  // indexes — those are backend-only; see the note above).
+  const byDocument = await t.run(async (ctx) =>
+    ctx.db
+      .query("aiKnowledgeChunks")
+      .withIndex("by_document", (q) => q.eq("documentId", documentId))
+      .collect(),
+  );
+  expect(byDocument.map((c) => c._id)).toEqual([chunkId]);
+
+  const byAccount = await t.run(async (ctx) =>
+    ctx.db
+      .query("aiConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(byAccount.map((c) => c._id)).toEqual([aiConfigId]);
+});
+
+test("Task 4 — an out-of-union value is rejected by the schema validator", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  await expect(
+    t.run(async (ctx) =>
+      ctx.db.insert("aiConfigs", {
+        accountId,
+        // Not one of the `provider` union's literals — proves the
+        // schema rejects it rather than silently accepting any string.
+        provider: "not-a-real-provider" as unknown as "openai",
+        model: "gpt-4o-mini",
+        apiKey: "ciphertext-fixture-not-a-real-key",
+        isActive: true,
+        autoReplyEnabled: false,
+        autoReplyMaxPerConversation: 3,
+      }),
+    ),
+  ).rejects.toThrow();
+});
