@@ -1,7 +1,8 @@
 "use client"
 
-import { useCallback, useEffect, useState } from 'react'
-import { createClient } from '@/lib/supabase/client'
+import { useMemo, useState } from 'react'
+import { useQuery } from 'convex/react'
+import { api } from '../../../../convex/_generated/api'
 import { useAuth } from '@/hooks/use-auth'
 import { formatCurrency } from '@/lib/currency'
 import {
@@ -11,20 +12,8 @@ import {
   Send,
 } from 'lucide-react'
 
-import {
-  loadActivity,
-  loadConversationsSeries,
-  loadMetrics,
-  loadPipelineDonut,
-  loadResponseTime,
-} from '@/lib/dashboard/queries'
-import type {
-  ActivityItem,
-  ConversationsSeriesPoint,
-  MetricsBundle,
-  PipelineDonutData,
-  ResponseTimeSummary,
-} from '@/lib/dashboard/types'
+import { startOfLocalDay, daysAgoStart, lastNDayKeys } from '@/lib/dashboard/date-utils'
+import type { ConversationsSeriesPoint } from '@/lib/dashboard/types'
 
 import { MetricCard } from '@/components/dashboard/metric-card'
 import { SkeletonCard } from '@/components/dashboard/skeleton'
@@ -40,86 +29,91 @@ type RangeDays = 7 | 30 | 90
 
 export default function DashboardPage() {
   const t = useTranslations('Dashboard.page')
-  const { defaultCurrency } = useAuth()
-  const [metrics, setMetrics] = useState<MetricsBundle | null>(null)
-  const [metricsLoading, setMetricsLoading] = useState(true)
+  // `accountId` is the account-readiness signal: `accountQuery` (which
+  // backs every `api.dashboard.*` below) derives the account server-side
+  // and THROWS `NO_ACCOUNT`/`UNAUTHENTICATED` if a query runs before the
+  // caller's membership resolves. Gating each query on `accountId` (via
+  // the "skip" sentinel) means they only ever fire once the account is
+  // known, so a fresh sign-in shows skeletons instead of a thrown error.
+  const { defaultCurrency, accountId } = useAuth()
 
   const [range, setRange] = useState<RangeDays>(30)
-  // Keep a cache per range so switching tabs doesn't re-fetch what we
-  // already have. Ranges the user hasn't opened yet stay null and
-  // trigger a fetch on first view.
-  const [series, setSeries] = useState<Record<RangeDays, ConversationsSeriesPoint[] | null>>({
-    7: null,
-    30: null,
-    90: null,
-  })
-  const [seriesLoading, setSeriesLoading] = useState(true)
 
-  const [pipeline, setPipeline] = useState<PipelineDonutData | null>(null)
-  const [pipelineLoading, setPipelineLoading] = useState(true)
-
-  const [responseTime, setResponseTime] = useState<ResponseTimeSummary | null>(null)
-  const [responseTimeLoading, setResponseTimeLoading] = useState(true)
-
-  const [activity, setActivity] = useState<ActivityItem[] | null>(null)
-  const [activityLoading, setActivityLoading] = useState(true)
-
-  const loadAll = useCallback(() => {
-    const db = createClient()
-
-    // Kick everything off in parallel. Each block has its own
-    // setState + finally so a slow query doesn't hold up faster
-    // sections — each widget shows its own skeleton independently.
-    void loadMetrics(db)
-      .then((m) => setMetrics(m))
-      .catch((err) => console.error('[dashboard] metrics failed:', err))
-      .finally(() => setMetricsLoading(false))
-
-    void loadConversationsSeries(db, 30)
-      .then((s) => setSeries((prev) => ({ ...prev, 30: s })))
-      .catch((err) => console.error('[dashboard] series failed:', err))
-      .finally(() => setSeriesLoading(false))
-
-    void loadPipelineDonut(db)
-      .then((p) => setPipeline(p))
-      .catch((err) => console.error('[dashboard] pipeline failed:', err))
-      .finally(() => setPipelineLoading(false))
-
-    void loadResponseTime(db)
-      .then((r) => setResponseTime(r))
-      .catch((err) => console.error('[dashboard] response time failed:', err))
-      .finally(() => setResponseTimeLoading(false))
-
-    // Fetch up to 50 so the biggest page-size option in the feed
-    // (50 rows) is already in memory — switching sizes then becomes
-    // a pure client-side slice with no extra round trip.
-    void loadActivity(db, 50)
-      .then((a) => setActivity(a))
-      .catch((err) => console.error('[dashboard] activity failed:', err))
-      .finally(() => setActivityLoading(false))
-  }, [])
-
-  useEffect(() => {
-    loadAll()
-  }, [loadAll])
-
-  // Range switch handler — kept in an event callback (not an effect)
-  // so the setState calls stay out of the react-hooks/set-state-in-effect
-  // rule's way. The cached bucket check means switching back to a
-  // previously-viewed range is instant and doesn't re-fetch.
-  const handleRangeChange = useCallback(
-    (r: RangeDays) => {
-      setRange(r)
-      if (series[r] !== null) return
-      setSeriesLoading(true)
-      const db = createClient()
-      loadConversationsSeries(db, r)
-        .then((s) => setSeries((prev) => ({ ...prev, [r]: s })))
-        .catch((err) => console.error('[dashboard] series failed:', err))
-        .finally(() => setSeriesLoading(false))
-    },
-    [series],
+  // Local-day boundaries ("today", the chart's day buckets, "this week")
+  // are the caller's-timezone concept, so they're computed here in the
+  // browser and passed to the UTC-only Convex aggregations — see
+  // convex/dashboard.ts and convex/lib/dashboardDate.ts. `tzOffsetMinutes`
+  // matches `Date.prototype.getTimezoneOffset()` (the convention those
+  // helpers document). Memoised so "today" is captured once (per account /
+  // per range), mirroring how the old client-side loader computed it once
+  // per fetch rather than drifting every render.
+  const metricsArgs = useMemo(
+    () =>
+      accountId
+        ? {
+            todayStartMs: startOfLocalDay().getTime(),
+            yesterdayStartMs: daysAgoStart(1).getTime(),
+          }
+        : ('skip' as const),
+    [accountId],
   )
+
+  const seriesArgs = useMemo(
+    () =>
+      accountId
+        ? {
+            sinceMs: daysAgoStart(range - 1).getTime(),
+            dayKeys: lastNDayKeys(range),
+            tzOffsetMinutes: new Date().getTimezoneOffset(),
+          }
+        : ('skip' as const),
+    [accountId, range],
+  )
+
+  const responseTimeArgs = useMemo(
+    () =>
+      accountId
+        ? {
+            // 14-day window (today + 13 prior days) — matches the original
+            // loadResponseTime's `daysAgoStart(13)`.
+            sinceMs: daysAgoStart(13).getTime(),
+            tzOffsetMinutes: new Date().getTimezoneOffset(),
+          }
+        : ('skip' as const),
+    [accountId],
+  )
+
+  // Reactive subscriptions. Each returns `undefined` while loading (or
+  // while skipped), so `=== undefined` is the per-widget loading flag and
+  // each card/chart shows its own skeleton independently — same
+  // independent-loading UX the old per-query `finally(setLoading)` gave.
+  const metricsData = useQuery(api.dashboard.metrics, metricsArgs)
+  const seriesData = useQuery(api.dashboard.conversationsSeries, seriesArgs)
+  const pipelineData = useQuery(api.dashboard.pipelineDonut, accountId ? {} : 'skip')
+  const responseTimeData = useQuery(api.dashboard.responseTime, responseTimeArgs)
+  // Fetch up to 50 so the biggest page-size option in the feed (50 rows)
+  // is already in memory — switching sizes is then a pure client slice.
+  const activityData = useQuery(api.dashboard.activity, accountId ? { limit: 50 } : 'skip')
+
+  const metrics = metricsData ?? null
+  const metricsLoading = metricsData === undefined
+  const pipeline = pipelineData ?? null
+  const pipelineLoading = pipelineData === undefined
+  const responseTime = responseTimeData ?? null
+  const responseTimeLoading = responseTimeData === undefined
+  const activity = activityData ?? null
+  const activityLoading = activityData === undefined
+
+  // ConversationsChart takes a per-range record (its contract, so a
+  // future full-cache variant stays a drop-in). We only ever subscribe to
+  // the active range — Convex re-subscribes reactively when `range`
+  // changes — so fill just that slot; the chart reads `series[range]`.
+  const series: Record<RangeDays, ConversationsSeriesPoint[] | null> = {
+    7: range === 7 ? (seriesData ?? null) : null,
+    30: range === 30 ? (seriesData ?? null) : null,
+    90: range === 90 ? (seriesData ?? null) : null,
+  }
+  const seriesLoading = seriesData === undefined
 
   return (
     <div className="space-y-5">
@@ -144,8 +138,8 @@ export default function DashboardPage() {
               delta={{
                 sign: metrics.activeConversations.previous,
                 label: deltaLabel(
-                  metrics.activeConversations.previous, 
-                  t('newTodayVsYesterday'), 
+                  metrics.activeConversations.previous,
+                  t('newTodayVsYesterday'),
                   t('noChange', { suffix: t('newTodayVsYesterday') })
                 ),
               }}
@@ -204,7 +198,7 @@ export default function DashboardPage() {
             series={series}
             loading={seriesLoading}
             range={range}
-            onRangeChange={handleRangeChange}
+            onRangeChange={setRange}
           />
         </div>
         <div className="h-full lg:col-span-2">
