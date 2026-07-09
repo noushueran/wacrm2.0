@@ -130,8 +130,17 @@ function isLiteralIp(host: string): boolean {
  * (real DNS resolution) in Convex's action runtime. Synchronous (the
  * original is async only because of the `dns.lookup` call this version
  * can't make).
+ *
+ * Exported (Phase 6, Task 3): the automations engine's `send_webhook`
+ * step POSTs to an arbitrary, per-step-configured URL — a different
+ * feature from this file's own `dispatch` (which fans out to the
+ * account's *registered* `webhookEndpoints`), so it doesn't call
+ * `dispatch` itself, but it needs the exact same SSRF guard before
+ * making its own outbound `fetch`. Reused here rather than
+ * copy-pasted, to avoid two copies of a security-critical check
+ * drifting apart.
  */
-function isDeliverableUrl(rawUrl: string): boolean {
+export function isDeliverableUrl(rawUrl: string): boolean {
   let host: string;
   try {
     host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "");
