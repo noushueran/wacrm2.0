@@ -587,7 +587,15 @@ test("retrieve isolation (vector path): a decoy account's chunk is never returne
   // isolation must hold on Alice's OWN retrieval regardless.
   await configureEmbeddingsKey(asAlice);
 
-  const queryText = "shipping policy question";
+  // Deliberately shares NO word with Alice's own content below — if the
+  // lexical FTS top-up could ALSO find Alice's chunk for this query, a
+  // regression that dropped ONLY `ctx.vectorSearch`'s `accountId`
+  // filter (while `getChunksByIds`'s own defense-in-depth re-check
+  // stayed intact) would still surface Alice's content via that FTS
+  // fallback — silently masking the very regression this test exists
+  // to catch. With no lexical overlap, the ONLY way Alice's content can
+  // come back at all is via a correctly-scoped vector search.
+  const queryText = "telescope aquarium maintenance";
 
   const aliceDocId = await seedDocument(t, {
     accountId: aliceAccountId,
