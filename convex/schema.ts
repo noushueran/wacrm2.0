@@ -97,6 +97,14 @@ export default defineSchema({
     lastMessageText: v.optional(v.string()),
     lastMessageAt: v.optional(v.number()),
     unreadCount: v.number(),
+    // AI auto-reply control (migrations 029 + 033). In Postgres these were
+    // NOT NULL DEFAULT false / NOT NULL DEFAULT 0 / nullable text. Convex
+    // has no column defaults, and all three were added by later migrations
+    // to a table with pre-existing rows, so they're optional here (the
+    // writing mutation supplies false/0; `aiHandoffSummary` was nullable).
+    aiAutoreplyDisabled: v.optional(v.boolean()),
+    aiReplyCount: v.optional(v.number()),
+    aiHandoffSummary: v.optional(v.string()),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"]),
@@ -145,6 +153,12 @@ export default defineSchema({
     replyToMessageId: v.optional(v.id("messages")),
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
+    // True when the AI auto-reply bot generated this message (migration
+    // 033). Postgres: NOT NULL DEFAULT false; optional here for the same
+    // reason as the conversations AI columns (late addition, no Convex
+    // default). Already surfaced optional in `src/types/index.ts`
+    // (`Message.ai_generated?: boolean`).
+    aiGenerated: v.optional(v.boolean()),
   })
     .index("by_conversation", ["conversationId"])
     .index("by_message_id", ["messageId"])
@@ -188,13 +202,15 @@ export default defineSchema({
   // is the old `assigned_to` column (migration 002) — it referenced
   // `profiles(id)` in Postgres, not `auth.users(id)` directly, but
   // conceptually (like `conversations.assignedToUserId`) it names the
-  // assigned user.
+  // assigned user. `contactId` is optional: migration 004
+  // (contact_delete_set_null) dropped its NOT NULL and made the FK
+  // ON DELETE SET NULL, so a deal survives its contact being deleted.
   deals: defineTable({
     accountId: v.id("accounts"),
     createdByUserId: v.optional(v.id("users")),
     pipelineId: v.id("pipelines"),
     stageId: v.id("pipelineStages"),
-    contactId: v.id("contacts"),
+    contactId: v.optional(v.id("contacts")),
     conversationId: v.optional(v.id("conversations")),
     title: v.string(),
     value: v.number(),

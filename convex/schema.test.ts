@@ -51,6 +51,11 @@ test("Task 1 — conversations + messages round-trip through the schema's valida
       contactId,
       status: "open",
       unreadCount: 0,
+      // Optional AI columns (migrations 029 + 033) — set them here so the
+      // fixup's new validators are actually exercised, not just skipped.
+      aiAutoreplyDisabled: false,
+      aiReplyCount: 0,
+      aiHandoffSummary: "handed off: pricing question",
     }),
   );
 
@@ -58,10 +63,11 @@ test("Task 1 — conversations + messages round-trip through the schema's valida
     ctx.db.insert("messages", {
       accountId,
       conversationId,
-      senderType: "customer",
+      senderType: "bot",
       contentType: "text",
       contentText: "Hi there",
       status: "delivered",
+      aiGenerated: true, // migration 033 column
     }),
   );
 
@@ -73,13 +79,17 @@ test("Task 1 — conversations + messages round-trip through the schema's valida
   expect(conversation!.contactId).toBe(contactId);
   expect(conversation!.status).toBe("open");
   expect(conversation!.unreadCount).toBe(0);
+  expect(conversation!.aiAutoreplyDisabled).toBe(false);
+  expect(conversation!.aiReplyCount).toBe(0);
+  expect(conversation!.aiHandoffSummary).toBe("handed off: pricing question");
 
   expect(message).not.toBeNull();
   expect(message!.accountId).toBe(accountId);
   expect(message!.conversationId).toBe(conversationId);
-  expect(message!.senderType).toBe("customer");
+  expect(message!.senderType).toBe("bot");
   expect(message!.contentType).toBe("text");
   expect(message!.status).toBe("delivered");
+  expect(message!.aiGenerated).toBe(true);
 
   // Also exercise the declared indexes, not just the field validators.
   const byConversation = await t.run(async (ctx) =>
