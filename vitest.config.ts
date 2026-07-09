@@ -6,7 +6,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "convex/**/*.test.ts"],
     // Dummy secrets — encryption.ts / webhook-signature.ts read these
     // at module load. Tests never hit a real Meta/Supabase service, so
     // any 32-byte hex / non-empty string will do; keep them lexically
