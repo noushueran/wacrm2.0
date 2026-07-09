@@ -239,3 +239,146 @@ test("Task 2 — an out-of-union value is rejected by the schema validator", asy
     ),
   ).rejects.toThrow();
 });
+
+test("Task 3 — automations + flowRuns round-trip through the schema's validators", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  const contactId = await t.run(async (ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15551234567",
+      phoneNormalized: "15551234567",
+    }),
+  );
+
+  const automationId = await t.run(async (ctx) =>
+    ctx.db.insert("automations", {
+      accountId,
+      name: "Welcome new contacts",
+      description: "Sends a greeting on the first inbound message",
+      // Plain string, not a union — Postgres never put a CHECK on
+      // automations.trigger_type (see the schema comment).
+      triggerType: "first_inbound_message",
+      triggerConfig: { keyword: null },
+      isActive: true,
+      executionCount: 0,
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const flowId = await t.run(async (ctx) =>
+    ctx.db.insert("flows", {
+      accountId,
+      name: "Support triage",
+      status: "active",
+      triggerType: "keyword",
+      triggerConfig: { keywords: ["help"] },
+      fallbackPolicy: {
+        on_unknown_reply: "reprompt",
+        max_reprompts: 2,
+        on_timeout_hours: 24,
+        on_exhaust: "handoff",
+      },
+      executionCount: 0,
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const flowRunId = await t.run(async (ctx) =>
+    ctx.db.insert("flowRuns", {
+      accountId,
+      flowId,
+      contactId,
+      status: "active",
+      currentNodeKey: "start",
+      // Exercises the `v.optional(v.any())` validator with a nested
+      // object, not just a bare scalar.
+      vars: { name: "Priya" },
+      repromptCount: 0,
+      lastAdvancedAt: Date.now(),
+    }),
+  );
+
+  const automation = await t.run(async (ctx) => ctx.db.get(automationId));
+  const flowRun = await t.run(async (ctx) => ctx.db.get(flowRunId));
+
+  expect(automation).not.toBeNull();
+  expect(automation!.accountId).toBe(accountId);
+  expect(automation!.triggerType).toBe("first_inbound_message");
+  expect(automation!.isActive).toBe(true);
+  expect(automation!.executionCount).toBe(0);
+
+  expect(flowRun).not.toBeNull();
+  expect(flowRun!.accountId).toBe(accountId);
+  expect(flowRun!.flowId).toBe(flowId);
+  expect(flowRun!.contactId).toBe(contactId);
+  expect(flowRun!.status).toBe("active");
+  expect(flowRun!.vars).toEqual({ name: "Priya" });
+
+  // Also exercise the declared indexes, not just the field validators.
+  const byAccount = await t.run(async (ctx) =>
+    ctx.db
+      .query("automations")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(byAccount.map((a) => a._id)).toEqual([automationId]);
+
+  const byAccountContact = await t.run(async (ctx) =>
+    ctx.db
+      .query("flowRuns")
+      .withIndex("by_account_contact", (q) =>
+        q.eq("accountId", accountId).eq("contactId", contactId),
+      )
+      .collect(),
+  );
+  expect(byAccountContact.map((r) => r._id)).toEqual([flowRunId]);
+
+  const byFlow = await t.run(async (ctx) =>
+    ctx.db
+      .query("flowRuns")
+      .withIndex("by_flow", (q) => q.eq("flowId", flowId))
+      .collect(),
+  );
+  expect(byFlow.map((r) => r._id)).toEqual([flowRunId]);
+
+  const byStatus = await t.run(async (ctx) =>
+    ctx.db
+      .query("flowRuns")
+      .withIndex("by_status", (q) => q.eq("status", "active"))
+      .collect(),
+  );
+  expect(byStatus.map((r) => r._id)).toEqual([flowRunId]);
+});
+
+test("Task 3 — an out-of-union value is rejected by the schema validator", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  const automationId = await t.run(async (ctx) =>
+    ctx.db.insert("automations", {
+      accountId,
+      name: "Broken automation",
+      triggerType: "keyword_match",
+      isActive: false,
+      executionCount: 0,
+    }),
+  );
+
+  await expect(
+    t.run(async (ctx) =>
+      ctx.db.insert("automationSteps", {
+        automationId,
+        // Not one of the 13-value `stepType` union's literals. Unlike
+        // most unions in this file, this one has no backing Postgres
+        // CHECK (see the schema comment) — it's sourced from the app's
+        // closed `AutomationStepType` type / engine switch instead, so
+        // this test is the only proof the schema still rejects a
+        // bogus value rather than silently widening to any string.
+        stepType: "not-a-real-step" as unknown as "wait",
+        position: 0,
+      }),
+    ),
+  ).rejects.toThrow();
+});

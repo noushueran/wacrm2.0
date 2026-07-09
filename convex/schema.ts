@@ -523,6 +523,273 @@ export default defineSchema({
     .index("by_user", ["userId"])
     .index("by_account", ["accountId"]),
 
-  // (other tables added in later Phase 1 tasks: automations + flows
-  // [Task 3], AI [Task 4])
+  // ============================================================
+  // Automations + Flows (Phase 1, Task 3). Source: supabase/migrations
+  // 006_automations.sql, 007_automations_increment_counter.sql (RPC
+  // only — no schema change), 010_flows.sql,
+  // 012_flows_increment_counter.sql (RPC only), 016_flow_media.sql,
+  // 017_account_sharing.sql, 020_account_sharing_followups.sql
+  // (indexes only). All 8 tables were swept across every migration
+  // (grep "ALTER TABLE <table>"), not just the named set, per Task
+  // 1/2's own precedent of late migrations touching tables outside
+  // their named source list. Two real findings from that sweep:
+  //   - Migration 017 added `account_id` (NOT NULL) to `automations`,
+  //     `automationLogs`, `automationPendingExecutions`, `flows`, and
+  //     `flowRuns` — but NOT to `automationSteps`, `flowNodes`, or
+  //     `flowRunEvents`, which stay tenant-scoped only transitively via
+  //     their parent FK (same pattern as `pipelineStages`/
+  //     `contactCustomValues` in Task 1). It also swapped `flowRuns`'s
+  //     "one active run per contact" partial unique index from
+  //     `(user_id, contact_id)` to `(account_id, contact_id)`.
+  //   - Migration 016 widened `flow_nodes.node_type`'s CHECK to add
+  //     `'send_media'` — this task's own tricky-notes list enumerates
+  //     only 10 of the resulting 11 values; the 11th (`send_media`)
+  //     only turns up by actually reading migration 016, which is why
+  //     it's included in the union below.
+  // Every `user_id` FK to auth.users on these tables stays audit/
+  // assignment metadata post-017 (migration 017's own header: "no
+  // longer used for tenancy isolation") — mapped to `createdByUserId`
+  // like every other bare `user_id` column in this file.
+  // ============================================================
+
+  // The definition envelope for one automation ("when X happens, do
+  // Y"). `triggerType` stays a plain string, not a union: unlike
+  // `flows.triggerType` below, Postgres never put a CHECK on this
+  // column (the closed `AutomationTriggerType` set in
+  // src/types/index.ts is enforced only at the app layer) — same
+  // reasoning Task 1 used for `customFields.fieldType`. `updatedAt` is
+  // new: Postgres maintains it with an on-UPDATE trigger (Convex has
+  // none), but the app reads it (`select('*')` plus the
+  // `Automation.updated_at` type) the same way `flows.updatedAt`
+  // below is both read and explicitly written by the flow-edit route,
+  // so it's modeled here too rather than silently dropped.
+  automations: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    name: v.string(),
+    description: v.optional(v.string()),
+    triggerType: v.string(),
+    triggerConfig: v.optional(v.any()),
+    isActive: v.boolean(),
+    executionCount: v.number(),
+    lastExecutedAt: v.optional(v.number()),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One node in an automation's step tree. `parentStepId`/`branch` are
+  // both unset for root-level steps; a Condition step's 'yes'/'no'
+  // children set both. `stepType` has no DB-level CHECK in Postgres
+  // (unlike `flowNodes.nodeType` below) but the brief calls for a
+  // union anyway — cross-checked against the exhaustive `switch
+  // (step.step_type)` in src/lib/automations/engine.ts (13 cases) and
+  // the `AutomationStepType` closed set in src/types/index.ts; both
+  // agree on exactly these 13 values, so there's no hidden 14th like
+  // `flowNodes.nodeType` had with `send_media`.
+  automationSteps: defineTable({
+    automationId: v.id("automations"),
+    parentStepId: v.optional(v.id("automationSteps")),
+    branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
+    stepType: v.union(
+      v.literal("send_message"),
+      v.literal("send_buttons"),
+      v.literal("send_list"),
+      v.literal("send_template"),
+      v.literal("add_tag"),
+      v.literal("remove_tag"),
+      v.literal("assign_conversation"),
+      v.literal("update_contact_field"),
+      v.literal("create_deal"),
+      v.literal("wait"),
+      v.literal("condition"),
+      v.literal("send_webhook"),
+      v.literal("close_conversation"),
+    ),
+    stepConfig: v.optional(v.any()),
+    position: v.number(),
+  }).index("by_automation", ["automationId"]),
+
+  // An audit row written once per automation execution (one per
+  // triggering event, not per step — `stepsExecuted` is the per-step
+  // detail array). `contactId` is nullable / ON DELETE SET NULL so
+  // history survives contact deletion (mirrors migration 004's
+  // pattern Task 1 already used for `deals.contactId`).
+  automationLogs: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    automationId: v.id("automations"),
+    contactId: v.optional(v.id("contacts")),
+    triggerEvent: v.string(),
+    stepsExecuted: v.optional(v.any()),
+    status: v.union(
+      v.literal("success"),
+      v.literal("partial"),
+      v.literal("failed"),
+    ),
+    errorMessage: v.optional(v.string()),
+  }).index("by_account", ["accountId"]),
+
+  // A queued resume point created when a running automation hits a
+  // `wait` step. The cron endpoint (`/api/automations/cron`) drains
+  // rows where `status === "pending"` and `runAt <= now`, via the
+  // `by_status_runat` index below — this is the row this Phase 1 plan
+  // explicitly foreshadows for `ctx.scheduler` in a later
+  // function-phase. `runAt` is `NOT NULL` with no default in Postgres
+  // (the engine always supplies it when scheduling the wait), so
+  // unlike most other domain timestamps in this file it's a required
+  // `v.number()`, not optional — same treatment Task 2 gave
+  // `accountInvitations.expiresAt`.
+  automationPendingExecutions: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    automationId: v.id("automations"),
+    contactId: v.optional(v.id("contacts")),
+    logId: v.optional(v.id("automationLogs")),
+    parentStepId: v.optional(v.id("automationSteps")),
+    branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
+    nextStepPosition: v.number(),
+    context: v.optional(v.any()),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("running"),
+      v.literal("done"),
+      v.literal("failed"),
+    ),
+    runAt: v.number(),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_status_runat", ["status", "runAt"]),
+
+  // The definition envelope for one conversational flow (bot). Mirrors
+  // `automations` above but for the graph-based engine. `entryNodeId`
+  // references `flowNodes.nodeKey` (a stable string the migration's
+  // own comment calls out as deliberately NOT the row's UUID — see
+  // `flowNodes` below), so it stays `v.optional(v.string())`, never a
+  // `v.id(...)`. `updatedAt`: same reasoning as `automations` above,
+  // except here there's direct proof the app writes it by hand —
+  // `src/app/api/flows/[id]/route.ts`'s PATCH handler sets
+  // `updated_at: new Date().toISOString()` itself rather than relying
+  // solely on the (Convex-less) DB trigger.
+  flows: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    name: v.string(),
+    description: v.optional(v.string()),
+    status: v.union(
+      v.literal("draft"),
+      v.literal("active"),
+      v.literal("archived"),
+    ),
+    triggerType: v.union(
+      v.literal("keyword"),
+      v.literal("first_inbound_message"),
+      v.literal("manual"),
+    ),
+    triggerConfig: v.optional(v.any()),
+    entryNodeId: v.optional(v.string()),
+    fallbackPolicy: v.optional(v.any()),
+    executionCount: v.number(),
+    lastExecutedAt: v.optional(v.number()),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One node in a flow's graph. Edges live inside `config` (e.g. each
+  // button carries its own next-node key) rather than a separate edge
+  // table — see migration 010's header for why. `nodeKey` is a stable
+  // string, not the row id, so edges/`entryNodeId` survive a clone
+  // without UUID rewriting. `nodeType`'s union has 11 values, not the
+  // 10 this task's tricky-notes list literally enumerates: migration
+  // 016 (named in this task's source list) widened the CHECK to add
+  // `'send_media'` after 010 shipped the original 10 — caught by
+  // reading 016 directly rather than trusting the summarized list.
+  // `positionX`/`positionY` are reserved for the not-yet-built v2
+  // react-flow canvas (migration 010's own comment); the v1 list
+  // editor always writes 0.
+  flowNodes: defineTable({
+    flowId: v.id("flows"),
+    nodeKey: v.string(),
+    nodeType: v.union(
+      v.literal("start"),
+      v.literal("send_buttons"),
+      v.literal("send_list"),
+      v.literal("send_message"),
+      v.literal("send_media"),
+      v.literal("collect_input"),
+      v.literal("condition"),
+      v.literal("set_tag"),
+      v.literal("handoff"),
+      v.literal("http_fetch"),
+      v.literal("end"),
+    ),
+    config: v.optional(v.any()),
+    positionX: v.number(),
+    positionY: v.number(),
+  }).index("by_flow_node_key", ["flowId", "nodeKey"]),
+
+  // Per-contact runtime state machine for a flow. Postgres's
+  // `started_at` (`NOT NULL DEFAULT NOW()`, never subsequently
+  // updated) is deliberately NOT modeled as its own field — it's set
+  // at the same instant the row is created and nothing ever changes
+  // it, so it's exactly what `_creationTime` already gives for free
+  // (the same "don't duplicate created_at" reasoning the Global
+  // Constraints spell out, just under a different column name).
+  // `lastAdvancedAt` IS modeled: unlike `startedAt` it's genuinely
+  // mutated every time the runner advances the state machine, and the
+  // cron sweep (`idx_flow_runs_active_advanced`) queries it directly.
+  // `contactId`/`conversationId` are nullable / ON DELETE SET NULL so
+  // history survives contact deletion (same pattern as
+  // `automationLogs.contactId` above). The "one active run per
+  // account+contact" partial UNIQUE from migration 017 (originally
+  // per-user from 010) becomes the plain `by_account_contact` index —
+  // Convex has no partial indexes, so the actual one-active-run
+  // invariant is enforced in the future engine mutation, not the
+  // schema (same deferral the brief calls out).
+  flowRuns: defineTable({
+    accountId: v.id("accounts"),
+    createdByUserId: v.optional(v.id("users")),
+    flowId: v.id("flows"),
+    contactId: v.optional(v.id("contacts")),
+    conversationId: v.optional(v.id("conversations")),
+    status: v.union(
+      v.literal("active"),
+      v.literal("completed"),
+      v.literal("handed_off"),
+      v.literal("timed_out"),
+      v.literal("paused_by_agent"),
+      v.literal("failed"),
+    ),
+    currentNodeKey: v.optional(v.string()),
+    lastPromptMessageId: v.optional(v.id("messages")),
+    vars: v.optional(v.any()),
+    repromptCount: v.number(),
+    lastAdvancedAt: v.optional(v.number()),
+    endedAt: v.optional(v.number()),
+    endReason: v.optional(v.string()),
+  })
+    .index("by_account_contact", ["accountId", "contactId"])
+    .index("by_flow", ["flowId"])
+    .index("by_status", ["status"]),
+
+  // Append-only audit trail for a flow run — used by the runner for
+  // idempotency (never advance twice on the same inbound message) and
+  // the future run-history viewer. `eventType`'s 9-value union comes
+  // straight off the CHECK in migration 010; no later migration alters
+  // it (unlike `flowNodes.nodeType`).
+  flowRunEvents: defineTable({
+    flowRunId: v.id("flowRuns"),
+    eventType: v.union(
+      v.literal("started"),
+      v.literal("node_entered"),
+      v.literal("message_sent"),
+      v.literal("reply_received"),
+      v.literal("fallback_fired"),
+      v.literal("handoff"),
+      v.literal("timeout"),
+      v.literal("error"),
+      v.literal("completed"),
+    ),
+    nodeKey: v.optional(v.string()),
+    payload: v.optional(v.any()),
+  }).index("by_run", ["flowRunId"]),
+
+  // (other tables added in later Phase 1 tasks: AI [Task 4])
 });
