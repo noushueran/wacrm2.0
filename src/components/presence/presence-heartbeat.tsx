@@ -1,16 +1,17 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useMutation } from "convex/react";
 
-import { createClient } from "@/lib/supabase/client";
+import { api } from "../../../convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
 import { HEARTBEAT_MS, IDLE_AFTER_MS, type StoredPresence } from "@/lib/presence";
 
 /**
  * PresenceHeartbeat — headless. Mount ONCE per signed-in dashboard tab
  * (in the dashboard shell, below the auth gate). Reports this tab's
- * presence to the `member_presence` table via the `touch_presence` RPC
- * roughly every HEARTBEAT_MS.
+ * presence to the `memberPresence` table via the `presence.touch`
+ * Convex mutation roughly every HEARTBEAT_MS.
  *
  * The client only ever reports 'online' or 'away':
  *   - 'away'   when the tab is hidden, or no user input for IDLE_AFTER_MS
@@ -21,6 +22,9 @@ import { HEARTBEAT_MS, IDLE_AFTER_MS, type StoredPresence } from "@/lib/presence
  */
 export function PresenceHeartbeat() {
   const { accountId } = useAuth();
+  // `useMutation` returns a stable reference, so listing it in the effect
+  // deps below does not re-run the heartbeat setup.
+  const touch = useMutation(api.presence.touch);
 
   // 0 = "never recorded"; set on mount so we don't read the clock during
   // render (impure). Until the effect runs the tab counts as active.
@@ -29,11 +33,10 @@ export function PresenceHeartbeat() {
   useEffect(() => {
     // Hold off until the account is known. Beating during the brief
     // window on a fresh signup — authed but profile/account row not yet
-    // created — would make touch_presence raise "No account for caller"
+    // created — would make presence.touch raise "No account for caller"
     // and log a spurious error. The effect re-runs once accountId lands.
     if (!accountId) return;
 
-    const supabase = createClient();
     let cancelled = false;
     let lastBeatAt = 0;
     lastActivityRef.current = Date.now();
@@ -56,13 +59,17 @@ export function PresenceHeartbeat() {
       const t = Date.now();
       if (t - lastBeatAt < 1_000) return;
       lastBeatAt = t;
-      const { error } = await supabase.rpc("touch_presence", {
-        p_status: currentStatus(),
-      });
-      if (error && !cancelled) {
-        // Non-fatal: presence is best-effort. Log once per failure so a
-        // misconfigured RPC is visible without spamming.
-        console.error("[PresenceHeartbeat] touch_presence failed:", error.message);
+      try {
+        await touch({ status: currentStatus() });
+      } catch (error) {
+        if (!cancelled) {
+          // Non-fatal: presence is best-effort. Log once per failure so a
+          // misconfigured mutation is visible without spamming.
+          console.error(
+            "[PresenceHeartbeat] presence.touch failed:",
+            error instanceof Error ? error.message : error,
+          );
+        }
       }
     };
 
@@ -99,7 +106,7 @@ export function PresenceHeartbeat() {
       document.removeEventListener("visibilitychange", onReturn);
       window.removeEventListener("focus", onReturn);
     };
-  }, [accountId]);
+  }, [accountId, touch]);
 
   return null;
 }
