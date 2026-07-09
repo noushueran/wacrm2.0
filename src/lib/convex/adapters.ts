@@ -11,6 +11,7 @@ import type {
   Message,
   MessageReaction,
   PipelineStage,
+  Profile,
   Tag,
 } from "@/types";
 
@@ -100,6 +101,27 @@ export function toUiContactNote(doc: Doc<"contactNotes">): ContactNote {
     contact_id: doc.contactId,
     user_id: doc.createdByUserId ?? "",
     note_text: doc.noteText,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** A membership row (from `api.members.list`, which appends a nullable
+ *  `email` gated on the caller's role) mapped to the `Profile` shape the
+ *  inbox assign-dropdown already consumes — it only reads `user_id` (to
+ *  match `assigned_agent_id` + key presence dots) and `full_name`. The
+ *  legacy `Profile.role` free-form string is satisfied by the typed
+ *  account role; `id` carries the membership id (unused by the dropdown
+ *  but required by the type). */
+export function toUiMemberProfile(
+  doc: Omit<Doc<"memberships">, "email"> & { email?: string | null },
+): Profile {
+  return {
+    id: doc._id,
+    user_id: doc.userId,
+    full_name: doc.fullName ?? doc.email ?? "Member",
+    email: doc.email ?? "",
+    role: doc.role,
+    account_id: doc.accountId,
     created_at: new Date(doc._creationTime).toISOString(),
   };
 }

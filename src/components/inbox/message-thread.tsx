@@ -4,7 +4,11 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useMutation, useQuery, usePaginatedQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
-import { toUiMessage, toUiReaction } from "@/lib/convex/adapters";
+import {
+  toUiMemberProfile,
+  toUiMessage,
+  toUiReaction,
+} from "@/lib/convex/adapters";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
@@ -18,7 +22,6 @@ import type {
   Contact,
   ConversationStatus,
   MessageTemplate,
-  Profile,
   InteractiveMessagePayload,
 } from "@/types";
 import {
@@ -145,40 +148,21 @@ export function MessageThread({
   const { getPresence, getRow, now } = usePresence();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
-  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
 
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
-  // Profiles are bounded by RLS to rows the current user is allowed to
-  // see — today that's just the current user, but the dropdown keeps the
-  // shape ready for shared-team workspaces without a refactor.
-  //
-  // Not migrated: this task's allowed Convex API surface has no
-  // account-members query (a `convex/members.ts` module exists, but
-  // wasn't part of the list this task was scoped to call), so the
-  // assign dropdown's teammate list stays on this pre-existing Supabase
-  // read for now. Flagged in the task report as a follow-up.
-  useEffect(() => {
-    let cancelled = false;
-    const supabase = createClient();
-    supabase
-      .from("profiles")
-      .select("*")
-      .order("full_name")
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) {
-          console.error("Failed to fetch profiles:", error);
-          return;
-        }
-        setProfiles((data as Profile[]) ?? []);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // The assign dropdown's teammate list — every member of the account,
+  // via reactive `api.members.list` (the Convex counterpart to the old
+  // Supabase `profiles` read), mapped to the `Profile` shape the
+  // dropdown already consumes. A member added/removed elsewhere surfaces
+  // here without a manual refetch.
+  const memberDocs = useQuery(api.members.list);
+  const profiles = useMemo(
+    () => (memberDocs ?? []).map(toUiMemberProfile),
+    [memberDocs],
+  );
 
   // Messages — Convex paginated query, newest-first; reversed below for
   // chronological (oldest-first) display. "Load older messages" calls
