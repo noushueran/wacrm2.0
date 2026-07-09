@@ -638,6 +638,8 @@
       "exportCsv": "Export CSV",
       "noRecipients": "No recipients found.",
       "noRecipientsFilter": "No recipients match this filter.",
+      "loadMore": "Load more",
+      "loadingMore": "Loading more...",
       "table": {
         "contact": "Contact",
         "phone": "Phone",

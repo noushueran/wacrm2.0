@@ -1,9 +1,15 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
-import { Broadcast, BroadcastRecipient, RecipientStatus } from '@/types';
+import { useMutation, usePaginatedQuery, useQuery } from 'convex/react';
+import type { BroadcastRecipient, Contact, RecipientStatus } from '@/types';
+import {
+  convexErrorMessage,
+  toUiBroadcast,
+  toUiBroadcastRecipient,
+  toUiContact,
+} from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
 import {
   Table,
@@ -39,6 +45,11 @@ import {
   getRecipientStatus,
 } from '@/lib/broadcast-status';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../../../convex/_generated/api';
+import type { Id } from '../../../../../convex/_generated/dataModel';
+
+const RECIPIENTS_PAGE_SIZE = 50;
 
 interface StatCardProps {
   label: string;
@@ -142,54 +153,163 @@ function downloadBlob(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
-export default function BroadcastDetailPage() {
-  const params = useParams();
+/**
+ * One recipient row. `broadcasts.listRecipients` returns bare
+ * `broadcastRecipients` docs with no embedded contact — unlike
+ * `conversations.list`'s `embedContact`, it does no server-side join
+ * (see that query's handler in convex/broadcasts.ts). Rather than add a
+ * backend function, each row resolves its own contact via the existing
+ * single-contact `contacts.get` query (added for Phase 8 Task 2a) — one
+ * small reactive subscription per visible row. `onContactResolved` lifts
+ * the resolved contact up to the parent (a ref, not state — see below)
+ * so CSV export can reuse it instead of re-fetching.
+ */
+function RecipientRow({
+  recipient,
+  tStatus,
+  onContactResolved,
+}: {
+  recipient: BroadcastRecipient;
+  tStatus: ReturnType<typeof useTranslations>;
+  onContactResolved: (contactId: string, contact: Contact) => void;
+}) {
+  const contactDoc = useQuery(
+    api.contacts.get,
+    recipient.contact_id
+      ? { contactId: recipient.contact_id as Id<'contacts'> }
+      : 'skip',
+  );
+  const contact = useMemo(
+    () => (contactDoc ? toUiContact(contactDoc) : undefined),
+    [contactDoc],
+  );
+  // Distinguish "still loading" from "no contact_id" / "genuinely
+  // unknown" so we don't flash the 'Unknown' fallback for a contact
+  // that's simply mid-fetch.
+  const contactLoading = !!recipient.contact_id && contactDoc === undefined;
+
+  useEffect(() => {
+    if (recipient.contact_id && contact) {
+      onContactResolved(recipient.contact_id, contact);
+    }
+  }, [recipient.contact_id, contact, onContactResolved]);
+
+  const rStatus = getRecipientStatus(recipient.status);
+
+  return (
+    <TableRow className="border-border">
+      <TableCell className="font-medium text-foreground">
+        {contactLoading ? '' : (contact?.name ?? 'Unknown')}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {contactLoading ? '' : (contact?.phone ?? '-')}
+      </TableCell>
+      <TableCell>
+        <span
+          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${rStatus.classes}`}
+        >
+          {tStatus(rStatus.label)}
+        </span>
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {recipient.sent_at
+          ? new Date(recipient.sent_at).toLocaleString()
+          : '-'}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {recipient.delivered_at
+          ? new Date(recipient.delivered_at).toLocaleString()
+          : '-'}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {recipient.read_at
+          ? new Date(recipient.read_at).toLocaleString()
+          : '-'}
+      </TableCell>
+      <TableCell className="max-w-xs truncate text-xs text-red-400">
+        {recipient.error_message ?? '-'}
+      </TableCell>
+    </TableRow>
+  );
+}
+
+/**
+ * Class-based React error boundary — the only way to catch a render-time
+ * throw from a descendant, which is exactly what `useQuery` does when
+ * its query throws server-side (see `BroadcastDetailContent`'s
+ * `broadcasts.get` call below): either an `ArgumentValidationError` (not
+ * even a well-formed `broadcasts` id) or a `ConvexError NOT_FOUND`
+ * (well-formed but foreign/deleted — `requireOwnBroadcast` in
+ * convex/broadcasts.ts). A `try/catch` wrapped directly around the
+ * `useQuery` call in the component itself was tried first, but
+ * `eslint-plugin-react-hooks`'s `rules-of-hooks` flags a hook call
+ * inside a `try` block as conditional — this boundary is the correct,
+ * lint-clean pattern React itself provides for the same problem. Renders
+ * `fallback` (the same "not found" UI the Supabase version showed for
+ * any fetch failure) instead of crashing the whole page.
+ */
+class BroadcastNotFoundBoundary extends Component<
+  { fallback: React.ReactNode; children: React.ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  render() {
+    if (this.state.hasError) return this.props.fallback;
+    return this.props.children;
+  }
+}
+
+function BroadcastDetailContent({ broadcastId }: { broadcastId: string }) {
   const router = useRouter();
   const t = useTranslations('Broadcasts.detail');
   const tStatus = useTranslations('Broadcasts.status');
-  const broadcastId = params.id as string;
 
-  const [broadcast, setBroadcast] = useState<Broadcast | null>(null);
-  const [recipients, setRecipients] = useState<BroadcastRecipient[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<RecipientStatus | 'all'>(
     'all',
   );
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  useEffect(() => {
-    async function fetchData() {
-      try {
-        const supabase = createClient();
+  // Contacts resolved by individual `RecipientRow`s, keyed by contact id
+  // — a ref (not state) because it's only ever read imperatively inside
+  // `handleExport`, never rendered directly, so mutating it shouldn't
+  // trigger a re-render of this component.
+  const contactCacheRef = useRef<Record<string, Contact>>({});
+  const handleContactResolved = useCallback(
+    (contactId: string, contact: Contact) => {
+      contactCacheRef.current[contactId] = contact;
+    },
+    [],
+  );
 
-        const { data: bc, error: bcError } = await supabase
-          .from('broadcasts')
-          .select('*')
-          .eq('id', broadcastId)
-          .single();
+  // A throw from here (an invalid/foreign/deleted `broadcastId` — see
+  // the `BroadcastNotFoundBoundary` doc comment above) is caught by that
+  // boundary one level up, not here.
+  const broadcastDoc = useQuery(api.broadcasts.get, {
+    broadcastId: broadcastId as Id<'broadcasts'>,
+  });
+  const broadcast = useMemo(
+    () => (broadcastDoc ? toUiBroadcast(broadcastDoc) : null),
+    [broadcastDoc],
+  );
+  const loading = broadcastDoc === undefined;
 
-        if (bcError) throw bcError;
-        setBroadcast(bc);
+  const paginatedRecipients = usePaginatedQuery(
+    api.broadcasts.listRecipients,
+    { broadcastId: broadcastId as Id<'broadcasts'> },
+    { initialNumItems: RECIPIENTS_PAGE_SIZE },
+  );
+  const recipients = useMemo(
+    () => paginatedRecipients.results.map((doc) => toUiBroadcastRecipient(doc)),
+    [paginatedRecipients.results],
+  );
 
-        const { data: recs, error: recsError } = await supabase
-          .from('broadcast_recipients')
-          .select('*, contact:contacts(*)')
-          .eq('broadcast_id', broadcastId)
-          .order('created_at', { ascending: false });
-
-        if (recsError) throw recsError;
-        setRecipients(recs ?? []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : t('notFound'));
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    fetchData();
-  }, [broadcastId]);
+  const removeBroadcast = useMutation(api.broadcasts.remove);
 
   const filteredRecipients = useMemo(
     () =>
@@ -210,15 +330,24 @@ export default function BroadcastDetailPage() {
       t('table.read'),
       t('table.error'),
     ];
-    const rows = recipients.map((r) => [
-      r.contact?.name ?? '',
-      r.contact?.phone ?? '',
-      r.status,
-      r.sent_at ?? '',
-      r.delivered_at ?? '',
-      r.read_at ?? '',
-      r.error_message ?? '',
-    ]);
+    // Contact name/phone come from `contactCacheRef` — populated
+    // reactively as each visible `RecipientRow` resolves its own
+    // contact. Export (like the table) only covers recipients loaded so
+    // far via cursor pagination, not the full broadcast beyond that.
+    const rows = recipients.map((r) => {
+      const contact = r.contact_id
+        ? contactCacheRef.current[r.contact_id]
+        : undefined;
+      return [
+        contact?.name ?? '',
+        contact?.phone ?? '',
+        r.status,
+        r.sent_at ?? '',
+        r.delivered_at ?? '',
+        r.read_at ?? '',
+        r.error_message ?? '',
+      ];
+    });
     const csv = toCsv([header, ...rows]);
     const safeName = broadcast.name.replace(/[^a-z0-9-_]+/gi, '-').toLowerCase();
     downloadBlob(`broadcast-${safeName}-${broadcastId.slice(0, 8)}.csv`, csv);
@@ -226,22 +355,17 @@ export default function BroadcastDetailPage() {
 
   async function handleDelete() {
     setDeleting(true);
-    const supabase = createClient();
-    // broadcast_recipients cascades on broadcasts.id (migration 001), so a
-    // single delete is sufficient — the aggregate trigger in migration 003
-    // is defined on broadcast_recipients but fires only on its own row
-    // changes, not on a cascaded drop of the parent row.
-    const { error: delErr } = await supabase
-      .from('broadcasts')
-      .delete()
-      .eq('id', broadcastId);
-    setDeleting(false);
-    if (delErr) {
-      toast.error(t('toastFailedDelete', { error: delErr.message }));
-      return;
+    try {
+      // broadcastRecipients has no ON DELETE in Convex — `remove`
+      // cascades explicitly server-side (see convex/broadcasts.ts).
+      await removeBroadcast({ broadcastId: broadcastId as Id<'broadcasts'> });
+      toast.success(t('toastDeleted'));
+      router.push('/broadcasts');
+    } catch (err) {
+      toast.error(t('toastFailedDelete', { error: convexErrorMessage(err) }));
+    } finally {
+      setDeleting(false);
     }
-    toast.success(t('toastDeleted'));
-    router.push('/broadcasts');
   }
 
   if (loading) {
@@ -252,16 +376,12 @@ export default function BroadcastDetailPage() {
     );
   }
 
-  if (error || !broadcast) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-2">
-        <p className="text-sm text-red-400">{error ?? t('notFound')}</p>
-        <Button variant="outline" onClick={() => router.push('/broadcasts')}>
-          {t('backToBroadcasts')}
-        </Button>
-      </div>
-    );
-  }
+  // Unreachable in practice once `loading` is false — `broadcasts.get`
+  // either returns a doc or throws (caught by `BroadcastNotFoundBoundary`
+  // above this component, which unmounts it before this point). Kept so
+  // TypeScript narrows `broadcast` from `Broadcast | null` to `Broadcast`
+  // for everything below.
+  if (!broadcast) return null;
 
   const status = getBroadcastStatus(broadcast.status);
 
@@ -401,8 +521,11 @@ export default function BroadcastDetailPage() {
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
           <h2 className="text-sm font-medium text-foreground">
             {statusFilter !== 'all'
-              ? t('recipientsHeader', { filtered: filteredRecipients.length, total: recipients.length })
-              : t('recipientsHeaderAll', { total: recipients.length })}
+              ? t('recipientsHeader', {
+                  filtered: filteredRecipients.length,
+                  total: broadcast.total_recipients,
+                })
+              : t('recipientsHeaderAll', { total: broadcast.total_recipients })}
           </h2>
           <div className="flex items-center gap-2">
             <DropdownMenu>
@@ -482,49 +605,65 @@ export default function BroadcastDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredRecipients.map((recipient) => {
-                  const rStatus = getRecipientStatus(recipient.status);
-                  return (
-                    <TableRow key={recipient.id} className="border-border">
-                      <TableCell className="font-medium text-foreground">
-                        {recipient.contact?.name ?? 'Unknown'}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {recipient.contact?.phone ?? '-'}
-                      </TableCell>
-                      <TableCell>
-                        <span
-                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${rStatus.classes}`}
-                        >
-                          {tStatus(rStatus.label)}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {recipient.sent_at
-                          ? new Date(recipient.sent_at).toLocaleString()
-                          : '-'}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {recipient.delivered_at
-                          ? new Date(recipient.delivered_at).toLocaleString()
-                          : '-'}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {recipient.read_at
-                          ? new Date(recipient.read_at).toLocaleString()
-                          : '-'}
-                      </TableCell>
-                      <TableCell className="max-w-xs truncate text-xs text-red-400">
-                        {recipient.error_message ?? '-'}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
+                {filteredRecipients.map((recipient) => (
+                  <RecipientRow
+                    key={recipient.id}
+                    recipient={recipient}
+                    tStatus={tStatus}
+                    onContactResolved={handleContactResolved}
+                  />
+                ))}
               </TableBody>
             </Table>
           </div>
         )}
+
+        {/* Cursor pagination — `listRecipients` loads
+            `RECIPIENTS_PAGE_SIZE` at a time. The header above always
+            shows the broadcast's true total (its own denormalized
+            counter), but the {filtered} count and this table only
+            reflect rows loaded so far. */}
+        {paginatedRecipients.status === 'CanLoadMore' && (
+          <div className="flex justify-center border-t border-border py-3">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => paginatedRecipients.loadMore(RECIPIENTS_PAGE_SIZE)}
+              className="border-border text-muted-foreground hover:bg-muted"
+            >
+              {t('loadMore')}
+            </Button>
+          </div>
+        )}
+        {paginatedRecipients.status === 'LoadingMore' && (
+          <div className="flex items-center justify-center gap-2 border-t border-border py-3 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            {t('loadingMore')}
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+export default function BroadcastDetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const t = useTranslations('Broadcasts.detail');
+  const broadcastId = params.id as string;
+
+  return (
+    <BroadcastNotFoundBoundary
+      fallback={
+        <div className="flex h-64 flex-col items-center justify-center gap-2">
+          <p className="text-sm text-red-400">{t('notFound')}</p>
+          <Button variant="outline" onClick={() => router.push('/broadcasts')}>
+            {t('backToBroadcasts')}
+          </Button>
+        </div>
+      }
+    >
+      <BroadcastDetailContent broadcastId={broadcastId} />
+    </BroadcastNotFoundBoundary>
   );
 }

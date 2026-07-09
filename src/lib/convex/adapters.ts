@@ -1,6 +1,8 @@
 import { ConvexError } from "convex/values";
 import type { Doc } from "../../../convex/_generated/dataModel";
 import type {
+  Broadcast,
+  BroadcastRecipient,
   Contact,
   ContactCustomValue,
   ContactNote,
@@ -277,6 +279,78 @@ export function toUiDeal(
       ? new Date(doc.updatedAt).toISOString()
       : createdAt,
     stage: doc.stage ? toUiPipelineStage(doc.stage) : undefined,
+  };
+}
+
+// ============================================================
+// Broadcasts vertical adapters (Phase 8, Task 3) — a bulk template send
+// (`broadcasts`) and its per-contact fan-out (`broadcastRecipients`).
+// Same rename + `_creationTime`/epoch-ms -> ISO-string convention as
+// every adapter above.
+// ============================================================
+
+/** `Broadcast` (unlike `Conversation`/`Deal` above) has no `updated_at`
+ *  field on the UI type — `convex/schema.ts`'s `broadcasts.updatedAt` is
+ *  write-side bookkeeping only (`setStatus`'s own patch) that nothing in
+ *  `src/types` or the broadcasts UI reads, so it's intentionally left
+ *  unmapped here, same "don't add fields the type doesn't have"
+ *  restraint as every other adapter. */
+export function toUiBroadcast(doc: Doc<"broadcasts">): Broadcast {
+  return {
+    id: doc._id,
+    user_id: doc.createdByUserId ?? "",
+    name: doc.name,
+    template_name: doc.templateName,
+    template_language: doc.templateLanguage,
+    template_variables: doc.templateVariables as
+      | Record<string, unknown>
+      | undefined,
+    audience_filter: doc.audienceFilter as
+      | Record<string, unknown>
+      | undefined,
+    scheduled_at: doc.scheduledAt
+      ? new Date(doc.scheduledAt).toISOString()
+      : undefined,
+    status: doc.status,
+    total_recipients: doc.totalRecipients,
+    sent_count: doc.sentCount,
+    delivered_count: doc.deliveredCount,
+    read_count: doc.readCount,
+    replied_count: doc.repliedCount,
+    failed_count: doc.failedCount,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `convex/broadcasts.ts`'s `listRecipients` returns bare
+ *  `broadcastRecipients` docs with no embedded contact — unlike
+ *  `conversations.list`'s `embedContact`, it does no join (see that
+ *  query's handler). `contact` is therefore an optional param the
+ *  caller passes in only when it has separately resolved one (e.g. the
+ *  broadcast detail page's per-row `contacts.get` lookup) — this
+ *  adapter never fetches anything itself, same rule every function in
+ *  this file follows. */
+export function toUiBroadcastRecipient(
+  doc: Doc<"broadcastRecipients">,
+  contact?: Contact,
+): BroadcastRecipient {
+  return {
+    id: doc._id,
+    broadcast_id: doc.broadcastId,
+    contact_id: doc.contactId ?? null,
+    status: doc.status,
+    sent_at: doc.sentAt ? new Date(doc.sentAt).toISOString() : undefined,
+    delivered_at: doc.deliveredAt
+      ? new Date(doc.deliveredAt).toISOString()
+      : undefined,
+    read_at: doc.readAt ? new Date(doc.readAt).toISOString() : undefined,
+    replied_at: doc.repliedAt
+      ? new Date(doc.repliedAt).toISOString()
+      : undefined,
+    error_message: doc.errorMessage,
+    whatsapp_message_id: doc.whatsappMessageId,
+    created_at: new Date(doc._creationTime).toISOString(),
+    contact,
   };
 }
 

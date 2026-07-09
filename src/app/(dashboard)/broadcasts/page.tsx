@@ -1,10 +1,9 @@
 'use client';
 
-import { useEffect, useState, useMemo, useRef } from 'react';
+import { useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
-import { Broadcast } from '@/types';
-import { Button } from '@/components/ui/button';
+import { useQuery } from 'convex/react';
+import { toUiBroadcast } from '@/lib/convex/adapters';
 import {
   Table,
   TableBody,
@@ -19,12 +18,7 @@ import { GatedButton } from '@/components/ui/gated-button';
 import { getBroadcastStatus } from '@/lib/broadcast-status';
 import { useTranslations } from 'next-intl';
 
-/**
- * Poll cadence while any broadcast is sending. Kept modest so we don't
- * beat on Supabase — the aggregate trigger in migration 003 keeps
- * counts consistent; we just need to surface the freshest snapshot.
- */
-const POLL_INTERVAL_MS = 5_000;
+import { api } from '../../../../convex/_generated/api';
 
 function percent(numerator: number, denominator: number): number {
   if (!denominator) return 0;
@@ -62,90 +56,26 @@ export default function BroadcastsPage() {
   const t = useTranslations('Broadcasts.page');
   const tStatus = useTranslations('Broadcasts.status');
   const canCreate = useCan('send-messages');
-  const [broadcasts, setBroadcasts] = useState<Broadcast[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
-  // Used to kick off polling only while something is actively sending.
-  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  async function fetchBroadcasts() {
-    try {
-      const supabase = createClient();
-      const { data, error: fetchError } = await supabase
-        .from('broadcasts')
-        .select('*')
-        .order('created_at', { ascending: false });
-
-      if (fetchError) throw fetchError;
-      setBroadcasts(data ?? []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t('errorLoad'));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    fetchBroadcasts();
-  }, []);
+  // Reactive — Convex pushes fresh denormalized counts on every
+  // recipient status change (see convex/broadcasts.ts's
+  // `setRecipientStatus`), so the Supabase-era polling `setInterval`
+  // (visibility-gated, only while a broadcast was "sending") that used
+  // to keep this list fresh is gone entirely: this query just re-renders
+  // on its own whenever the server data changes.
+  const rows = useQuery(api.broadcasts.list);
+  const broadcasts = useMemo(() => (rows ?? []).map(toUiBroadcast), [rows]);
+  const loading = rows === undefined;
 
   const anySending = useMemo(
     () => broadcasts.some((b) => b.status === 'sending'),
     [broadcasts],
   );
 
-  useEffect(() => {
-    function startPolling() {
-      if (pollTimer.current) return;
-      pollTimer.current = setInterval(fetchBroadcasts, POLL_INTERVAL_MS);
-    }
-    function stopPolling() {
-      if (!pollTimer.current) return;
-      clearInterval(pollTimer.current);
-      pollTimer.current = null;
-    }
-
-    // Pause polling while the tab is hidden — keeps Supabase cold when
-    // the user is away, and ensures a fresh fetch the moment they
-    // refocus so they don't see stale data on return.
-    function handleVisibilityChange() {
-      if (!anySending) return;
-      if (document.visibilityState === 'hidden') {
-        stopPolling();
-      } else {
-        fetchBroadcasts();
-        startPolling();
-      }
-    }
-
-    if (anySending && document.visibilityState === 'visible') {
-      startPolling();
-    } else {
-      stopPolling();
-    }
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      stopPolling();
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [anySending]);
-
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-2">
-        <p className="text-sm text-red-400">{error}</p>
-        <Button variant="outline" onClick={() => window.location.reload()}>
-          {t('retry')}
-        </Button>
       </div>
     );
   }
