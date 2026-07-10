@@ -55,6 +55,7 @@ import type * as lib_phone from "../lib/phone.js";
 import type * as lib_roles from "../lib/roles.js";
 import type * as lib_whatsapp_interactive from "../lib/whatsapp/interactive.js";
 import type * as lib_whatsapp_metaApi from "../lib/whatsapp/metaApi.js";
+import type * as lib_whatsapp_webhookParse from "../lib/whatsapp/webhookParse.js";
 import type * as lib_whatsappEncryption from "../lib/whatsappEncryption.js";
 import type * as members from "../members.js";
 import type * as messages from "../messages.js";
@@ -125,6 +126,7 @@ declare const fullApi: ApiFromModules<{
   "lib/roles": typeof lib_roles;
   "lib/whatsapp/interactive": typeof lib_whatsapp_interactive;
   "lib/whatsapp/metaApi": typeof lib_whatsapp_metaApi;
+  "lib/whatsapp/webhookParse": typeof lib_whatsapp_webhookParse;
   "lib/whatsappEncryption": typeof lib_whatsappEncryption;
   members: typeof members;
   messages: typeof messages;
