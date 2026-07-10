@@ -1,6 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
-import { ConvexError } from "convex/values";
+import { ConvexError, v } from "convex/values";
 
 /**
  * First-login bootstrap: gives the current user exactly one account (as
@@ -106,5 +106,49 @@ export const me = query({
         defaultCurrency: account.defaultCurrency,
       },
     };
+  },
+});
+
+/**
+ * The caller updates their OWN account membership's display profile —
+ * `fullName`/`avatarUrl`, the same denormalized snapshot `me` above
+ * reads back (Phase 8, Task 3: the settings "profile" form). A plain
+ * `mutation` (not `accountMutation`) — matches this file's existing
+ * `bootstrapAccount`/`currentUser`/`me` style of deriving identity via
+ * `getAuthUserId` + a direct `memberships.by_user` lookup, rather than
+ * scoping by `ctx.accountId`: there's no cross-tenant reach to guard
+ * here, since a user only ever has the one membership row this looks
+ * up, and this mutation never takes an accountId/userId argument a
+ * client could supply to target anyone else's.
+ *
+ * `avatarUrl` is patched only when supplied — the same "omitted
+ * optional arg carries no key at all" idiom `whatsappConfig.upsert`/
+ * `aiConfig.upsert` use for their own optional fields, so clearing the
+ * avatar field is never an accidental side effect of a name-only save.
+ * `name` is required on every call, mirroring `me`'s own "the profile
+ * form always has a name field" shape.
+ */
+export const updateProfile = mutation({
+  args: {
+    name: v.string(),
+    avatarUrl: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
+
+    const patch: { fullName: string; avatarUrl?: string } = {
+      fullName: args.name,
+    };
+    if (args.avatarUrl !== undefined) patch.avatarUrl = args.avatarUrl;
+
+    await ctx.db.patch(membership._id, patch);
+    return membership._id;
   },
 });

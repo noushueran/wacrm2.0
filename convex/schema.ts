@@ -456,9 +456,11 @@ export default defineSchema({
   // dropped its UNIQUE constraint in favor of UNIQUE(account_id), but
   // never dropped the column itself, so it stays as audit metadata like
   // every other former-owner column in this file. `accessToken` is
-  // encrypted at rest by the application layer (see 028/029's header
-  // comments, which reuse the same `encrypt()`/`decrypt()` helper), so
-  // it stays a plain `v.string()` rather than a structured type.
+  // encrypted at rest by `whatsappConfig.upsert` itself (Phase 8 Task 3
+  // moved this off the Next.js app layer and onto the same inline
+  // `encrypt()`/`decrypt()` helper `aiConfigs.apiKey` below already
+  // uses), so it stays a plain `v.string()` rather than a structured
+  // type.
   whatsappConfig: defineTable({
     accountId: v.id("accounts"),
     createdByUserId: v.optional(v.id("users")),
@@ -887,9 +889,10 @@ export default defineSchema({
   // per account. UNIQUE(account_id) in Postgres -> `by_account` doubles
   // as the enforcing index (same treatment as `whatsappConfig` in Task
   // 2). `apiKey`/`embeddingsApiKey` are AES-256-GCM-encrypted ciphertext
-  // at rest (app-layer encrypt/decrypt, same as
-  // `whatsappConfig.accessToken`), so they stay plain
-  // `v.string()`/optional rather than a structured type.
+  // at rest, encrypted inline by this table's own `upsert` mutation
+  // (the same `encrypt()`/`decrypt()` helper `whatsappConfig.accessToken`
+  // now also uses), so they stay plain `v.string()`/optional rather
+  // than a structured type.
   // `autoReplyMaxPerConversation`'s Postgres CHECK (BETWEEN 1 AND 20)
   // has no Convex equivalent — enforced in the future settings mutation
   // instead. `updatedAt` WAS deliberately left unmodeled in the original

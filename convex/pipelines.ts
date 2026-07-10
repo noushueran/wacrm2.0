@@ -111,6 +111,22 @@ export const create = accountMutation({
   },
 });
 
+/**
+ * Renames the pipeline itself — same admin gate + ownership check as
+ * every other structural mutation in this file (mirrors `renameStage`'s
+ * shape, one level up: a pipeline rather than one of its stages).
+ */
+export const rename = accountMutation({
+  args: { pipelineId: v.id("pipelines"), name: v.string() },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    await requireOwnPipeline(ctx, args.pipelineId);
+
+    await ctx.db.patch(args.pipelineId, { name: args.name });
+    return args.pipelineId;
+  },
+});
+
 export const addStage = accountMutation({
   args: {
     pipelineId: v.id("pipelines"),

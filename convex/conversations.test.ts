@@ -457,6 +457,82 @@ test("findOrCreateForContact throws NOT_FOUND for a contact belonging to a diffe
 });
 
 // ============================================================
+// getByContact — read-only counterpart to findOrCreateForContact;
+// never creates, returns null when no thread exists yet
+// ============================================================
+
+test("getByContact returns the contact's conversation with its embedded contact", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+    name: "Jonas",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const result = await asUser.query(api.conversations.getByContact, {
+    contactId,
+  });
+
+  expect(result).not.toBeNull();
+  expect(result!._id).toBe(conversationId);
+  expect(result!.contact).not.toBeNull();
+  expect(result!.contact!._id).toBe(contactId);
+});
+
+test("getByContact returns null when the contact has no conversation yet", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  const result = await asUser.query(api.conversations.getByContact, {
+    contactId,
+  });
+  expect(result).toBeNull();
+});
+
+test("getByContact throws NOT_FOUND for a contact belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await expect(
+    asBob.query(api.conversations.getByContact, {
+      contactId: aliceContactId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "contact" } });
+
+  // Alice herself can still read it — proves the throw above is really
+  // about cross-account isolation, not a broken `getByContact` in
+  // general.
+  const hers = await asAlice.query(api.conversations.getByContact, {
+    contactId: aliceContactId,
+  });
+  expect(hers).toBeNull();
+});
+
+// ============================================================
 // assign — target must be a real member of the same account
 // ============================================================
 

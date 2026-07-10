@@ -20,17 +20,20 @@
  *                     decrypt-only — `encrypt` below never produces this)
  *
  * `decrypt` (+ the `isLegacyFormat` structural check) was the original
- * Phase 6 port. `encrypt` was NOT ported then: per
- * `convex/whatsappConfig.ts`'s own header comment, encrypting
- * `accessToken` at rest stays an application-layer (Next.js API route)
- * concern that happens BEFORE `whatsappConfig.upsert` is ever called,
- * so that module only ever needed to read a token back out (in
- * `metaSend.ts`). `convex/aiConfig.ts` (Phase 7) is different: its
- * `upsert` mutation receives a caller's PLAINTEXT BYO provider key
- * directly over the wire and must encrypt it itself before the row is
- * ever written — there is no app-layer route in front of it — so
- * `encrypt` is ported here too, sharing this file's key/IV helpers with
- * `decrypt`.
+ * Phase 6 port, from back when `convex/whatsappConfig.ts`'s `upsert`
+ * only ever needed to read a token back out (in `metaSend.ts`) —
+ * encrypting `accessToken` at rest was, at the time, an
+ * application-layer (Next.js API route) concern that happened BEFORE
+ * `upsert` was ever called. `encrypt` was ported in Phase 7 for
+ * `convex/aiConfig.ts`: its `upsert` mutation receives a caller's
+ * PLAINTEXT BYO provider key directly over the wire and must encrypt
+ * it itself before the row is ever written — there is no app-layer
+ * route in front of it. Phase 8 Task 3 then moved `convex/
+ * whatsappConfig.ts`'s `upsert` onto this exact same `encrypt` call
+ * for `accessToken` too (its settings form now talks to Convex
+ * directly, so the old app-layer encryption step no longer exists
+ * upstream of it) — both mutations now share this one `encrypt`/
+ * `decrypt` pair rather than each owning their own.
  *
  * The one real wire-format difference from Node's `crypto` module:
  * Node's GCM cipher/decipher take the auth tag separately

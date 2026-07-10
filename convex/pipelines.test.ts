@@ -192,6 +192,87 @@ test("list never returns another account's pipelines", async () => {
 });
 
 // ============================================================
+// rename
+// ============================================================
+
+test("rename updates the pipeline's name", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const pipelineId = await asUser.mutation(api.pipelines.create, {
+    name: "Sales",
+  });
+
+  const result = await asUser.mutation(api.pipelines.rename, {
+    pipelineId,
+    name: "Enterprise Sales",
+  });
+  expect(result).toBe(pipelineId);
+
+  const pipeline = await t.run((ctx) => ctx.db.get(pipelineId));
+  expect(pipeline!.name).toBe("Enterprise Sales");
+});
+
+test("rename throws FORBIDDEN for a caller below the admin role, and leaves the name unmodified", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const pipelineId = await t.run((ctx) =>
+    ctx.db.insert("pipelines", { accountId, name: "Sales" }),
+  );
+
+  await expect(
+    asUser.mutation(api.pipelines.rename, { pipelineId, name: "Hijacked" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+
+  expect((await t.run((ctx) => ctx.db.get(pipelineId)))!.name).toBe("Sales");
+});
+
+test("rename throws NOT_FOUND for a pipeline belonging to a different account, and leaves it unmodified", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  const alicePipelineId = await asAlice.mutation(api.pipelines.create, {
+    name: "Sales",
+  });
+
+  await expect(
+    asBob.mutation(api.pipelines.rename, {
+      pipelineId: alicePipelineId,
+      name: "Hijacked",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "pipeline" } });
+
+  const untouched = await t.run((ctx) => ctx.db.get(alicePipelineId));
+  expect(untouched!.name).toBe("Sales");
+
+  // Alice herself can still rename her own pipeline — proves the throw
+  // above is really about cross-account isolation, not a broken
+  // `rename` in general.
+  await asAlice.mutation(api.pipelines.rename, {
+    pipelineId: alicePipelineId,
+    name: "Renamed",
+  });
+  const renamed = await t.run((ctx) => ctx.db.get(alicePipelineId));
+  expect(renamed!.name).toBe("Renamed");
+});
+
+// ============================================================
 // addStage
 // ============================================================
 

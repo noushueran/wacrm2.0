@@ -103,6 +103,36 @@ export const get = accountQuery({
   },
 });
 
+/**
+ * The contact's own conversation, or `null` if no thread has been
+ * opened for them yet — the read the deal-form "Link to Conversation"
+ * banner needs (Phase 8, Task 3). Ownership is checked on the CONTACT
+ * (mirrors `findOrCreateForContact`'s own check below) rather than on
+ * a conversation id, since the caller may not know whether a
+ * conversation exists at all yet. Unlike `findOrCreateForContact`,
+ * this never creates one — a deal can exist before any inbound/
+ * outbound WhatsApp message ever happened for its contact, and the
+ * banner only needs to know whether a thread exists to link to.
+ */
+export const getByContact = accountQuery({
+  args: { contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    const contact = await ctx.db.get(args.contactId);
+    if (!contact || contact.accountId !== ctx.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "contact" });
+    }
+
+    const conversation = await ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .filter((q) => q.eq(q.field("accountId"), ctx.accountId))
+      .first();
+    if (!conversation) return null;
+
+    return await embedContact(ctx, conversation);
+  },
+});
+
 // ============================================================
 // Conversation mutations (Phase 2, Task 3) — creating a thread for a
 // contact, assigning it, changing its status, and marking it read.

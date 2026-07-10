@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import type { Id } from "./_generated/dataModel";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against (mirrors the pattern from the Convex testing docs).
@@ -23,6 +24,33 @@ async function insertUser(
   user: { name: string; email: string },
 ) {
   return await t.run(async (ctx) => ctx.db.insert("users", user));
+}
+
+/**
+ * Adds a second membership row to an *existing* account, bypassing any
+ * invite flow — used only by `updateProfile`'s isolation test, which
+ * needs a real teammate row on the SAME account to prove the mutation
+ * patches only the CALLER's own membership. Mirrors every other
+ * `convex/*.test.ts` suite's own `seedTeammate` helper.
+ */
+async function insertTeammate(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; name: string; email: string },
+) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: opts.name,
+      email: opts.email,
+    });
+    const membershipId = await ctx.db.insert("memberships", {
+      userId,
+      accountId: opts.accountId,
+      role: "agent",
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return { userId, membershipId };
+  });
 }
 
 test("bootstrapAccount creates exactly one account + one owner membership", async () => {
@@ -123,4 +151,101 @@ test("currentUser returns null when authenticated but not yet bootstrapped", asy
 
   const result = await asUser.query(api.accounts.currentUser, {});
   expect(result).toBeNull();
+});
+
+// ============================================================
+// updateProfile — caller patches their OWN membership's fullName/
+// avatarUrl (Phase 8, Task 3)
+// ============================================================
+
+test("updateProfile updates the caller's own fullName and avatarUrl", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
+    name: "Sarah Connor",
+    avatarUrl: "https://example.com/sarah.png",
+  });
+
+  const membership = await t.run((ctx) => ctx.db.get(membershipId));
+  expect(membership!.userId).toBe(userId);
+  expect(membership!.fullName).toBe("Sarah Connor");
+  expect(membership!.avatarUrl).toBe("https://example.com/sarah.png");
+
+  // `me` reads back the very same denormalized fields, proving this is
+  // the row it sources `name`/`avatarUrl` from.
+  const profile = await asSarah.query(api.accounts.me, {});
+  expect(profile!.name).toBe("Sarah Connor");
+  expect(profile!.avatarUrl).toBe("https://example.com/sarah.png");
+});
+
+test("updateProfile only patches the caller's own membership, not a teammate's in the same account", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const { membershipId: teammateMembershipId } = await insertTeammate(t, {
+    accountId,
+    name: "Teammate Tom",
+    email: "tom@example.com",
+  });
+
+  await asSarah.mutation(api.accounts.updateProfile, {
+    name: "Sarah Connor",
+  });
+
+  const teammateMembership = await t.run((ctx) =>
+    ctx.db.get(teammateMembershipId),
+  );
+  expect(teammateMembership!.fullName).toBe("Teammate Tom");
+});
+
+test("updateProfile preserves the existing avatarUrl when omitted on a later call", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
+    name: "Sarah Connor",
+    avatarUrl: "https://example.com/sarah.png",
+  });
+
+  // Second call omits `avatarUrl` entirely — it must not be cleared.
+  await asSarah.mutation(api.accounts.updateProfile, { name: "Sarah C." });
+
+  const membership = await t.run((ctx) => ctx.db.get(membershipId));
+  expect(membership!.fullName).toBe("Sarah C.");
+  expect(membership!.avatarUrl).toBe("https://example.com/sarah.png");
+});
+
+test("updateProfile throws UNAUTHENTICATED when called without an authenticated identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.mutation(api.accounts.updateProfile, { name: "Nobody" }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("updateProfile throws NO_ACCOUNT when authenticated but not yet bootstrapped", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "NoAccount",
+    email: "noaccount@example.com",
+  });
+  const asUser = t.withIdentity({ subject: `${userId}|session-none` });
+
+  await expect(
+    asUser.mutation(api.accounts.updateProfile, { name: "Someone" }),
+  ).rejects.toMatchObject({ data: { code: "NO_ACCOUNT" } });
 });
