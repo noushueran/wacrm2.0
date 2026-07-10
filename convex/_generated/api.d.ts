@@ -25,6 +25,7 @@ import type * as customFields from "../customFields.js";
 import type * as dashboard from "../dashboard.js";
 import type * as deals from "../deals.js";
 import type * as files from "../files.js";
+import type * as flows from "../flows.js";
 import type * as flowsEngine from "../flowsEngine.js";
 import type * as http from "../http.js";
 import type * as ingest from "../ingest.js";
@@ -99,6 +100,7 @@ declare const fullApi: ApiFromModules<{
   dashboard: typeof dashboard;
   deals: typeof deals;
   files: typeof files;
+  flows: typeof flows;
   flowsEngine: typeof flowsEngine;
   http: typeof http;
   ingest: typeof ingest;
