@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useQuery } from 'convex/react';
+import { useAction, useQuery } from 'convex/react';
 import { ChevronRight, Loader2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 
@@ -53,18 +53,16 @@ export function SettingsOverview({
     ? (invitationsResult?.length ?? null)
     : null;
 
-  // WhatsApp connection *health* is still a slow, independent Meta ping
-  // via `/api/whatsapp/config` (decrypts the token and calls out — far
-  // slower than the cheap Convex reads below, so it's kept on its own
-  // loading flag rather than blocking the rest of the tiles). No Convex
-  // action exposes this live check yet — `convex/whatsappConfig.ts`'s
-  // client-visible surface is only `get`/`upsert`/`remove`/
-  // `verifyRegistration`, none of which ping Meta for `connected`/
-  // `phone_info` — so this stays on the legacy route, same TODO(P8-T4)
-  // as `whatsapp-config.tsx`'s own `runHealthCheck`. Whether a config
-  // row exists at all (`whatsappConfigResult` below) already comes from
-  // the reactive `api.whatsappConfig.get` query instead of a Supabase
-  // select.
+  // WhatsApp connection *health* — a live Meta ping via the Convex
+  // `connectionStatus` action (Convex port of the old Supabase-backed
+  // health-check route — see `convex/whatsappConfig.ts`'s own doc
+  // comment on `connectionStatus`, and `whatsapp-config.tsx`'s own
+  // `runHealthCheck`, which now calls the same action). Slower than the
+  // cheap Convex reads below (it calls out to Meta), so it's kept on
+  // its own loading flag rather than blocking the rest of the tiles.
+  // Whether a config row exists at all (`whatsappConfigResult` below)
+  // already comes from the reactive `api.whatsappConfig.get` query.
+  const checkConnectionStatus = useAction(api.whatsappConfig.connectionStatus);
   const [whatsappConnected, setWhatsappConnected] = useState(false);
   const [whatsappHealthLoading, setWhatsappHealthLoading] = useState(true);
 
@@ -74,9 +72,7 @@ export function SettingsOverview({
 
     (async () => {
       setWhatsappHealthLoading(true);
-      const health = await fetch('/api/whatsapp/config', { cache: 'no-store' })
-        .then((r) => r.json())
-        .catch(() => null);
+      const health = await checkConnectionStatus({}).catch(() => null);
       if (cancelled) return;
       setWhatsappConnected(!!health?.connected);
       setWhatsappHealthLoading(false);
@@ -85,7 +81,7 @@ export function SettingsOverview({
     return () => {
       cancelled = true;
     };
-  }, [user?.id, accountId]);
+  }, [user?.id, accountId, checkConnectionStatus]);
 
   // Templates / tags / custom fields / WhatsApp-config-row — reactive
   // Convex reads (Phase 8/9 stragglers rewire), replacing the one-shot

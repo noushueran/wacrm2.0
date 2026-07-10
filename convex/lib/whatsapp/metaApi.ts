@@ -8,19 +8,26 @@
  * codebase's `convex/` convention); behavior otherwise unchanged for
  * everything kept.
  *
- * NOT ported (out of scope — registration, not the send+persist
- * engine primitives or Phase 8 Task 4's template management):
- * `registerPhoneNumber`, `subscribeWabaToApp`, `uploadResumableMedia`,
- * `editMessageTemplate`, `deleteMessageTemplate`.
+ * NOT ported (out of scope — template-header media handles and
+ * template-management-only edit/delete, neither touched by the
+ * connect-flow regression fix or Phase 8 Task 4's template
+ * management): `uploadResumableMedia`, `editMessageTemplate`,
+ * `deleteMessageTemplate`.
  *
  * `verifyPhoneNumber`/`getSubscribedApps` WERE ported (AI/WhatsApp
  * backend gap-fill task) — `convex/whatsappConfig.ts`'s
  * `verifyRegistration` action needs both for its read-only Meta-side
  * diagnostic checks (phone metadata + WABA app-subscription).
- * `registerPhoneNumber` (the POST /register call that actually
- * SUBSCRIBES a number — a write, unlike these two GETs) remains
- * unported: it belongs to the config save/POST route, not
- * `verifyRegistration`, which never writes to Meta.
+ * `registerPhoneNumber`/`subscribeWabaToApp` (the POST /register +
+ * POST /subscribed_apps calls that actually WRITE to Meta — unlike
+ * every other function in this section, which only ever GETs) WERE
+ * ALSO ported (connect-flow regression fix): the settings form's Save
+ * button had been wired straight to `whatsappConfig.upsert`, which
+ * only stores the row and never actually registers a saved production
+ * number for inbound webhooks. `convex/whatsappConfig.ts`'s
+ * `connectAndSave` action (the Convex port of the save/POST route)
+ * needs both to restore that missing verify→register→subscribe
+ * pipeline.
  *
  * `getMediaUrl`/`downloadMedia` WERE ALSO ported (inbound-media-proxy
  * migration): `convex/whatsappConfig.ts`'s `fetchMedia` action needs
@@ -122,6 +129,110 @@ export async function verifyPhoneNumber(
     await throwMetaError(response, `Meta API error: ${response.status}`);
   }
   return response.json();
+}
+
+// ============================================================
+// Cloud API registration (subscription for inbound webhooks) —
+// `convex/whatsappConfig.ts`'s `connectAndSave` action needs both of
+// these (the save/POST-route port). Saving a phoneNumberId + accessToken
+// to `whatsappConfig` is NOT enough to receive inbound events from
+// Meta; see `src/lib/whatsapp/meta-api.ts`'s own header comment on this
+// section (ported verbatim below, quote style aside) for the full
+// rationale on why both calls are required and idempotent.
+// ============================================================
+
+export interface RegisterPhoneNumberArgs {
+  phoneNumberId: string;
+  accessToken: string;
+  /**
+   * 6-digit PIN the user set in Meta WhatsApp Manager →
+   * Two-step verification. If 2FA is not enabled on the number,
+   * Meta rejects /register with a clear error and the user is
+   * pointed at the right setting in the UI.
+   */
+  pin: string;
+}
+
+export interface RegisterPhoneNumberResult {
+  success: boolean;
+  /**
+   * True when Meta indicated the number was already registered to
+   * THIS app — same outcome as a fresh registration from the
+   * caller's POV, surfaced separately for logging clarity.
+   */
+  alreadyRegistered: boolean;
+}
+
+/**
+ * Register a phone number for inbound webhook events. Convex port of
+ * `src/lib/whatsapp/meta-api.ts`'s function of the same name — ported
+ * verbatim (quote style aside).
+ *
+ * Errors that should be surfaced verbatim to the user:
+ *   * Missing / wrong PIN  → "Two-step verification PIN required..."
+ *   * No 2FA enabled       → "Two-factor authentication is not on..."
+ *   * Number on other app  → "Number is registered to another app..."
+ */
+export async function registerPhoneNumber(
+  args: RegisterPhoneNumberArgs,
+): Promise<RegisterPhoneNumberResult> {
+  const { phoneNumberId, accessToken, pin } = args;
+  const url = `${META_API_BASE}/${phoneNumberId}/register`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ messaging_product: "whatsapp", pin }),
+  });
+
+  if (response.ok) {
+    return { success: true, alreadyRegistered: false };
+  }
+
+  // Meta returns an error envelope with a code. Code 133005 + the
+  // text "already registered" appears when the number is already
+  // subscribed to this app — that's success from the caller's
+  // perspective, surface it as such.
+  let data: {
+    error?: { message?: string; code?: number; error_subcode?: number };
+  } = {};
+  try {
+    data = await response.json();
+  } catch {
+    /* keep empty */
+  }
+  const message = data.error?.message ?? `Meta API error: ${response.status}`;
+  if (/already.*registered/i.test(message)) {
+    return { success: true, alreadyRegistered: true };
+  }
+  throw new Error(message);
+}
+
+export interface SubscribeWabaToAppArgs {
+  wabaId: string;
+  accessToken: string;
+}
+
+/**
+ * Subscribe the WABA to this Meta app's webhook. Idempotent — Meta
+ * returns success even when the subscription already exists. Convex
+ * port of `src/lib/whatsapp/meta-api.ts`'s function of the same name —
+ * ported verbatim (quote style aside).
+ */
+export async function subscribeWabaToApp(
+  args: SubscribeWabaToAppArgs,
+): Promise<void> {
+  const { wabaId, accessToken } = args;
+  const url = `${META_API_BASE}/${wabaId}/subscribed_apps`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
 }
 
 export interface GetSubscribedAppsArgs {

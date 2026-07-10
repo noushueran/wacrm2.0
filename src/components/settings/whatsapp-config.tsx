@@ -50,9 +50,18 @@ export function WhatsAppConfig() {
   const loading = configDoc === undefined;
   const config = configDoc ? toUiWhatsappConfig(configDoc) : null;
 
-  const upsertConfig = useMutation(api.whatsappConfig.upsert);
   const removeConfig = useMutation(api.whatsappConfig.remove);
   const verifyRegistration = useAction(api.whatsappConfig.verifyRegistration);
+  // Connect-flow regression fix: `handleSave` used to call `upsert`
+  // directly (store-only — see `connectAndSave`'s own doc comment in
+  // `convex/whatsappConfig.ts` for what that dropped). `connectAndSave`
+  // replicates the old Supabase-backed POST route's verify -> register
+  // -> subscribe -> persist pipeline; `connectionStatus` replicates
+  // that route's GET health-check, replacing the two `fetch('/api/
+  // whatsapp/config')` calls below and `settings-overview.tsx`'s
+  // WhatsApp tile.
+  const connectAndSave = useAction(api.whatsappConfig.connectAndSave);
+  const checkConnectionStatus = useAction(api.whatsappConfig.connectionStatus);
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -111,12 +120,10 @@ export function WhatsAppConfig() {
       ? `${window.location.origin}/api/whatsapp/webhook`
       : '';
 
-  // TODO(P8-T4): still Meta-coupled — decrypts the stored token and
-  // pings the Graph API via the legacy Supabase-backed
-  // `/api/whatsapp/config` GET route. The config row itself now lives
-  // in Convex (`configDoc` above); this health check hasn't been
-  // ported yet, so `connectionStatus` can go stale relative to it (see
-  // this component's rewrite notes).
+  // Pings Meta via the Convex `connectionStatus` action — the Convex
+  // port of the old Supabase-backed WhatsApp-config health-check route
+  // (see `connectAndSave`'s own doc comment above for why this
+  // replaces the legacy `fetch` call).
   const runHealthCheck = useCallback(async (hasConfig: boolean) => {
     if (!hasConfig) {
       setConnectionStatus('disconnected');
@@ -125,8 +132,7 @@ export function WhatsAppConfig() {
       return;
     }
     try {
-      const res = await fetch('/api/whatsapp/config', { method: 'GET' });
-      const payload = await res.json();
+      const payload = await checkConnectionStatus({});
 
       if (payload.connected) {
         setConnectionStatus('connected');
@@ -141,7 +147,7 @@ export function WhatsAppConfig() {
       console.error('Health check failed:', err);
       setConnectionStatus('disconnected');
     }
-  }, []);
+  }, [checkConnectionStatus]);
 
   // Hydrate the form from the Convex-sourced row exactly once (on
   // first load, once/if it stops being `undefined`) — mirrors the old
@@ -178,17 +184,18 @@ export function WhatsAppConfig() {
     }
 
     // Reuse the existing stored token when the field wasn't (re)edited
-    // — `upsert`'s `accessToken` arg is required, not optional (unlike
-    // `wabaId`/`verifyToken` below), so "leave it unchanged" means
-    // resending the same value rather than omitting the key entirely.
-    // `configDoc` (the raw query result) is the only place this value
-    // can be read back from — the `config` adapter output above always
-    // masks it (see `toUiWhatsappConfig`'s doc comment).
+    // — `connectAndSave`'s `accessToken` arg is optional specifically
+    // for this: omitting it tells the action to decrypt + reuse the
+    // account's already-stored credential for the Meta calls, rather
+    // than resending a value that never changed (unlike the old
+    // `upsert`-based save, which always resent SOMETHING and, since
+    // `configDoc?.accessToken` is ciphertext, would have re-encrypted
+    // already-encrypted bytes on every unchanged re-save).
     const tokenChanged =
       tokenEdited && accessToken !== MASKED_TOKEN && accessToken.trim().length > 0;
-    const tokenToSend = tokenChanged ? accessToken.trim() : configDoc?.accessToken;
+    const tokenToSend = tokenChanged ? accessToken.trim() : undefined;
 
-    if (!tokenToSend) {
+    if (!tokenToSend && !configDoc) {
       toast.error('Access Token is required for initial setup');
       return;
     }
@@ -196,35 +203,37 @@ export function WhatsAppConfig() {
     try {
       setSaving(true);
 
-      // NOTE(P8-T4): `convex/whatsappConfig.ts`'s `upsert` persists
-      // `accessToken` exactly as given — unlike `convex/aiConfig.ts`'s
-      // `upsert` (which calls `whatsappEncryption.encrypt()` inline
-      // before storing), it does NOT encrypt it server-side. That
-      // file's own header comment frames encryption as an
-      // "application-layer" step that must happen BEFORE `upsert` is
-      // called; today that step lives in the legacy Supabase-backed
-      // `/api/whatsapp/config` POST route, which this save path no
-      // longer goes through. Until a Convex action ports that step
-      // (mirroring `aiConfig.upsert`), a token saved through this form
-      // is stored as given, not AES-GCM-encrypted at rest.
-      await upsertConfig({
+      const result = await connectAndSave({
         phoneNumberId: phoneNumberId.trim(),
         wabaId: wabaId.trim() || undefined,
         accessToken: tokenToSend,
         verifyToken: verifyToken.trim() || undefined,
-        // Meta verification/registration is deferred (TODO(P8-T4)
-        // below), so this save can't itself confirm "connected" —
-        // preserve whatever the row already recorded rather than
-        // regressing a previously-verified config back to
-        // "disconnected" just because e.g. the WABA ID changed.
-        status: configDoc?.status ?? 'disconnected',
+        pin: pin.trim() || undefined,
       });
 
-      toast.success('WhatsApp configuration saved.');
+      if ('error' in result) {
+        toast.error(result.error);
+        return;
+      }
+
+      if (result.registration_error) {
+        toast.error(
+          `Saved, but not registered for inbound webhooks: ${result.registration_error}`,
+          { duration: 8000 },
+        );
+      } else if (result.registration_skipped) {
+        toast.success('WhatsApp configuration saved.');
+        toast(
+          'Registration skipped — add a two-step verification PIN above and save again to receive inbound messages.',
+          { duration: 6000 },
+        );
+      } else {
+        toast.success('WhatsApp configuration saved and registered for inbound webhooks.');
+      }
+
       // Re-mask the token field (mirrors ai-config.tsx's
-      // fetchConfig-after-save re-mask) and clear the PIN — the PIN
-      // has no destination in this Convex save path (see the PIN
-      // input's own TODO(P8-T4) note below).
+      // fetchConfig-after-save re-mask) and clear the PIN — it's a
+      // one-time credential each save, never re-displayed.
       setTokenEdited(false);
       setAccessToken(MASKED_TOKEN);
       setPin('');
@@ -243,14 +252,10 @@ export function WhatsAppConfig() {
     }
   }
 
-  // TODO(P8-T4): Meta-coupled — left as-is, still calls the legacy
-  // Supabase-backed route (decrypts the stored token, pings the Graph
-  // API). Not part of this migration's scope (config CRUD only).
   async function handleTestConnection() {
     try {
       setTesting(true);
-      const res = await fetch('/api/whatsapp/config', { method: 'GET' });
-      const payload = await res.json();
+      const payload = await checkConnectionStatus({});
 
       if (payload.connected) {
         setConnectionStatus('connected');

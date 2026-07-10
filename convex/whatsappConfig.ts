@@ -1,5 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { action, internalQuery } from "./_generated/server";
+import { action, internalMutation, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
@@ -8,8 +8,11 @@ import { hasMinRole } from "./lib/roles";
 import {
   verifyPhoneNumber,
   getSubscribedApps,
+  registerPhoneNumber,
+  subscribeWabaToApp,
   getMediaUrl,
   downloadMedia,
+  type MetaPhoneInfo,
 } from "./lib/whatsapp/metaApi";
 import type { Id } from "./_generated/dataModel";
 
@@ -148,6 +151,126 @@ export const upsert = accountMutation({
 });
 
 /**
+ * Server-only find-or-insert persist step for `connectAndSave` below
+ * (the Convex port of `POST /api/whatsapp/config`'s save/register/
+ * subscribe pipeline) — an `internalMutation` (not `accountMutation`)
+ * because `connectAndSave` is an `action` with no `ctx.db` of its own
+ * and has ALREADY derived + validated `accountId`/`userId` itself
+ * (mirrors `messages.appendInternal`'s "auth already happened one
+ * level up" split). Reuses `upsert`'s own three building blocks:
+ * the `by_phone_number_id` cross-account claim guard, the
+ * `by_account` find-or-patch-else-insert idiom, and the inline
+ * `whatsappEncryption.encrypt()` step for `accessToken` — this
+ * mutation always receives a PLAINTEXT token (`connectAndSave` has
+ * already resolved it, fresh or decrypted-from-storage) and encrypts
+ * it itself, exactly like `upsert` does for its own callers.
+ *
+ * `wabaId`/`verifyToken` follow `upsert`'s own "omitted = leave
+ * untouched" idiom (an omitted `v.optional` arg carries no key at
+ * all once it crosses the action->mutation boundary, so spreading it
+ * via `rest` below is a no-op patch) — `connectAndSave`'s own
+ * `handleSave` caller already relies on this exact behavior for
+ * `upsert`, so a re-save that doesn't touch the WABA ID field must
+ * not clobber it here either.
+ *
+ * `status`/`connectedAt`/`registeredAt`/`subscribedAppsAt`/
+ * `lastRegistrationError` are the deliberate OPPOSITE: `connectAndSave`
+ * computes a definitive value for every one of these on EVERY call
+ * (including `undefined` — e.g. clearing a previously-failed
+ * `lastRegistrationError` once a retry succeeds), so they're always
+ * assigned explicitly by name below rather than folded into `rest`'s
+ * conditional spread. `ctx.db.patch` documents "fields set to
+ * undefined are removed" — an explicitly-present-but-undefined key in
+ * the object literal genuinely clears a stale value, whereas a key
+ * that's merely absent (rest's behavior for wabaId/verifyToken) is
+ * left untouched. Getting this distinction backwards would leave a
+ * fixed-then-resaved config stuck showing its OLD registration error
+ * forever, the exact class of staleness bug this task exists to fix.
+ */
+export const persistConnection = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    userId: v.id("users"),
+    phoneNumberId: v.string(),
+    wabaId: v.optional(v.string()),
+    // Always plaintext — `connectAndSave` has already resolved it
+    // (fresh arg or decrypted from the existing row) before calling
+    // this mutation; encrypted here, exactly like `upsert` does.
+    accessToken: v.string(),
+    verifyToken: v.optional(v.string()),
+    status: v.union(v.literal("connected"), v.literal("disconnected")),
+    connectedAt: v.optional(v.number()),
+    registeredAt: v.optional(v.number()),
+    subscribedAppsAt: v.optional(v.number()),
+    lastRegistrationError: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { accountId, userId, phoneNumberId, wabaId, accessToken, verifyToken } =
+      args;
+
+    const claimed = await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_phone_number_id", (q) =>
+        q.eq("phoneNumberId", phoneNumberId),
+      )
+      .first();
+    if (claimed && claimed.accountId !== accountId) {
+      throw new ConvexError({ code: "PHONE_NUMBER_CLAIMED" });
+    }
+
+    const existing = await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first();
+
+    const storedAccessToken = await encrypt(accessToken);
+    // Only included when the caller actually supplied them, so an
+    // omitted field is left untouched on patch (mirrors `upsert`).
+    const maybeWabaId = wabaId !== undefined ? { wabaId } : {};
+    const maybeVerifyToken = verifyToken !== undefined ? { verifyToken } : {};
+    // Built via EXPLICIT property access (never `...rest`-destructured
+    // from `args`) — an optional arg the caller omitted is stripped
+    // entirely by the time it crosses the action->mutation boundary
+    // (confirmed empirically: a `...rest` destructure here reproduced
+    // the exact staleness bug this function's doc comment warns about,
+    // silently dropping `lastRegistrationError` from the patch instead
+    // of clearing it). Explicitly naming each field below means the
+    // key is always present in this literal — `undefined` included —
+    // which `ctx.db.patch` correctly treats as "remove this field."
+    const connectionState = {
+      status: args.status,
+      connectedAt: args.connectedAt,
+      registeredAt: args.registeredAt,
+      subscribedAppsAt: args.subscribedAppsAt,
+      lastRegistrationError: args.lastRegistrationError,
+    };
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        phoneNumberId,
+        ...maybeWabaId,
+        ...maybeVerifyToken,
+        accessToken: storedAccessToken,
+        ...connectionState,
+        updatedAt: Date.now(),
+      });
+      return existing._id;
+    }
+
+    return await ctx.db.insert("whatsappConfig", {
+      accountId,
+      createdByUserId: userId,
+      phoneNumberId,
+      ...maybeWabaId,
+      ...maybeVerifyToken,
+      accessToken: storedAccessToken,
+      ...connectionState,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
  * Admin+ clears the caller's own account's WhatsApp config entirely —
  * a plain delete-if-present, not an error when there's nothing to
  * clear (mirrors `get`'s own "never configured" contract — `null`
@@ -261,6 +384,345 @@ export const matchVerifyToken = internalQuery({
       }
     }
     return null;
+  },
+});
+
+// ============================================================
+// connectAndSave / connectionStatus — connect-flow regression fix.
+// The settings form's Save button had been rewired straight onto
+// `upsert` above, which ONLY stores the row: it never verifies the
+// credentials against Meta, never calls `/register` (so a freshly-
+// saved production number is never actually subscribed for inbound
+// webhooks), and never calls `/subscribed_apps`. These two actions
+// restore the full pipeline `POST`/`GET /api/whatsapp/config` used to
+// run, as Convex ports (mirroring `verifyRegistration` below's own
+// `getAuthUserId` + `internal.accounts.accountContextForUser` auth
+// derivation, and its DRY-RUN convention via the shared `isDryRun()`
+// helper defined just below this section).
+// ============================================================
+
+interface ConnectAndSaveResult {
+  success: boolean;
+  saved: true;
+  registered: boolean;
+  registration_skipped?: boolean;
+  registration_error?: string | null;
+  phone_info: MetaPhoneInfo;
+}
+
+/**
+ * Admin+ verify→register→subscribe→persist, for the settings form's
+ * Save button. Convex port of `POST /api/whatsapp/config` — replicates
+ * its exact branch logic (numbered to match that route's own comments):
+ *
+ *   1. Resolve the PLAINTEXT access token to use against Meta: the
+ *      caller's freshly-supplied `accessToken`, or (when omitted, e.g.
+ *      a re-save that only touched `wabaId`) the account's already-
+ *      stored one, decrypted. Neither available -> `ACCESS_TOKEN_REQUIRED`
+ *      (mirrors `upsert`'s own first-save-with-no-token guard).
+ *   2. Reject a `phoneNumberId` already claimed by a DIFFERENT account
+ *      -> `PHONE_NUMBER_CLAIMED` (same code + same `by_phone_number_id`
+ *      check as `upsert`, so the settings form's existing
+ *      `isConvexErrorCode(err, 'PHONE_NUMBER_CLAIMED')` catch keeps
+ *      working unchanged).
+ *   3. Verify the credentials against Meta (`verifyPhoneNumber`) BEFORE
+ *      touching storage — on failure, return `{ error }` (NOT saved),
+ *      exactly like the route's own 400 JSON body.
+ *   4. Register the phone number for inbound webhooks
+ *      (`registerPhoneNumber`) when needed: the first save for this
+ *      number, or whenever a fresh PIN is supplied. No PIN given ->
+ *      `registration_skipped: true` (best-effort, not a failure — Meta
+ *      TEST numbers have no 2FA PIN to give; route's own issue #242
+ *      comment). A register failure does NOT abort the save — it
+ *      still persists, with `status: "disconnected"` and the error
+ *      recorded, so the user can retry without re-entering everything.
+ *   5. Subscribe the WABA to this app (`subscribeWabaToApp`) whenever
+ *      `wabaId` is supplied THIS round (no fallback to a previously
+ *      stored one, matching the route's own `if (waba_id)` check on
+ *      the request body, not the DB row) — failures here are non-fatal
+ *      (logged, not surfaced as `registration_error`).
+ *   6. Persist via `internal.whatsappConfig.persistConnection`,
+ *      computing `status`/`connectedAt`/`registeredAt` exactly like the
+ *      route's own `baseRow`: `disconnected`/`null`/`null` when
+ *      registration failed this round, `connected`/now/the resolved
+ *      registration timestamp otherwise.
+ *
+ * DRY-RUN aware (`CONVEX_META_DRY_RUN`, via the shared `isDryRun()`
+ * below): all three outbound Meta calls (`verifyPhoneNumber`,
+ * `registerPhoneNumber`, `subscribeWabaToApp`) are skipped and treated
+ * as succeeding, with a synthetic `phone_info` — the claim-check and
+ * persistence steps are local, network-free work and always run for
+ * real, mirroring `verifyRegistration`'s own "only the Meta calls are
+ * faked" convention.
+ */
+export const connectAndSave = action({
+  args: {
+    phoneNumberId: v.string(),
+    wabaId: v.optional(v.string()),
+    accessToken: v.optional(v.string()),
+    verifyToken: v.optional(v.string()),
+    pin: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<ConnectAndSaveResult | { error: string }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(
+      internal.accounts.accountContextForUser,
+      { userId },
+    );
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+    const { accountId } = context;
+
+    if (
+      args.pin !== undefined &&
+      args.pin !== null &&
+      args.pin !== "" &&
+      !/^\d{6}$/.test(args.pin)
+    ) {
+      return { error: "PIN must be exactly 6 digits." };
+    }
+
+    const existing = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId,
+    });
+
+    // Step 1 — resolve the plaintext token to use against Meta.
+    let accessToken: string;
+    if (args.accessToken) {
+      accessToken = args.accessToken;
+    } else if (existing) {
+      accessToken = await decrypt(existing.accessToken);
+    } else {
+      throw new ConvexError({ code: "ACCESS_TOKEN_REQUIRED" });
+    }
+
+    // Step 2 — reject a phoneNumberId already claimed by a different account.
+    const claimed = await ctx.runQuery(
+      internal.whatsappConfig.accountByPhoneNumberId,
+      { phoneNumberId: args.phoneNumberId },
+    );
+    if (claimed && claimed.accountId !== accountId) {
+      throw new ConvexError({ code: "PHONE_NUMBER_CLAIMED" });
+    }
+
+    const dryRun = isDryRun();
+
+    // Step 3 — verify credentials against Meta BEFORE saving anything.
+    let phoneInfo: MetaPhoneInfo;
+    if (dryRun) {
+      phoneInfo = {
+        id: args.phoneNumberId,
+        display_phone_number: args.phoneNumberId,
+        verified_name: "DRY-RUN",
+      };
+    } else {
+      try {
+        phoneInfo = await verifyPhoneNumber({
+          phoneNumberId: args.phoneNumberId,
+          accessToken,
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unknown Meta API error";
+        return { error: `Meta API error: ${message}` };
+      }
+    }
+
+    // Step 4 — register the phone number for inbound webhooks.
+    const sameNumber =
+      existing?.phoneNumberId === args.phoneNumberId &&
+      existing?.registeredAt != null;
+    const needsRegistration =
+      !sameNumber || (typeof args.pin === "string" && args.pin.length > 0);
+
+    let registeredAt: number | null = existing?.registeredAt ?? null;
+    let registrationError: string | null = null;
+    let registrationSkipped = false;
+
+    if (needsRegistration) {
+      if (!args.pin) {
+        // No PIN provided — best-effort skip, not a failure. See this
+        // action's own doc comment (step 4) for why.
+        registrationSkipped = true;
+      } else if (dryRun) {
+        registeredAt = Date.now();
+      } else {
+        try {
+          await registerPhoneNumber({
+            phoneNumberId: args.phoneNumberId,
+            accessToken,
+            pin: args.pin,
+          });
+          registeredAt = Date.now();
+        } catch (err) {
+          registrationError =
+            err instanceof Error ? err.message : "Unknown Meta API error";
+          // Fall through — still persist below so the user can retry
+          // without re-entering everything.
+        }
+      }
+    }
+
+    // Step 5 — subscribe the WABA to this app (non-fatal on failure).
+    let subscribedAppsAt: number | null = null;
+    if (args.wabaId) {
+      if (dryRun) {
+        subscribedAppsAt = Date.now();
+      } else {
+        try {
+          await subscribeWabaToApp({ wabaId: args.wabaId, accessToken });
+          subscribedAppsAt = Date.now();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn("WABA subscribed_apps failed (non-fatal):", message);
+        }
+      }
+    }
+
+    // Step 6 — persist, even when /register failed.
+    await ctx.runMutation(internal.whatsappConfig.persistConnection, {
+      accountId,
+      userId,
+      phoneNumberId: args.phoneNumberId,
+      wabaId: args.wabaId,
+      accessToken,
+      verifyToken: args.verifyToken,
+      status: registrationError ? "disconnected" : "connected",
+      connectedAt: registrationError ? undefined : Date.now(),
+      registeredAt: registrationError ? undefined : (registeredAt ?? undefined),
+      subscribedAppsAt: subscribedAppsAt ?? undefined,
+      lastRegistrationError: registrationError ?? undefined,
+    });
+
+    if (registrationError) {
+      // Save succeeded but the number isn't actually live. Structured
+      // failure, not a throw, so the UI can show the specific
+      // remediation step instead of a generic toast — matches the
+      // route's own 200-with-detail contract for this branch.
+      return {
+        success: false,
+        saved: true,
+        registered: false,
+        registration_error: registrationError,
+        phone_info: phoneInfo,
+      };
+    }
+
+    return {
+      success: true,
+      saved: true,
+      registered: registeredAt != null,
+      registration_skipped: registrationSkipped,
+      phone_info: phoneInfo,
+    };
+  },
+});
+
+interface ConnectionStatusResult {
+  connected: boolean;
+  reason?: "no_config" | "token_corrupted" | "meta_api_error";
+  message?: string;
+  needs_reset?: boolean;
+  phone_info?: MetaPhoneInfo;
+}
+
+/**
+ * Health-check backing the settings form's connection banner/"Test API
+ * Connection" button and `settings-overview.tsx`'s WhatsApp tile.
+ * Convex port of `GET /api/whatsapp/config` — mirrors its exact
+ * branches: no config saved yet (`no_config`), a token that can't be
+ * decrypted with the current `ENCRYPTION_KEY` (`token_corrupted`,
+ * `needs_reset: true` — surfaces the Reset Configuration flow), Meta
+ * rejecting the credentials (`meta_api_error`), or a genuine
+ * `{ connected: true, phone_info }`. Always resolves (never throws)
+ * for every one of those diagnostic outcomes, exactly like the source
+ * route's own "200 in all non-auth cases" contract.
+ *
+ * Unlike `connectAndSave`/`verifyRegistration` (both admin+), the
+ * source route has NO role check at all — any authenticated member of
+ * the account can view this diagnostic. Gated here at `viewer` (the
+ * lowest rank) rather than left ungated, so `settings-overview.tsx`'s
+ * health tile still renders correctly for non-admin teammates
+ * (matching the route's own "any authenticated member" floor) while
+ * still requiring genuine account membership.
+ *
+ * DRY-RUN aware (`CONVEX_META_DRY_RUN`): the one outbound Meta call
+ * (`verifyPhoneNumber`) is skipped and replaced with a synthetic
+ * success — the config-load/decrypt steps are local, network-free work
+ * and always run for real, dry-run or not.
+ */
+export const connectionStatus = action({
+  args: {},
+  handler: async (ctx): Promise<ConnectionStatusResult> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(
+      internal.accounts.accountContextForUser,
+      { userId },
+    );
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "viewer")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "viewer" });
+    }
+    const { accountId } = context;
+
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId,
+    });
+    if (!config) {
+      return {
+        connected: false,
+        reason: "no_config",
+        message:
+          "No WhatsApp configuration saved yet. Fill in the form and click Save Configuration.",
+      };
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = await decrypt(config.accessToken);
+    } catch {
+      return {
+        connected: false,
+        reason: "token_corrupted",
+        needs_reset: true,
+        message:
+          'The stored access token cannot be decrypted with the current ENCRYPTION_KEY. This usually means the key changed, or it differs between environments (local vs Hostinger vs Vercel). Click "Reset Configuration" below, then re-save.',
+      };
+    }
+
+    if (isDryRun()) {
+      return {
+        connected: true,
+        phone_info: {
+          id: config.phoneNumberId,
+          display_phone_number: config.phoneNumberId,
+          verified_name: "DRY-RUN",
+        },
+      };
+    }
+
+    try {
+      const phoneInfo = await verifyPhoneNumber({
+        phoneNumberId: config.phoneNumberId,
+        accessToken,
+      });
+      return { connected: true, phone_info: phoneInfo };
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unknown Meta API error";
+      return {
+        connected: false,
+        reason: "meta_api_error",
+        message: `Meta API rejected the credentials: ${message}`,
+      };
+    }
   },
 });
 

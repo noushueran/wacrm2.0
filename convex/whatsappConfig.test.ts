@@ -940,3 +940,729 @@ test("fetchMedia throws a clear error when the caller's own account has no Whats
     asBob.action(api.whatsappConfig.fetchMedia, { mediaId: "media-123" }),
   ).rejects.toThrow(/WhatsApp not configured/);
 });
+
+// ============================================================
+// connectAndSave — Convex port of POST /api/whatsapp/config's
+// verify -> register -> subscribe -> persist pipeline (connect-flow
+// regression fix: the settings form's Save button had been wired
+// straight onto `upsert` above, which only ever stored the row and
+// never actually registered a saved production number for inbound
+// webhooks).
+// ============================================================
+
+/**
+ * Routes a stubbed `fetch` across the three Meta endpoints
+ * `connectAndSave`/`connectionStatus` call, keyed by URL/method — same
+ * "one mock, multiple endpoints" style as `verifyRegistration`'s own
+ * tests above, extended to also handle the two WRITE endpoints
+ * (`/register`, POST `/subscribed_apps`) those tests never needed.
+ */
+function mockConnectFetch(
+  opts: {
+    verifyOk?: boolean;
+    verifyMessage?: string;
+    registerOk?: boolean;
+    registerMessage?: string;
+    subscribeOk?: boolean;
+  } = {},
+) {
+  const {
+    verifyOk = true,
+    verifyMessage = "Invalid OAuth access token",
+    registerOk = true,
+    registerMessage = "Two-step verification PIN required.",
+    subscribeOk = true,
+  } = opts;
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+
+    if (url.includes("/register")) {
+      if (registerOk) {
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+        });
+      }
+      return new Response(
+        JSON.stringify({ error: { message: registerMessage } }),
+        { status: 400 },
+      );
+    }
+
+    if (url.includes("/subscribed_apps") && method === "POST") {
+      if (subscribeOk) {
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+        });
+      }
+      return new Response(
+        JSON.stringify({ error: { message: "subscribe failed" } }),
+        { status: 400 },
+      );
+    }
+
+    // verifyPhoneNumber (phone metadata GET).
+    if (verifyOk) {
+      return new Response(
+        JSON.stringify({
+          id: "1000000000",
+          display_phone_number: "+15551234567",
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify({ error: { message: verifyMessage } }), {
+      status: 401,
+    });
+  });
+}
+
+test("connectAndSave verifies, registers (with a PIN), subscribes the WABA, and persists a connected row on a first save", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal("fetch", mockConnectFetch());
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    verifyToken: "verify-1",
+    pin: "123456",
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    saved: true,
+    registered: true,
+    registration_skipped: false,
+    phone_info: { id: "1000000000" },
+  });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.accountId).toBe(accountId);
+  expect(row!.createdByUserId).toBe(userId);
+  expect(row!.phoneNumberId).toBe("1000000000");
+  expect(row!.wabaId).toBe("waba-1");
+  expect(row!.verifyToken).toBe("verify-1");
+  expect(row!.status).toBe("connected");
+  expect(row!.connectedAt).toBeTypeOf("number");
+  expect(row!.registeredAt).toBeTypeOf("number");
+  expect(row!.subscribedAppsAt).toBeTypeOf("number");
+  expect(row!.lastRegistrationError).toBeUndefined();
+  await expect(decrypt(row!.accessToken)).resolves.toBe("plaintext-token");
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave skips /register on a re-save of the same already-registered number with no PIN, falling back to the stored token when accessToken is omitted", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal("fetch", mockConnectFetch());
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  // Second save: no accessToken (must fall back to the stored,
+  // decrypted token) and no pin — /register must NOT be attempted
+  // again since the number is already registered.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/register")) {
+        throw new Error("/register should not be called on this re-save");
+      }
+      return new Response(
+        JSON.stringify({
+          id: "1000000000",
+          display_phone_number: "+15551234567",
+        }),
+        { status: 200 },
+      );
+    }),
+  );
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    registered: true,
+    registration_skipped: false,
+  });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  await expect(decrypt(row!.accessToken)).resolves.toBe("plaintext-token");
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave marks registration_skipped (not a failure) when saving with no PIN and no prior registration", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/register")) {
+        throw new Error("/register should not be called with no PIN");
+      }
+      return new Response(
+        JSON.stringify({
+          id: "1000000000",
+          display_phone_number: "+15551234567",
+        }),
+        { status: 200 },
+      );
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    registered: false,
+    registration_skipped: true,
+  });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.status).toBe("connected");
+  expect(row!.registeredAt).toBeUndefined();
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave still saves (as disconnected, with the error recorded) when /register fails", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal(
+    "fetch",
+    mockConnectFetch({
+      registerOk: false,
+      registerMessage: "Two-step verification PIN required.",
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "000000",
+  });
+
+  expect(result).toMatchObject({
+    success: false,
+    saved: true,
+    registered: false,
+    registration_error: "Two-step verification PIN required.",
+  });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.status).toBe("disconnected");
+  expect(row!.connectedAt).toBeUndefined();
+  expect(row!.registeredAt).toBeUndefined();
+  expect(row!.lastRegistrationError).toBe("Two-step verification PIN required.");
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave clears a previously recorded registration error once a retry succeeds", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal("fetch", mockConnectFetch({ registerOk: false }));
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "000000",
+  });
+  let row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.lastRegistrationError).toBe("Two-step verification PIN required.");
+
+  // Retry with a fresh PIN, this time succeeding.
+  vi.stubGlobal("fetch", mockConnectFetch({ registerOk: true }));
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    pin: "123456",
+  });
+  expect(result).toMatchObject({ success: true, registered: true });
+
+  row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.status).toBe("connected");
+  expect(row!.lastRegistrationError).toBeUndefined();
+  expect(row!.registeredAt).toBeTypeOf("number");
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave rejects a phoneNumberId already claimed by a different account, without ever calling Meta", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "alice-token",
+    status: "connected",
+  });
+
+  const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(
+    t,
+    { name: "Bob", email: "bob@example.com", role: "admin" },
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("Meta should never be called for a rejected claim");
+    }),
+  );
+
+  await expect(
+    asBob.action(api.whatsappConfig.connectAndSave, {
+      phoneNumberId: "1000000000",
+      accessToken: "bob-token",
+      pin: "123456",
+    }),
+  ).rejects.toMatchObject({ data: { code: "PHONE_NUMBER_CLAIMED" } });
+
+  const bobsRows = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", bobAccountId))
+      .collect(),
+  );
+  expect(bobsRows).toHaveLength(0);
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.whatsappConfig.connectAndSave, {
+      phoneNumberId: "1000000000",
+      accessToken: "plaintext-token",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("connectAndSave throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  await expect(
+    t.action(api.whatsappConfig.connectAndSave, {
+      phoneNumberId: "1000000000",
+    }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("connectAndSave throws ACCESS_TOKEN_REQUIRED when no accessToken is supplied and none is stored yet", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  await expect(
+    asUser.action(api.whatsappConfig.connectAndSave, {
+      phoneNumberId: "1000000000",
+    }),
+  ).rejects.toMatchObject({ data: { code: "ACCESS_TOKEN_REQUIRED" } });
+});
+
+test("connectAndSave returns a structured error (and saves nothing) when Meta rejects the credentials", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal(
+    "fetch",
+    mockConnectFetch({
+      verifyOk: false,
+      verifyMessage: "Invalid OAuth access token",
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  expect(result).toEqual({
+    error: "Meta API error: Invalid OAuth access token",
+  });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave rejects a malformed PIN before ever calling Meta", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("Meta should never be called for a malformed PIN");
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "12ab",
+  });
+
+  expect(result).toEqual({ error: "PIN must be exactly 6 digits." });
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave still succeeds when WABA subscription fails (non-fatal)", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal("fetch", mockConnectFetch({ subscribeOk: false }));
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  expect(result).toMatchObject({ success: true, registered: true });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.status).toBe("connected");
+  expect(row!.subscribedAppsAt).toBeUndefined();
+
+  vi.unstubAllGlobals();
+});
+
+test("connectAndSave in DRY-RUN synthesizes a full success without ever calling Meta", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("fetch should never be called in DRY-RUN");
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  expect(result).toMatchObject({
+    success: true,
+    registered: true,
+    registration_skipped: false,
+    phone_info: { verified_name: "DRY-RUN" },
+  });
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(row!.status).toBe("connected");
+  expect(row!.registeredAt).toBeTypeOf("number");
+  expect(row!.subscribedAppsAt).toBeTypeOf("number");
+
+  vi.unstubAllGlobals();
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
+// connectionStatus — Convex port of GET /api/whatsapp/config's health
+// check (connect-flow regression fix companion: the settings form's
+// health banner/"Test API Connection" button and
+// settings-overview.tsx's WhatsApp tile both still hit the legacy
+// Supabase-backed route before this).
+// ============================================================
+
+test("connectionStatus reports no_config when nothing is saved yet", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toEqual({
+    connected: false,
+    reason: "no_config",
+    message:
+      "No WhatsApp configuration saved yet. Fill in the form and click Save Configuration.",
+  });
+});
+
+test("connectionStatus reports connected:true with phone_info for a healthy config", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal("fetch", mockConnectFetch());
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({
+    connected: true,
+    phone_info: { id: "1000000000" },
+  });
+
+  vi.unstubAllGlobals();
+});
+
+test("connectionStatus reports meta_api_error when Meta rejects the credentials", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal(
+    "fetch",
+    mockConnectFetch({
+      verifyOk: false,
+      verifyMessage: "Invalid OAuth access token",
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({
+    connected: false,
+    reason: "meta_api_error",
+    message: "Meta API rejected the credentials: Invalid OAuth access token",
+  });
+
+  vi.unstubAllGlobals();
+});
+
+test("connectionStatus reports token_corrupted + needs_reset when the stored token can't be decrypted", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await t.run((ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId,
+      phoneNumberId: "1000000000",
+      accessToken: "not-a-valid-ciphertext",
+      status: "connected",
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const result = await asUser.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({
+    connected: false,
+    reason: "token_corrupted",
+    needs_reset: true,
+  });
+});
+
+test("connectionStatus in DRY-RUN reports a synthetic success without ever calling Meta", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("fetch should never be called in DRY-RUN");
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({
+    connected: true,
+    phone_info: { verified_name: "DRY-RUN" },
+  });
+
+  vi.unstubAllGlobals();
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("connectionStatus is reachable by a non-admin viewer (role floor)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAdmin.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "alice-token",
+    status: "connected",
+  });
+  const viewerId = await seedTeammate(t, {
+    accountId,
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
+
+  const result = await asViewer.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({ connected: true });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("connectionStatus throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  await expect(
+    t.action(api.whatsappConfig.connectionStatus, {}),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("cross-account isolation: connectionStatus never reads a different account's config", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "alice-token",
+    status: "connected",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  const result = await asBob.action(api.whatsappConfig.connectionStatus, {});
+  expect(result).toMatchObject({ connected: false, reason: "no_config" });
+});
