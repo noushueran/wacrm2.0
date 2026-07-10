@@ -2,8 +2,9 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
+import { useMutation } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
+import { convexErrorMessage } from '@/lib/convex/adapters';
 import { toast } from 'sonner';
 import { MessageTemplate } from '@/types';
 import { Step1ChooseTemplate } from '@/components/broadcasts/step1-choose-template';
@@ -13,6 +14,8 @@ import { Step4ScheduleSend } from '@/components/broadcasts/step4-schedule-send';
 import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
 import { Check } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../../../convex/_generated/api';
 
 const steps = [
   { label: 'template', key: 'template' },
@@ -26,6 +29,7 @@ export default function NewBroadcastPage() {
   const t = useTranslations('Broadcasts.new');
   const { accountId } = useAuth();
   const { createAndSendBroadcast, isProcessing, progress } = useBroadcastSending();
+  const createDraftBroadcast = useMutation(api.broadcasts.create);
 
   const [currentStep, setCurrentStep] = useState(0);
   const [template, setTemplate] = useState<MessageTemplate | null>(null);
@@ -67,9 +71,8 @@ export default function NewBroadcastPage() {
     } catch (err) {
       // Previously swallowed with console.error — the wizard would
       // just no-op, leaving the user confused. Surface the reason.
-      const message = err instanceof Error ? err.message : 'Broadcast failed';
       console.error('Broadcast failed:', err);
-      toast.error(message);
+      toast.error(convexErrorMessage(err));
     }
   }
 
@@ -77,8 +80,8 @@ export default function NewBroadcastPage() {
    * Writes a draft broadcast row — no recipients, no sending. The user
    * can revisit it via the list page to finish the flow later. We
    * don't persist the in-progress audience/variable config here
-   * because the current schema doesn't carry it past `audience_filter`
-   * and `template_variables`; those are enough for the user to
+   * because the current schema doesn't carry it past `audienceFilter`
+   * and `templateVariables`; those are enough for the user to
    * recognize the draft but not to exactly round-trip into the wizard.
    * A full resume-draft UX is a future polish.
    */
@@ -87,42 +90,31 @@ export default function NewBroadcastPage() {
       toast.error(t('toastGiveName'));
       return;
     }
-    const supabase = createClient();
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) {
-      toast.error(t('toastNotSignedIn'));
-      return;
-    }
     if (!accountId) {
       toast.error(t('toastNotLinked'));
       return;
     }
 
-    const { error } = await supabase.from('broadcasts').insert({
-      user_id: user.id,
-      account_id: accountId,
-      name: name.trim(),
-      template_name: template.name,
-      template_language: template.language ?? 'en_US',
-      template_variables: variables,
-      audience_filter: {
-        type: audience.type,
-        tagIds: audience.tagIds,
-      },
-      status: 'draft',
-      total_recipients: 0,
-      sent_count: 0,
-      delivered_count: 0,
-      read_count: 0,
-      replied_count: 0,
-      failed_count: 0,
-    });
-
-    if (error) {
-      toast.error(t('toastFailedDraft', { error: error.message }));
+    try {
+      // No recipients yet — `broadcasts.create`'s `contactIds` accepts an
+      // empty array, matching the pre-Convex draft's `total_recipients: 0`.
+      // The audience/variable config the user has picked so far still
+      // isn't fully resolved to contact ids at this point in the wizard,
+      // same limitation the pre-Convex draft had.
+      await createDraftBroadcast({
+        name: name.trim(),
+        templateName: template.name,
+        templateLanguage: template.language ?? 'en_US',
+        contactIds: [],
+        templateVariables: variables,
+        audienceFilter: {
+          type: audience.type,
+          tagIds: audience.tagIds,
+        },
+        status: 'draft',
+      });
+    } catch (err) {
+      toast.error(t('toastFailedDraft', { error: convexErrorMessage(err) }));
       return;
     }
     toast.success(t('toastDraftSaved'));

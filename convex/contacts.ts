@@ -190,6 +190,77 @@ export const filterByTags = accountQuery({
   },
 });
 
+/**
+ * Contacts whose `customFieldId` custom-field value matches `value`
+ * under `operator` (`is`/`is_not`/exact, or `contains` — case-
+ * insensitive substring) — the Convex equivalent of the pre-Convex
+ * broadcast composer's `resolveCustomFieldAudience` (`src/hooks/
+ * use-broadcast-sending.ts`, Supabase era). Added for Phase 8 Task 4
+ * (the broadcast composer rewire): the composer's "custom field"
+ * audience type had no Convex query to resolve against.
+ *
+ * `contactCustomValues` has no index on `customFieldId` alone (see
+ * schema.ts — only `by_contact_field`, `by_contact`, `by_account`), so
+ * this reuses the exact `by_account` + in-memory `filter` access
+ * pattern `customFields.remove`'s own cascade already established for
+ * this table, rather than adding a new index for what's expected to
+ * stay an occasional read (one per broadcast-composer "custom field"
+ * pick, not a hot path).
+ *
+ * Only ever matches contacts that HAVE a `contactCustomValues` row for
+ * this field — the same limitation the Postgres-era implementation
+ * had (a contact with no row for this field never matches `is_not`
+ * either, since there's nothing to compare against).
+ */
+export const byCustomFieldValue = accountQuery({
+  args: {
+    customFieldId: v.id("customFields"),
+    operator: v.union(
+      v.literal("is"),
+      v.literal("is_not"),
+      v.literal("contains"),
+    ),
+    value: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("contactCustomValues")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .filter((q) => q.eq(q.field("customFieldId"), args.customFieldId))
+      .collect();
+
+    const needle = args.value.toLowerCase();
+    const matches = rows.filter((row) => {
+      const value = row.value ?? "";
+      switch (args.operator) {
+        case "is":
+          return value === args.value;
+        case "is_not":
+          return value !== args.value;
+        case "contains":
+          return value.toLowerCase().includes(needle);
+      }
+    });
+
+    const contactIds = [...new Set(matches.map((row) => row.contactId))];
+
+    // Defense-in-depth, same reasoning as `filterByTags` above: nothing
+    // stops a caller from supplying another account's real
+    // customFieldId, but every `contactCustomValues` row this query can
+    // ever see is already scoped to `ctx.accountId` via the `by_account`
+    // index above, so a foreign customFieldId simply matches zero rows
+    // — no cross-account contact id can ever reach `contactIds`. The
+    // `ctx.db.get` + accountId re-check below only guards against a
+    // contact having been deleted after its value row was written
+    // (matches `filterByTags`'s own null-drop).
+    const fetched = await Promise.all(contactIds.map((id) => ctx.db.get(id)));
+    return fetched.filter(
+      (contact): contact is Doc<"contacts"> =>
+        contact !== null && contact.accountId === ctx.accountId,
+    );
+  },
+});
+
 export const update = accountMutation({
   args: {
     contactId: v.id("contacts"),

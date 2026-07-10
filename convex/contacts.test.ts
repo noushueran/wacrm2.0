@@ -222,6 +222,122 @@ test("filterByTags never returns another account's contacts, even when the calle
   expect(bobsView).toEqual({ items: [], total: 0 });
 });
 
+// ============================================================
+// byCustomFieldValue — Phase 8 Task 4 (broadcast composer rewire)
+// ============================================================
+
+test("byCustomFieldValue matches by is/is_not/contains, and never matches a contact with no value row for that field", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const fieldId = await asAlice.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+
+  const proContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+    name: "Pro User",
+  });
+  const freeContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "222",
+    name: "Free User",
+  });
+  const noValueContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "333",
+    name: "No Value User",
+  });
+
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: proContactId,
+    values: [{ customFieldId: fieldId, value: "Pro" }],
+  });
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: freeContactId,
+    values: [{ customFieldId: fieldId, value: "Free" }],
+  });
+  // noValueContactId gets no `contactCustomValues` row at all.
+
+  const isMatches = await asAlice.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is",
+    value: "Pro",
+  });
+  expect(isMatches.map((c) => c._id)).toEqual([proContactId]);
+
+  // "is_not" only ever compares against EXISTING value rows —
+  // noValueContactId has none, so it can never match either operator,
+  // same limitation the Postgres-era `.neq('value', value)` filter had.
+  const isNotMatches = await asAlice.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is_not",
+    value: "Pro",
+  });
+  expect(isNotMatches.map((c) => c._id)).toEqual([freeContactId]);
+
+  const containsMatches = await asAlice.query(
+    api.contacts.byCustomFieldValue,
+    { customFieldId: fieldId, operator: "contains", value: "ro" },
+  );
+  expect(containsMatches.map((c) => c._id)).toEqual([proContactId]);
+
+  const noMatches = await asAlice.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is",
+    value: "Enterprise",
+  });
+  expect(noMatches).toEqual([]);
+});
+
+test("byCustomFieldValue never returns another account's contacts, even when the caller supplies the other account's real customFieldId", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  const fieldId = await asAlice.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: aliceContactId,
+    values: [{ customFieldId: fieldId, value: "Pro" }],
+  });
+
+  // Bob doesn't have this fieldId in his own account's catalogue, but
+  // nothing stops him from supplying it verbatim as an argument — every
+  // `contactCustomValues` row this query can see is already scoped to
+  // the caller's own account via `by_account`, so this must come back
+  // empty rather than leaking Alice's contact.
+  const bobsView = await asBob.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is",
+    value: "Pro",
+  });
+  expect(bobsView).toEqual([]);
+
+  const alicesView = await asAlice.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is",
+    value: "Pro",
+  });
+  expect(alicesView.map((c) => c._id)).toEqual([aliceContactId]);
+});
+
 test("update throws (not a silent no-op) when the contact belongs to a different account, and leaves it unmodified", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAlice } = await seedAccountMember(t, {

@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useConvex, useQuery } from 'convex/react';
+import type { FunctionReturnType } from 'convex/server';
+import { toUiCustomField, toUiTag } from '@/lib/convex/adapters';
 import { CustomField, Tag } from '@/types';
 import { Button } from '@/components/ui/button';
 import {
@@ -15,6 +17,9 @@ import {
   X,
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 type AudienceType = 'all' | 'tags' | 'custom_field' | 'csv';
 type CustomFieldOperator = 'is' | 'is_not' | 'contains';
@@ -85,83 +90,94 @@ export function Step2SelectAudience({
       icon: Upload,
     },
   ], [t]);
-  const [tags, setTags] = useState<Tag[]>([]);
-  const [customFields, setCustomFields] = useState<CustomField[]>([]);
-  const [loadingTags, setLoadingTags] = useState(false);
-  const [loadingFields, setLoadingFields] = useState(false);
+  const convex = useConvex();
+
+  // Tags are used both by the primary "Filter by Tags" audience type
+  // AND by the exclude-list below — always subscribed, unconditionally.
+  const tagsResult = useQuery(api.tags.list);
+  const tags = useMemo<Tag[]>(
+    () =>
+      (tagsResult ?? [])
+        .map(toUiTag)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [tagsResult],
+  );
+  const loadingTags = tagsResult === undefined;
+
+  // Lazy-load custom fields only when that audience type is active —
+  // the "skip" sentinel keeps this subscription off until then.
+  // `customFields.list` already returns them sorted by field name.
+  const customFieldsResult = useQuery(
+    api.customFields.list,
+    audience.type === 'custom_field' ? {} : 'skip',
+  );
+  const customFields = useMemo<CustomField[]>(
+    () => (customFieldsResult ?? []).map(toUiCustomField),
+    [customFieldsResult],
+  );
+  const loadingFields =
+    audience.type === 'custom_field' && customFieldsResult === undefined;
+
   const [estimatedCount, setEstimatedCount] = useState<number | null>(null);
   const [loadingCount, setLoadingCount] = useState(false);
 
-  // Tags are used both by the primary "Filter by Tags" audience type
-  // AND by the exclude-list below — so always load once on mount.
-  useEffect(() => {
-    async function fetchTags() {
-      setLoadingTags(true);
-      try {
-        const supabase = createClient();
-        const { data } = await supabase.from('tags').select('*').order('name');
-        setTags(data ?? []);
-      } finally {
-        setLoadingTags(false);
+  /**
+   * Every contact carrying any of `tagIds` (OR across tags), paginated
+   * to completion via `contacts.filterByTags`. Local reimplementation of
+   * the same helper `src/hooks/use-broadcast-sending.ts` uses — this
+   * component only needs a count estimate, not the hook's send-time
+   * contact-id resolution.
+   */
+  const resolveContactIdsByTags = useCallback(
+    async (tagIds: Id<'tags'>[]): Promise<Set<Id<'contacts'>>> => {
+      const ids = new Set<Id<'contacts'>>();
+      if (tagIds.length === 0) return ids;
+      const limit = 500;
+      let offset = 0;
+      for (;;) {
+        const result = await convex.query(api.contacts.filterByTags, {
+          tagIds,
+          limit,
+          offset,
+        });
+        for (const item of result.items) ids.add(item._id);
+        offset += limit;
+        if (offset >= result.total) break;
       }
-    }
-    fetchTags();
-  }, []);
-
-  // Lazy-load custom fields only when that audience type is active.
-  useEffect(() => {
-    if (audience.type !== 'custom_field') return;
-    async function fetchFields() {
-      setLoadingFields(true);
-      try {
-        const supabase = createClient();
-        const { data } = await supabase
-          .from('custom_fields')
-          .select('*')
-          .order('field_name');
-        setCustomFields(data ?? []);
-      } finally {
-        setLoadingFields(false);
-      }
-    }
-    fetchFields();
-  }, [audience.type]);
+      return ids;
+    },
+    [convex],
+  );
 
   const fetchEstimatedCount = useCallback(async () => {
     setLoadingCount(true);
     try {
-      const supabase = createClient();
-
-      // Base query — produces the superset before exclude is applied.
-      let baseIds: Set<string> | null = null; // null means "all contacts"
+      // Base set — produces the superset before exclude is applied.
+      // `null` means "all contacts".
+      let baseIds: Set<Id<'contacts'>> | null = null;
 
       if (audience.type === 'all') {
-        // Handled below — full-table count adjusted by excludes.
+        // Handled below — full count adjusted by excludes.
       } else if (
         audience.type === 'tags' &&
         audience.tagIds &&
         audience.tagIds.length > 0
       ) {
-        const { data } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.tagIds);
-        baseIds = new Set((data ?? []).map((r) => r.contact_id));
+        baseIds = await resolveContactIdsByTags(
+          audience.tagIds.map((id) => id as Id<'tags'>),
+        );
       } else if (
         audience.type === 'custom_field' &&
         audience.customField?.fieldId &&
         audience.customField.value
       ) {
         const { fieldId, operator, value } = audience.customField;
-        let q = supabase
-          .from('contact_custom_values')
-          .select('contact_id')
-          .eq('custom_field_id', fieldId);
-        if (operator === 'is') q = q.eq('value', value);
-        else if (operator === 'is_not') q = q.neq('value', value);
-        else q = q.ilike('value', `%${value}%`);
-        const { data } = await q;
-        baseIds = new Set((data ?? []).map((r) => r.contact_id));
+        const contacts = await convex.query(api.contacts.byCustomFieldValue, {
+          customFieldId: fieldId as Id<'customFields'>,
+          operator,
+          value,
+        });
+        baseIds = new Set(contacts.map((c) => c._id));
       } else if (
         audience.type === 'csv' &&
         audience.csvContacts &&
@@ -175,33 +191,44 @@ export function Step2SelectAudience({
         return;
       }
 
-      // Apply exclude tags
-      let excludeSet: Set<string> | null = null;
+      // Apply exclude tags.
+      let excludeSet: Set<Id<'contacts'>> | null = null;
       if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
-        const { data: excludeRows } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.excludeTagIds);
-        excludeSet = new Set((excludeRows ?? []).map((r) => r.contact_id));
+        excludeSet = await resolveContactIdsByTags(
+          audience.excludeTagIds.map((id) => id as Id<'tags'>),
+        );
       }
 
       if (baseIds) {
-        const effective = [...baseIds].filter(
-          (id) => !excludeSet?.has(id),
-        );
+        const effective = [...baseIds].filter((id) => !excludeSet?.has(id));
         setEstimatedCount(effective.length);
       } else {
-        // "All" — fetch the total, then subtract exclude set if any.
-        const { count } = await supabase
-          .from('contacts')
-          .select('*', { count: 'exact', head: true });
-        const total = count ?? 0;
-        setEstimatedCount(excludeSet ? Math.max(0, total - excludeSet.size) : total);
+        // "All" — page through every contact, then subtract the
+        // exclude set if any. Convex has no cheap COUNT(*) equivalent
+        // to Postgres's `{ count: 'exact', head: true }`.
+        let total = 0;
+        let cursor: string | null = null;
+        for (;;) {
+          // Explicit type annotation avoids TS7022 (see
+          // use-broadcast-sending.ts's `resolveAllContactIds` for why).
+          const result: FunctionReturnType<typeof api.contacts.list> =
+            await convex.query(api.contacts.list, {
+              paginationOpts: { numItems: 500, cursor },
+            });
+          total += result.page.length;
+          if (result.isDone) break;
+          cursor = result.continueCursor;
+        }
+        setEstimatedCount(
+          excludeSet ? Math.max(0, total - excludeSet.size) : total,
+        );
       }
     } finally {
       setLoadingCount(false);
     }
   }, [
+    convex,
+    resolveContactIdsByTags,
     audience.type,
     audience.tagIds,
     audience.customField,

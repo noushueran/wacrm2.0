@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useConvex } from 'convex/react';
+import type { FunctionReturnType } from 'convex/server';
 import { MessageTemplate } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -16,6 +17,9 @@ import {
 } from '@/components/ui/dialog';
 import { ArrowLeft, Send, Loader2, Users, Save } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
 
 interface AudienceConfig {
   type: string;
@@ -47,6 +51,7 @@ export function Step4ScheduleSend({
   progress,
 }: Step4Props) {
   const t = useTranslations('Broadcasts.wizard');
+  const convex = useConvex();
   const [showConfirm, setShowConfirm] = useState(false);
   const [estimatedReach, setEstimatedReach] = useState<number>(0);
   const [loadingReach, setLoadingReach] = useState(true);
@@ -55,20 +60,43 @@ export function Step4ScheduleSend({
     async function calculateReach() {
       setLoadingReach(true);
       try {
-        const supabase = createClient();
-
         if (audience.type === 'all') {
-          const { count } = await supabase
-            .from('contacts')
-            .select('*', { count: 'exact', head: true });
-          setEstimatedReach(count ?? 0);
-        } else if (audience.type === 'tags' && audience.tagIds && audience.tagIds.length > 0) {
-          const { data: contactTags } = await supabase
-            .from('contact_tags')
-            .select('contact_id')
-            .in('tag_id', audience.tagIds);
-
-          const uniqueIds = new Set((contactTags ?? []).map((ct) => ct.contact_id));
+          // Convex has no cheap COUNT(*) equivalent to Postgres's
+          // `{ count: 'exact', head: true }` — page through every
+          // contact via `contacts.list` instead.
+          let total = 0;
+          let cursor: string | null = null;
+          for (;;) {
+            // Explicit type annotation avoids TS7022 (see
+            // use-broadcast-sending.ts's `resolveAllContactIds` for why).
+            const result: FunctionReturnType<typeof api.contacts.list> =
+              await convex.query(api.contacts.list, {
+                paginationOpts: { numItems: 500, cursor },
+              });
+            total += result.page.length;
+            if (result.isDone) break;
+            cursor = result.continueCursor;
+          }
+          setEstimatedReach(total);
+        } else if (
+          audience.type === 'tags' &&
+          audience.tagIds &&
+          audience.tagIds.length > 0
+        ) {
+          const tagIds = audience.tagIds.map((id) => id as Id<'tags'>);
+          const uniqueIds = new Set<Id<'contacts'>>();
+          const limit = 500;
+          let offset = 0;
+          for (;;) {
+            const result = await convex.query(api.contacts.filterByTags, {
+              tagIds,
+              limit,
+              offset,
+            });
+            for (const item of result.items) uniqueIds.add(item._id);
+            offset += limit;
+            if (offset >= result.total) break;
+          }
           setEstimatedReach(uniqueIds.size);
         } else if (audience.type === 'csv' && audience.csvContacts) {
           setEstimatedReach(audience.csvContacts.length);
@@ -81,7 +109,7 @@ export function Step4ScheduleSend({
     }
 
     calculateReach();
-  }, [audience]);
+  }, [convex, audience]);
 
   const audienceLabel =
     audience.type === 'all'
