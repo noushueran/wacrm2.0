@@ -3,6 +3,11 @@ import type { Doc, Id } from "../../../convex/_generated/dataModel";
 import type {
   AccountInvitation,
   AccountMember,
+  Automation,
+  AutomationLog,
+  AutomationLogStepResult,
+  AutomationTriggerConfig,
+  AutomationTriggerType,
   Broadcast,
   BroadcastRecipient,
   Contact,
@@ -667,6 +672,79 @@ export function toUiAiKnowledgeDoc(
     updated_at: doc.updatedAt
       ? new Date(doc.updatedAt).toISOString()
       : new Date(doc._creationTime).toISOString(),
+  };
+}
+
+// ============================================================
+// Automations vertical adapters (Phase 8, Task 5 / P8-T5) — the
+// account-scoped automation definitions (`automations`) and their
+// per-execution audit rows (`automationLogs`). Same rename +
+// `_creationTime`/epoch-ms -> ISO-string convention as every adapter
+// above. The nested step tree itself (`automationSteps`, flattened /
+// rebuilt server-side by `convex/lib/automations/stepsTree.ts`) has no
+// adapter here — `automations.get`'s `steps` result (a
+// `BuilderStepNode[]`) already matches the builder's own
+// `ServerStepNode` shape structurally (see
+// `automation-builder.tsx`'s `fromServerSteps`), so callers pass it
+// straight through instead.
+// ============================================================
+
+/** `automations.list`'s per-item shape (a full automation doc plus a
+ *  denormalized `stepCount` — see convex/automations.ts) and
+ *  `automations.get`'s `automation` field both satisfy this same input
+ *  shape (`stepCount` is optional here precisely because `get` doesn't
+ *  include it, and nothing on the `Automation` UI type reads it
+ *  anyway). `trigger_type`/`trigger_config` are cast to their closed UI
+ *  unions the same way every other freeform-string-in-Convex column is
+ *  cast elsewhere in this file — Postgres never put a CHECK on
+ *  `triggerType` either (see schema.ts's own comment on this column). */
+export function toUiAutomation(
+  doc: Doc<"automations"> & { stepCount?: number },
+): Automation {
+  return {
+    id: doc._id,
+    account_id: doc.accountId,
+    user_id: doc.createdByUserId ?? "",
+    name: doc.name,
+    description: doc.description,
+    trigger_type: doc.triggerType as AutomationTriggerType,
+    trigger_config: (doc.triggerConfig ?? {}) as AutomationTriggerConfig,
+    is_active: doc.isActive,
+    execution_count: doc.executionCount,
+    last_executed_at: doc.lastExecutedAt
+      ? new Date(doc.lastExecutedAt).toISOString()
+      : null,
+    created_at: new Date(doc._creationTime).toISOString(),
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `automations.logs`'s per-item shape — a bare `automationLogs` doc
+ *  with no embedded contact (unlike the old Supabase `select('*,
+ *  contact:contacts(id, name, phone)')` join — see that query's
+ *  handler in convex/automations.ts, which never fetches one).
+ *  `contact` is therefore an optional param the caller passes in only
+ *  when it has separately resolved one (the logs page's own per-row
+ *  `contacts.get` lookup), same convention as
+ *  `toUiBroadcastRecipient` above; this adapter never fetches anything
+ *  itself. */
+export function toUiAutomationLog(
+  doc: Doc<"automationLogs">,
+  contact?: Contact,
+): AutomationLog {
+  return {
+    id: doc._id,
+    automation_id: doc.automationId,
+    user_id: doc.createdByUserId ?? "",
+    contact_id: doc.contactId ?? null,
+    trigger_event: doc.triggerEvent,
+    steps_executed: (doc.stepsExecuted ?? []) as AutomationLogStepResult[],
+    status: doc.status,
+    error_message: doc.errorMessage,
+    created_at: new Date(doc._creationTime).toISOString(),
+    contact,
   };
 }
 

@@ -1,7 +1,8 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useMemo, useState } from "react"
 import { useRouter } from "next/navigation"
+import { useMutation, useQuery } from "convex/react"
 import { toast } from "sonner"
 import {
   Zap,
@@ -18,10 +19,10 @@ import {
   Loader2,
 } from "lucide-react"
 
-import { createClient } from "@/lib/supabase/client"
 import { useCan } from "@/hooks/use-can"
 import { useTranslations } from "next-intl"
 import type { Automation } from "@/types"
+import { convexErrorMessage, toUiAutomation } from "@/lib/convex/adapters"
 import { Button } from "@/components/ui/button"
 import { GatedButton } from "@/components/ui/gated-button"
 import { Switch } from "@/components/ui/switch"
@@ -44,6 +45,9 @@ import { AUTOMATION_TEMPLATES, type TemplateSlug } from "@/lib/automations/templ
 import { triggerMeta, formatRelative } from "@/lib/automations/trigger-meta"
 import { cn } from "@/lib/utils"
 
+import { api } from "../../../../convex/_generated/api"
+import type { Id } from "../../../../convex/_generated/dataModel"
+
 const TEMPLATE_ORDER: TemplateSlug[] = [
   "welcome_message",
   "out_of_office",
@@ -62,93 +66,57 @@ export default function AutomationsPage() {
   const router = useRouter()
   const canCreate = useCan("send-messages")
   const t = useTranslations("Automations.list")
-  const [automations, setAutomations] = useState<Automation[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Automation | null>(null)
   const [deleting, setDeleting] = useState(false)
 
-  async function load() {
-    try {
-      const supabase = createClient()
-      const { data, error: fetchErr } = await supabase
-        .from("automations")
-        .select("*")
-        .order("created_at", { ascending: false })
-      if (fetchErr) throw fetchErr
-      setAutomations((data ?? []) as Automation[])
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load automations")
-    }
-  }
+  const rows = useQuery(api.automations.list)
+  const automations = useMemo(() => (rows ?? []).map(toUiAutomation), [rows])
+  const loading = rows === undefined
 
-  useEffect(() => {
-    load()
-  }, [])
+  const setActiveMutation = useMutation(api.automations.setActive)
+  const duplicateMutation = useMutation(api.automations.duplicate)
+  const removeMutation = useMutation(api.automations.remove)
 
   async function toggleActive(a: Automation, next: boolean) {
-    // Optimistic flip so the switch feels instant.
-    setAutomations((prev) =>
-      prev?.map((x) => (x.id === a.id ? { ...x, is_active: next } : x)) ?? prev,
-    )
-    const res = await fetch(`/api/automations/${a.id}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ is_active: next }),
-    })
-    if (!res.ok) {
-      // Roll back on error.
-      setAutomations((prev) =>
-        prev?.map((x) => (x.id === a.id ? { ...x, is_active: !next } : x)) ?? prev,
-      )
-      const body = await res.json().catch(() => ({}))
-      toast.error(body?.error ?? t("toasts.updateError"))
-      return
+    try {
+      await setActiveMutation({
+        automationId: a.id as Id<"automations">,
+        isActive: next,
+      })
+      toast.success(next ? t("toasts.activated") : t("toasts.paused"))
+    } catch (err) {
+      toast.error(convexErrorMessage(err) || t("toasts.updateError"))
     }
-    toast.success(next ? t("toasts.activated") : t("toasts.paused"))
   }
 
   async function duplicate(a: Automation) {
-    const res = await fetch(`/api/automations/${a.id}/duplicate`, { method: "POST" })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      toast.error(body?.error ?? t("toasts.duplicateError"))
-      return
+    try {
+      await duplicateMutation({ automationId: a.id as Id<"automations"> })
+      toast.success(t("toasts.duplicated"))
+    } catch (err) {
+      toast.error(convexErrorMessage(err) || t("toasts.duplicateError"))
     }
-    toast.success(t("toasts.duplicated"))
-    load()
   }
 
   async function confirmDelete() {
     if (!pendingDelete) return
     setDeleting(true)
-    const res = await fetch(`/api/automations/${pendingDelete.id}`, { method: "DELETE" })
-    setDeleting(false)
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      toast.error(body?.error ?? t("toasts.deleteError"))
-      return
+    try {
+      await removeMutation({ automationId: pendingDelete.id as Id<"automations"> })
+      toast.success(t("toasts.deleted"))
+      setPendingDelete(null)
+    } catch (err) {
+      toast.error(convexErrorMessage(err) || t("toasts.deleteError"))
+    } finally {
+      setDeleting(false)
     }
-    toast.success(t("toasts.deleted"))
-    setPendingDelete(null)
-    load()
   }
 
-  async function startFromTemplate(slug: TemplateSlug) {
+  function startFromTemplate(slug: TemplateSlug) {
     router.push(`/automations/new?template=${slug}`)
   }
 
-  if (error) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-2">
-        <p className="text-sm text-red-400">{error}</p>
-        <Button variant="outline" onClick={() => window.location.reload()}>
-          {t("retry")}
-        </Button>
-      </div>
-    )
-  }
-
-  if (automations === null) {
+  if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />

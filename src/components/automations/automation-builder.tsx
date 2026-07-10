@@ -4,10 +4,12 @@ import {
   createContext,
   useContext,
   useEffect,
+  useMemo,
   useState,
   type ReactNode,
 } from "react"
 import { useRouter } from "next/navigation"
+import { useMutation, useQuery } from "convex/react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
@@ -46,13 +48,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import type {
-  AccountMember,
   AutomationStepType,
   AutomationTriggerType,
   CustomField,
   InteractiveMessagePayload,
   KeywordMatchTriggerConfig,
   MessageTemplate,
+  Profile,
   Tag as TagRecord,
 } from "@/types"
 import {
@@ -61,8 +63,19 @@ import {
   blankListPayload,
 } from "@/components/interactive/interactive-builder"
 import { interactivePayloadPreviewText } from "@/lib/whatsapp/interactive"
-import { createClient } from "@/lib/supabase/client"
+import {
+  convexErrorMessage,
+  toUiCustomField,
+  toUiMemberProfile,
+  toUiPipeline,
+  toUiPipelineStage,
+  toUiTag,
+  toUiTemplate,
+} from "@/lib/convex/adapters"
 import { cn } from "@/lib/utils"
+
+import { api } from "../../../convex/_generated/api"
+import type { Id } from "../../../convex/_generated/dataModel"
 
 // ------------------------------------------------------------
 // Types (builder-local — mirror the flattened rows we POST)
@@ -205,7 +218,7 @@ function blankConfig(type: AutomationStepType): Record<string, unknown> {
 
 interface AutomationResources {
   tags: TagRecord[]
-  members: AccountMember[]
+  members: Profile[]
   templates: MessageTemplate[]
   customFields: CustomField[]
   pipelines: PipelineOption[]
@@ -238,63 +251,46 @@ function useResources(): AutomationResources {
 }
 
 function ResourcesProvider({ children }: { children: ReactNode }) {
-  const [tags, setTags] = useState<TagRecord[]>([])
-  const [members, setMembers] = useState<AccountMember[]>([])
-  const [templates, setTemplates] = useState<MessageTemplate[]>([])
-  const [customFields, setCustomFields] = useState<CustomField[]>([])
-  const [pipelines, setPipelines] = useState<PipelineOption[]>([])
-  const [stages, setStages] = useState<PipelineStageOption[]>([])
+  // Tags, templates and custom fields come straight from Convex —
+  // `accountQuery` scopes them to the caller's account. Only APPROVED
+  // templates can actually be sent (anything else 400s at send time,
+  // matching the broadcast picker), and `templates.list`/`tags.list`
+  // don't sort server-side, so both are alphabetized here the same way
+  // the old Supabase `.order("name")` did. Members go through
+  // `members.list` so the agent picker inherits its email-visibility
+  // rule (agents/viewers get a nulled `email` — see convex/members.ts).
+  const tagsResult = useQuery(api.tags.list)
+  const templatesResult = useQuery(api.templates.list)
+  const customFieldsResult = useQuery(api.customFields.list)
+  const pipelinesResult = useQuery(api.pipelines.list)
+  const membersResult = useQuery(api.members.list)
 
-  useEffect(() => {
-    let cancelled = false
-    const supabase = createClient()
-
-    // Tags, templates and custom fields come straight from the DB — RLS
-    // scopes them to the caller's account. Only APPROVED templates can
-    // actually be sent (anything else 400s at send time), matching the
-    // broadcast picker.
-    void (async () => {
-      const [tagsRes, templatesRes, customFieldsRes, pipelinesRes, stagesRes] =
-        await Promise.all([
-          supabase.from("tags").select("*").order("name"),
-          supabase
-            .from("message_templates")
-            .select("*")
-            .eq("status", "APPROVED")
-            .order("name"),
-          supabase.from("custom_fields").select("*").order("field_name"),
-          supabase.from("pipelines").select("id, name").order("name"),
-          supabase
-            .from("pipeline_stages")
-            .select("id, name, pipeline_id, position")
-            .order("position"),
-        ])
-      if (cancelled) return
-      setTags((tagsRes.data as TagRecord[] | null) ?? [])
-      setTemplates((templatesRes.data as MessageTemplate[] | null) ?? [])
-      setCustomFields((customFieldsRes.data as CustomField[] | null) ?? [])
-      setPipelines((pipelinesRes.data as PipelineOption[] | null) ?? [])
-      setStages((stagesRes.data as PipelineStageOption[] | null) ?? [])
-    })()
-
-    // Members go through the API so we inherit its email-visibility
-    // rules (agents/viewers don't see emails). Unreachable on older
-    // deployments → pickers fall back to a raw agent-id input.
-    void (async () => {
-      try {
-        const res = await fetch("/api/account/members", { cache: "no-store" })
-        if (!res.ok) return
-        const json = (await res.json()) as { members?: AccountMember[] }
-        if (!cancelled) setMembers(json.members ?? [])
-      } catch {
-        // Members endpoint absent — caller falls back to raw input.
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
+  const tags = useMemo(
+    () => (tagsResult ?? []).map(toUiTag).sort((a, b) => a.name.localeCompare(b.name)),
+    [tagsResult],
+  )
+  const templates = useMemo(
+    () =>
+      (templatesResult ?? [])
+        .filter((doc) => doc.status === "APPROVED")
+        .map(toUiTemplate)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [templatesResult],
+  )
+  const customFields = useMemo(
+    () => (customFieldsResult ?? []).map(toUiCustomField),
+    [customFieldsResult],
+  )
+  const rawPipelines = useMemo(() => pipelinesResult ?? [], [pipelinesResult])
+  const pipelines = useMemo(() => rawPipelines.map(toUiPipeline), [rawPipelines])
+  const stages = useMemo(
+    () => rawPipelines.flatMap((p) => p.stages.map(toUiPipelineStage)),
+    [rawPipelines],
+  )
+  const members = useMemo(
+    () => (membersResult ?? []).map(toUiMemberProfile),
+    [membersResult],
+  )
 
   return (
     <ResourcesContext.Provider
@@ -631,6 +627,9 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
   const [saving, setSaving] = useState(false)
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
+  const createAutomation = useMutation(api.automations.create)
+  const updateAutomation = useMutation(api.automations.update)
+
   function patchTop<K extends keyof BuilderInitial>(key: K, value: BuilderInitial[K]) {
     setState((s) => ({ ...s, [key]: value }))
   }
@@ -663,47 +662,39 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
   async function save() {
     setSaving(true)
     try {
-      const payload = {
-        name: state.name || "Untitled automation",
-        description: state.description || null,
-        trigger_type: state.trigger_type,
-        trigger_config: state.trigger_config,
-        is_active: state.is_active,
-        steps: toApiSteps(state.steps),
-      }
+      const steps = toApiSteps(state.steps)
+      const name = state.name || "Untitled automation"
 
-      const res = isEditing
-        ? await fetch(`/api/automations/${initial.id}`, {
-            method: "PATCH",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(payload),
-          })
-        : await fetch(`/api/automations`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(payload),
-          })
-
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        // If the server blocked activation with validation issues,
-        // surface the first concrete problem so the user can fix it
-        // without opening DevTools for the full array.
-        const firstIssue: { path?: string; message?: string } | undefined =
-          body?.issues?.[0]
-        if (firstIssue?.message) {
-          toast.error(firstIssue.message, {
-            description: firstIssue.path ? `at ${firstIssue.path}` : undefined,
-          })
-        } else {
-          toast.error(body?.error ?? t("toasts.saveFailed"))
-        }
-        return
+      if (isEditing) {
+        await updateAutomation({
+          automationId: initial.id as Id<"automations">,
+          name,
+          description: state.description || undefined,
+          triggerType: state.trigger_type,
+          triggerConfig: state.trigger_config,
+          isActive: state.is_active,
+          steps,
+        })
+        toast.success(t("toasts.saved"))
+      } else {
+        const newId = await createAutomation({
+          name,
+          description: state.description || undefined,
+          triggerType: state.trigger_type,
+          triggerConfig: state.trigger_config,
+          isActive: state.is_active,
+          steps,
+        })
+        toast.success(t("toasts.created"))
+        router.replace(`/automations/${newId}/edit`)
       }
-      toast.success(isEditing ? t("toasts.saved") : t("toasts.created"))
-      if (!isEditing && body?.automation?.id) {
-        router.replace(`/automations/${body.automation.id}/edit`)
-      }
+    } catch (err) {
+      // The activation-validation gate the old REST routes ran (400
+      // with an `issues` array) was deliberately not ported to
+      // `convex/automations.ts` (see that file's header comment) — a
+      // save can only fail here on a genuine error, surfaced via
+      // `convexErrorMessage`.
+      toast.error(convexErrorMessage(err) || t("toasts.saveFailed"))
     } finally {
       setSaving(false)
     }
