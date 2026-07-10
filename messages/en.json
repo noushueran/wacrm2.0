@@ -1500,7 +1500,6 @@
     "sections": {
       "overview": "Overview",
       "profile": "Your profile",
-      "security": "Login & security",
       "appearance": "Appearance",
       "whatsapp": "WhatsApp",
       "templates": "Templates",
@@ -1522,7 +1521,7 @@
       "photoHint": "PNG, JPG, WebP, or GIF. Up to 2 MB.",
       "displayName": "Display name",
       "email": "Email",
-      "emailChangeHint": "Check the inbox for <bold>{oldEmail}</bold> and <bold>{newEmail}</bold> — both need to confirm before the change takes effect.",
+      "emailReadOnlyHint": "Contact support to change your email.",
       "accountDetails": "Account details",
       "role": "Role",
       "joined": "Joined",
@@ -1535,36 +1534,8 @@
       "imageTooLarge": "Image is too large",
       "imageTooLargeDesc": "Maximum 2 MB.",
       "nameRequired": "Display name is required",
-      "invalidEmail": "Enter a valid email address",
-      "uploadFailed": "Upload failed: {message}",
-      "saveFailed": "Save failed: {message}",
-      "profileSaved": "Profile saved",
-      "emailChangeFailed": "Email change failed: {message}",
-      "profileSavedEmailCheck": "Profile saved — check your email to confirm the address change",
-      
-      "passwordTitle": "Password",
-      "passwordDesc": "Use at least {min} characters. You will stay signed in on this device after changing it.",
-      "currentPassword": "Current password",
-      "newPassword": "New password",
-      "confirmPassword": "Confirm new password",
-      "updating": "Updating…",
-      "updatePassword": "Update password",
-      "cannotChangeNoEmail": "Cannot change password without a current email",
-      "passwordTooShort": "Password must be at least {min} characters",
-      "passwordMismatch": "New password and confirmation do not match",
-      "currentPasswordIncorrect": "Current password is incorrect",
-      "passwordUpdateFailed": "Password update failed: {message}",
-      "passwordUpdated": "Password updated",
-      
-      "sessionsTitle": "Active sessions",
-      "sessionsDesc": "Sign out of every device where you're logged in — including this one. Useful if you lost a laptop or shared your password.",
-      "signOutAll": "Sign out of all devices",
-      "signOutConfirmTitle": "Sign out everywhere?",
-      "signOutConfirmDesc": "Every device logged into this account will be signed out and will need to log in again. You will be redirected to the login page.",
-      "cancel": "Cancel",
-      "signingOut": "Signing out…",
-      "signOutEverywhere": "Sign out everywhere",
-      "signOutFailed": "Sign-out failed: {message}"
+      "uploadFailed": "Upload failed. Please try again.",
+      "profileSaved": "Profile saved"
     },
     "appearance": {
       "title": "Appearance",
@@ -1574,10 +1545,6 @@
       "active": "Active",
       "accentColor": "Accent color",
       "useTheme": "Use {name} theme"
-    },
-    "security": {
-      "title": "Login & security",
-      "description": "Change your password and sign out of your devices. These keep your account safe."
     },
     "apiKeys": {
       "title": "API keys",

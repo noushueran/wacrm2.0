@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2, Upload, Trash2, Mail, CircleAlert } from 'lucide-react';
+import { Loader2, Upload, Trash2, CircleAlert } from 'lucide-react';
+import { useConvex, useMutation } from 'convex/react';
 
-import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
+import { convexErrorMessage } from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -18,6 +19,9 @@ import { Card, CardContent } from '@/components/ui/card';
 import { useTranslations } from 'next-intl';
 import { SettingsPanelHead } from './settings-panel-head';
 
+import { api } from '../../../convex/_generated/api';
+import type { Id } from '../../../convex/_generated/dataModel';
+
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const ALLOWED_MIME = new Set([
   'image/png',
@@ -26,30 +30,24 @@ const ALLOWED_MIME = new Set([
   'image/gif',
 ]);
 
-// Rough email shape check — the real validator is Supabase Auth, which
-// rejects anything malformed when we call updateUser({ email }). We
-// just want to stop obvious typos before making a network call.
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 export function ProfileForm() {
   const t = useTranslations('Settings.profile');
-  const { user, profile, refreshProfile } = useAuth();
-  const supabase = createClient();
+  const { user, profile } = useAuth();
+  const convex = useConvex();
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const updateProfile = useMutation(api.accounts.updateProfile);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [fullName, setFullName] = useState('');
-  const [email, setEmail] = useState('');
   const [pendingAvatar, setPendingAvatar] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [removeAvatar, setRemoveAvatar] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [emailChangePending, setEmailChangePending] = useState(false);
 
   // Seed form state once the profile loads.
   useEffect(() => {
     if (!profile) return;
     setFullName(profile.full_name ?? '');
-    setEmail(profile.email ?? '');
   }, [profile]);
 
   // Cleanup object URLs to avoid leaks.
@@ -99,93 +97,60 @@ export function ProfileForm() {
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !profile) return;
+    if (!profile) return;
 
     const trimmedName = fullName.trim();
     if (!trimmedName) {
       toast.error(t('nameRequired'));
       return;
     }
-    const trimmedEmail = email.trim();
-    if (!EMAIL_RE.test(trimmedEmail)) {
-      toast.error(t('invalidEmail'));
-      return;
-    }
 
     setSaving(true);
     try {
-      let nextAvatarUrl: string | null = profile.avatar_url ?? null;
+      // `undefined` = no avatar change — the mutation's `avatarUrl` arg
+      // is patched only when supplied (see convex/accounts.ts's
+      // `updateProfile` doc comment).
+      let nextAvatarUrl: string | undefined;
 
-      // Upload a newly-staged image, if any.
       if (pendingAvatar) {
-        const ext =
-          pendingAvatar.name.split('.').pop()?.toLowerCase() || 'png';
-        const path = `${user.id}/avatar-${Date.now()}.${ext}`;
-        const { error: uploadError } = await supabase.storage
-          .from('avatars')
-          .upload(path, pendingAvatar, {
-            cacheControl: '3600',
-            upsert: true,
-            contentType: pendingAvatar.type,
-          });
-        if (uploadError) {
-          throw new Error(t('uploadFailed', { message: uploadError.message }));
-        }
-        const {
-          data: { publicUrl },
-        } = supabase.storage.from('avatars').getPublicUrl(path);
-        nextAvatarUrl = publicUrl;
-      } else if (removeAvatar) {
-        nextAvatarUrl = null;
-      }
-
-      // Persist name + avatar to profiles.
-      const { error: updateError } = await supabase
-        .from('profiles')
-        .update({
-          full_name: trimmedName,
-          avatar_url: nextAvatarUrl,
-        })
-        .eq('user_id', user.id);
-      if (updateError) {
-        throw new Error(t('saveFailed', { message: updateError.message }));
-      }
-
-      // Email change goes through Supabase Auth, which emails a
-      // confirmation to both the old and new addresses. We don't
-      // touch profiles.email — Supabase will push the change there
-      // after the user clicks the link (handled by the handle_new_user
-      // trigger pattern in production deployments).
-      let emailSent = false;
-      if (trimmedEmail.toLowerCase() !== profile.email.toLowerCase()) {
-        const { error: emailError } = await supabase.auth.updateUser({
-          email: trimmedEmail,
+        // Convex client-upload flow: mint a short-lived upload URL, POST
+        // the file bytes to it directly, then resolve the returned
+        // storage id to a fetchable URL.
+        const uploadUrl = await generateUploadUrl({});
+        const response = await fetch(uploadUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': pendingAvatar.type },
+          body: pendingAvatar,
         });
-        if (emailError) {
-          // Partial success: name/avatar saved but email didn't.
-          toast.success(t('profileSaved'));
-          toast.error(t('emailChangeFailed', { message: emailError.message }));
-          setSaving(false);
-          await refreshProfile();
-          return;
+        if (!response.ok) {
+          throw new Error(t('uploadFailed'));
         }
-        emailSent = true;
+        const { storageId } = (await response.json()) as {
+          storageId: Id<'_storage'>;
+        };
+        const resolvedUrl = await convex.query(api.files.getUrl, {
+          storageId,
+        });
+        if (!resolvedUrl) {
+          throw new Error(t('uploadFailed'));
+        }
+        nextAvatarUrl = resolvedUrl;
+      } else if (removeAvatar) {
+        nextAvatarUrl = '';
       }
 
-      setEmailChangePending(emailSent);
+      await updateProfile({
+        name: trimmedName,
+        ...(nextAvatarUrl !== undefined ? { avatarUrl: nextAvatarUrl } : {}),
+      });
+
       setPendingAvatar(null);
       setPreviewUrl(null);
       setRemoveAvatar(false);
-      await refreshProfile();
-
-      toast.success(
-        emailSent
-          ? t('profileSavedEmailCheck')
-          : t('profileSaved'),
-      );
+      toast.success(t('profileSaved'));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      toast.error(msg);
+      console.error('[ProfileForm] save error:', err);
+      toast.error(convexErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -194,7 +159,6 @@ export function ProfileForm() {
   const dirty =
     !!profile &&
     (fullName.trim() !== (profile.full_name ?? '') ||
-      email.trim().toLowerCase() !== (profile.email ?? '').toLowerCase() ||
       pendingAvatar !== null ||
       removeAvatar);
 
@@ -277,7 +241,10 @@ export function ProfileForm() {
             />
           </div>
 
-          {/* Email */}
+          {/* Email — read-only. Convex Auth here is the Password
+              provider with no email provider configured, so there is no
+              in-app email-change flow to wire up (see the settings
+              Security-section removal in this same change). */}
           <div className="space-y-2">
             <Label htmlFor="profile-email" className="text-foreground">
               {t('email')}
@@ -285,23 +252,13 @@ export function ProfileForm() {
             <Input
               id="profile-email"
               type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={saving}
-              required
+              value={profile?.email ?? ''}
+              disabled
+              readOnly
             />
-            {emailChangePending && (
-              <p className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                <Mail className="mt-0.5 size-3.5 shrink-0" />
-                <span>
-                  {t.rich('emailChangeHint', { 
-                    oldEmail: profile?.email || '', 
-                    newEmail: email,
-                    bold: (chunks: React.ReactNode) => <strong>{chunks}</strong>
-                  })}
-                </span>
-              </p>
-            )}
+            <p className="text-xs text-muted-foreground">
+              {t('emailReadOnlyHint')}
+            </p>
           </div>
 
           {/* Read-only block */}
