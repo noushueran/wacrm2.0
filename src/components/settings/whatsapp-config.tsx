@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery } from 'convex/react';
+import { useAction, useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import {
   Eye,
@@ -51,6 +51,8 @@ export function WhatsAppConfig() {
   const config = configDoc ? toUiWhatsappConfig(configDoc) : null;
 
   const upsertConfig = useMutation(api.whatsappConfig.upsert);
+  const removeConfig = useMutation(api.whatsappConfig.remove);
+  const verifyRegistration = useAction(api.whatsappConfig.verifyRegistration);
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -84,13 +86,22 @@ export function WhatsAppConfig() {
   const lastRegistrationError = config?.last_registration_error ?? null;
 
   const [verifyingRegistration, setVerifyingRegistration] = useState(false);
+  // Matches `api.whatsappConfig.verifyRegistration`'s real return shape
+  // (it also carries `last_registration_error`/`registered_at`/
+  // `subscribed_apps_at` as raw epoch-ms numbers, but nothing below
+  // reads those off `registrationProbe` — that data already comes from
+  // `config`, sourced from the reactive `configDoc` query instead).
   type RegistrationProbe = {
     live: boolean;
-    checks: Record<string, boolean | null>;
+    checks: {
+      config_exists: boolean;
+      token_decryptable?: boolean;
+      phone_metadata_ok?: boolean;
+      waba_subscribed_to_app?: boolean | null;
+      locally_marked_registered?: boolean;
+    };
     errors?: string[];
-    last_registration_error?: string | null;
-    registered_at?: string | null;
-    subscribed_apps_at?: string | null;
+    message?: string;
   };
   const [registrationProbe, setRegistrationProbe] =
     useState<RegistrationProbe | null>(null);
@@ -277,10 +288,7 @@ export function WhatsAppConfig() {
     setVerifyingRegistration(true);
     setRegistrationProbe(null);
     try {
-      const res = await fetch('/api/whatsapp/config/verify-registration', {
-        method: 'GET',
-      });
-      const data = (await res.json()) as RegistrationProbe;
+      const data = await verifyRegistration({});
       setRegistrationProbe(data);
       if (data.live) {
         toast.success('Number is fully wired — Meta is delivering events.');
@@ -314,17 +322,12 @@ export function WhatsAppConfig() {
 
     try {
       setResetting(true);
-      const res = await fetch('/api/whatsapp/config', { method: 'DELETE' });
-      const data = await res.json();
+      await removeConfig({});
 
-      if (!res.ok) {
-        toast.error(data.error || 'Failed to reset configuration');
-        return;
-      }
-
-      toast.success(
-        'Legacy record cleared. This does not remove the saved configuration below yet — see TODO(P8-T4).',
-      );
+      // `configDoc` (and everything derived from it — `config`,
+      // `isRegistered`, the hydration effect) updates on its own once
+      // this reactively-observed row is gone; nothing to refetch here.
+      toast.success('WhatsApp configuration removed.');
       setConnectionStatus('disconnected');
       setResetReason(null);
       setStatusMessage('');

@@ -1,10 +1,13 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { useAction } from 'convex/react';
 import { toast } from 'sonner';
 import { Bot, RotateCcw, Send, Loader2, UserCircle2, ArrowRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
+
+import { api } from '../../../convex/_generated/api';
 
 interface Turn {
   role: 'user' | 'assistant';
@@ -14,6 +17,7 @@ interface Turn {
 }
 
 export function AiPlayground({ onGoToSetup }: { onGoToSetup?: () => void }) {
+  const playground = useAction(api.aiReply.playground);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -32,16 +36,11 @@ export function AiPlayground({ onGoToSetup }: { onGoToSetup?: () => void }) {
     setInput('');
     setSending(true);
     try {
-      const res = await fetch('/api/ai/playground', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // Send only role+content — the server ignores anything else.
-        body: JSON.stringify({
-          messages: next.map((t) => ({ role: t.role, content: t.content })),
-        }),
+      // Send only role+content — the action ignores anything else.
+      const data = await playground({
+        messages: next.map((t) => ({ role: t.role, content: t.content })),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
+      if ('error' in data) {
         if (data.code === 'ai_not_configured') {
           toast.error('No agent configured yet — finish Setup first.');
         } else {
@@ -56,10 +55,7 @@ export function AiPlayground({ onGoToSetup }: { onGoToSetup?: () => void }) {
         ...next,
         {
           role: 'assistant',
-          content:
-            typeof data.reply === 'string' && data.reply.trim()
-              ? data.reply
-              : '',
+          content: data.reply.trim() ? data.reply : '',
           handoff: Boolean(data.handoff),
         },
       ]);

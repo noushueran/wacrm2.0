@@ -30,20 +30,41 @@ export function SettingsOverview({
   const tRoles = useTranslations('Settings.roles');
   const tSections = useTranslations('Settings.sections');
 
-  // Members roster + pending invites still go through the Next.js
-  // `/api/account/*` routes (out of scope for this Convex UI rewire —
-  // teardown's job), not a direct Supabase read from this component.
-  const [membersCount, setMembersCount] = useState<number | null>(null);
-  const [pendingInvites, setPendingInvites] = useState<number | null>(null);
-  const [membersLoading, setMembersLoading] = useState(true);
+  // Members roster + pending invites — reactive Convex reads (this
+  // rewire's job; replaces the one-shot `/api/account/*` fetches).
+  // Counts only (this overview only needs `.length`), so the raw docs
+  // are read directly rather than through `toUiMember`/`toUiInvitation`
+  // — nothing here reads an individual member/invitation field.
+  const membersResult = useQuery(api.members.list);
+  const membersLoading = membersResult === undefined;
+  const membersCount = membersResult?.length ?? null;
+
+  // `invitations.list` is admin-gated server-side (`ctx.requireRole
+  // ("admin")`) — mirrors the old `canManageMembers ? fetch(...) :
+  // Promise.resolve(null)` gate by skipping the query entirely for
+  // non-admins rather than issuing one that would just throw FORBIDDEN
+  // (same "skip client-side, avoid the pointless round-trip" pattern
+  // `members-tab.tsx` already uses for this exact query).
+  const invitationsResult = useQuery(
+    api.invitations.list,
+    canManageMembers ? {} : 'skip',
+  );
+  const pendingInvites = canManageMembers
+    ? (invitationsResult?.length ?? null)
+    : null;
 
   // WhatsApp connection *health* is still a slow, independent Meta ping
   // via `/api/whatsapp/config` (decrypts the token and calls out — far
   // slower than the cheap Convex reads below, so it's kept on its own
-  // loading flag rather than blocking the rest of the tiles). Whether a
-  // config row exists at all (`whatsappConfigResult` below) now comes
-  // from the reactive `api.whatsappConfig.get` query instead of a
-  // Supabase select.
+  // loading flag rather than blocking the rest of the tiles). No Convex
+  // action exposes this live check yet — `convex/whatsappConfig.ts`'s
+  // client-visible surface is only `get`/`upsert`/`remove`/
+  // `verifyRegistration`, none of which ping Meta for `connected`/
+  // `phone_info` — so this stays on the legacy route, same TODO(P8-T4)
+  // as `whatsapp-config.tsx`'s own `runHealthCheck`. Whether a config
+  // row exists at all (`whatsappConfigResult` below) already comes from
+  // the reactive `api.whatsappConfig.get` query instead of a Supabase
+  // select.
   const [whatsappConnected, setWhatsappConnected] = useState(false);
   const [whatsappHealthLoading, setWhatsappHealthLoading] = useState(true);
 
@@ -51,36 +72,6 @@ export function SettingsOverview({
     if (!user || !accountId) return;
     let cancelled = false;
 
-    // Members + pending invites — resolve fast, render immediately.
-    (async () => {
-      setMembersLoading(true);
-      const [membersRes, invitesRes] = await Promise.allSettled([
-        fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
-        canManageMembers
-          ? fetch('/api/account/invitations', { cache: 'no-store' }).then((r) =>
-              r.json(),
-            )
-          : Promise.resolve(null),
-      ]);
-      if (cancelled) return;
-
-      const members =
-        membersRes.status === 'fulfilled' && Array.isArray(membersRes.value?.members)
-          ? membersRes.value.members.length
-          : null;
-      const invites =
-        invitesRes.status === 'fulfilled' &&
-        invitesRes.value &&
-        Array.isArray(invitesRes.value.invitations)
-          ? invitesRes.value.invitations.length
-          : null;
-
-      setMembersCount(members);
-      setPendingInvites(invites);
-      setMembersLoading(false);
-    })();
-
-    // WhatsApp connection health — slower, independent.
     (async () => {
       setWhatsappHealthLoading(true);
       const health = await fetch('/api/whatsapp/config', { cache: 'no-store' })
@@ -94,7 +85,7 @@ export function SettingsOverview({
     return () => {
       cancelled = true;
     };
-  }, [user?.id, accountId, canManageMembers]);
+  }, [user?.id, accountId]);
 
   // Templates / tags / custom fields / WhatsApp-config-row — reactive
   // Convex reads (Phase 8/9 stragglers rewire), replacing the one-shot

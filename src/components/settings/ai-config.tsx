@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useMutation, useQuery } from 'convex/react';
+import { useAction, useMutation, useQuery } from 'convex/react';
 import { toast } from 'sonner';
 import { Loader2, Sparkles, CheckCircle2, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
@@ -89,6 +89,7 @@ export function AiConfig() {
   );
 
   const upsertConfig = useMutation(api.aiConfig.upsert);
+  const testConnection = useAction(api.aiConfig.testConnection);
 
   // The handoff-target picker's teammate list, via reactive
   // `api.members.list` (any member may read it) mapped through the
@@ -167,18 +168,16 @@ export function AiConfig() {
   const handleTest = async () => {
     setTesting(true);
     try {
-      const res = await fetch('/api/ai/test', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider,
-          model: model.trim(),
-          api_key: keyPayload(),
-        }),
+      const result = await testConnection({
+        provider,
+        model: model.trim(),
+        apiKey: keyPayload(),
       });
-      const data = await res.json();
-      if (res.ok) toast.success(t('testSuccess'));
-      else toast.error(data.error ?? t('testRejected'));
+      if ('error' in result) {
+        toast.error(result.error ?? t('testRejected'));
+      } else {
+        toast.success(t('testSuccess'));
+      }
     } catch {
       toast.error(t('testNetworkError'));
     } finally {

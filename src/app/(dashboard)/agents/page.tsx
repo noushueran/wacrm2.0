@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { useQuery } from 'convex/react';
 import { Bot, Sparkles, Settings2, BarChart3 } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { AiPlayground } from '@/components/agents/ai-playground';
@@ -8,6 +9,8 @@ import { AiUsageCard } from '@/components/agents/ai-usage';
 import { AiConfig } from '@/components/settings/ai-config';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
+
+import { api } from '../../../../convex/_generated/api';
 
 type Tab = 'playground' | 'setup' | 'usage';
 
@@ -17,24 +20,19 @@ export default function AgentsPage() {
   const [tab, setTab] = useState<Tab>('playground');
   const [decided, setDecided] = useState(false);
 
-  // Land first-time users on Setup, returning users on the Playground.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch('/api/ai/config');
-        const data = await res.json().catch(() => ({}));
-        if (!cancelled) setTab(data?.configured ? 'playground' : 'setup');
-      } catch {
-        if (!cancelled) setTab('setup');
-      } finally {
-        if (!cancelled) setDecided(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const configDoc = useQuery(api.aiConfig.get);
+  // Land first-time users on Setup, returning users on the Playground —
+  // decided exactly once. Render-time "adjust state" (React's own
+  // recommended fix for an effect that only mirrors external data into
+  // state — see https://react.dev/learn/you-might-not-need-an-effect)
+  // rather than a `useEffect`: `!decided` guards it from ever firing
+  // again once true, so finishing Setup (which makes `configDoc` go
+  // non-null) can't yank the user back to Playground out from under
+  // them.
+  if (!decided && configDoc !== undefined) {
+    setDecided(true);
+    setTab(configDoc ? 'playground' : 'setup');
+  }
 
   return (
     <div>

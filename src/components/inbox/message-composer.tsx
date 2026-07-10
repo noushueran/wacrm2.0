@@ -7,6 +7,7 @@ import {
   useEffect,
   KeyboardEvent,
 } from "react";
+import { useAction, useMutation } from "convex/react";
 import {
   Send,
   LayoutTemplate,
@@ -55,6 +56,9 @@ import {
 import { validateInteractivePayload } from "@/lib/whatsapp/interactive";
 import type { InteractiveMessagePayload, QuickReply } from "@/types";
 import { QuickReplyPicker } from "./quick-reply-picker";
+
+import { api } from "../../../convex/_generated/api";
+import type { Id } from "../../../convex/_generated/dataModel";
 
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
@@ -142,6 +146,9 @@ export function MessageComposer({
   onClearReply,
 }: MessageComposerProps) {
   const t = useTranslations("Inbox.composer");
+
+  const draftReply = useAction(api.aiReply.draft);
+  const createQuickReply = useMutation(api.quickReplies.create);
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -261,21 +268,18 @@ export function MessageComposer({
     if (drafting) return;
     setDrafting(true);
     try {
-      const res = await fetch("/api/ai/draft", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversation_id: conversationId }),
+      const result = await draftReply({
+        conversationId: conversationId as Id<"conversations">,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (data.code === "ai_not_configured") {
+      if ("error" in result) {
+        if (result.code === "ai_not_configured") {
           toast.error("AI isn't set up yet — enable it in Settings → AI Assistant.");
         } else {
-          toast.error(data.error ?? "Couldn't draft a reply.");
+          toast.error(result.error ?? "Couldn't draft a reply.");
         }
         return;
       }
-      const draftText = typeof data.draft === "string" ? data.draft.trim() : "";
+      const draftText = result.draft.trim();
       if (!draftText) {
         toast.error("The assistant didn't return a reply.");
         return;
@@ -296,7 +300,7 @@ export function MessageComposer({
     } finally {
       setDrafting(false);
     }
-  }, [drafting, conversationId, adjustHeight]);
+  }, [drafting, conversationId, adjustHeight, draftReply]);
 
   // ---- Interactive message + quick replies --------------------------
 
@@ -332,27 +336,19 @@ export function MessageComposer({
     if (!title) return;
     setSavingQuickReply(true);
     try {
-      const res = await fetch("/api/quick-replies", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title,
-          kind: "interactive",
-          interactive_payload: interactivePayload,
-        }),
+      await createQuickReply({
+        title,
+        kind: "interactive",
+        interactivePayload,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        toast.error(data.error ?? t("quickReplySaveError"));
-        return;
-      }
       toast.success(t("quickReplySaved"));
-    } catch {
+    } catch (err) {
+      console.error("[MessageComposer] quick reply save error:", err);
       toast.error(t("quickReplySaveError"));
     } finally {
       setSavingQuickReply(false);
     }
-  }, [interactivePayload, t]);
+  }, [interactivePayload, t, createQuickReply]);
 
   // A picked quick reply: text fills the composer; interactive opens the
   // builder pre-filled so the agent can tweak before sending.

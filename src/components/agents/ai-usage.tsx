@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { toast } from 'sonner';
+import { useMemo, useState } from 'react';
+import { useQuery } from 'convex/react';
 import { BarChart3, Bot, PencilLine } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
@@ -23,6 +23,9 @@ import { Skeleton } from '@/components/dashboard/skeleton';
 import { BarChart } from '@/components/tremor/bar-chart';
 import { formatCompactNumber } from '@/lib/currency';
 import { format, parseISO } from 'date-fns';
+import { daysAgoStart, lastNDayKeys, localDayKey } from '@/lib/dashboard/date-utils';
+
+import { api } from '../../../convex/_generated/api';
 
 interface UsageResponse {
   window_days: number;
@@ -58,39 +61,84 @@ export function AiUsageCard() {
   const canView = accountRole ? canEditSettings(accountRole) : false;
 
   const [days, setDays] = useState<number>(30);
-  const [loading, setLoading] = useState(true);
-  const [data, setData] = useState<UsageResponse | null>(null);
-  const loadedRef = useRef<string | null>(null);
 
-  const fetchUsage = useCallback(async (windowDays: number) => {
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/ai/usage?days=${windowDays}`, {
-        cache: 'no-store',
-      });
-      const json = await res.json().catch(() => null);
-      if (!res.ok) {
-        toast.error(json?.error ?? 'Failed to load usage');
-        setData(null);
-        return;
-      }
-      setData(json as UsageResponse);
-    } catch {
-      toast.error('Failed to load usage');
-      setData(null);
-    } finally {
-      setLoading(false);
+  // `api.aiUsage.summary` takes a `sinceMs` cutoff (not a `days` count)
+  // and returns raw `aiUsageLog` rows — no totals/by-mode/by-model/daily
+  // breakdown baked in (that's dashboard-rendering logic the query
+  // deliberately leaves to its caller; see that query's own doc comment
+  // in convex/aiUsage.ts). `sinceMs` is memoized on `days` only, not
+  // recomputed on every render, so switching windows re-queries but a
+  // plain re-render doesn't. Skipped entirely for non-admins, mirroring
+  // the old `if (!canView || !accountId) return` guard.
+  const sinceMs = useMemo(() => daysAgoStart(days - 1).getTime(), [days]);
+  const usageDocs = useQuery(
+    api.aiUsage.summary,
+    canView && accountId ? { sinceMs } : 'skip',
+  );
+  const loading = canView && usageDocs === undefined;
+
+  // Same totals/by-mode/by-model/zero-filled-daily aggregation
+  // `src/app/api/ai/usage/route.ts` used to do server-side, now done
+  // client-side over the raw rows (reusing the same local-day bucketing
+  // helpers every other dashboard chart uses, so day boundaries agree).
+  // This query has no MAX_ROWS cap (unlike the old route), so
+  // `truncated` is always false.
+  const data = useMemo<UsageResponse | null>(() => {
+    if (!usageDocs) return null;
+
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let totalTokens = 0;
+    const byMode = {
+      auto_reply: { calls: 0, tokens: 0 },
+      draft: { calls: 0, tokens: 0 },
+    };
+    const modelMap = new Map<
+      string,
+      { model: string; provider: string; calls: number; tokens: number }
+    >();
+    const daily = new Map<string, { date: string; tokens: number; calls: number }>();
+    for (const key of lastNDayKeys(days)) {
+      daily.set(key, { date: key, tokens: 0, calls: 0 });
     }
-  }, []);
 
-  useEffect(() => {
-    if (!canView || !accountId) return;
-    // Refetch on account switch or window change.
-    const key = `${accountId}:${days}`;
-    if (loadedRef.current === key) return;
-    loadedRef.current = key;
-    void fetchUsage(days);
-  }, [canView, accountId, days, fetchUsage]);
+    for (const row of usageDocs) {
+      promptTokens += row.promptTokens;
+      completionTokens += row.completionTokens;
+      totalTokens += row.totalTokens;
+
+      byMode[row.mode].calls += 1;
+      byMode[row.mode].tokens += row.totalTokens;
+
+      const mk = `${row.provider}:${row.model}`;
+      const m =
+        modelMap.get(mk) ??
+        { model: row.model, provider: row.provider, calls: 0, tokens: 0 };
+      m.calls += 1;
+      m.tokens += row.totalTokens;
+      modelMap.set(mk, m);
+
+      const bucket = daily.get(localDayKey(new Date(row._creationTime)));
+      if (bucket) {
+        bucket.tokens += row.totalTokens;
+        bucket.calls += 1;
+      }
+    }
+
+    return {
+      window_days: days,
+      truncated: false,
+      totals: {
+        calls: usageDocs.length,
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: totalTokens,
+      },
+      by_mode: byMode,
+      by_model: [...modelMap.values()].sort((a, b) => b.tokens - a.tokens),
+      daily: [...daily.values()],
+    };
+  }, [usageDocs, days]);
 
   if (profileLoading || !canView) return null;
 

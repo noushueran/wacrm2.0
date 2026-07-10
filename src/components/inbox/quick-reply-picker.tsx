@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
+import { useQuery } from "convex/react";
 import { Loader2, MessageSquare, Zap } from "lucide-react";
 import { useTranslations } from "next-intl";
 
@@ -12,6 +13,9 @@ import {
 } from "@/components/ui/dialog";
 import type { QuickReply } from "@/types";
 import { interactivePayloadPreviewText } from "@/lib/whatsapp/interactive";
+import { toUiQuickReply } from "@/lib/convex/adapters";
+
+import { api } from "../../../convex/_generated/api";
 
 interface QuickReplyPickerProps {
   open: boolean;
@@ -30,28 +34,16 @@ export function QuickReplyPicker({
   onPick,
 }: QuickReplyPickerProps) {
   const t = useTranslations("Inbox.composer");
-  const [items, setItems] = useState<QuickReply[]>([]);
-  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setLoading(true);
-    void (async () => {
-      try {
-        const res = await fetch("/api/quick-replies", { cache: "no-store" });
-        const data = await res.json().catch(() => ({}));
-        if (!cancelled && res.ok) {
-          setItems((data.quick_replies as QuickReply[]) ?? []);
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
+  // Only subscribed while the dialog is open — mirrors the old
+  // fetch-on-open behaviour rather than keeping this query warm in the
+  // background for the whole inbox session.
+  const quickRepliesResult = useQuery(api.quickReplies.list, open ? {} : "skip");
+  const items = useMemo(
+    () => (quickRepliesResult ?? []).map(toUiQuickReply),
+    [quickRepliesResult],
+  );
+  const loading = open && quickRepliesResult === undefined;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
