@@ -735,6 +735,36 @@ export const listActiveAutomations = internalQuery({
   },
 });
 
+/**
+ * Existence check backing the AI auto-reply "stand down" precedence
+ * (Phase 8, Task 4b — `convex/ingest.ts`'s `shouldDispatchAiReply`).
+ * Ported from `src/lib/ai/auto-reply.ts`'s own query (lines ~61-68):
+ * does this account have ANY active automation whose trigger is a
+ * per-message auto-responder (`new_message_received` or
+ * `keyword_match`)? Deliberately account-wide and NOT keyed to whether
+ * a particular automation's own `triggerConfig` would actually match
+ * THIS message — matches the source's coarse `.limit(1)` existence
+ * check exactly (relationship triggers like `first_inbound_message`/
+ * `new_contact_created` don't count, same as the source's own comment
+ * on this: "Relationship triggers... don't count — they're not
+ * per-message auto-responders").
+ */
+export const hasActiveAutoResponder = internalQuery({
+  args: { accountId: v.id("accounts") },
+  handler: async (ctx, args): Promise<boolean> => {
+    const automations = await ctx.db
+      .query("automations")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .filter((q) => q.eq(q.field("isActive"), true))
+      .collect();
+    return automations.some(
+      (a) =>
+        a.triggerType === "new_message_received" ||
+        a.triggerType === "keyword_match",
+    );
+  },
+});
+
 export const getAutomation = internalQuery({
   args: { automationId: v.id("automations") },
   handler: async (ctx, args) => await ctx.db.get(args.automationId),

@@ -31,10 +31,13 @@ import type { GenerateResult } from "./lib/ai/types";
 //     several inbound handlers (flows / automations / this) a webhook
 //     should invoke for one inbound message — this task's own brief
 //     scopes `dispatchInbound` to the reply generation itself, not to
-//     that cross-engine precedence call, and nothing in this codebase
-//     yet wires an inbound webhook to `automationsEngine.runForTrigger`,
-//     `flowsEngine`, or this function (checked `convex/ingest.ts`). A
-//     future integration task owns deciding when to call this at all.
+//     that cross-engine precedence call. CLOSED as of Phase 8, Task 4b:
+//     `convex/ingest.ts`'s `processInbound` now owns exactly this
+//     decision (`shouldDispatchAiReply` + `automationsEngine.
+//     hasActiveAutoResponder`), gating whether it calls
+//     `aiReply.dispatchInbound` at all — this function itself still has
+//     no such check in its own body, by design; the precedence lives at
+//     the orchestration layer, not here.
 //   - The account-wide rate limiter (`checkRateLimit` on a shared BYO
 //     key) — an in-process token bucket in the source with no obvious
 //     Convex equivalent (no long-lived process to hold the bucket

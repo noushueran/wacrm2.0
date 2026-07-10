@@ -613,3 +613,83 @@ test("update_contact_field refuses to write a custom field owned by a different 
   );
   expect(values).toHaveLength(0);
 });
+
+// ------------------------------------------------------------
+// hasActiveAutoResponder — backs convex/ingest.ts's AI "stand down"
+// precedence (Phase 8, Task 4b). Direct, focused coverage of the
+// query's own isActive + triggerType filtering, independent of the
+// full processInbound fan-out (which exercises it indirectly in
+// convex/ingest.test.ts).
+// ------------------------------------------------------------
+
+test("hasActiveAutoResponder: false with no automations at all", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId }),
+  ).toBe(false);
+});
+
+test("hasActiveAutoResponder: true when an active new_message_received automation exists", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAutomation(t, { accountId, triggerType: "new_message_received" });
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId }),
+  ).toBe(true);
+});
+
+test("hasActiveAutoResponder: true when an active keyword_match automation exists", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAutomation(t, {
+    accountId,
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: ["help"], match_type: "contains" },
+  });
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId }),
+  ).toBe(true);
+});
+
+test("hasActiveAutoResponder: false when the only matching-triggerType automation is inactive", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAutomation(t, {
+    accountId,
+    triggerType: "new_message_received",
+    isActive: false,
+  });
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId }),
+  ).toBe(false);
+});
+
+test("hasActiveAutoResponder: false for an active automation whose trigger isn't a per-message auto-responder", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAutomation(t, { accountId, triggerType: "new_contact_created" });
+  await seedAutomation(t, { accountId, triggerType: "first_inbound_message" });
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId }),
+  ).toBe(false);
+});
+
+test("hasActiveAutoResponder: scoped to the account — another account's active auto-responder doesn't leak in", async () => {
+  const t = convexTest(schema, modules);
+  const accountA = await seedAccount(t, "Acme");
+  const accountB = await seedAccount(t, "Globex");
+  await seedAutomation(t, { accountId: accountB, triggerType: "new_message_received" });
+
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId: accountA }),
+  ).toBe(false);
+  expect(
+    await t.query(internal.automationsEngine.hasActiveAutoResponder, { accountId: accountB }),
+  ).toBe(true);
+});

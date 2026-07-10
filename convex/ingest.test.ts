@@ -8,6 +8,7 @@ import {
   buildMessageReceivedPayload,
   determineAutomationTriggers,
   runBestEffort,
+  shouldDispatchAiReply,
 } from "./ingest";
 import { encrypt } from "./lib/whatsappEncryption";
 import type { Id } from "./_generated/dataModel";
@@ -652,13 +653,71 @@ test("runBestEffort: a resolving fn completes normally with no error logged", as
 });
 
 // ------------------------------------------------------------
+// shouldDispatchAiReply — the AI "stand down" precedence ported from
+// src/lib/ai/auto-reply.ts:53-68 (see ingest.ts's own comment on this
+// function for why the decision lives here rather than inside
+// aiReply.dispatchInbound itself).
+// ------------------------------------------------------------
+
+test("shouldDispatchAiReply: dispatches when nothing stands in the way", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "hi there",
+      hasActiveAutoResponder: false,
+    }),
+  ).toBe(true);
+});
+
+test("shouldDispatchAiReply: stands down when a flow consumed the message", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: true,
+      inboundText: "hi there",
+      hasActiveAutoResponder: false,
+    }),
+  ).toBe(false);
+});
+
+test("shouldDispatchAiReply: stands down for an interactive reply", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      interactiveReplyId: "btn_yes",
+      inboundText: "Yes please",
+      hasActiveAutoResponder: false,
+    }),
+  ).toBe(false);
+});
+
+test("shouldDispatchAiReply: stands down for empty/whitespace-only text", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "   ",
+      hasActiveAutoResponder: false,
+    }),
+  ).toBe(false);
+});
+
+test("shouldDispatchAiReply: stands down when the account has an active auto-responder automation", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "hi there",
+      hasActiveAutoResponder: true,
+    }),
+  ).toBe(false);
+});
+
+// ------------------------------------------------------------
 // processInbound — integration tests via convex-test, real engines,
 // DRY-RUN throughout (both CONVEX_META_DRY_RUN, for flows/AI-send/
 // webhook delivery, and CONVEX_AI_DRY_RUN for the LLM call itself —
 // same two-flag convention `aiReply.test.ts` documents).
 // ------------------------------------------------------------
 
-test("processInbound on a brand-new contact runs the full fan-out in order: ingest -> flows (no match) -> automations (all four triggers) -> AI reply -> webhook delivery", async () => {
+test("processInbound on a brand-new contact runs the full fan-out in order: ingest -> flows (no match) -> automations (all four triggers) -> AI stands down (active auto-responder automation) -> webhook delivery", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -709,12 +768,96 @@ test("processInbound on a brand-new contact runs the full fan-out in order: inge
       .first(),
   );
   const messages = await messagesFor(t, conversation!._id);
+  // The account has an ACTIVE new_message_received/keyword_match
+  // automation (seeded above, and confirmed to have fired via the tag
+  // assertions above) — the AI stands down rather than double-texting
+  // the customer (shouldDispatchAiReply in ingest.ts). See the
+  // dedicated stand-down tests below for the isolated, single-variable
+  // version of this precedence.
   const botMessages = messages.filter((m) => m.senderType === "bot");
-  expect(botMessages).toHaveLength(1);
-  expect(botMessages[0]!.aiGenerated).toBe(true);
+  expect(botMessages).toHaveLength(0);
 
   const endpoint = await t.run((ctx) => ctx.db.get(endpointId));
   expect(endpoint!.lastDeliveryAt).toBeDefined();
+});
+
+test("processInbound: AI reply stands down when an active new_message_received automation exists, even though that automation itself still fires", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const tagId = await seedTag(t, accountId, "auto-responder");
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_message_received", tagId });
+  await seedAiConfig(t, accountId);
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "anyone around?", wamid: "wamid.STANDDOWN1" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(result.flowConsumed).toBe(false);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  // The automation itself still fired...
+  expect(await tagLink(t, contact!._id, tagId)).not.toBeNull();
+
+  // ...but the AI did not reply, avoiding a double-text.
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+});
+
+test("processInbound: AI reply stands down for an active keyword_match automation even when this message's own text doesn't match its keywords (account-wide existence check, not a per-message match)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const tagId = await seedTag(t, accountId, "keyword-responder");
+  // "help" never appears in the inbound text below, so the automation's
+  // own triggerMatches() won't fire (no tag applied) — but the
+  // stand-down check is an ACCOUNT-WIDE existence check on active
+  // new_message_received/keyword_match automations, not a per-message
+  // match (mirrors src/lib/ai/auto-reply.ts's own `.limit(1)` query), so
+  // the AI still stands down.
+  await seedAutomationWithAddTag(t, {
+    accountId,
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: ["help"], match_type: "contains" },
+    tagId,
+  });
+  await seedAiConfig(t, accountId);
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "just saying hello", wamid: "wamid.STANDDOWN2" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(result.flowConsumed).toBe(false);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  // Keyword never matched this message — the automation's own tag did
+  // NOT apply.
+  expect(await tagLink(t, contact!._id, tagId)).toBeNull();
+
+  // The AI still stood down — the check is account-wide existence, not
+  // per-message match.
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
 });
 
 test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry)", async () => {

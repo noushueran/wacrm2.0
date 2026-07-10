@@ -280,20 +280,21 @@ export const ingestInbound = internalMutation({
 //     consumed the message, whether or not any automation or AI reply
 //     fired.
 //
-// NOT ported (a pre-existing, already-flagged gap, not an oversight of
-// this task): the "stand down when an active new_message_received/
-// keyword_match automation exists" check inside the SOURCE's
-// `dispatchInboundToAiReply` (src/lib/ai/auto-reply.ts) that avoids
-// double-texting the customer when both an automation and the AI would
-// otherwise reply to the same inbound. `processMessage` itself has NO
-// such check in its own body (it lives one layer deeper, inside the AI
-// reply function) — and `convex/aiReply.ts`'s own header comment
-// documents this exact check as a deliberate Phase 7 scope cut,
-// explicitly deferring the decision of "when to call
-// aiReply.dispatchInbound at all" to "a future integration task". This
-// task's brief calls for exactly the dispatch shape used below (no
-// extra gating query); closing that gap is flagged in this task's own
-// report as a follow-up, not silently absorbed here.
+// CLOSED (Phase 8, Task 4b): the "stand down when an active
+// new_message_received/keyword_match automation exists" check inside
+// the SOURCE's `dispatchInboundToAiReply` (src/lib/ai/auto-reply.ts:
+// 53-68), which avoids double-texting the customer when both an
+// automation and the AI would otherwise reply to the same inbound.
+// `processMessage` itself has no such check in its own body (it lives
+// one layer deeper, inside the AI reply function) — but this Convex
+// port's architecture puts ALL cross-engine dispatch precedence in
+// THIS orchestrator (mirroring how `flowConsumed`/`automationTriggers`
+// are already decided here, not inside `flowsEngine`/`automationsEngine`
+// themselves), so the check lives here too, as `shouldDispatchAiReply`
+// below, rather than inside `aiReply.dispatchInbound` — closing the
+// gap `convex/aiReply.ts`'s own header comment explicitly deferred to
+// "a future integration task". See `shouldDispatchAiReply`'s own
+// comment for the exact precedence and its test coverage.
 // ============================================================
 
 type FlowDispatchMessage =
@@ -363,6 +364,37 @@ export function determineAutomationTriggers(input: {
   if (input.wasCreated) triggers.unshift("new_contact_created");
   if (input.isFirstInboundMessage) triggers.unshift("first_inbound_message");
   return triggers;
+}
+
+/**
+ * src/lib/ai/auto-reply.ts:53-68 — the "stand down when an active
+ * message-level automation exists" precedence (see this file's header
+ * comment above for why it now lives here rather than inside
+ * `aiReply.dispatchInbound` itself). `new_message_received`/
+ * `keyword_match` automations are dispatched independently for this
+ * same inbound (see `determineAutomationTriggers` above) and may send
+ * their own reply, so when the account has ANY active one, the AI
+ * stands down entirely to avoid double-texting the customer —
+ * regardless of whether that automation's own trigger actually matched
+ * THIS message's content (the source's own check is exactly this
+ * coarse: an account-wide existence check, not a per-message match —
+ * see `automationsEngine.hasActiveAutoResponder`'s own comment). Pure,
+ * so the whole precedence is directly testable without a live query;
+ * `hasActiveAutoResponder` is supplied by the caller (that internal
+ * query's result) since this function has no `ctx` and cannot read the
+ * DB itself.
+ */
+export function shouldDispatchAiReply(input: {
+  flowConsumed: boolean;
+  interactiveReplyId?: string;
+  inboundText: string;
+  hasActiveAutoResponder: boolean;
+}): boolean {
+  if (input.flowConsumed) return false;
+  if (input.interactiveReplyId) return false;
+  if (!input.inboundText.trim()) return false;
+  if (input.hasActiveAutoResponder) return false;
+  return true;
 }
 
 /**
@@ -500,15 +532,33 @@ export const processInbound = internalAction({
     );
 
     // ---- AI auto-reply (route.ts:799-811) — flows win over the LLM,
-    // and an interactive tap never reaches the LLM either.
+    // an interactive tap never reaches the LLM either, and (closing
+    // this file's previously-flagged gap — see the header comment
+    // above) the AI stands down when the account has an active
+    // new_message_received/keyword_match automation, avoiding a
+    // double-text with that automation's own reply.
     if (!flowConsumed && !message.interactiveReplyId && inboundText.trim()) {
-      await runBestEffort("aiReply.dispatchInbound", () =>
-        ctx.runAction(internal.aiReply.dispatchInbound, {
+      await runBestEffort("aiReply.dispatchInbound", async () => {
+        const hasActiveAutoResponder: boolean = await ctx.runQuery(
+          internal.automationsEngine.hasActiveAutoResponder,
+          { accountId },
+        );
+        if (
+          !shouldDispatchAiReply({
+            flowConsumed,
+            interactiveReplyId: message.interactiveReplyId,
+            inboundText,
+            hasActiveAutoResponder,
+          })
+        ) {
+          return;
+        }
+        await ctx.runAction(internal.aiReply.dispatchInbound, {
           accountId,
           conversationId: res.conversationId,
           contactId: res.contactId,
-        }),
-      );
+        });
+      });
     }
 
     // ---- message.received webhook (route.ts:813-826) — OUTSIDE every
