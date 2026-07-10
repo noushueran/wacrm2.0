@@ -1,8 +1,11 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalMutation } from "./_generated/server";
+import { internalMutation, action } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { getAuthUserId } from "@convex-dev/auth/server";
+import { hasMinRole } from "./lib/roles";
 import { v, ConvexError } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
-import type { QueryCtx } from "./_generated/server";
+import type { QueryCtx, MutationCtx } from "./_generated/server";
 
 // ============================================================
 // Message templates (Phase 4, Task 1) — the local catalog row for one
@@ -11,8 +14,11 @@ import type { QueryCtx } from "./_generated/server";
 // events are Phase 6 (see `src/app/api/whatsapp/templates/submit/
 // route.ts` and `src/lib/whatsapp/template-webhook.ts`, which this
 // module's `upsert`/`updateStatusByMetaId` are modeled after). Every
-// function is built on `accountQuery`/`accountMutation` (never the raw
-// `query`/`mutation`) — the same isolation model `contacts.ts` uses.
+// query/mutation is built on `accountQuery`/`accountMutation` (never
+// the raw `query`/`mutation`) — the same isolation model `contacts.ts`
+// uses. `submit`/`syncFromMeta` at the bottom (Phase 8, Task 4) are the
+// one exception — they're plain, authed `action`s (see their own doc
+// comment for why), mirroring `send.ts`/`reactions.ts`'s `reactToMeta`.
 // ============================================================
 
 /**
@@ -69,16 +75,76 @@ const statusValidator = v.union(
 );
 
 /**
+ * Fields shared by `upsert` (public, `ctx.accountId`) and
+ * `upsertInternal` (server-only, explicit `accountId` — see that
+ * function's own doc comment for why it exists). `qualityScore` isn't
+ * one of `upsert`'s own args (only Meta's sync list/webhook ever
+ * populate it — `updateStatusByMetaId` below is the other place that
+ * patches it) but lives here since `upsertTemplateRow` is the one
+ * place both callers' fields funnel through.
+ */
+interface UpsertTemplateFields {
+  name: string;
+  language: string;
+  category: "Marketing" | "Utility" | "Authentication";
+  bodyText: string;
+  headerType?: "text" | "image" | "video" | "document";
+  headerContent?: string;
+  headerMediaUrl?: string;
+  headerHandle?: string;
+  footerText?: string;
+  buttons?: unknown;
+  sampleValues?: { body?: string[]; header?: string[] };
+  status?: "DRAFT" | "PENDING" | "APPROVED" | "REJECTED" | "PAUSED" | "DISABLED" | "IN_APPEAL" | "PENDING_DELETION";
+  metaTemplateId?: string;
+  submissionError?: string;
+  lastSubmittedAt?: number;
+  qualityScore?: "GREEN" | "YELLOW" | "RED";
+}
+
+/**
  * Finds-or-creates a template keyed by (accountId, name, language) via
  * `by_account_name_lang`, then patches or inserts the rest of the
  * payload. Every field beyond `name`/`language` is patched only when
  * the caller actually supplies it (the `...rest` spread over an
- * omitted `v.optional(...)` arg carries no key at all, so `ctx.db
- * .patch` leaves that column untouched) — the same "patch only what's
- * provided" idiom `contacts.update`/`deals.update` already use, rather
- * than a full-row replace that would silently null out fields the
- * caller didn't mean to touch.
+ * omitted field carries no key at all, so `ctx.db.patch` leaves that
+ * column untouched) — the same "patch only what's provided" idiom
+ * `contacts.update`/`deals.update` already use, rather than a full-row
+ * replace that would silently null out fields the caller didn't mean
+ * to touch. Shared by `upsert` and `upsertInternal` below so the
+ * find-or-create logic itself lives in exactly one place.
  */
+async function upsertTemplateRow(
+  ctx: { db: MutationCtx["db"] },
+  accountId: Id<"accounts">,
+  createdByUserId: Id<"users"> | undefined,
+  args: UpsertTemplateFields,
+): Promise<{ templateId: Id<"messageTemplates">; created: boolean }> {
+  const { name, language, ...rest } = args;
+
+  const existing = await ctx.db
+    .query("messageTemplates")
+    .withIndex("by_account_name_lang", (q) =>
+      q.eq("accountId", accountId).eq("name", name).eq("language", language),
+    )
+    .first();
+
+  if (existing) {
+    await ctx.db.patch(existing._id, { ...rest, updatedAt: Date.now() });
+    return { templateId: existing._id, created: false };
+  }
+
+  const templateId = await ctx.db.insert("messageTemplates", {
+    accountId,
+    createdByUserId,
+    name,
+    language,
+    ...rest,
+    updatedAt: Date.now(),
+  });
+  return { templateId, created: true };
+}
+
 export const upsert = accountMutation({
   args: {
     name: v.string(),
@@ -111,28 +177,65 @@ export const upsert = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    const { name, language, ...rest } = args;
+    const { templateId } = await upsertTemplateRow(
+      ctx,
+      ctx.accountId,
+      ctx.userId,
+      args,
+    );
+    return templateId;
+  },
+});
 
-    const existing = await ctx.db
-      .query("messageTemplates")
-      .withIndex("by_account_name_lang", (q) =>
-        q.eq("accountId", ctx.accountId).eq("name", name).eq("language", language),
-      )
-      .first();
-
-    if (existing) {
-      await ctx.db.patch(existing._id, { ...rest, updatedAt: Date.now() });
-      return existing._id;
-    }
-
-    return await ctx.db.insert("messageTemplates", {
-      accountId: ctx.accountId,
-      createdByUserId: ctx.userId,
-      name,
-      language,
-      ...rest,
-      updatedAt: Date.now(),
-    });
+/**
+ * Server-only counterpart to `upsert`, for `convex/metaTemplates.ts`'s
+ * submit/sync flow (Phase 8, Task 4) — same find-or-create via
+ * `upsertTemplateRow`, but keyed on a caller-supplied `accountId`/
+ * `userId` instead of `ctx.accountId`/`ctx.userId`, since the calling
+ * action (`submit`/`syncFromMeta` below) has already derived + role-
+ * checked the account itself before an action's `ctx.runMutation`
+ * ever reaches here (mirrors `messages.appendInternal` vs the public
+ * `messages.append` — see that pair's own comment). Adds
+ * `qualityScore`, which `upsert`'s own args don't carry.
+ */
+export const upsertInternal = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    userId: v.optional(v.id("users")),
+    name: v.string(),
+    language: v.string(),
+    category: categoryValidator,
+    bodyText: v.string(),
+    headerType: v.optional(
+      v.union(
+        v.literal("text"),
+        v.literal("image"),
+        v.literal("video"),
+        v.literal("document"),
+      ),
+    ),
+    headerContent: v.optional(v.string()),
+    headerMediaUrl: v.optional(v.string()),
+    headerHandle: v.optional(v.string()),
+    footerText: v.optional(v.string()),
+    buttons: v.optional(v.any()),
+    sampleValues: v.optional(
+      v.object({
+        body: v.optional(v.array(v.string())),
+        header: v.optional(v.array(v.string())),
+      }),
+    ),
+    status: v.optional(statusValidator),
+    metaTemplateId: v.optional(v.string()),
+    submissionError: v.optional(v.string()),
+    lastSubmittedAt: v.optional(v.number()),
+    qualityScore: v.optional(
+      v.union(v.literal("GREEN"), v.literal("YELLOW"), v.literal("RED")),
+    ),
+  },
+  handler: async (ctx, args) => {
+    const { accountId, userId, ...rest } = args;
+    return await upsertTemplateRow(ctx, accountId, userId, rest);
   },
 });
 
@@ -296,5 +399,219 @@ export const applyMetaStatusWebhook = internalMutation({
         updatedAt: Date.now(),
       });
     }
+  },
+});
+
+// ============================================================
+// submit / syncFromMeta — authed PUBLIC actions (Phase 8, Task 4)
+// wrapping `convex/metaTemplates.ts`'s internalActions with the same
+// three things `send.ts`/`reactions.ts`'s `reactToMeta` add on top of a
+// plain `action` (which, unlike `accountQuery`/`accountMutation`, gets
+// none of this for free):
+//   1. deriving the caller's account + role from their session
+//      (`getAuthUserId` + `internal.accounts.accountContextForUser`,
+//      since an action has no `ctx.db` to run `lib/auth.ts`'s own
+//      membership lookup inline);
+//   2. role-gating at "agent" — the same floor `upsert`/`remove` above
+//      already enforce;
+//   3. persisting the Meta result via `upsertInternal` above (an
+//      action can't call `ctx.db` directly, only `ctx.runMutation`).
+//
+// Both are the Convex counterpart to `src/app/api/whatsapp/templates/
+// {submit,sync}/route.ts` — see `convex/metaTemplates.ts`'s own header
+// for the Meta-call/DRY-RUN half of this port.
+// ============================================================
+
+const submitArgs = {
+  name: v.string(),
+  language: v.string(),
+  category: categoryValidator,
+  bodyText: v.string(),
+  headerType: v.optional(
+    v.union(
+      v.literal("text"),
+      v.literal("image"),
+      v.literal("video"),
+      v.literal("document"),
+    ),
+  ),
+  headerContent: v.optional(v.string()),
+  headerMediaUrl: v.optional(v.string()),
+  headerHandle: v.optional(v.string()),
+  footerText: v.optional(v.string()),
+  buttons: v.optional(v.any()),
+  sampleValues: v.optional(
+    v.object({
+      body: v.optional(v.array(v.string())),
+      header: v.optional(v.array(v.string())),
+    }),
+  ),
+};
+
+/**
+ * Submit a new template to Meta for approval and persist it locally.
+ * Auth + role → reject `category: "Authentication"` (not supported
+ * here — same message the source route gave) → `metaTemplates
+ * .submitToMeta` (Meta POST, or a DRY-RUN synthetic result) →
+ * `upsertInternal` with the returned status + metaTemplateId.
+ *
+ * Mirrors the source submit route's two failure-recovery paths:
+ *   - Meta itself rejects the submission → the attempt is persisted as
+ *     a DRAFT with `submissionError` set (so it's visible + editable),
+ *     then the Meta error message is rethrown.
+ *   - Meta accepts it but the local `upsertInternal` write fails → a
+ *     data-drift state; the thrown message names the `metaTemplateId`
+ *     Meta already assigned so the user can recover via
+ *     `syncFromMeta` below, exactly like the source route's own note.
+ */
+export const submit = action({
+  args: submitArgs,
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    templateId: Id<"messageTemplates">;
+    metaTemplateId: string;
+    status: TemplateStatus;
+    dryRun: boolean;
+  }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    // AUTHENTICATION templates aren't supported here yet — same guard
+    // the source's submit route enforced; create them in Meta WhatsApp
+    // Manager and pull them in via "Sync from Meta" instead.
+    if (args.category === "Authentication") {
+      throw new Error(
+        'AUTHENTICATION templates are not yet supported here — create them in Meta WhatsApp Manager and use "Sync from Meta".',
+      );
+    }
+
+    const templateFields = {
+      name: args.name,
+      language: args.language,
+      category: args.category,
+      bodyText: args.bodyText,
+      headerType: args.headerType,
+      headerContent: args.headerContent,
+      headerMediaUrl: args.headerMediaUrl,
+      headerHandle: args.headerHandle,
+      footerText: args.footerText,
+      buttons: args.buttons,
+      sampleValues: args.sampleValues,
+    };
+
+    let meta: { metaTemplateId: string; status: string; dryRun: boolean };
+    try {
+      meta = await ctx.runAction(internal.metaTemplates.submitToMeta, {
+        accountId,
+        ...templateFields,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Meta submit failed.";
+      // Persist the failed attempt so the user can retry; row stays
+      // DRAFT until they fix and re-submit — mirrors the source route's
+      // own catch block.
+      await ctx.runMutation(internal.templates.upsertInternal, {
+        accountId,
+        userId,
+        ...templateFields,
+        status: "DRAFT",
+        submissionError: message,
+        lastSubmittedAt: Date.now(),
+      });
+      throw new Error(message);
+    }
+
+    const status = normalizeTemplateStatus(meta.status);
+    try {
+      const { templateId } = await ctx.runMutation(internal.templates.upsertInternal, {
+        accountId,
+        userId,
+        ...templateFields,
+        status,
+        metaTemplateId: meta.metaTemplateId,
+        lastSubmittedAt: Date.now(),
+      });
+      return { templateId, metaTemplateId: meta.metaTemplateId, status, dryRun: meta.dryRun };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save locally.";
+      throw new Error(
+        `Submitted to Meta but failed to save locally: ${message}. Run "Sync from Meta" to recover. (meta_template_id: ${meta.metaTemplateId})`,
+      );
+    }
+  },
+});
+
+/**
+ * Pull every template on the account's WABA and upsert each locally.
+ * Auth + role → `metaTemplates.syncFromMeta` (Meta GET, or a DRY-RUN
+ * empty list) → `upsertInternal` per template, tallying inserted vs.
+ * updated. A single template's persist failure is collected into
+ * `errors` rather than aborting the whole sync — matches the source
+ * sync route's own per-template error collection (one bad row
+ * shouldn't block the rest of the account's templates from syncing).
+ */
+export const syncFromMeta = action({
+  args: {},
+  handler: async (
+    ctx,
+  ): Promise<{
+    total: number;
+    inserted: number;
+    updated: number;
+    errors: { name: string; language: string; message: string }[];
+    truncated: boolean;
+    dryRun: boolean;
+  }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    const { templates, truncated, dryRun } = await ctx.runAction(
+      internal.metaTemplates.syncFromMeta,
+      { accountId },
+    );
+
+    let inserted = 0;
+    let updated = 0;
+    const errors: { name: string; language: string; message: string }[] = [];
+
+    for (const tpl of templates) {
+      try {
+        const { created } = await ctx.runMutation(internal.templates.upsertInternal, {
+          accountId,
+          userId,
+          ...tpl,
+        });
+        if (created) inserted++;
+        else updated++;
+      } catch (err) {
+        errors.push({
+          name: tpl.name,
+          language: tpl.language,
+          message: err instanceof Error ? err.message : "Failed to save locally.",
+        });
+      }
+    }
+
+    return { total: templates.length, inserted, updated, errors, truncated, dryRun };
   },
 });

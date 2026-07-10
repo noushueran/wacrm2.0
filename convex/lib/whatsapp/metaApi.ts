@@ -8,19 +8,25 @@
  * codebase's `convex/` convention); behavior otherwise unchanged for
  * everything kept.
  *
- * NOT ported (out of scope for Phase 6 Task 1 — template management /
- * registration, not the send+persist engine primitives):
- * `verifyPhoneNumber`, `registerPhoneNumber`, `subscribeWabaToApp`,
- * `getSubscribedApps`, `uploadResumableMedia`, `submitMessageTemplate`,
- * `editMessageTemplate`, `deleteMessageTemplate`,
- * `getMediaUrl`, `downloadMedia` (the last also uses Node's `Buffer`,
- * unavailable outside a `"use node"` action — not needed here since
+ * NOT ported (out of scope — registration/media-download, not the
+ * send+persist engine primitives or Phase 8 Task 4's template
+ * management): `verifyPhoneNumber`, `registerPhoneNumber`,
+ * `subscribeWabaToApp`, `getSubscribedApps`, `uploadResumableMedia`,
+ * `editMessageTemplate`, `deleteMessageTemplate`, `getMediaUrl`,
+ * `downloadMedia` (the last also uses Node's `Buffer`, unavailable
+ * outside a `"use node"` action — not needed here since
  * `convex/files.ts`'s `storeFromUrl` uses `fetch()` + `Response#blob()`
  * instead).
  *
  * `sendReactionMessage` WAS ported (Phase 8, Task 4) — `convex/
  * metaSend.ts`'s `sendReaction` needs it for the public `reactToMeta`
- * action's Meta leg.
+ * action's Meta leg. `submitMessageTemplate`/`listMessageTemplates`
+ * (bottom of this file) WERE ALSO ported then, for `convex/
+ * metaTemplates.ts`'s `submitToMeta`/`syncFromMeta` — a DIFFERENT Graph
+ * API surface (`/{waba-id}/message_templates`) than every sender above
+ * (`/{phone-number-id}/messages`); `listMessageTemplates` is new here
+ * (the source app's sync route inlined its own fetch+pagination loop
+ * rather than going through a named helper).
  *
  * `sendTemplateMessage` is intentionally the SIMPLIFIED legacy
  * body-only-params path from the original — the structured
@@ -31,6 +37,8 @@
  * matching the original's own convention (see its header comment: a
  * swapped-args bug was hit four times with positional args).
  */
+
+import type { MetaTemplateSubmitPayload } from "./templateComponents";
 
 const META_API_VERSION = "v21.0";
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -606,4 +614,143 @@ function validateInteractiveHeaderFooter(
       `Interactive footerText exceeds ${INTERACTIVE_LIMITS.footerMaxLength} chars.`,
     );
   }
+}
+
+// ============================================================
+// Template management (Phase 8, Task 4) — create + list message
+// templates on the WABA. A DIFFERENT Graph API surface than every
+// sender above (`/{waba-id}/message_templates` vs `/{phone-number-id}
+// /messages`) — ported for `convex/metaTemplates.ts`'s
+// `submitToMeta`/`syncFromMeta` internalActions.
+// ============================================================
+
+export interface SubmitMessageTemplateArgs {
+  wabaId: string;
+  accessToken: string;
+  payload: MetaTemplateSubmitPayload;
+}
+
+export interface SubmitMessageTemplateResult {
+  id: string;
+  status: string;
+  category?: string;
+}
+
+/**
+ * Submit a message template to Meta for approval. Returns Meta's
+ * assigned template id + initial status (typically PENDING). Faithful
+ * port of `src/lib/whatsapp/meta-api.ts`'s function of the same name.
+ * 429s (rate limit: 100 creates/hour/WABA) surface as a regular
+ * `Error("Meta API error: 429")` via `throwMetaError` — the nicer
+ * "try again later" message the source route's HTTP handler gave a
+ * 429 is a UI-layer nicety this port's caller can add, not something
+ * this network primitive needs to know about.
+ */
+export async function submitMessageTemplate(
+  args: SubmitMessageTemplateArgs,
+): Promise<SubmitMessageTemplateResult> {
+  const { wabaId, accessToken, payload } = args;
+  const url = `${META_API_BASE}/${wabaId}/message_templates`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = await response.json();
+  if (!data?.id) {
+    throw new Error("Meta accepted the template but returned no id.");
+  }
+  return {
+    id: String(data.id),
+    status: typeof data.status === "string" ? data.status : "PENDING",
+    category: typeof data.category === "string" ? data.category : undefined,
+  };
+}
+
+export interface MetaTemplateButtonRaw {
+  type: string;
+  text: string;
+  url?: string;
+  phone_number?: string;
+  example?: string[] | string;
+}
+
+export interface MetaTemplateComponentRaw {
+  type: string;
+  text?: string;
+  format?: string;
+  buttons?: MetaTemplateButtonRaw[];
+  example?: {
+    header_text?: string[];
+    header_handle?: string[];
+    body_text?: string[][];
+  };
+}
+
+export interface MetaTemplateListItem {
+  id: string;
+  name: string;
+  language: string;
+  status: string;
+  category: string;
+  components?: MetaTemplateComponentRaw[];
+  quality_score?: { score?: string } | string;
+}
+
+export interface ListMessageTemplatesArgs {
+  wabaId: string;
+  accessToken: string;
+}
+
+export interface ListMessageTemplatesResult {
+  templates: MetaTemplateListItem[];
+  truncated: boolean;
+}
+
+// Same cap as the source sync route's own `PAGE_CAP` — a runaway
+// `paging.next` chain (or a WABA with an unusual number of templates)
+// stops after 20 pages (2,000 templates at limit=100) rather than
+// looping forever.
+const TEMPLATE_LIST_PAGE_CAP = 20;
+
+/**
+ * List every message template on a WABA, following Meta's cursor
+ * pagination up to `TEMPLATE_LIST_PAGE_CAP` pages. Returns `truncated:
+ * true` rather than throwing when the cap is hit — mirrors the source
+ * sync route's own `truncated` response field. NEW here (not a port —
+ * the source route inlined this loop directly in its POST handler).
+ */
+export async function listMessageTemplates(
+  args: ListMessageTemplatesArgs,
+): Promise<ListMessageTemplatesResult> {
+  const { wabaId, accessToken } = args;
+  const templates: MetaTemplateListItem[] = [];
+  let nextUrl: string | null =
+    `${META_API_BASE}/${wabaId}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`;
+  let pageCount = 0;
+
+  while (nextUrl && pageCount < TEMPLATE_LIST_PAGE_CAP) {
+    pageCount++;
+    const response = await fetch(nextUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) {
+      await throwMetaError(response, `Meta API error: ${response.status}`);
+    }
+    const body: { data?: MetaTemplateListItem[]; paging?: { next?: string } } =
+      await response.json();
+    if (body.data) templates.push(...body.data);
+    nextUrl = body.paging?.next ?? null;
+  }
+
+  return {
+    templates,
+    truncated: pageCount >= TEMPLATE_LIST_PAGE_CAP && nextUrl !== null,
+  };
 }

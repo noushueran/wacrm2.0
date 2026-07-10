@@ -13,7 +13,7 @@ import {
   RotateCcw,
   Upload,
 } from 'lucide-react';
-import { useMutation, useQuery } from 'convex/react';
+import { useAction, useMutation, useQuery } from 'convex/react';
 import {
   uploadAccountMedia,
   MEDIA_MAX_BYTES_BY_KIND,
@@ -140,6 +140,15 @@ export function TemplateManager() {
   const loading = templatesResult === undefined;
 
   const removeTemplate = useMutation(api.templates.remove);
+  // P8-T4: submit-to-Meta + sync-from-Meta now run through Convex
+  // actions (`convex/templates.ts`'s `submit`/`syncFromMeta`, which wrap
+  // `convex/metaTemplates.ts`'s Meta Graph API calls) instead of the
+  // Supabase-backed `/api/whatsapp/templates/{submit,sync}` routes. The
+  // template list above is already reactive (`api.templates.list`), so
+  // a submitted/synced template appears automatically — no manual
+  // refetch needed after either call.
+  const submitTemplate = useAction(api.templates.submit);
+  const syncTemplatesFromMeta = useAction(api.templates.syncFromMeta);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -239,12 +248,6 @@ export function TemplateManager() {
     setDialogOpen(true);
   }
 
-  // TODO(P8-T4): Meta-coupled — deferred, exactly like the inbox send.
-  // Submitting/resubmitting a template still POSTs/PATCHes the
-  // Supabase-backed /api/whatsapp/templates/{submit,[id]} routes (Meta
-  // Graph API call + Supabase `message_templates` upsert). Leave as-is
-  // until that flow is migrated onto Convex — the Convex-backed
-  // `templates` list above won't reflect this write until then.
   async function handleSubmit() {
     // AUTHENTICATION is blocked by the persistent banner + disabled
     // submit button; this is a defensive second line of defense.
@@ -252,29 +255,39 @@ export function TemplateManager() {
     try {
       setSubmitting(true);
       const isEdit = editingId !== null;
-      const url = isEdit
-        ? `/api/whatsapp/templates/${editingId}`
-        : '/api/whatsapp/templates/submit';
-      const res = await fetch(url, {
-        method: isEdit ? 'PATCH' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildSubmitPayload()),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data?.error || `${isEdit ? 'Edit' : 'Submit'} failed (HTTP ${res.status})`,
-        );
+      if (isEdit) {
+        // Editing an existing (REJECTED/PAUSED/APPROVED) template still
+        // PATCHes the Supabase-backed /api/whatsapp/templates/[id] route
+        // — Meta's separate edit-by-hsm_id Graph API call, a different
+        // surface than the create call P8-T4 moved to Convex above.
+        // Left as-is pending a follow-up task; the route file stays on
+        // disk for that reason.
+        const res = await fetch(`/api/whatsapp/templates/${editingId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(buildSubmitPayload()),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || `Edit failed (HTTP ${res.status})`);
+        }
+        toast.success(data.dry_run ? t('toastSaveEditDry') : t('toastSubmitEditSuccess'));
+      } else {
+        const payload = buildSubmitPayload();
+        const result = await submitTemplate({
+          name: payload.name,
+          language: payload.language,
+          category: payload.category,
+          bodyText: payload.body_text,
+          headerType: payload.header_type,
+          headerContent: payload.header_content,
+          headerMediaUrl: payload.header_media_url,
+          footerText: payload.footer_text,
+          buttons: payload.buttons,
+          sampleValues: payload.sample_values,
+        });
+        toast.success(result.dryRun ? t('toastSaveNewDry') : t('toastSubmitNewSuccess'));
       }
-      toast.success(
-        data.dry_run
-          ? isEdit
-            ? t('toastSaveEditDry')
-            : t('toastSaveNewDry')
-          : isEdit
-            ? t('toastSubmitEditSuccess')
-            : t('toastSubmitNewSuccess'),
-      );
       setDialogOpen(false);
       setForm(emptyForm);
       setEditingId(null);
@@ -286,21 +299,11 @@ export function TemplateManager() {
     }
   }
 
-  // TODO(P8-T4): Meta-coupled — deferred, exactly like the inbox send.
-  // Sync still POSTs the Supabase-backed /api/whatsapp/templates/sync
-  // route (paginated Meta Graph API read + Supabase `message_templates`
-  // upsert). Leave as-is until that flow is migrated onto Convex — the
-  // Convex-backed `templates` list above won't reflect this write until
-  // then.
   async function handleSyncFromMeta() {
     if (!user) return;
     setSyncing(true);
     try {
-      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);
-      }
+      const data = await syncTemplatesFromMeta({});
       toast.success(
         t('toastSyncCount', { total: data.total }) +
           (data.inserted || data.updated

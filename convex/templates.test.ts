@@ -520,3 +520,285 @@ test("applyMetaStatusWebhook has no session/account to filter by: it patches EVE
   expect((await t.run((ctx) => ctx.db.get(bobTemplateId)))!.status).toBe("APPROVED");
   warnSpy.mockRestore();
 });
+
+// ============================================================
+// upsertInternal — server-only counterpart to `upsert` (Phase 8, Task
+// 4), for `metaTemplates.ts`'s submit/sync flow. No identity/role
+// check (the calling action already derived + checked the account) —
+// called directly with an explicit accountId/userId, mirroring
+// `metaSend.test.ts`'s own no-identity internalAction calls.
+// ============================================================
+
+test("upsertInternal inserts a new row scoped to the given accountId and reports created: true", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await t.mutation(internal.templates.upsertInternal, {
+    accountId,
+    userId,
+    ...baseTemplate,
+    status: "PENDING",
+    metaTemplateId: "meta-1",
+    qualityScore: "GREEN",
+  });
+
+  expect(result.created).toBe(true);
+  const row = await t.run((ctx) => ctx.db.get(result.templateId));
+  expect(row!.accountId).toBe(accountId);
+  expect(row!.createdByUserId).toBe(userId);
+  expect(row!.status).toBe("PENDING");
+  expect(row!.metaTemplateId).toBe("meta-1");
+  expect(row!.qualityScore).toBe("GREEN");
+});
+
+test("upsertInternal patches the existing (accountId, name, language) row and reports created: false", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const first = await t.mutation(internal.templates.upsertInternal, {
+    accountId,
+    userId,
+    ...baseTemplate,
+    status: "PENDING",
+  });
+  expect(first.created).toBe(true);
+
+  const second = await t.mutation(internal.templates.upsertInternal, {
+    accountId,
+    userId,
+    ...baseTemplate,
+    status: "APPROVED",
+    qualityScore: "YELLOW",
+  });
+
+  expect(second.created).toBe(false);
+  expect(second.templateId).toBe(first.templateId);
+  const row = await t.run((ctx) => ctx.db.get(first.templateId));
+  expect(row!.status).toBe("APPROVED");
+  expect(row!.qualityScore).toBe("YELLOW");
+  expect(await t.run((ctx) => ctx.db.query("messageTemplates").collect())).toHaveLength(1);
+});
+
+// ============================================================
+// submit — authed PUBLIC action (Phase 8, Task 4). Auth/role gating
+// mirrors `send.test.ts`'s own conventions for `send.ts`'s `send`.
+// ============================================================
+
+test("submit throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.action(api.templates.submit, { ...baseTemplate }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("submit throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Viewer",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+
+  await expect(
+    asUser.action(api.templates.submit, { ...baseTemplate }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+test("submit rejects category: Authentication with the same guidance message as the source route", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.templates.submit, {
+      ...baseTemplate,
+      category: "Authentication",
+    }),
+  ).rejects.toThrow(/AUTHENTICATION templates are not yet supported/);
+});
+
+test("submit in DRY-RUN persists a PENDING row with a synthetic metaTemplateId and returns dryRun: true", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await asUser.action(api.templates.submit, { ...baseTemplate });
+
+  expect(result.metaTemplateId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+  expect(result.status).toBe("PENDING");
+  expect(result.dryRun).toBe(true);
+
+  const row = await t.run((ctx) => ctx.db.get(result.templateId));
+  expect(row!.accountId).toBe(accountId);
+  expect(row!.name).toBe(baseTemplate.name);
+  expect(row!.status).toBe("PENDING");
+  expect(row!.metaTemplateId).toBe(result.metaTemplateId);
+  expect(row!.submissionError).toBeUndefined();
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("submit persists a DRAFT row with submissionError and rethrows when Meta rejects the create call", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Invalid parameter" } }),
+          { status: 400 },
+        ),
+    ),
+  );
+
+  await expect(
+    asUser.action(api.templates.submit, { ...baseTemplate }),
+  ).rejects.toThrow(/Invalid parameter/);
+
+  const row = await t.run((ctx) =>
+    ctx.db
+      .query("messageTemplates")
+      .withIndex("by_account_name_lang", (q) =>
+        q
+          .eq("accountId", accountId)
+          .eq("name", baseTemplate.name)
+          .eq("language", baseTemplate.language),
+      )
+      .first(),
+  );
+  expect(row!.status).toBe("DRAFT");
+  expect(row!.submissionError).toBe("Invalid parameter");
+  expect(row!.metaTemplateId).toBeUndefined();
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
+// syncFromMeta — authed PUBLIC action (Phase 8, Task 4)
+// ============================================================
+
+test("syncFromMeta throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(t.action(api.templates.syncFromMeta, {})).rejects.toMatchObject({
+    data: { code: "UNAUTHENTICATED" },
+  });
+});
+
+test("syncFromMeta throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Viewer",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+
+  await expect(
+    asUser.action(api.templates.syncFromMeta, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+test("syncFromMeta in DRY-RUN returns all-zero counts and does not touch the local catalog", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await asUser.action(api.templates.syncFromMeta, {});
+
+  expect(result).toEqual({
+    total: 0,
+    inserted: 0,
+    updated: 0,
+    errors: [],
+    truncated: false,
+    dryRun: true,
+  });
+  expect(await t.run((ctx) => ctx.db.query("messageTemplates").collect())).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("syncFromMeta inserts a new template on first run and updates the same row on a second run", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  const metaListResponse = (status: string) =>
+    new Response(
+      JSON.stringify({
+        data: [
+          {
+            id: "meta-sync-1",
+            name: "order_confirmation",
+            language: "en_US",
+            status,
+            category: "UTILITY",
+            components: [{ type: "BODY", text: "Order shipped." }],
+          },
+        ],
+        paging: {},
+      }),
+      { status: 200 },
+    );
+
+  vi.stubGlobal("fetch", vi.fn(async () => metaListResponse("PENDING")));
+  const first = await asUser.action(api.templates.syncFromMeta, {});
+  expect(first).toMatchObject({ total: 1, inserted: 1, updated: 0, errors: [] });
+
+  vi.stubGlobal("fetch", vi.fn(async () => metaListResponse("APPROVED")));
+  const second = await asUser.action(api.templates.syncFromMeta, {});
+  expect(second).toMatchObject({ total: 1, inserted: 0, updated: 1, errors: [] });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("messageTemplates")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.status).toBe("APPROVED");
+  expect(rows[0]!.metaTemplateId).toBe("meta-sync-1");
+
+  vi.unstubAllGlobals();
+});
