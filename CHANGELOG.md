@@ -1,9 +1,9 @@
 # Changelog
 
 User-visible changes in `wacrm`. Self-hosters: when pulling an update,
-check this file for any **migration required** notes and apply the
-matching SQL files from `supabase/migrations/` against your Supabase
-project before restarting the app.
+check this file for any **migration required** notes and run
+`npx convex deploy` (which pushes the schema in `convex/schema.ts` to
+your Convex deployment) before restarting the app.
 
 Versions follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Pre-1.0, `MINOR` bumps cover new modules; `PATCH` bumps cover bug fixes
