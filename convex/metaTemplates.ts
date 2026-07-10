@@ -6,6 +6,7 @@ import type { Id } from "./_generated/dataModel";
 import { decrypt } from "./lib/whatsappEncryption";
 import {
   submitMessageTemplate,
+  editMessageTemplate,
   listMessageTemplates,
   type MetaTemplateButtonRaw,
   type MetaTemplateComponentRaw,
@@ -19,19 +20,25 @@ import { normalizeTemplateStatus } from "./templates";
 
 // ============================================================
 // Meta TEMPLATE management (Phase 8, Task 4) — create a message
-// template on the WABA (`submitToMeta`) and list every template
-// already on the WABA (`syncFromMeta`). A DIFFERENT Graph API surface
-// than `convex/metaSend.ts` (`/{waba-id}/message_templates` vs
-// `/{phone-number-id}/messages`) — mirrors that file's own "load
-// config, decrypt, POST — unless CONVEX_META_DRY_RUN, then a synthetic
-// result" shape. Convex port of `src/app/api/whatsapp/templates/
-// {submit,sync}/route.ts`.
+// template on the WABA (`submitToMeta`), list every template already on
+// the WABA (`syncFromMeta`), and edit an already-submitted template by
+// its `metaTemplateId`/hsm_id (`editOnMeta`, template-EDIT task). Each
+// is its own Graph API surface: `POST /{waba-id}/message_templates`
+// (create), `GET /{waba-id}/message_templates` (list), and
+// `POST /{message_template_id}` (edit) — vs. `convex/metaSend.ts`'s
+// `/{phone-number-id}/messages`. All three mirror that file's own "load
+// config, decrypt, POST/GET — unless CONVEX_META_DRY_RUN, then a
+// synthetic result" shape. Convex port of `src/app/api/whatsapp/
+// templates/{submit,sync}/route.ts` and `.../templates/[id]/route.ts`'s
+// PATCH handler.
 //
-// Both actions here are `internalAction`s: they take a caller-supplied
-// `accountId` (no user session) and do nothing but talk to Meta — the
-// public, authed wrappers (`templates.submit`/`templates.syncFromMeta`
-// in `convex/templates.ts`) derive + role-check the caller's account
-// first, then persist the result via `templates.upsertInternal`. This
+// Every action here is an `internalAction`: it takes a caller-supplied
+// `accountId` (no user session) and does nothing but talk to Meta — the
+// public, authed wrappers (`templates.submit`/`templates.syncFromMeta`/
+// `templates.editSubmit` in `convex/templates.ts`) derive + role-check
+// the caller's account first, then persist the result via
+// `templates.upsertInternal` (create/sync) or `templates
+// .applyEditSuccessInternal`/`applyEditFailureInternal` (edit). This
 // module never touches `ctx.db`.
 // ============================================================
 
@@ -145,6 +152,92 @@ export const submitToMeta = internalAction({
     });
     const result = await submitMessageTemplate({ wabaId, accessToken, payload });
     return { metaTemplateId: result.id, status: result.status, dryRun: false };
+  },
+});
+
+// ============================================================
+// editOnMeta — edit an already-submitted template by hsm_id
+// (template-EDIT task). Convex port of `src/app/api/whatsapp/
+// templates/[id]/route.ts`'s PATCH handler's Meta-call half.
+// ============================================================
+
+/**
+ * Load + decrypt the account's WhatsApp access token only. Unlike
+ * `loadWabaConfig` above, editing a template targets `metaTemplateId`
+ * directly (`POST /{message_template_id}`, no WABA-scoped URL), so this
+ * doesn't require — or check for — `wabaId`. Mirrors the source PATCH
+ * route's own gate, which only ever checked "does a config row exist,"
+ * never `waba_id`.
+ */
+async function loadDecryptedAccessToken(
+  ctx: ActionCtx,
+  accountId: Id<"accounts">,
+): Promise<string> {
+  const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+    accountId,
+  });
+  if (!config) {
+    throw new Error("WhatsApp not configured for this account");
+  }
+  return decrypt(config.accessToken);
+}
+
+/**
+ * Edit an existing (APPROVED/REJECTED/PAUSED) message template on Meta
+ * via its `metaTemplateId` (hsm_id) — a DIFFERENT Graph call than
+ * `submitToMeta`'s create (`POST /{message_template_id}` with just
+ * `components`; no `name`/`category`/`language`, unlike create's
+ * `POST /{waba_id}/message_templates`). DRY-RUN (`CONVEX_META_DRY_RUN`)
+ * skips the network call entirely, mirroring `submitToMeta`'s own
+ * short-circuit — lets `templates.editSubmit`'s tests (and local dev)
+ * exercise the full edit-then-persist flow without a live Meta app.
+ */
+export const editOnMeta = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    metaTemplateId: v.string(),
+    name: v.string(),
+    language: v.string(),
+    category: categoryValidator,
+    bodyText: v.string(),
+    headerType: v.optional(headerTypeValidator),
+    headerContent: v.optional(v.string()),
+    headerMediaUrl: v.optional(v.string()),
+    headerHandle: v.optional(v.string()),
+    footerText: v.optional(v.string()),
+    buttons: v.optional(v.any()),
+    sampleValues: v.optional(
+      v.object({
+        body: v.optional(v.array(v.string())),
+        header: v.optional(v.array(v.string())),
+      }),
+    ),
+  },
+  handler: async (ctx, args): Promise<{ dryRun: boolean }> => {
+    if (isDryRun()) {
+      return { dryRun: true };
+    }
+
+    const accessToken = await loadDecryptedAccessToken(ctx, args.accountId);
+    const payload = buildMetaTemplatePayload({
+      name: args.name,
+      language: args.language,
+      category: args.category,
+      bodyText: args.bodyText,
+      headerType: args.headerType,
+      headerContent: args.headerContent,
+      headerMediaUrl: args.headerMediaUrl,
+      headerHandle: args.headerHandle,
+      footerText: args.footerText,
+      buttons: args.buttons as TemplateButtonInput[] | undefined,
+      sampleValues: args.sampleValues,
+    });
+    await editMessageTemplate({
+      metaTemplateId: args.metaTemplateId,
+      accessToken,
+      components: payload.components,
+    });
+    return { dryRun: false };
   },
 });
 

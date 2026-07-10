@@ -149,6 +149,12 @@ export function TemplateManager() {
   // refetch needed after either call.
   const submitTemplate = useAction(api.templates.submit);
   const syncTemplatesFromMeta = useAction(api.templates.syncFromMeta);
+  // Template-EDIT task: editing an already-submitted (APPROVED/
+  // REJECTED/PAUSED) template is Meta's separate edit-by-hsm_id Graph
+  // call, distinct from `submit`'s create — `convex/templates.ts`'s
+  // `editSubmit` action wraps it, replacing the last Supabase-backed
+  // per-template lifecycle route caller below.
+  const editTemplate = useAction(api.templates.editSubmit);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -256,28 +262,21 @@ export function TemplateManager() {
       setSubmitting(true);
       const isEdit = editingId !== null;
       if (isEdit) {
-        // TODO(P8-T4): still PATCHes the Supabase-backed
-        // /api/whatsapp/templates/[id] route. Checked whether
-        // `api.templates.submit` (the Convex action the create branch
-        // below already uses) could cover this too — it can't: `submit`
-        // always calls `metaTemplates.submitToMeta`, which POSTs Meta's
-        // *create* endpoint and has no `templateId`/edit parameter at
-        // all, whereas editing an existing REJECTED/PAUSED/APPROVED
-        // template is Meta's separate edit-by-hsm_id Graph API call — a
-        // surface `convex/templates.ts` has no action for yet. This
-        // stragglers pass is UI-only (no new backend fn to invent), so
-        // this branch stays on the legacy route until that Convex
-        // action exists; the route file remains on disk for that reason.
-        const res = await fetch(`/api/whatsapp/templates/${editingId}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildSubmitPayload()),
+        const payload = buildSubmitPayload();
+        const result = await editTemplate({
+          templateId: editingId as Id<'messageTemplates'>,
+          name: payload.name,
+          language: payload.language,
+          category: payload.category,
+          bodyText: payload.body_text,
+          headerType: payload.header_type,
+          headerContent: payload.header_content,
+          headerMediaUrl: payload.header_media_url,
+          footerText: payload.footer_text,
+          buttons: payload.buttons,
+          sampleValues: payload.sample_values,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || `Edit failed (HTTP ${res.status})`);
-        }
-        toast.success(data.dry_run ? t('toastSaveEditDry') : t('toastSubmitEditSuccess'));
+        toast.success(result.dryRun ? t('toastSaveEditDry') : t('toastSubmitEditSuccess'));
       } else {
         const payload = buildSubmitPayload();
         const result = await submitTemplate({

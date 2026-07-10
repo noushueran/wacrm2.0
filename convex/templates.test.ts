@@ -702,6 +702,229 @@ test("submit persists a DRAFT row with submissionError and rethrows when Meta re
 });
 
 // ============================================================
+// editSubmit — authed PUBLIC action (template-EDIT task, edit-by-hsm_id)
+// ============================================================
+
+test("editSubmit throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  await expect(
+    t.action(api.templates.editSubmit, { templateId, ...baseTemplate }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("editSubmit throws FORBIDDEN for a non-admin (agent is below the admin floor, unlike submit)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  await expect(
+    asUser.action(api.templates.editSubmit, { templateId, ...baseTemplate }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("editSubmit throws NOT_FOUND when the template belongs to a different account", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  const aliceTemplateId = await asAlice.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  await expect(
+    asBob.action(api.templates.editSubmit, {
+      templateId: aliceTemplateId,
+      ...baseTemplate,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "messageTemplate" },
+  });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("editSubmit rejects a template that was never submitted to Meta (no metaTemplateId)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "DRAFT",
+  });
+
+  await expect(
+    asUser.action(api.templates.editSubmit, { templateId, ...baseTemplate }),
+  ).rejects.toThrow(/never submitted to Meta/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("editSubmit rejects a template whose status isn't APPROVED/REJECTED/PAUSED", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "PENDING",
+    metaTemplateId: "meta-1",
+  });
+
+  await expect(
+    asUser.action(api.templates.editSubmit, { templateId, ...baseTemplate }),
+  ).rejects.toThrow(/cannot be edited/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("editSubmit rejects category: Authentication with the same guidance message as the source route", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  await expect(
+    asUser.action(api.templates.editSubmit, {
+      templateId,
+      ...baseTemplate,
+      category: "Authentication",
+    }),
+  ).rejects.toThrow(/AUTHENTICATION templates are not editable here/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("editSubmit in DRY-RUN patches the local row with the edited content, flips status to PENDING, and returns dryRun: true", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "REJECTED",
+    metaTemplateId: "meta-1",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(templateId, { rejectionReason: "Sample content violates policy" }),
+  );
+
+  const result = await asUser.action(api.templates.editSubmit, {
+    templateId,
+    ...baseTemplate,
+    bodyText: "Hi {{1}}, thanks for shopping with us!",
+  });
+
+  expect(result).toEqual({ templateId, status: "PENDING", dryRun: true });
+
+  const row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.accountId).toBe(accountId);
+  expect(row!.bodyText).toBe("Hi {{1}}, thanks for shopping with us!");
+  expect(row!.status).toBe("PENDING");
+  expect(row!.rejectionReason).toBeUndefined();
+  expect(row!.submissionError).toBeUndefined();
+  // name/language/metaTemplateId are immutable on edit — untouched.
+  expect(row!.name).toBe(baseTemplate.name);
+  expect(row!.metaTemplateId).toBe("meta-1");
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("editSubmit persists only submissionError + lastSubmittedAt (leaving the live content untouched) and rethrows when Meta rejects the edit call", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Edit limit reached" } }),
+          { status: 400 },
+        ),
+    ),
+  );
+
+  await expect(
+    asUser.action(api.templates.editSubmit, {
+      templateId,
+      ...baseTemplate,
+      bodyText: "This edit should not be persisted",
+    }),
+  ).rejects.toThrow(/Edit limit reached/);
+
+  const row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.submissionError).toBe("Edit limit reached");
+  // Original content survives the failed edit attempt untouched.
+  expect(row!.bodyText).toBe(baseTemplate.bodyText);
+  expect(row!.status).toBe("APPROVED");
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
 // syncFromMeta — authed PUBLIC action (Phase 8, Task 4)
 // ============================================================
 

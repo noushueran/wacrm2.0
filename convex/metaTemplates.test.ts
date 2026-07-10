@@ -199,6 +199,167 @@ test("submitToMeta surfaces Meta's own error message when the create call fails"
 });
 
 // ============================================================
+// editOnMeta — DRY-RUN
+// ============================================================
+
+test("editOnMeta in DRY-RUN returns dryRun: true without a whatsappConfig row or a network call", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await t.action(internal.metaTemplates.editOnMeta, {
+    accountId,
+    metaTemplateId: "meta-tmpl-1",
+    ...baseTemplateArgs,
+  });
+
+  expect(result).toEqual({ dryRun: true });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
+// editOnMeta — config gating (non-DRY-RUN)
+// ============================================================
+
+test("editOnMeta throws 'WhatsApp not configured' when DRY-RUN is off and no whatsappConfig row exists", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    t.action(internal.metaTemplates.editOnMeta, {
+      accountId,
+      metaTemplateId: "meta-tmpl-1",
+      ...baseTemplateArgs,
+    }),
+  ).rejects.toThrow(/WhatsApp not configured/);
+});
+
+test("editOnMeta does NOT require wabaId (unlike submitToMeta) — a config row with only an access token is enough", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  // Deliberately no wabaId — editOnMeta's edit-by-hsm_id call targets
+  // `/{message_template_id}` directly, unlike submitToMeta's create,
+  // which needs the WABA-scoped URL.
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const fetchMock = vi.fn(async (url: string) => {
+    expect(url).toBe("https://graph.facebook.com/v21.0/meta-tmpl-1");
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await t.action(internal.metaTemplates.editOnMeta, {
+    accountId,
+    metaTemplateId: "meta-tmpl-1",
+    ...baseTemplateArgs,
+  });
+
+  expect(result).toEqual({ dryRun: false });
+  expect(fetchMock).toHaveBeenCalledOnce();
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
+// editOnMeta — real Meta call (fetch mocked)
+// ============================================================
+
+test("editOnMeta POSTs only the built components (no name/category/language) to /{metaTemplateId}", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(url).toBe("https://graph.facebook.com/v21.0/meta-tmpl-1");
+    expect(init?.method).toBe("POST");
+    expect(init?.headers).toMatchObject({ Authorization: "Bearer plaintext-token" });
+    const body = JSON.parse(init!.body as string);
+    expect(body).toEqual({
+      components: [{ type: "BODY", text: "Hello {{1}}" }],
+    });
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await t.action(internal.metaTemplates.editOnMeta, {
+    accountId,
+    metaTemplateId: "meta-tmpl-1",
+    ...baseTemplateArgs,
+  });
+
+  expect(result).toEqual({ dryRun: false });
+  expect(fetchMock).toHaveBeenCalledOnce();
+
+  vi.unstubAllGlobals();
+});
+
+test("editOnMeta surfaces Meta's own error message when the edit call fails", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Edit limit reached" } }),
+          { status: 400 },
+        ),
+    ),
+  );
+
+  await expect(
+    t.action(internal.metaTemplates.editOnMeta, {
+      accountId,
+      metaTemplateId: "meta-tmpl-1",
+      ...baseTemplateArgs,
+    }),
+  ).rejects.toThrow(/Edit limit reached/);
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
 // syncFromMeta — DRY-RUN
 // ============================================================
 

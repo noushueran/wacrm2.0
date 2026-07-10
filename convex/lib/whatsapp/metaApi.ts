@@ -8,11 +8,11 @@
  * codebase's `convex/` convention); behavior otherwise unchanged for
  * everything kept.
  *
- * NOT ported (out of scope — template-header media handles and
- * template-management-only edit/delete, neither touched by the
- * connect-flow regression fix or Phase 8 Task 4's template
- * management): `uploadResumableMedia`, `editMessageTemplate`,
- * `deleteMessageTemplate`.
+ * NOT ported (out of scope — template-header media handles and the
+ * delete side of template management, neither touched by the
+ * connect-flow regression fix, Phase 8 Task 4's template management, or
+ * the template-EDIT task that ported `editMessageTemplate` below):
+ * `uploadResumableMedia`, `deleteMessageTemplate`.
  *
  * `verifyPhoneNumber`/`getSubscribedApps` WERE ported (AI/WhatsApp
  * backend gap-fill task) — `convex/whatsappConfig.ts`'s
@@ -54,6 +54,14 @@
  * (`/{phone-number-id}/messages`); `listMessageTemplates` is new here
  * (the source app's sync route inlined its own fetch+pagination loop
  * rather than going through a named helper).
+ *
+ * `editMessageTemplate` WAS ALSO ported (template-EDIT task) — for
+ * `convex/metaTemplates.ts`'s `editOnMeta`, the Convex counterpart to
+ * `src/app/api/whatsapp/templates/[id]/route.ts`'s PATCH handler. A
+ * THIRD Graph API surface again (`POST /{message_template_id}`, no
+ * `waba_id` in the URL at all) — Meta's edit-by-hsm_id call, distinct
+ * from both the create endpoint above and every sender at the top of
+ * this file.
  *
  * `sendTemplateMessage` is intentionally the SIMPLIFIED legacy
  * body-only-params path from the original — the structured
@@ -942,6 +950,60 @@ export async function submitMessageTemplate(
     status: typeof data.status === "string" ? data.status : "PENDING",
     category: typeof data.category === "string" ? data.category : undefined,
   };
+}
+
+export interface EditMessageTemplateArgs {
+  /** Meta's template id (stored locally as `metaTemplateId`). */
+  metaTemplateId: string;
+  accessToken: string;
+  /** Send the full components array — Meta replaces, not patches. */
+  components: MetaTemplateSubmitPayload["components"];
+  /** Optional — only certain category transitions are allowed by Meta. */
+  category?: MetaTemplateSubmitPayload["category"];
+}
+
+export interface EditMessageTemplateResult {
+  success: boolean;
+}
+
+/**
+ * Edit an existing (APPROVED or REJECTED) message template.
+ *
+ * Meta caps edits at 10 per 30 days (and 1 per 24h for APPROVED
+ * templates). Every edit re-triggers review, so the status flips back
+ * to PENDING until Meta approves the new components — the caller
+ * (`convex/metaTemplates.ts`'s `editOnMeta`) doesn't get a status back
+ * from this call at all (Meta's edit response is just `{success}`), so
+ * that PENDING flip is hardcoded by the caller, not read from here.
+ *
+ * Faithful port of `src/lib/whatsapp/meta-api.ts`'s function of the
+ * same name — note the endpoint is `POST /{message_template_id}`
+ * (this template's own id), NOT `/{waba_id}/message_templates` like
+ * `submitMessageTemplate` above; no `name`/`language` on edit, and
+ * `category` is optional (present in this signature for parity with
+ * the source, but the only caller in this codebase never passes it,
+ * mirroring the source route's own PATCH handler, which only ever
+ * sent `components`).
+ */
+export async function editMessageTemplate(
+  args: EditMessageTemplateArgs,
+): Promise<EditMessageTemplateResult> {
+  const { metaTemplateId, accessToken, components, category } = args;
+  const body: Record<string, unknown> = { components };
+  if (category) body.category = category;
+  const response = await fetch(`${META_API_BASE}/${metaTemplateId}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  return { success: data?.success !== false };
 }
 
 export interface MetaTemplateButtonRaw {

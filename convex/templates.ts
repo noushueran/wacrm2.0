@@ -1,5 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalMutation, action } from "./_generated/server";
+import { internalMutation, internalQuery, action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { hasMinRole } from "./lib/roles";
@@ -549,6 +549,210 @@ export const submit = action({
         `Submitted to Meta but failed to save locally: ${message}. Run "Sync from Meta" to recover. (meta_template_id: ${meta.metaTemplateId})`,
       );
     }
+  },
+});
+
+// ============================================================
+// editSubmit — authed PUBLIC action (template-EDIT task), the Convex
+// counterpart to `src/app/api/whatsapp/templates/[id]/route.ts`'s PATCH
+// handler, wrapping `convex/metaTemplates.ts`'s `editOnMeta`
+// internalAction. Unlike `submit` above (role floor "agent"), this
+// requires "admin" — editing a template already live/reviewed on Meta
+// (and capped at 10 edits/30 days, 1/24h while APPROVED) is a bigger
+// blast-radius operation than drafting a brand-new one.
+// ============================================================
+
+const EDITABLE_STATUSES: ReadonlySet<string> = new Set([
+  "APPROVED",
+  "REJECTED",
+  "PAUSED",
+]);
+
+/**
+ * Server-only, id-scoped fetch with no identity/role check of its own
+ * (the calling action already resolved + is about to compare its own
+ * `accountId`) — used by `editSubmit` to load the target template's
+ * current `metaTemplateId`/`status` before deciding whether an edit is
+ * even allowed. Mirrors `upsertInternal`'s own "internal, no auth,
+ * caller already checked" convention.
+ */
+export const getInternal = internalQuery({
+  args: { templateId: v.id("messageTemplates") },
+  handler: async (ctx, args) => {
+    return await ctx.db.get(args.templateId);
+  },
+});
+
+/**
+ * Server-only, id-scoped patch for `editSubmit`'s Meta-failure path —
+ * mirrors the source PATCH route's own catch block, which touches ONLY
+ * `submission_error`/`last_submitted_at` and deliberately leaves every
+ * other column (the template's still-live approved content) untouched —
+ * unlike `upsertInternal`'s find-or-create (used by the CREATE flow,
+ * where no prior content exists to protect).
+ */
+export const applyEditFailureInternal = internalMutation({
+  args: {
+    templateId: v.id("messageTemplates"),
+    submissionError: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.templateId, {
+      submissionError: args.submissionError,
+      lastSubmittedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Server-only, id-scoped patch for `editSubmit`'s Meta-success path.
+ * Patches the exact row already resolved by id — not a find-or-create
+ * by (accountId, name, language) like `upsertInternal`, since an edit's
+ * target row is already known and name/language never change on edit
+ * (mirrors the source route's own update object, which never touches
+ * those two columns either). Flips `status` to PENDING and
+ * unconditionally clears `submissionError`/`rejectionReason` —
+ * hardcoded here rather than threaded through as args, so the clear
+ * always happens regardless of what the caller passes (same defensive
+ * "hardcode the reset" approach `applyMetaStatusWebhook` above uses).
+ */
+export const applyEditSuccessInternal = internalMutation({
+  args: {
+    templateId: v.id("messageTemplates"),
+    category: categoryValidator,
+    headerType: v.optional(
+      v.union(
+        v.literal("text"),
+        v.literal("image"),
+        v.literal("video"),
+        v.literal("document"),
+      ),
+    ),
+    headerContent: v.optional(v.string()),
+    headerMediaUrl: v.optional(v.string()),
+    headerHandle: v.optional(v.string()),
+    bodyText: v.string(),
+    footerText: v.optional(v.string()),
+    buttons: v.optional(v.any()),
+    sampleValues: v.optional(
+      v.object({
+        body: v.optional(v.array(v.string())),
+        header: v.optional(v.array(v.string())),
+      }),
+    ),
+  },
+  handler: async (ctx, args) => {
+    const { templateId, ...rest } = args;
+    await ctx.db.patch(templateId, {
+      ...rest,
+      status: "PENDING",
+      submissionError: undefined,
+      rejectionReason: undefined,
+      lastSubmittedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Edit an existing APPROVED/REJECTED/PAUSED template on Meta
+ * (edit-by-hsm_id — a different Graph call than `submit`'s create) and
+ * persist the result locally. Auth + "admin" role → load the target row
+ * and assert the caller's own account owns it → the same three
+ * preflight guards the source PATCH route enforced (meta_template_id
+ * must already be set; status must be one of `EDITABLE_STATUSES`;
+ * category can't be Authentication) → `metaTemplates.editOnMeta` (Meta
+ * POST, or a DRY-RUN synthetic success) → patch the local row.
+ *
+ * Mirrors the source route's two failure-recovery paths:
+ *   - Meta rejects the edit → only `submissionError`/`lastSubmittedAt`
+ *     are patched (the template's still-live approved content is left
+ *     alone), then the Meta error message is rethrown.
+ *   - Meta accepts it → the local row is patched with the edited
+ *     content, `status: "PENDING"` (Meta re-reviews every edit), and
+ *     `submissionError`/`rejectionReason` cleared.
+ */
+export const editSubmit = action({
+  args: { templateId: v.id("messageTemplates"), ...submitArgs },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    templateId: Id<"messageTemplates">;
+    status: TemplateStatus;
+    dryRun: boolean;
+  }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+    const { accountId } = context;
+
+    const template = await ctx.runQuery(internal.templates.getInternal, {
+      templateId: args.templateId,
+    });
+    if (!template || template.accountId !== accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "messageTemplate" });
+    }
+    if (!template.metaTemplateId) {
+      throw new Error(
+        'This template was never submitted to Meta — use New Template to submit it instead.',
+      );
+    }
+    if (!template.status || !EDITABLE_STATUSES.has(template.status)) {
+      throw new Error(
+        `Templates in status ${template.status ?? "DRAFT"} cannot be edited. Allowed: APPROVED, REJECTED, PAUSED.`,
+      );
+    }
+    if (args.category === "Authentication") {
+      throw new Error(
+        'AUTHENTICATION templates are not editable here — manage them in Meta WhatsApp Manager.',
+      );
+    }
+
+    const templateFields = {
+      category: args.category,
+      headerType: args.headerType,
+      headerContent: args.headerContent,
+      headerMediaUrl: args.headerMediaUrl,
+      headerHandle: args.headerHandle,
+      bodyText: args.bodyText,
+      footerText: args.footerText,
+      buttons: args.buttons,
+      sampleValues: args.sampleValues,
+    };
+
+    let meta: { dryRun: boolean };
+    try {
+      meta = await ctx.runAction(internal.metaTemplates.editOnMeta, {
+        accountId,
+        metaTemplateId: template.metaTemplateId,
+        name: args.name,
+        language: args.language,
+        ...templateFields,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Meta edit failed.";
+      await ctx.runMutation(internal.templates.applyEditFailureInternal, {
+        templateId: args.templateId,
+        submissionError: message,
+      });
+      throw new Error(message);
+    }
+
+    await ctx.runMutation(internal.templates.applyEditSuccessInternal, {
+      templateId: args.templateId,
+      ...templateFields,
+    });
+
+    return { templateId: args.templateId, status: "PENDING", dryRun: meta.dryRun };
   },
 });
 
