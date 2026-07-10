@@ -58,6 +58,77 @@ async function seedAccountMember(
   return { userId, accountId, asUser };
 }
 
+/**
+ * Inserts a minimal `pipelines` + `pipelineStages` + `deals` row
+ * directly via `t.run`, bypassing `pipelines.create`/`deals.create` —
+ * this suite only needs a real `deals` row with a real `contactId` to
+ * exercise `contacts.remove`'s SET NULL cascade, not `pipelines
+ * .create`'s own default-stages behavior (mirrors
+ * `convex/conversations.test.ts`'s `seedConversation`, which inserts
+ * directly for the same "out of this file's own vertical" reason).
+ */
+async function seedDeal(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; contactId: Id<"contacts"> },
+) {
+  return await t.run(async (ctx) => {
+    const pipelineId = await ctx.db.insert("pipelines", {
+      accountId: opts.accountId,
+      name: "Sales",
+    });
+    const stageId = await ctx.db.insert("pipelineStages", {
+      accountId: opts.accountId,
+      pipelineId,
+      name: "New Lead",
+      position: 0,
+      color: "#3b82f6",
+    });
+    return await ctx.db.insert("deals", {
+      accountId: opts.accountId,
+      pipelineId,
+      stageId,
+      contactId: opts.contactId,
+      title: "Big Fish",
+      value: 5000,
+      status: "open",
+    });
+  });
+}
+
+/**
+ * Inserts a minimal `broadcasts` + `broadcastRecipients` row directly
+ * via `t.run` — same "bypass the real mutation, just need a real row
+ * with a real contactId" reasoning as `seedDeal` above (the real
+ * `broadcasts.create`/send flow does far more than this cascade test
+ * needs: template validation, per-recipient WhatsApp sends, etc.).
+ */
+async function seedBroadcastRecipient(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; contactId: Id<"contacts"> },
+) {
+  return await t.run(async (ctx) => {
+    const broadcastId = await ctx.db.insert("broadcasts", {
+      accountId: opts.accountId,
+      name: "Spring Sale",
+      templateName: "spring_sale",
+      templateLanguage: "en_US",
+      status: "draft",
+      totalRecipients: 0,
+      sentCount: 0,
+      deliveredCount: 0,
+      readCount: 0,
+      repliedCount: 0,
+      failedCount: 0,
+    });
+    return await ctx.db.insert("broadcastRecipients", {
+      accountId: opts.accountId,
+      broadcastId,
+      contactId: opts.contactId,
+      status: "pending",
+    });
+  });
+}
+
 const onePage = { paginationOpts: { numItems: 50, cursor: null } };
 
 // ============================================================
@@ -618,6 +689,205 @@ test("remove cascades: deletes the contact's contactTags rows along with it, but
   expect(links).toHaveLength(0);
   expect(await t.run((ctx) => ctx.db.get(contactId))).toBeNull();
   expect(await t.run((ctx) => ctx.db.get(tagId))).not.toBeNull();
+});
+
+// ============================================================
+// remove — cascades onto contactCustomValues/contactNotes (DELETE)
+// and deals/broadcastRecipients (SET NULL). conversations/messages are
+// deliberately left untouched — see `convex/contacts.ts`'s `remove`
+// comment and `convex/conversations.test.ts`'s own dangling-contact
+// test, which relies on that gap staying open.
+// ============================================================
+
+test("remove cascades: deletes the contact's contactCustomValues and contactNotes rows", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const fieldId = await asUser.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+  await asUser.mutation(api.customFields.setForContact, {
+    contactId,
+    values: [{ customFieldId: fieldId, value: "Pro" }],
+  });
+  await asUser.mutation(api.contactNotes.add, {
+    contactId,
+    body: "Called about renewal",
+  });
+
+  await asUser.mutation(api.contacts.remove, { contactId });
+
+  const values = await t.run((ctx) =>
+    ctx.db
+      .query("contactCustomValues")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .collect(),
+  );
+  expect(values).toHaveLength(0);
+
+  const notes = await t.run((ctx) =>
+    ctx.db
+      .query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .collect(),
+  );
+  expect(notes).toHaveLength(0);
+});
+
+test("remove cascades: SET NULL on deals.contactId, but keeps the deal itself", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const dealId = await seedDeal(t, { accountId, contactId });
+
+  await asUser.mutation(api.contacts.remove, { contactId });
+
+  const deal = await t.run((ctx) => ctx.db.get(dealId));
+  expect(deal).not.toBeNull();
+  expect(deal!.contactId).toBeUndefined();
+});
+
+test("remove cascades: SET NULL on broadcastRecipients.contactId, but keeps the recipient row", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const recipientId = await seedBroadcastRecipient(t, {
+    accountId,
+    contactId,
+  });
+
+  await asUser.mutation(api.contacts.remove, { contactId });
+
+  const recipient = await t.run((ctx) => ctx.db.get(recipientId));
+  expect(recipient).not.toBeNull();
+  expect(recipient!.contactId).toBeUndefined();
+});
+
+test("remove cascades never touch another account's contactCustomValues/contactNotes/deals/broadcastRecipients rows", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "admin",
+    });
+  const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(
+    t,
+    { name: "Bob", email: "bob@example.com", role: "admin" },
+  );
+
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const bobContactId = await asBob.mutation(api.contacts.create, {
+    phone: "222",
+  });
+
+  const aliceFieldId = await asAlice.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: aliceContactId,
+    values: [{ customFieldId: aliceFieldId, value: "Pro" }],
+  });
+  const bobFieldId = await asBob.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+  await asBob.mutation(api.customFields.setForContact, {
+    contactId: bobContactId,
+    values: [{ customFieldId: bobFieldId, value: "Pro" }],
+  });
+
+  await asAlice.mutation(api.contactNotes.add, {
+    contactId: aliceContactId,
+    body: "Alice note",
+  });
+  await asBob.mutation(api.contactNotes.add, {
+    contactId: bobContactId,
+    body: "Bob note",
+  });
+
+  const aliceDealId = await seedDeal(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const bobDealId = await seedDeal(t, {
+    accountId: bobAccountId,
+    contactId: bobContactId,
+  });
+
+  const aliceRecipientId = await seedBroadcastRecipient(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const bobRecipientId = await seedBroadcastRecipient(t, {
+    accountId: bobAccountId,
+    contactId: bobContactId,
+  });
+
+  await asAlice.mutation(api.contacts.remove, { contactId: aliceContactId });
+
+  // Bob's rows: completely untouched by Alice's cascade.
+  const bobValues = await t.run((ctx) =>
+    ctx.db
+      .query("contactCustomValues")
+      .withIndex("by_contact", (q) => q.eq("contactId", bobContactId))
+      .collect(),
+  );
+  expect(bobValues).toHaveLength(1);
+  const bobNotes = await t.run((ctx) =>
+    ctx.db
+      .query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", bobContactId))
+      .collect(),
+  );
+  expect(bobNotes).toHaveLength(1);
+  const bobDeal = await t.run((ctx) => ctx.db.get(bobDealId));
+  expect(bobDeal!.contactId).toBe(bobContactId);
+  const bobRecipient = await t.run((ctx) => ctx.db.get(bobRecipientId));
+  expect(bobRecipient!.contactId).toBe(bobContactId);
+
+  // Alice's own rows: cascaded as expected.
+  const aliceValues = await t.run((ctx) =>
+    ctx.db
+      .query("contactCustomValues")
+      .withIndex("by_contact", (q) => q.eq("contactId", aliceContactId))
+      .collect(),
+  );
+  expect(aliceValues).toHaveLength(0);
+  const aliceNotes = await t.run((ctx) =>
+    ctx.db
+      .query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", aliceContactId))
+      .collect(),
+  );
+  expect(aliceNotes).toHaveLength(0);
+  const aliceDeal = await t.run((ctx) => ctx.db.get(aliceDealId));
+  expect(aliceDeal!.contactId).toBeUndefined();
+  const aliceRecipient = await t.run((ctx) => ctx.db.get(aliceRecipientId));
+  expect(aliceRecipient!.contactId).toBeUndefined();
 });
 
 test("tags.remove cascades: deletes the contactTags rows referencing it", async () => {

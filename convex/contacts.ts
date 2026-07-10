@@ -325,6 +325,74 @@ export const remove = accountMutation({
     for (const link of links) {
       await ctx.db.delete(link._id);
     }
+
+    // Explicit cascade: Postgres had `contact_custom_values.contact_id
+    // ... ON DELETE CASCADE` — a custom-field value is meaningless once
+    // its contact is gone. Mirrors the `contactTags` cascade above.
+    const customValues = await ctx.db
+      .query("contactCustomValues")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .collect();
+    for (const value of customValues) {
+      await ctx.db.delete(value._id);
+    }
+
+    // Explicit cascade: Postgres had `contact_notes.contact_id ...
+    // ON DELETE CASCADE` — same reasoning as `contactCustomValues` above.
+    const notes = await ctx.db
+      .query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .collect();
+    for (const note of notes) {
+      await ctx.db.delete(note._id);
+    }
+
+    // Explicit SET NULL: migration 004 (contact_delete_set_null) made
+    // `deals.contact_id ON DELETE SET NULL` so a deal's sales history
+    // survives its contact being deleted — unlike the DELETE cascades
+    // above, these rows are unlinked, never removed.
+    const deals = await ctx.db
+      .query("deals")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .collect();
+    for (const deal of deals) {
+      await ctx.db.patch(deal._id, { contactId: undefined });
+    }
+
+    // Explicit SET NULL: migration 004 gave `broadcast_recipients.
+    // contact_id` the same ON DELETE SET NULL treatment as `deals`
+    // above, so a broadcast's send history survives too.
+    // `broadcastRecipients` has no `by_contact` index (see schema.ts —
+    // only `by_broadcast`/`by_account`/`by_wamid`), so this scopes
+    // through the account's own `by_account` index and filters down to
+    // this contact in memory instead — the same pattern
+    // `customFields.remove`'s cascade uses onto `contactCustomValues`
+    // for the identical reason (no index on the column being filtered).
+    // A dedicated `by_contact` index would speed this up, but adding
+    // one is a schema change beyond this cascade fix — worth revisiting
+    // if broadcast recipient volume ever makes this scan a hot path.
+    const recipients = await ctx.db
+      .query("broadcastRecipients")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .filter((q) => q.eq(q.field("contactId"), args.contactId))
+      .collect();
+    for (const recipient of recipients) {
+      await ctx.db.patch(recipient._id, { contactId: undefined });
+    }
+
+    // Deliberately NOT cascaded: `conversations` / `messages`.
+    // `conversations.contactId` is NOT NULL (`v.id("contacts")`), so it
+    // can't be SET NULL without a schema change, and the read layer
+    // already tolerates a dangling reference on purpose —
+    // `conversations.ts`'s `embedContact` returns `contact: null` for a
+    // deleted contact rather than throwing, which
+    // `convex/conversations.test.ts`'s "embeds contact: null when the
+    // conversation's contact has been deleted" test asserts directly.
+    // Deleting a contact's conversation + message history outright is a
+    // separate, destructive product decision that's out of scope here;
+    // a future improvement making `conversations.contactId` optional
+    // would allow a clean SET NULL cascade instead.
+
     await ctx.db.delete(args.contactId);
   },
 });
