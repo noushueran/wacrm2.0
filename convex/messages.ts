@@ -1,5 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalMutation } from "./_generated/server";
+import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -261,5 +261,29 @@ export const appendInternal = internalMutation({
       args.conversationId,
     );
     return await insertMessageAndUpdateConversation(ctx, args, conversation);
+  },
+});
+
+/**
+ * Server-only counterpart to a `requireOwnMessage`-style lookup, for
+ * `reactions.reactToMeta` (Phase 8, Task 4) — a public `action` has no
+ * `ctx.db` to check message ownership inline the way
+ * `reactions.ts`'s own private `requireOwnMessage` does for its
+ * `accountQuery`/`accountMutation` siblings, so `accountId` is an
+ * explicit, caller-supplied argument instead (same treatment as
+ * `whatsappConfig.getForAccount`, this codebase's established naming
+ * for "the internal, caller-supplied-accountId counterpart of a public
+ * `get`"). Returns the full `Doc<"messages">` — `reactToMeta` reads both
+ * `conversationId` (to call `metaSend.sendReaction`) and `messageId`
+ * (Meta's wamid, to know what to react to) off it.
+ */
+export const getForAccount = internalQuery({
+  args: { accountId: v.id("accounts"), messageId: v.id("messages") },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message || message.accountId !== args.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "message" });
+    }
+    return message;
   },
 });

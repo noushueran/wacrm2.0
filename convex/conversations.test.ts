@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -457,6 +457,79 @@ test("findOrCreateForContact throws NOT_FOUND for a contact belonging to a diffe
 });
 
 // ============================================================
+// findOrCreateForContactInternal — server-only counterpart, for
+// `send.ts`'s public `send` action (Phase 8, Task 4): no user session
+// to derive `ctx.accountId` from, so `accountId` is caller-supplied.
+// ============================================================
+
+test("findOrCreateForContactInternal returns the same conversation id on a second call, without creating a duplicate row", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  const first = await t.mutation(
+    internal.conversations.findOrCreateForContactInternal,
+    { accountId, contactId },
+  );
+  const second = await t.mutation(
+    internal.conversations.findOrCreateForContactInternal,
+    { accountId, contactId },
+  );
+
+  expect(second).toBe(first);
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!._id).toBe(first);
+  expect(rows[0]!.accountId).toBe(accountId);
+  expect(rows[0]!.status).toBe("open");
+  expect(rows[0]!.unreadCount).toBe(0);
+});
+
+test("findOrCreateForContactInternal throws NOT_FOUND for a contact belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await expect(
+    t.mutation(internal.conversations.findOrCreateForContactInternal, {
+      accountId: bobAccountId,
+      contactId: aliceContactId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "contact" } });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", aliceContactId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+});
+
+// ============================================================
 // getByContact — read-only counterpart to findOrCreateForContact;
 // never creates, returns null when no thread exists yet
 // ============================================================
@@ -812,4 +885,153 @@ test("assign does not notify when an agent assigns a conversation to themselves"
 
   const alicesNotifications = await asAlice.query(api.notifications.list, {});
   expect(alicesNotifications).toHaveLength(0);
+});
+
+// ============================================================
+// resolveSendTarget — server-only recipient-phone + reply-context
+// resolution, for `send.ts`'s `send` action and `metaSend.sendReaction`
+// (Phase 8, Task 4).
+// ============================================================
+
+test("resolveSendTarget returns the conversation's contact phone", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const result = await t.query(internal.conversations.resolveSendTarget, {
+    accountId,
+    conversationId,
+  });
+
+  expect(result.to).toBe("15551234567");
+  expect(result.contextMessageId).toBeUndefined();
+});
+
+test("resolveSendTarget throws NOT_FOUND for a conversation belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    t.query(internal.conversations.resolveSendTarget, {
+      accountId: bobAccountId,
+      conversationId: aliceConversationId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("resolveSendTarget resolves a replyToMessageId in the same conversation to its Meta wamid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const parentMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "hi",
+    messageId: "wamid.PARENT123",
+  });
+
+  const result = await t.query(internal.conversations.resolveSendTarget, {
+    accountId,
+    conversationId,
+    replyToMessageId: parentMessageId,
+  });
+
+  expect(result.to).toBe("15551234567");
+  expect(result.contextMessageId).toBe("wamid.PARENT123");
+});
+
+test("resolveSendTarget omits contextMessageId (without throwing) when the reply target has no Meta wamid yet", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const parentMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "agent",
+    contentType: "text",
+    contentText: "still sending",
+  });
+
+  const result = await t.query(internal.conversations.resolveSendTarget, {
+    accountId,
+    conversationId,
+    replyToMessageId: parentMessageId,
+  });
+
+  expect(result.contextMessageId).toBeUndefined();
+});
+
+test("resolveSendTarget throws NOT_FOUND for a replyToMessageId belonging to a different conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const otherContactId = await asUser.mutation(api.contacts.create, {
+    phone: "15559998888",
+  });
+  const otherConversationId = await seedConversation(t, {
+    accountId,
+    contactId: otherContactId,
+  });
+  const otherMessageId = await asUser.mutation(api.messages.append, {
+    conversationId: otherConversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "hi",
+    messageId: "wamid.OTHER",
+  });
+
+  await expect(
+    t.query(internal.conversations.resolveSendTarget, {
+      accountId,
+      conversationId,
+      replyToMessageId: otherMessageId,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "replyToMessage" },
+  });
 });

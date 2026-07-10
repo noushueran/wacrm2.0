@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -514,4 +514,203 @@ test("forConversation throws NOT_FOUND for a conversation belonging to a differe
     conversationId,
   });
   expect(alicesView).toEqual([]);
+});
+
+// ============================================================
+// reactToMeta — the authed, PUBLIC action that notifies Meta of a
+// reaction (Phase 8, Task 4). Does NOT touch `messageReactions` itself
+// (the UI's own `set`/`remove` calls above already own that row) — every
+// test here only asserts the Meta-notify leg succeeds/fails correctly.
+// Every DRY-RUN test sets `CONVEX_META_DRY_RUN`, mirroring
+// `convex/metaSend.test.ts`'s own convention.
+// ============================================================
+
+test("reactToMeta in DRY-RUN does not throw for the caller's own account", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const targetMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "Hi",
+    messageId: "wamid.TARGET123",
+  });
+
+  const result = await asUser.action(api.reactions.reactToMeta, {
+    messageId: targetMessageId,
+    emoji: "👍",
+  });
+
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("reactToMeta supports emoji: '' (removal) without throwing", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const targetMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "Hi",
+    messageId: "wamid.TARGET123",
+  });
+
+  const result = await asUser.action(api.reactions.reactToMeta, {
+    messageId: targetMessageId,
+    emoji: "",
+  });
+
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("reactToMeta throws when the target message has never been sent to WhatsApp (no wamid)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const targetMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "agent",
+    contentType: "text",
+    contentText: "still sending",
+  });
+
+  await expect(
+    asUser.action(api.reactions.reactToMeta, {
+      messageId: targetMessageId,
+      emoji: "👍",
+    }),
+  ).rejects.toThrow(/has not been sent to WhatsApp/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("reactToMeta is account-scoped: rejects a message belonging to a different account", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const aliceMessageId = await asAlice.mutation(api.messages.append, {
+    conversationId: aliceConversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "Hi",
+    messageId: "wamid.ALICE123",
+  });
+
+  await expect(
+    asBob.action(api.reactions.reactToMeta, {
+      messageId: aliceMessageId,
+      emoji: "👍",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "message" } });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("reactToMeta throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const targetMessageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "Hi",
+    messageId: "wamid.X",
+  });
+
+  await expect(
+    t.action(api.reactions.reactToMeta, {
+      messageId: targetMessageId,
+      emoji: "👍",
+    }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("reactToMeta throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Viewer",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "15551234567",
+      phoneNormalized: "15551234567",
+    }),
+  );
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const targetMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "Hi",
+      messageId: "wamid.X",
+      status: "sent",
+    }),
+  );
+
+  await expect(
+    asUser.action(api.reactions.reactToMeta, {
+      messageId: targetMessageId,
+      emoji: "👍",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });

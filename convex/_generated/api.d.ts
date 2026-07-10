@@ -64,6 +64,7 @@ import type * as pipelines from "../pipelines.js";
 import type * as presence from "../presence.js";
 import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
+import type * as send from "../send.js";
 import type * as tags from "../tags.js";
 import type * as templates from "../templates.js";
 import type * as webhookDelivery from "../webhookDelivery.js";
@@ -133,6 +134,7 @@ declare const fullApi: ApiFromModules<{
   presence: typeof presence;
   quickReplies: typeof quickReplies;
   reactions: typeof reactions;
+  send: typeof send;
   tags: typeof tags;
   templates: typeof templates;
   webhookDelivery: typeof webhookDelivery;

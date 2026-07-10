@@ -12,11 +12,15 @@
  * registration, not the send+persist engine primitives):
  * `verifyPhoneNumber`, `registerPhoneNumber`, `subscribeWabaToApp`,
  * `getSubscribedApps`, `uploadResumableMedia`, `submitMessageTemplate`,
- * `editMessageTemplate`, `deleteMessageTemplate`, `sendReactionMessage`,
+ * `editMessageTemplate`, `deleteMessageTemplate`,
  * `getMediaUrl`, `downloadMedia` (the last also uses Node's `Buffer`,
  * unavailable outside a `"use node"` action — not needed here since
  * `convex/files.ts`'s `storeFromUrl` uses `fetch()` + `Response#blob()`
  * instead).
+ *
+ * `sendReactionMessage` WAS ported (Phase 8, Task 4) — `convex/
+ * metaSend.ts`'s `sendReaction` needs it for the public `reactToMeta`
+ * action's Meta leg.
  *
  * `sendTemplateMessage` is intentionally the SIMPLIFIED legacy
  * body-only-params path from the original — the structured
@@ -238,6 +242,52 @@ export async function sendTemplateMessage(
       Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = await response.json();
+  return { messageId: data.messages[0].id };
+}
+
+// ============================================================
+// Reactions
+// ============================================================
+
+export interface SendReactionMessageArgs {
+  phoneNumberId: string;
+  accessToken: string;
+  to: string;
+  /** Meta's message_id of the message being reacted to. */
+  targetMessageId: string;
+  /** Single emoji, or empty string to remove an existing reaction. */
+  emoji: string;
+}
+
+/**
+ * Send a reaction (or removal) to a previously-exchanged message.
+ * Empty `emoji` removes the reaction per Meta's spec. Convex port of
+ * `src/lib/whatsapp/meta-api.ts`'s `sendReactionMessage` — ported
+ * verbatim (quote style aside) for `convex/metaSend.ts`'s `sendReaction`.
+ */
+export async function sendReactionMessage(
+  args: SendReactionMessageArgs,
+): Promise<MetaSendResult> {
+  const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args;
+  const url = `${META_API_BASE}/${phoneNumberId}/messages`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "reaction",
+      reaction: { message_id: targetMessageId, emoji },
+    }),
   });
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`);

@@ -1,4 +1,4 @@
-import { mutation, query } from "./_generated/server";
+import { mutation, query, internalQuery } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
 
@@ -150,5 +150,39 @@ export const updateProfile = mutation({
 
     await ctx.db.patch(membership._id, patch);
     return membership._id;
+  },
+});
+
+/**
+ * Server-only counterpart to the membership lookup `lib/auth.ts`'s
+ * `withAccount` performs for every `accountQuery`/`accountMutation` —
+ * for the PUBLIC actions (`send.ts`'s `send`, `reactions.reactToMeta`,
+ * Phase 8 Task 4) that need the exact same "trustworthy account+role
+ * from the caller's own session" derivation but have no `ctx.db` of
+ * their own to run it inline (an action's `ctx` has no `db`; only
+ * `runQuery`/`runMutation`/`runAction`). Callers resolve
+ * `getAuthUserId(ctx)` themselves first (an action's `ctx.auth` supports
+ * it exactly like a query/mutation ctx's — `getAuthUserId` only ever
+ * needs `ctx.auth`), then call this via
+ * `ctx.runQuery(internal.accounts.accountContextForUser, {userId})`.
+ *
+ * Returns `null` for "authenticated but not yet bootstrapped" (mirrors
+ * `withAccount`'s own `NO_ACCOUNT` case, and `currentUser`/`me`'s `null`
+ * contract above) rather than throwing, so each caller maps it to its
+ * own action-specific `ConvexError` instead of this query dictating
+ * one — this is a data lookup, not an auth gate itself. Same "first
+ * membership row" resolution as `withAccount`/`currentUser`/`me`
+ * (`by_user`, `.first()`) — a user has exactly one membership in this
+ * codebase's current model, so there's nothing to disambiguate.
+ */
+export const accountContextForUser = internalQuery({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .first();
+    if (!membership) return null;
+    return { accountId: membership.accountId, role: membership.role };
   },
 });

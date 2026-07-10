@@ -1,4 +1,5 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
@@ -197,6 +198,41 @@ export const findOrCreateForContact = accountMutation({
 });
 
 /**
+ * Server-only counterpart to `findOrCreateForContact` above, for
+ * `send.ts`'s public `send` action (Phase 8, Task 4) — an action has no
+ * `ctx.db`/user session of its own (same reasoning as `messages.ts`'s
+ * `appendInternal`), so `accountId` is an explicit, caller-supplied
+ * argument instead of `ctx.accountId`. Otherwise byte-for-byte the same
+ * find-or-create body: verify the contact belongs to `accountId`, reuse
+ * `by_contact` + an `accountId` filter (see `findOrCreateForContact`'s
+ * own comment for why that filter is defense-in-depth, not
+ * load-bearing), insert if none exists.
+ */
+export const findOrCreateForContactInternal = internalMutation({
+  args: { accountId: v.id("accounts"), contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    const contact = await ctx.db.get(args.contactId);
+    if (!contact || contact.accountId !== args.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "contact" });
+    }
+
+    const existing = await ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .filter((q) => q.eq(q.field("accountId"), args.accountId))
+      .first();
+    if (existing) return existing._id;
+
+    return await ctx.db.insert("conversations", {
+      accountId: args.accountId,
+      contactId: args.contactId,
+      status: "open",
+      unreadCount: 0,
+    });
+  },
+});
+
+/**
  * Assigns a conversation to an account teammate and bumps it to
  * "pending" — the agent now owns following up. `userId` must itself be
  * a member of this same account (checked via `by_user_account`); an
@@ -298,5 +334,60 @@ export const markRead = accountMutation({
     await requireOwnConversation(ctx, args.conversationId);
     await ctx.db.patch(args.conversationId, { unreadCount: 0 });
     return args.conversationId;
+  },
+});
+
+/**
+ * Resolves the Meta recipient phone (+ optional reply context) for a
+ * conversation, scoped to `accountId` — the piece `send.ts`'s public
+ * `send` action and `metaSend.sendReaction` both need before they can
+ * call into `metaSend.ts`'s actions, which take `to`/`contextMessageId`
+ * directly rather than a `conversationId` (see that module's header
+ * comment on why the contact-phone lookup was deliberately left OUT of
+ * those actions — this query is exactly that lookup, resurrected for
+ * the two callers that DO still need it). An `internalQuery` rather
+ * than folded into `metaSend.ts` itself, since it reads
+ * `conversations`/`contacts`/`messages` — tables that file has never
+ * needed to touch directly.
+ *
+ * Doubles as both callers' tenancy gate: throws the same `NOT_FOUND`
+ * "doesn't exist" / "exists but isn't yours" conflation
+ * `requireOwnConversation` uses elsewhere in this file, for either a
+ * foreign `conversationId` or a `replyToMessageId` that exists but
+ * belongs to a different conversation — so a cross-account probe can't
+ * distinguish "no such row" from "not yours" via either argument.
+ *
+ * A reply target that exists (in this conversation) but has no Meta
+ * `messageId` yet (still sending, or failed) is NOT an error —
+ * `contextMessageId` comes back `undefined` and the send proceeds
+ * without reply context, mirroring `src/lib/whatsapp/send-message.ts`'s
+ * own "warn and send without context" handling for the same case.
+ */
+export const resolveSendTarget = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    replyToMessageId: v.optional(v.id("messages")),
+  },
+  handler: async (ctx, args) => {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+    const contact = await ctx.db.get(conversation.contactId);
+    if (!contact) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "contact" });
+    }
+
+    let contextMessageId: string | undefined;
+    if (args.replyToMessageId) {
+      const parent = await ctx.db.get(args.replyToMessageId);
+      if (!parent || parent.conversationId !== args.conversationId) {
+        throw new ConvexError({ code: "NOT_FOUND", entity: "replyToMessage" });
+      }
+      contextMessageId = parent.messageId;
+    }
+
+    return { to: contact.phone, contextMessageId };
   },
 });

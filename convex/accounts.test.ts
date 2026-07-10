@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 
@@ -248,4 +248,41 @@ test("updateProfile throws NO_ACCOUNT when authenticated but not yet bootstrappe
   await expect(
     asUser.mutation(api.accounts.updateProfile, { name: "Someone" }),
   ).rejects.toMatchObject({ data: { code: "NO_ACCOUNT" } });
+});
+
+// ============================================================
+// accountContextForUser — server-only membership lookup for PUBLIC
+// actions (`send.ts`'s `send`, `reactions.reactToMeta`; Phase 8, Task 4)
+// that have no `ctx.db` of their own to call `lib/auth.ts`'s
+// `withAccount` inline.
+// ============================================================
+
+test("accountContextForUser returns the caller's accountId + role", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const result = await t.query(internal.accounts.accountContextForUser, {
+    userId,
+  });
+
+  expect(result).toEqual({ accountId, role: "owner" });
+});
+
+test("accountContextForUser returns null for a user with no membership yet", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Nomad",
+    email: "nomad@example.com",
+  });
+
+  const result = await t.query(internal.accounts.accountContextForUser, {
+    userId,
+  });
+
+  expect(result).toBeNull();
 });

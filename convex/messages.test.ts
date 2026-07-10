@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -302,4 +302,74 @@ test("append throws NOT_FOUND for a conversation belonging to a different accoun
   expect(conversation!.unreadCount).toBe(0);
   expect(conversation!.lastMessageText).toBeUndefined();
   expect(conversation!.lastMessageAt).toBeUndefined();
+});
+
+// ============================================================
+// getForAccount — server-only counterpart of a `requireOwnMessage`-
+// style lookup, for `reactions.reactToMeta` (Phase 8, Task 4): a public
+// `action` has no `ctx.db` to check message ownership inline.
+// ============================================================
+
+test("getForAccount returns the message when it belongs to accountId", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const messageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "hi",
+    messageId: "wamid.X",
+  });
+
+  const result = await t.query(internal.messages.getForAccount, {
+    accountId,
+    messageId,
+  });
+
+  expect(result._id).toBe(messageId);
+  expect(result.messageId).toBe("wamid.X");
+  expect(result.conversationId).toBe(conversationId);
+});
+
+test("getForAccount throws NOT_FOUND for a message belonging to a different account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const aliceMessageId = await asAlice.mutation(api.messages.append, {
+    conversationId: aliceConversationId,
+    senderType: "customer",
+    contentType: "text",
+    contentText: "hi",
+  });
+
+  await expect(
+    t.query(internal.messages.getForAccount, {
+      accountId: bobAccountId,
+      messageId: aliceMessageId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "message" } });
 });

@@ -361,3 +361,103 @@ test("sendMedia in DRY-RUN persists a media message with the right contentType",
 
   delete process.env.CONVEX_META_DRY_RUN;
 });
+
+// ============================================================
+// sendReaction — Meta-only notify (Phase 8, Task 4). Unlike every
+// action above, this one does NOT persist via `appendInternal` (a
+// reaction is its own row — `convex/reactions.ts` owns that write); the
+// account-scoping guard instead comes from `conversations
+// .resolveSendTarget`, run unconditionally so it fires in DRY-RUN too.
+// ============================================================
+
+test("sendReaction in DRY-RUN does not throw and returns a synthetic wamid, without persisting a message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const result = await t.action(internal.metaSend.sendReaction, {
+    accountId,
+    conversationId,
+    targetWhatsappMessageId: "wamid.TARGET123",
+    emoji: "👍",
+  });
+
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("sendReaction accepts an empty emoji (Meta's 'remove reaction' convention) without throwing", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const result = await t.action(internal.metaSend.sendReaction, {
+    accountId,
+    conversationId,
+    targetWhatsappMessageId: "wamid.TARGET123",
+    emoji: "",
+  });
+
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("sendReaction is account-scoped: rejects a conversation belonging to a different account, even in DRY-RUN", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    t.action(internal.metaSend.sendReaction, {
+      accountId: bobAccountId,
+      conversationId: aliceConversationId,
+      targetWhatsappMessageId: "wamid.SHOULD_NOT_SEND",
+      emoji: "👍",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});

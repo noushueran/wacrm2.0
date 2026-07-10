@@ -10,6 +10,7 @@ import {
   sendTemplateMessage,
   sendInteractiveButtons,
   sendInteractiveList,
+  sendReactionMessage,
 } from "./lib/whatsapp/metaApi";
 import {
   validateInteractivePayload,
@@ -305,6 +306,58 @@ export const sendMedia = internalAction({
       mediaUrl: args.link,
       messageId: whatsappMessageId,
     });
+
+    return { whatsappMessageId };
+  },
+});
+
+/**
+ * Reacts to (or, with `emoji: ""`, removes a reaction from) a
+ * previously-exchanged message on Meta's side — the one metaSend action
+ * with NO `messages.appendInternal` persistence step, since a reaction
+ * is its own row (`convex/schema.ts`'s `messageReactions`) already
+ * written by the public `reactions.set`/`remove` mutations; this action
+ * only notifies Meta. Deliberately takes `conversationId` instead of a
+ * `to` phone (unlike every sibling action above) — there is no contact
+ * lookup left for a caller to have already done the way there is for
+ * text/template/interactive/media (see this file's header comment on
+ * why THOSE take `to` directly), so `conversations.resolveSendTarget`
+ * resolves it here instead. That same call is also this action's
+ * tenancy gate — run UNCONDITIONALLY (not just on the real-Meta-call
+ * branch) so a cross-account `conversationId` is rejected in DRY-RUN
+ * too, mirroring `sendText`'s own "account-scoped" guarantee even
+ * though there's no `appendInternal` write here to carry that check.
+ */
+export const sendReaction = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    targetWhatsappMessageId: v.string(),
+    emoji: v.string(),
+  },
+  handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
+    const { to } = await ctx.runQuery(
+      internal.conversations.resolveSendTarget,
+      { accountId: args.accountId, conversationId: args.conversationId },
+    );
+
+    let whatsappMessageId: string;
+    if (isDryRun()) {
+      whatsappMessageId = dryRunWamid();
+    } else {
+      const { phoneNumberId, accessToken } = await loadDecryptedConfig(
+        ctx,
+        args.accountId,
+      );
+      const result = await sendReactionMessage({
+        phoneNumberId,
+        accessToken,
+        to,
+        targetMessageId: args.targetWhatsappMessageId,
+        emoji: args.emoji,
+      });
+      whatsappMessageId = result.messageId;
+    }
 
     return { whatsappMessageId };
   },

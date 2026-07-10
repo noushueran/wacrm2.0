@@ -1,5 +1,9 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { action } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
+import { hasMinRole } from "./lib/roles";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
@@ -160,5 +164,58 @@ export const forConversation = accountQuery({
         q.eq("conversationId", args.conversationId),
       )
       .collect();
+  },
+});
+
+/**
+ * The authed, PUBLIC entrypoint that notifies Meta of a reaction (Phase
+ * 8, Task 4) — the counterpart to `send.ts`'s `send`, built the same
+ * way: `getAuthUserId` + `internal.accounts.accountContextForUser` to
+ * derive a trustworthy account/role (a plain `action` has no `ctx.db`
+ * to run `lib/auth.ts`'s membership lookup inline), `hasMinRole` to
+ * enforce the same "agent" floor `set`/`remove` above already require,
+ * then `internal.messages.getForAccount` to verify the target message
+ * belongs to this account and read its Meta wamid + conversation off
+ * it, before dispatching to `internal.metaSend.sendReaction`.
+ *
+ * Does NOT touch `messageReactions` itself — the DB row is already
+ * written by the UI's own call to `set`/`remove` above; this action's
+ * entire job is the Meta leg those two mutations can't do (they're
+ * plain mutations, no outbound `fetch`). `emoji: ""` removes an
+ * existing reaction on Meta's side, mirroring `sendReaction`'s own
+ * pass-through of that convention.
+ */
+export const reactToMeta = action({
+  args: { messageId: v.id("messages"), emoji: v.string() },
+  handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(
+      internal.accounts.accountContextForUser,
+      { userId },
+    );
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    const message = await ctx.runQuery(internal.messages.getForAccount, {
+      accountId,
+      messageId: args.messageId,
+    });
+    if (!message.messageId) {
+      throw new Error(
+        "Cannot react to a message that has not been sent to WhatsApp",
+      );
+    }
+
+    return await ctx.runAction(internal.metaSend.sendReaction, {
+      accountId,
+      conversationId: message.conversationId,
+      targetWhatsappMessageId: message.messageId,
+      emoji: args.emoji,
+    });
   },
 });
