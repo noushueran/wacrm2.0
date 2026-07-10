@@ -1,6 +1,7 @@
 import { mutation, query, internalQuery } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
+import { hasMinRole } from "./lib/roles";
 
 /**
  * First-login bootstrap: gives the current user exactly one account (as
@@ -150,6 +151,86 @@ export const updateProfile = mutation({
 
     await ctx.db.patch(membership._id, patch);
     return membership._id;
+  },
+});
+
+/**
+ * ISO-4217 codes offered by the currency picker (`src/lib/
+ * currency.ts`'s `CURRENCIES`). Duplicated here — codes only, not the
+ * labels/symbols — rather than imported: this codebase deliberately
+ * keeps `convex/` from reaching across into `src/` (see
+ * `convex/automationsEngine.ts`'s and `convex/lib/automations/
+ * validate.ts`'s own "inlined rather than imported from `@/...`"
+ * comments for the same convex/src boundary), so this list must be
+ * kept in sync by hand if `CURRENCIES` ever grows.
+ */
+const KNOWN_CURRENCY_CODES: ReadonlySet<string> = new Set([
+  "USD",
+  "EUR",
+  "GBP",
+  "INR",
+  "AUD",
+  "CAD",
+  "BRL",
+  "JPY",
+  "CNY",
+  "AED",
+  "ZAR",
+  "NGN",
+  "SGD",
+  "MXN",
+]);
+
+/**
+ * Sets the account-wide default currency — an admin+ action
+ * (`src/components/settings/deals-settings.tsx`'s "Deals" settings
+ * panel gates its own control on `canEditSettings` client-side; this
+ * mutation is the server-side enforcement of that same admin-only
+ * rule, the Convex counterpart to the Postgres original's
+ * `is_account_member(account_id, 'admin')` RLS policy).
+ *
+ * Same identity derivation as `updateProfile` above — `getAuthUserId`
+ * + a direct `memberships.by_user` lookup, not `accountMutation` —
+ * matching this file's own style of deriving identity inline rather
+ * than through `lib/auth.ts`'s wrapper. UNLIKE `updateProfile`,
+ * though, this patches the *shared* `accounts` row rather than only
+ * the caller's own membership, so (unlike `updateProfile`) a
+ * `hasMinRole` check against the caller's own role is required here —
+ * without it, a plain agent/viewer could change an account-wide
+ * setting through an endpoint meant only for the caller's own data.
+ *
+ * `currency` is checked against `KNOWN_CURRENCY_CODES` above rather
+ * than accepted as-is: an arbitrary string here would silently corrupt
+ * every `formatCurrency` call across the account, and the valid set is
+ * already small and known.
+ */
+export const setDefaultCurrency = mutation({
+  args: { currency: v.string() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
+
+    if (!hasMinRole(membership.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+
+    if (!KNOWN_CURRENCY_CODES.has(args.currency)) {
+      throw new ConvexError({
+        code: "INVALID_INPUT",
+        message: `unknown currency: ${args.currency}`,
+      });
+    }
+
+    await ctx.db.patch(membership.accountId, {
+      defaultCurrency: args.currency,
+    });
+    return membership.accountId;
   },
 });
 

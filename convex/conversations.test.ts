@@ -55,9 +55,10 @@ async function seedAccountMember(
  * Inserts a `conversations` row directly via `t.run` (Phase 2 Task 1
  * only builds the read side — `messages.append`'s denormalized writes
  * land in Task 2), per the task brief's own instruction. `unreadCount`
- * is the one required-but-uninteresting field beyond
- * `accountId`/`contactId`/`status`, so it defaults to 0 here exactly
- * like every real write will supply.
+ * defaults to 0, matching every real write, but is overridable —
+ * `unreadTotal`'s tests (Phase 8/9 stragglers) need seeded conversations
+ * with a nonzero count, the same way `status`/`lastMessageAt` are
+ * already overridable above their own defaults.
  */
 async function seedConversation(
   t: ReturnType<typeof convexTest>,
@@ -66,6 +67,7 @@ async function seedConversation(
     contactId: Id<"contacts">;
     status?: "open" | "pending" | "closed";
     lastMessageAt?: number;
+    unreadCount?: number;
   },
 ) {
   return await t.run((ctx) =>
@@ -74,7 +76,7 @@ async function seedConversation(
       contactId: opts.contactId,
       status: opts.status ?? "open",
       lastMessageAt: opts.lastMessageAt,
-      unreadCount: 0,
+      unreadCount: opts.unreadCount ?? 0,
     }),
   );
 }
@@ -606,6 +608,65 @@ test("getByContact throws NOT_FOUND for a contact belonging to a different accou
 });
 
 // ============================================================
+// unreadTotal — count of the account's conversations with
+// unreadCount > 0 (Phase 8/9 stragglers: the sidebar unread badge,
+// `src/hooks/use-total-unread.ts`'s Convex counterpart)
+// ============================================================
+
+test("unreadTotal counts only conversations with unreadCount > 0 in the caller's account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await seedConversation(t, { accountId, contactId, unreadCount: 2 });
+  await seedConversation(t, { accountId, contactId, unreadCount: 1 });
+  await seedConversation(t, { accountId, contactId, unreadCount: 0 });
+
+  const total = await asUser.query(api.conversations.unreadTotal, {});
+  expect(total).toBe(2);
+});
+
+test("unreadTotal does not count another account's unread conversations", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(
+    t,
+    { name: "Bob", email: "bob@example.com", role: "agent" },
+  );
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const bobContactId = await asBob.mutation(api.contacts.create, {
+    phone: "222",
+  });
+
+  await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+    unreadCount: 3,
+  });
+  await seedConversation(t, {
+    accountId: bobAccountId,
+    contactId: bobContactId,
+    unreadCount: 5,
+  });
+
+  expect(await asAlice.query(api.conversations.unreadTotal, {})).toBe(1);
+  expect(await asBob.query(api.conversations.unreadTotal, {})).toBe(1);
+});
+
+// ============================================================
 // assign — target must be a real member of the same account
 // ============================================================
 
@@ -676,6 +737,131 @@ test("assign sets assignedToUserId and status:pending for a real member of the a
   expect(row!.assignedToUserId).toBe(carolUserId);
   expect(row!.status).toBe("pending");
   expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeAssign);
+});
+
+// ============================================================
+// unassign — clears assignedToUserId; leaves status untouched (see
+// the mutation's own doc comment for why)
+// ============================================================
+
+test("unassign clears assignedToUserId and leaves status untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const carolUserId = await seedTeammate(t, {
+    accountId: aliceAccountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId,
+    status: "open",
+  });
+  await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: carolUserId,
+  });
+
+  const beforeUnassign = Date.now();
+  const result = await asAlice.mutation(api.conversations.unassign, {
+    conversationId,
+  });
+  expect(result).toBe(conversationId);
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.assignedToUserId).toBeUndefined();
+  // status is left untouched by design — `assign` bumped it to
+  // "pending" and `unassign` doesn't reverse that (see `unassign`'s
+  // own doc comment on this file for the reasoning).
+  expect(row!.status).toBe("pending");
+  expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeUnassign);
+});
+
+test("unassign throws NOT_FOUND for a conversation belonging to a different account, and leaves it untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const carolUserId = await seedTeammate(t, {
+    accountId: aliceAccountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId,
+  });
+  await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: carolUserId,
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.unassign, { conversationId }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.assignedToUserId).toBe(carolUserId);
+});
+
+test("unassign is rejected for a viewer (below the agent role floor), leaving the assignment untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const carolUserId = await seedTeammate(t, {
+    accountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const vicUserId = await seedTeammate(t, {
+    accountId,
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+  const asVic = t.withIdentity({ subject: `${vicUserId}|session-Vic` });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  await asAlice.mutation(api.conversations.assign, {
+    conversationId,
+    userId: carolUserId,
+  });
+
+  await expect(
+    asVic.mutation(api.conversations.unassign, { conversationId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.assignedToUserId).toBe(carolUserId);
 });
 
 // ============================================================

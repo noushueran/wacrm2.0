@@ -251,6 +251,122 @@ test("updateProfile throws NO_ACCOUNT when authenticated but not yet bootstrappe
 });
 
 // ============================================================
+// setDefaultCurrency — admin+ action; patches the CALLER's account row
+// (Phase 8/9 stragglers: `src/components/settings/deals-settings.tsx`'s
+// "Deals" settings panel)
+// ============================================================
+
+test("setDefaultCurrency updates the caller's account defaultCurrency", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  // bootstrapAccount always makes the caller "owner" — owner outranks
+  // admin, so this also proves `hasMinRole` accepts the higher role.
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const result = await asSarah.mutation(api.accounts.setDefaultCurrency, {
+    currency: "EUR",
+  });
+  expect(result).toBe(accountId);
+
+  const account = await t.run((ctx) => ctx.db.get(accountId));
+  expect(account!.defaultCurrency).toBe("EUR");
+
+  // `me` reads back the very same field, proving this is the row it
+  // sources `account.defaultCurrency` from.
+  const profile = await asSarah.query(api.accounts.me, {});
+  expect(profile!.account.defaultCurrency).toBe("EUR");
+});
+
+test("setDefaultCurrency is denied for a non-admin (agent) member", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const { userId: agentUserId } = await insertTeammate(t, {
+    accountId,
+    name: "Agent Andy",
+    email: "andy@example.com",
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|session-andy` });
+
+  await expect(
+    asAgent.mutation(api.accounts.setDefaultCurrency, { currency: "EUR" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+
+  const account = await t.run((ctx) => ctx.db.get(accountId));
+  expect(account!.defaultCurrency).toBe("USD");
+});
+
+test("setDefaultCurrency only touches the caller's own account, not another account's", async () => {
+  const t = convexTest(schema, modules);
+  const sarahUserId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${sarahUserId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const leeUserId = await insertUser(t, {
+    name: "Lee",
+    email: "lee@example.com",
+  });
+  const asLee = t.withIdentity({ subject: `${leeUserId}|session-lee` });
+  const leeAccountId = await asLee.mutation(api.accounts.bootstrapAccount, {});
+
+  await asSarah.mutation(api.accounts.setDefaultCurrency, {
+    currency: "GBP",
+  });
+
+  const leeAccount = await t.run((ctx) => ctx.db.get(leeAccountId));
+  expect(leeAccount!.defaultCurrency).toBe("USD");
+});
+
+test("setDefaultCurrency throws INVALID_INPUT for an unknown currency code", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  await expect(
+    asSarah.mutation(api.accounts.setDefaultCurrency, { currency: "XXX" }),
+  ).rejects.toMatchObject({ data: { code: "INVALID_INPUT" } });
+
+  const account = await t.run((ctx) => ctx.db.get(accountId));
+  expect(account!.defaultCurrency).toBe("USD");
+});
+
+test("setDefaultCurrency throws UNAUTHENTICATED when called without an authenticated identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.mutation(api.accounts.setDefaultCurrency, { currency: "EUR" }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("setDefaultCurrency throws NO_ACCOUNT when authenticated but not yet bootstrapped", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "NoAccount",
+    email: "noaccount@example.com",
+  });
+  const asUser = t.withIdentity({ subject: `${userId}|session-none` });
+
+  await expect(
+    asUser.mutation(api.accounts.setDefaultCurrency, { currency: "EUR" }),
+  ).rejects.toMatchObject({ data: { code: "NO_ACCOUNT" } });
+});
+
+// ============================================================
 // accountContextForUser — server-only membership lookup for PUBLIC
 // actions (`send.ts`'s `send`, `reactions.reactToMeta`; Phase 8, Task 4)
 // that have no `ctx.db` of their own to call `lib/auth.ts`'s

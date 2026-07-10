@@ -7,14 +7,15 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
-// Conversations — the Inbox list/thread read (`list`/`get`) plus the
-// mutations that drive its write side (Phase 2, Task 3):
-// `findOrCreateForContact`, `assign`, `setStatus`, `markRead`. Every
-// function here is built on `accountQuery`/`accountMutation` (never the
-// raw `query`/`mutation`), mirroring the account-isolation pattern
-// `contacts.ts` establishes: `ctx.accountId` always comes from the
-// caller's own `memberships` row, never a client-supplied argument
-// (there is no `accountId` field in any args validator below).
+// Conversations — the Inbox list/thread read (`list`/`get`/
+// `getByContact`/`unreadTotal`) plus the mutations that drive its write
+// side: `findOrCreateForContact`, `assign`, `unassign`, `setStatus`,
+// `markRead`. Every function here is built on `accountQuery`/
+// `accountMutation` (never the raw `query`/`mutation`), mirroring the
+// account-isolation pattern `contacts.ts` establishes: `ctx.accountId`
+// always comes from the caller's own `memberships` row, never a
+// client-supplied argument (there is no `accountId` field in any args
+// validator below).
 // ============================================================
 
 /**
@@ -131,6 +132,30 @@ export const getByContact = accountQuery({
     if (!conversation) return null;
 
     return await embedContact(ctx, conversation);
+  },
+});
+
+/**
+ * Count of the account's conversations with `unreadCount > 0` — the
+ * sidebar's unread nav badge (Phase 8/9 stragglers: the Convex
+ * counterpart to `src/hooks/use-total-unread.ts`, which currently sums
+ * this client-side from a Supabase realtime subscription). Ranges over
+ * `by_account` (not `by_account_last_message`, which `list` uses)
+ * since ordering is irrelevant to a count; the `> 0` test has no index
+ * boundary to range on, so it's a JS filter over the account's full
+ * conversation set rather than an index-level range — matching this
+ * account's conversation volume being small enough that this isn't a
+ * concern (same assumption `list`'s own pagination already leans on).
+ */
+export const unreadTotal = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    const conversations = await ctx.db
+      .query("conversations")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .collect();
+    return conversations.filter((conversation) => conversation.unreadCount > 0)
+      .length;
   },
 });
 
@@ -296,6 +321,41 @@ export const assign = accountMutation({
       });
     }
 
+    return args.conversationId;
+  },
+});
+
+/**
+ * Clears a conversation's assignment — the inverse of `assign`, for
+ * the Inbox's "Unassign" dropdown option and the "Resume AI" banner
+ * (Phase 8/9 stragglers): `assign` requires a concrete `userId`, so it
+ * has no way to represent "nobody owns this anymore." `assignedToUserId`
+ * is an optional field, and patching it to `undefined` removes it —
+ * the same idiom `templates.ts`'s `submissionError: undefined` uses to
+ * clear an optional field, rather than a special-cased "unset" API.
+ *
+ * `status` is deliberately left untouched. This mirrors the legacy
+ * Supabase write it replaces (`src/components/inbox/message-
+ * thread.tsx`'s `handleAssignChange`, the "Unassign" branch), which
+ * only ever cleared `assigned_agent_id` and never touched `status` —
+ * unlike `assign`, which bumps status to "pending" because assigning
+ * is itself the start of someone actively working the thread, clearing
+ * the assignee isn't itself a statement about whether the conversation
+ * is still open, pending, or closed. Callers that also want a status
+ * change (e.g. reopening) call `setStatus` explicitly. There's also no
+ * notification to fire in reverse — unassigning notifies nobody, since
+ * there's no `notify_conversation_assigned`-style trigger for it in the
+ * original schema.
+ */
+export const unassign = accountMutation({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnConversation(ctx, args.conversationId);
+    await ctx.db.patch(args.conversationId, {
+      assignedToUserId: undefined,
+      updatedAt: Date.now(),
+    });
     return args.conversationId;
   },
 });
