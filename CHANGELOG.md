@@ -9,6 +9,49 @@ Versions follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Pre-1.0, `MINOR` bumps cover new modules; `PATCH` bumps cover bug fixes
 and polish.
 
+## [Unreleased]
+
+Migrates the entire backend from Supabase (Postgres + Auth + Storage +
+RLS) to Convex. This is an infrastructure change — no user-facing
+behavior changes are included here (those ship as their own entries
+above and below). Self-hosters upgrading past this point need a Convex
+deployment (self-hosted or Convex Cloud) instead of a Supabase project;
+see `README.md` and `.env.local.example` for current setup + env vars.
+
+### Changed
+
+- **Auth.** Supabase Auth is replaced by [Convex Auth](https://labs.convex.dev/auth)
+  (`@convex-dev/auth`). Sessions are Convex-native.
+- **Data + tenant isolation.** Every table (accounts, memberships,
+  contacts, conversations, messages, deals, pipelines, templates,
+  broadcasts, automations, flows, AI config/knowledge base, API keys,
+  webhook endpoints, notifications, presence, …) now lives in Convex
+  (`convex/schema.ts`). Postgres Row-Level Security is replaced by a
+  code-enforced spine: every tenant-scoped query/mutation is built with
+  `accountQuery`/`accountMutation` (`convex/lib/auth.ts`), which derives
+  `ctx.accountId`/`ctx.role` from the caller's own `memberships` row —
+  never from client-supplied args — before the handler body runs.
+- **File storage.** Supabase Storage buckets (`flow-media`,
+  `chat-media`, `avatars`) are replaced by Convex file storage
+  (`convex/files.ts`): `generateUploadUrl`/`getUrl`/`remove` for client
+  uploads, `storeFromUrl` for the engine to persist inbound WhatsApp
+  media.
+- **Scheduling.** The Postgres-era cron-drain pattern is gone.
+  Automation Wait-steps and Flow timeouts now use Convex's native
+  `ctx.scheduler.runAfter`, scheduled directly by the engine that needs
+  the callback, instead of a polled cron endpoint.
+- **Public API (`/api/v1`).** Endpoints, scopes, and response shapes
+  are unchanged, but the implementation now resolves the presented key
+  via Convex (`apiKeys.resolveByHash`) and re-derives the account on
+  every call through account-scoped Convex functions instead of a
+  Supabase service-role client. See `docs/public-api.md`.
+- **Supabase fully removed.** All `@supabase/*` dependencies, the
+  `supabase/migrations/` SQL history, and Supabase-only server routes
+  are deleted from this repo. `SUPABASE_*` env vars no longer exist —
+  see `.env.local.example` for the current set (`NEXT_PUBLIC_CONVEX_URL`,
+  `NEXT_PUBLIC_CONVEX_SITE_URL`, `ENCRYPTION_KEY`, `META_APP_SECRET`,
+  `WEBHOOK_PROXY_SECRET`, …).
+
 ## [0.8.0] — 2026-07-08
 
 Polishes the AI auto-reply bot: it's now **visible and controllable from

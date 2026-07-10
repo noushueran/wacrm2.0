@@ -21,12 +21,13 @@ opinions become yours.
 git clone https://github.com/<your-username>/wacrm.git
 cd wacrm
 
-cp .env.local.example .env.local   # fill in Supabase + Meta creds
+cp .env.local.example .env.local   # fill in Meta + encryption creds
 npm install
+npx convex dev                     # starts Convex, writes the Convex URLs into .env.local
 npm run dev
 ```
 
-Full setup (Supabase migrations, WhatsApp Business API, deploy) lives in
+Full setup (Convex deployment, WhatsApp Business API, deploy) lives in
 [`docs/`](./docs/README.md).
 
 ## Keeping your fork up to date
@@ -84,7 +85,7 @@ If you do send a PR, the usual rules apply:
 
 - Branch off the latest `main` (don't push to a merged branch — commits
   end up orphaned).
-- Run `npm run typecheck` and `npm run format` locally first.
+- Run `npm test`, `npm run typecheck`, and `npm run format` locally first.
 - Fill in the PR template, especially the **Test plan**.
 - One logical change per PR.
 - Commit-message first line is imperative + terse; the body explains
@@ -113,6 +114,7 @@ in your fork:
 | `npm run dev` | Turbopack dev server on port 3000. |
 | `npm run build` | Production build. Next also runs its own typecheck here. |
 | `npm run typecheck` | `tsc --noEmit`. Fast TS-only pass. |
+| `npm test` | Runs the Vitest suite once (`vitest run`). |
 | `npm run lint` | ESLint. |
 | `npm run format` | Prettier write. |
 | `npm run format:check` | Prettier in check-only mode. Useful in CI. |

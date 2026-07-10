@@ -35,17 +35,18 @@ Include, if you can:
 
 In scope:
 - Anything in this repository (`ArnasDon/wacrm`), including webhook and auth
-  flows, token encryption, RLS policies, and the built-in cron endpoints.
+  flows, token encryption, and Convex account-scoping (`accountQuery`/
+  `accountMutation`).
 - Default configurations shipped in `docs/` — e.g. if the setup guide leaves
   an unsafe default.
 
 Out of scope:
-- Vulnerabilities in Supabase, Next.js, Node.js, or other upstream
+- Vulnerabilities in Convex, Next.js, Node.js, or other upstream
   dependencies — please report those to their maintainers. We'll happily
   bump versions on request.
 - Issues that require a pre-compromised deployment (e.g. a leaked
-  service-role key) unless they widen the blast radius beyond the initial
-  compromise.
+  `ENCRYPTION_KEY` or Convex deployment credentials) unless they widen
+  the blast radius beyond the initial compromise.
 - Social engineering, physical attacks, or third-party services your fork
   adds after deploy.
 

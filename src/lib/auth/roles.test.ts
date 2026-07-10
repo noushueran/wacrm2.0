@@ -20,10 +20,11 @@ describe("roleRank", () => {
     expect(roleRank("agent")).toBeGreaterThan(roleRank("viewer"));
   });
 
-  it("matches the SQL helper's numeric mapping", () => {
-    // Keep these in lockstep with `is_account_member`'s CASE expression
-    // in supabase/migrations/017_account_sharing.sql — any change here
-    // means the SQL helper needs the same change.
+  it("matches the account-role model's numeric mapping", () => {
+    // Keep these in lockstep with the role ladder in
+    // `convex/lib/roles.ts` (`roleRank`) and the `memberships.role`
+    // union in `convex/schema.ts` — any change here means those need
+    // the same change.
     expect(roleRank("owner")).toBe(4);
     expect(roleRank("admin")).toBe(3);
     expect(roleRank("agent")).toBe(2);

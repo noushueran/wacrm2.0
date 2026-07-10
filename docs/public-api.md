@@ -20,6 +20,12 @@ Authorization: Bearer wacrm_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Keys are **account-scoped**: a key acts on exactly one account, the
 one it was created in. There is no cross-account access.
 
+Behind the scenes, the request resolves the presented key via Convex
+(`apiKeys.resolveByHash`, matched by a SHA-256 hash of the key), and
+every subsequent call re-resolves the account from that same hash
+through account-scoped Convex functions rather than trusting a
+request-supplied account id.
+
 ### Creating a key
 
 In the dashboard: **Settings → API keys → New API key**. Only
@@ -286,8 +292,7 @@ last page.
 ## Webhooks
 
 Rather than polling, register an endpoint and wacrm will POST to it when
-things happen in your account. **Migration required:** apply
-`supabase/migrations/028_webhook_endpoints.sql`.
+things happen in your account.
 
 ### Events
 
