@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { useMutation } from "convex/react";
 import { authErrorMessage } from "@/lib/auth/auth-error-message";
+import { useIsClient } from "@/hooks/use-is-client";
 import { api } from "../../../../convex/_generated/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -35,6 +36,13 @@ function SignupPageInner() {
   // their own bootstrapped account — after sign-up we send them to the
   // redeem step so they join the inviter's account instead.
   const inviteToken = searchParams.get("invite");
+  // Same CDN-cache hydration guard as /login (see the note there): keep the
+  // server-rendered markup invariant to the `invite` query param by gating
+  // it behind `useIsClient`, so a Netlify-cached variant can't mismatch the
+  // client's first render (#418). `inviteToken` itself still drives the
+  // post-sign-up redirect in `handleSignup`.
+  const isClient = useIsClient();
+  const displayInvite = isClient ? inviteToken : null;
   const router = useRouter();
 
   const [fullName, setFullName] = useState("");
@@ -104,17 +112,17 @@ function SignupPageInner() {
       <Card className="w-full max-w-md border-border bg-card">
         <CardHeader className="items-center text-center">
           <div className="mb-2 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10">
-            {inviteToken ? (
+            {displayInvite ? (
               <UsersRound className="h-6 w-6 text-primary" />
             ) : (
               <MessageSquare className="h-6 w-6 text-primary" />
             )}
           </div>
           <CardTitle className="text-xl text-foreground">
-            {inviteToken ? "Create account & join" : "Create account"}
+            {displayInvite ? "Create account & join" : "Create account"}
           </CardTitle>
           <CardDescription className="text-muted-foreground">
-            {inviteToken
+            {displayInvite
               ? "Create your account, then accept the invitation to join your team."
               : "Get started with CRM Template for WhatsApp"}
           </CardDescription>
@@ -200,8 +208,8 @@ function SignupPageInner() {
             Already have an account?{" "}
             <Link
               href={
-                inviteToken
-                  ? `/login?invite=${encodeURIComponent(inviteToken)}`
+                displayInvite
+                  ? `/login?invite=${encodeURIComponent(displayInvite)}`
                   : "/login"
               }
               className="text-primary hover:text-primary/80"

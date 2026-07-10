@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useTranslations } from "next-intl";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { authErrorMessage } from "@/lib/auth/auth-error-message";
+import { useIsClient } from "@/hooks/use-is-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -37,6 +38,16 @@ function LoginPageInner() {
   // account. After a successful sign-in we send them to the join
   // page to accept rather than to /dashboard.
   const inviteToken = searchParams.get("invite");
+  // Gate every invite-dependent bit of MARKUP behind `useIsClient` so the
+  // server-rendered HTML never reflects the `invite` query param. `/login`
+  // is a dynamic route that Netlify's CDN caches WITHOUT keying on `invite`,
+  // so a cached no-invite page can be served to an `/login?invite=…` visitor
+  // (and vice-versa). Keeping the SSR output invariant means the client's
+  // first render always matches whatever variant was cached — no hydration
+  // mismatch (#418). The real `inviteToken` is still used by `handleLogin`
+  // for the post-auth redirect.
+  const isClient = useIsClient();
+  const displayInvite = isClient ? inviteToken : null;
   const t = useTranslations("LoginPage");
 
   const [email, setEmail] = useState("");
@@ -76,17 +87,17 @@ function LoginPageInner() {
       <Card className="w-full max-w-md border-border bg-card">
         <CardHeader className="items-center text-center">
           <div className="mb-2 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10">
-            {inviteToken ? (
+            {displayInvite ? (
               <UsersRound className="h-6 w-6 text-primary" />
             ) : (
               <MessageSquare className="h-6 w-6 text-primary" />
             )}
           </div>
           <CardTitle className="text-xl text-foreground">
-            {inviteToken ? t('titleAccept') : t('titleWelcome')}
+            {displayInvite ? t('titleAccept') : t('titleWelcome')}
           </CardTitle>
           <CardDescription className="text-muted-foreground">
-            {inviteToken
+            {displayInvite
               ? t('descAccept')
               : t('descWelcome')}
           </CardDescription>
@@ -150,8 +161,8 @@ function LoginPageInner() {
             {t('noAccount')}{" "}
             <Link
               href={
-                inviteToken
-                  ? `/signup?invite=${encodeURIComponent(inviteToken)}`
+                displayInvite
+                  ? `/signup?invite=${encodeURIComponent(displayInvite)}`
                   : "/signup"
               }
               className="text-primary hover:text-primary/80"

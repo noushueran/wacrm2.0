@@ -1,23 +1,10 @@
 "use client";
 
-import { useSyncExternalStore } from "react";
 import { Toaster } from "sonner";
 
+import { useIsClient } from "@/hooks/use-is-client";
 import { useTheme } from "@/hooks/use-theme";
 import { DEFAULT_MODE } from "@/lib/themes";
-
-// Returns false during SSR and the first hydration render, true after —
-// the sanctioned (warning-free, no setState-in-effect) way to diverge
-// server vs client. Lets us match the server-rendered default on first
-// paint, then adopt the real mode.
-const noopSubscribe = () => () => {};
-function useIsClient() {
-  return useSyncExternalStore(
-    noopSubscribe,
-    () => true,
-    () => false,
-  );
-}
 
 /**
  * Toaster wrapper that tracks the active light/dark mode.
