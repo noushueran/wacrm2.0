@@ -256,12 +256,18 @@ export function TemplateManager() {
       setSubmitting(true);
       const isEdit = editingId !== null;
       if (isEdit) {
-        // Editing an existing (REJECTED/PAUSED/APPROVED) template still
-        // PATCHes the Supabase-backed /api/whatsapp/templates/[id] route
-        // — Meta's separate edit-by-hsm_id Graph API call, a different
-        // surface than the create call P8-T4 moved to Convex above.
-        // Left as-is pending a follow-up task; the route file stays on
-        // disk for that reason.
+        // TODO(P8-T4): still PATCHes the Supabase-backed
+        // /api/whatsapp/templates/[id] route. Checked whether
+        // `api.templates.submit` (the Convex action the create branch
+        // below already uses) could cover this too — it can't: `submit`
+        // always calls `metaTemplates.submitToMeta`, which POSTs Meta's
+        // *create* endpoint and has no `templateId`/edit parameter at
+        // all, whereas editing an existing REJECTED/PAUSED/APPROVED
+        // template is Meta's separate edit-by-hsm_id Graph API call — a
+        // surface `convex/templates.ts` has no action for yet. This
+        // stragglers pass is UI-only (no new backend fn to invent), so
+        // this branch stays on the legacy route until that Convex
+        // action exists; the route file remains on disk for that reason.
         const res = await fetch(`/api/whatsapp/templates/${editingId}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },

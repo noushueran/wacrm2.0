@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useQuery } from 'convex/react';
 import { ChevronRight, Loader2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 
-import { createClient } from '@/lib/supabase/client';
+import { api } from '../../../convex/_generated/api';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { THEMES } from '@/lib/themes';
@@ -16,20 +17,6 @@ import { cn } from '@/lib/utils';
 import { SECTION_META, type SettingsSection } from './settings-sections';
 import { SettingsChip, StatusDot } from './settings-chip';
 import { ROLE_META } from './role-meta';
-
-interface OverviewCounts {
-  members: number | null;
-  pendingInvites: number | null;
-  templates: number | null;
-  templatesPending: number | null;
-  tags: number | null;
-  customFields: number | null;
-}
-
-interface WhatsAppStatus {
-  configured: boolean;
-  connected: boolean;
-}
 
 export function SettingsOverview({
   onSelect,
@@ -43,103 +30,93 @@ export function SettingsOverview({
   const tRoles = useTranslations('Settings.roles');
   const tSections = useTranslations('Settings.sections');
 
-  const [counts, setCounts] = useState<OverviewCounts | null>(null);
-  const [countsLoading, setCountsLoading] = useState(true);
-  // WhatsApp status is tracked separately: its health check decrypts the
-  // token and pings Meta, which is far slower than the cheap count
-  // queries. Gating it independently keeps a slow/flaky Meta round-trip
-  // from blanking the rest of the landing.
-  const [whatsapp, setWhatsapp] = useState<WhatsAppStatus | null>(null);
-  const [whatsappLoading, setWhatsappLoading] = useState(true);
+  // Members roster + pending invites still go through the Next.js
+  // `/api/account/*` routes (out of scope for this Convex UI rewire —
+  // teardown's job), not a direct Supabase read from this component.
+  const [membersCount, setMembersCount] = useState<number | null>(null);
+  const [pendingInvites, setPendingInvites] = useState<number | null>(null);
+  const [membersLoading, setMembersLoading] = useState(true);
+
+  // WhatsApp connection *health* is still a slow, independent Meta ping
+  // via `/api/whatsapp/config` (decrypts the token and calls out — far
+  // slower than the cheap Convex reads below, so it's kept on its own
+  // loading flag rather than blocking the rest of the tiles). Whether a
+  // config row exists at all (`whatsappConfigResult` below) now comes
+  // from the reactive `api.whatsappConfig.get` query instead of a
+  // Supabase select.
+  const [whatsappConnected, setWhatsappConnected] = useState(false);
+  const [whatsappHealthLoading, setWhatsappHealthLoading] = useState(true);
 
   useEffect(() => {
     if (!user || !accountId) return;
     let cancelled = false;
-    const supabase = createClient();
-    const userId = user.id;
-    const acctId = accountId;
 
-    // Cheap counts — resolve fast, render immediately.
+    // Members + pending invites — resolve fast, render immediately.
     (async () => {
-      setCountsLoading(true);
-      const [membersRes, invitesRes, templatesTotal, templatesPending, tagsRes, fieldsRes] =
-        await Promise.allSettled([
-          fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
-          canManageMembers
-            ? fetch('/api/account/invitations', { cache: 'no-store' }).then((r) =>
-                r.json(),
-              )
-            : Promise.resolve(null),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId)
-            .eq('status', 'PENDING'),
-          supabase
-            .from('tags')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase.from('custom_fields').select('id', { count: 'exact', head: true }),
-        ]);
-
+      setMembersLoading(true);
+      const [membersRes, invitesRes] = await Promise.allSettled([
+        fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
+        canManageMembers
+          ? fetch('/api/account/invitations', { cache: 'no-store' }).then((r) =>
+              r.json(),
+            )
+          : Promise.resolve(null),
+      ]);
       if (cancelled) return;
 
       const members =
         membersRes.status === 'fulfilled' && Array.isArray(membersRes.value?.members)
           ? membersRes.value.members.length
           : null;
-      const pendingInvites =
+      const invites =
         invitesRes.status === 'fulfilled' &&
         invitesRes.value &&
         Array.isArray(invitesRes.value.invitations)
           ? invitesRes.value.invitations.length
           : null;
 
-      setCounts({
-        members,
-        pendingInvites,
-        templates:
-          templatesTotal.status === 'fulfilled'
-            ? templatesTotal.value.count ?? null
-            : null,
-        templatesPending:
-          templatesPending.status === 'fulfilled'
-            ? templatesPending.value.count ?? null
-            : null,
-        tags: tagsRes.status === 'fulfilled' ? tagsRes.value.count ?? null : null,
-        customFields:
-          fieldsRes.status === 'fulfilled' ? fieldsRes.value.count ?? null : null,
-      });
-      setCountsLoading(false);
+      setMembersCount(members);
+      setPendingInvites(invites);
+      setMembersLoading(false);
     })();
 
-    // WhatsApp connection status — slower, independent.
+    // WhatsApp connection health — slower, independent.
     (async () => {
-      setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
-        supabase
-          .from('whatsapp_config')
-          .select('phone_number_id')
-          .eq('account_id', acctId)
-          .maybeSingle(),
-        fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
-      ]);
+      setWhatsappHealthLoading(true);
+      const health = await fetch('/api/whatsapp/config', { cache: 'no-store' })
+        .then((r) => r.json())
+        .catch(() => null);
       if (cancelled) return;
-      setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
-        connected: health.status === 'fulfilled' && !!health.value?.connected,
-      });
-      setWhatsappLoading(false);
+      setWhatsappConnected(!!health?.connected);
+      setWhatsappHealthLoading(false);
     })();
 
     return () => {
       cancelled = true;
     };
   }, [user?.id, accountId, canManageMembers]);
+
+  // Templates / tags / custom fields / WhatsApp-config-row — reactive
+  // Convex reads (Phase 8/9 stragglers rewire), replacing the one-shot
+  // Supabase count queries this effect used to also run. Each tile below
+  // gates on its own query's `loading` flag, so these need no `'skip'`
+  // gating of their own — mirrors `template-manager.tsx`'s unconditional
+  // `useQuery(api.templates.list)`.
+  const templatesResult = useQuery(api.templates.list);
+  const templatesLoading = templatesResult === undefined;
+  const templatesPendingCount = useMemo(
+    () => (templatesResult ?? []).filter((tpl) => tpl.status === 'PENDING').length,
+    [templatesResult],
+  );
+
+  const tagsResult = useQuery(api.tags.list);
+  const tagsLoading = tagsResult === undefined;
+
+  const customFieldsResult = useQuery(api.customFields.list);
+  const customFieldsLoading = customFieldsResult === undefined;
+
+  const whatsappConfigResult = useQuery(api.whatsappConfig.get);
+  const whatsappConfigLoading = whatsappConfigResult === undefined;
 
   const displayName = profile?.full_name || profile?.email || t('yourAccount');
   const initial = (profile?.full_name || profile?.email || 'U').charAt(0).toUpperCase();
@@ -151,8 +128,12 @@ export function SettingsOverview({
   const themeName = THEMES.find((t) => t.id === theme)?.name ?? theme;
   const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
-  // Per-tile loading + subtitle. `null` counts render as a graceful
-  // fallback so a single failed query never blanks a tile.
+  // Per-tile loading + subtitle. Each tile's own `loading` flag renders a
+  // spinner INSTEAD of `subtitle` (see the render below), so a
+  // Convex-backed subtitle only ever paints once its query has resolved
+  // — unlike the REST-backed members tile, there's no "resolved but
+  // failed" state to gracefully degrade for those, since a Convex query
+  // is either still loading (`undefined`) or a real resolved value.
   const tiles: {
     section: SettingsSection;
     loading: boolean;
@@ -160,10 +141,10 @@ export function SettingsOverview({
   }[] = [
     {
       section: 'whatsapp',
-      loading: whatsappLoading,
-      subtitle: !whatsapp?.configured ? (
+      loading: whatsappConfigLoading || whatsappHealthLoading,
+      subtitle: !whatsappConfigResult?.phoneNumberId ? (
         t('notSetup')
-      ) : whatsapp.connected ? (
+      ) : whatsappConnected ? (
         <>
           <StatusDot tone="ok" /> {t('connected')}
         </>
@@ -175,27 +156,24 @@ export function SettingsOverview({
     },
     {
       section: 'members',
-      loading: countsLoading,
+      loading: membersLoading,
       subtitle:
-        counts?.members == null
+        membersCount == null
           ? t('viewTeamMembers')
-          : `${t('membersCount', { count: counts.members })}${
-              counts.pendingInvites
-                ? ` · ${t('pendingInvites', { count: counts.pendingInvites })}`
+          : `${t('membersCount', { count: membersCount })}${
+              pendingInvites
+                ? ` · ${t('pendingInvites', { count: pendingInvites })}`
                 : ''
             }`,
     },
     {
       section: 'templates',
-      loading: countsLoading,
-      subtitle:
-        counts?.templates == null
-          ? t('manageTemplates')
-          : `${t('templatesCount', { count: counts.templates })}${
-              counts.templatesPending
-                ? ` · ${t('pendingReview', { count: counts.templatesPending })}`
-                : ''
-            }`,
+      loading: templatesLoading,
+      subtitle: `${t('templatesCount', { count: templatesResult?.length ?? 0 })}${
+        templatesPendingCount
+          ? ` · ${t('pendingReview', { count: templatesPendingCount })}`
+          : ''
+      }`,
     },
     {
       section: 'deals',
@@ -204,13 +182,10 @@ export function SettingsOverview({
     },
     {
       section: 'fields',
-      loading: countsLoading,
-      subtitle:
-        counts?.tags == null && counts?.customFields == null
-          ? t('tagsAndFields')
-          : `${t('tagsCount', { count: counts?.tags ?? 0 })} · ${t('fieldsCount', {
-              count: counts?.customFields ?? 0,
-            })}`,
+      loading: tagsLoading || customFieldsLoading,
+      subtitle: `${t('tagsCount', { count: tagsResult?.length ?? 0 })} · ${t('fieldsCount', {
+        count: customFieldsResult?.length ?? 0,
+      })}`,
     },
     {
       section: 'appearance',

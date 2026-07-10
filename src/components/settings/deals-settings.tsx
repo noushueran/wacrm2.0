@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useMutation } from "convex/react";
 import { toast } from "sonner";
 import { Coins, Loader2 } from "lucide-react";
 
-import { createClient } from "@/lib/supabase/client";
+import { api } from "../../../convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
 import { Button } from "@/components/ui/button";
@@ -24,12 +25,15 @@ import { SettingsPanelHead } from "./settings-panel-head";
  *
  * One currency per account (issue #218): the chosen code seeds new
  * deals and formats every aggregated total. Existing deals keep their
- * own saved currency. Writes go straight to `accounts.default_currency`;
- * the `accounts_update` RLS policy (017) already restricts that to
- * admins+, so non-admins see a disabled, read-only control.
+ * own saved currency. Writes go straight through
+ * `api.accounts.setDefaultCurrency` — that mutation re-derives the
+ * caller's own membership role server-side and throws `FORBIDDEN` below
+ * admin+ (the Convex counterpart to the old `accounts_update` RLS
+ * policy), so non-admins seeing a disabled, read-only control here is a
+ * UX nicety, not the only enforcement.
  */
 export function DealsSettings() {
-  const supabase = createClient();
+  const setDefaultCurrency = useMutation(api.accounts.setDefaultCurrency);
   const {
     accountId,
     defaultCurrency,
@@ -53,20 +57,21 @@ export function DealsSettings() {
   async function handleSave() {
     if (!accountId || !dirty) return;
     setSaving(true);
-    const { error } = await supabase
-      .from("accounts")
-      .update({ default_currency: selected })
-      .eq("id", accountId);
-    if (error) {
+    try {
+      await setDefaultCurrency({ currency: selected });
+      // `refreshProfile` is a documented no-op under Convex Auth —
+      // `useAuth()`'s `defaultCurrency` is sourced from the reactive
+      // `api.accounts.me` query, so the mutation's write already
+      // propagates to the deal form and every total on its own. Kept so
+      // this call site's "pull the new value back" intent stays
+      // unchanged regardless.
+      await refreshProfile();
+      toast.success(t("saveSuccess"));
+    } catch {
       toast.error(t("saveFailed"));
+    } finally {
       setSaving(false);
-      return;
     }
-    // Pull the new value back into the auth context so the deal form
-    // and every total pick it up without a full reload.
-    await refreshProfile();
-    setSaving(false);
-    toast.success(t("saveSuccess"));
   }
 
   return (

@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { useMemo, useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../../../convex/_generated/api";
+import { toUiTemplate } from "@/lib/convex/adapters";
 import type { MessageTemplate } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -81,56 +83,28 @@ export function TemplatePicker({
 }: TemplatePickerProps) {
   const t = useTranslations("Inbox.templatePicker");
 
-  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Only fetched while the dialog is actually open — mirrors the
+  // original's `if (!open) return` early-out inside its fetch effect.
+  const templatesResult = useQuery(api.templates.list, open ? {} : "skip");
+  const loading = open && templatesResult === undefined;
+  // Templates are account-owned (accountQuery scopes by `ctx.accountId`,
+  // not by creator), so every teammate's approved templates show up here,
+  // not just the caller's own. Only APPROVED templates can be sent via
+  // Meta — `api.templates.list` has no server-side status filter, so
+  // that narrowing (previously a Supabase `.eq('status', 'APPROVED')`)
+  // happens client-side here, same as step1-choose-template.tsx.
+  const templates = useMemo(
+    () =>
+      (templatesResult ?? [])
+        .map(toUiTemplate)
+        .filter((template) => template.status === "APPROVED"),
+    [templatesResult],
+  );
+
   const [selected, setSelected] = useState<MessageTemplate | null>(null);
   const [params, setParams] = useState<string[]>([]);
   const [headerText, setHeaderText] = useState<string>("");
   const [buttonParams, setButtonParams] = useState<Record<number, string>>({});
-
-  useEffect(() => {
-    if (!open) return;
-
-    let cancelled = false;
-    (async () => {
-      setLoading(true);
-      const supabase = createClient();
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!user) {
-        if (!cancelled) {
-          setTemplates([]);
-          setLoading(false);
-        }
-        return;
-      }
-
-      // Scope by RLS (message_templates_select → is_account_member), NOT by
-      // user_id. Templates are account-owned, so filtering on the caller's
-      // user_id hid templates that a teammate created — leaving them unable
-      // to send approved templates in a shared account.
-      const { data, error } = await supabase
-        .from("message_templates")
-        .select("*")
-        .eq("status", "APPROVED")
-        .order("created_at", { ascending: false });
-
-      if (cancelled) return;
-      if (error) {
-        console.error("Failed to fetch templates:", error);
-        setTemplates([]);
-      } else {
-        setTemplates((data as MessageTemplate[]) ?? []);
-      }
-      setLoading(false);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
 
   function resetSelection() {
     setSelected(null);

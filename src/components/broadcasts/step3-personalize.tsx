@@ -1,7 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useEffect, useMemo } from 'react';
+import { useQuery, usePaginatedQuery } from 'convex/react';
+import { api } from '../../../convex/_generated/api';
+import {
+  toUiContact,
+  toUiContactCustomValue,
+  toUiCustomField,
+} from '@/lib/convex/adapters';
 import { Contact, CustomField, MessageTemplate } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -14,6 +20,8 @@ import {
 } from '@/components/ui/select';
 import { ArrowLeft, ArrowRight, Eye, ImageIcon, Loader2 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+import type { Id } from '../../../convex/_generated/dataModel';
 
 type VariableType = 'static' | 'field' | 'custom_field';
 
@@ -77,56 +85,47 @@ export function Step3Personalize({
   onBack,
 }: Step3Props) {
   const t = useTranslations('Broadcasts.wizard');
-  const [customFields, setCustomFields] = useState<CustomField[]>([]);
-  const [loadingFields, setLoadingFields] = useState(true);
-  const [firstContact, setFirstContact] = useState<Contact | null>(null);
-  const [firstContactCustomValues, setFirstContactCustomValues] = useState<
-    Map<string, string>
-  >(new Map());
-  const [loadingPreview, setLoadingPreview] = useState(true);
 
-  // Load user's custom fields + a representative contact for the
-  // live preview. Fall back to sample data if no contacts exist yet.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const supabase = createClient();
-      const [fieldsRes, contactRes] = await Promise.all([
-        supabase.from('custom_fields').select('*').order('field_name'),
-        supabase
-          .from('contacts')
-          .select('*')
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-      ]);
-      if (cancelled) return;
+  const customFieldsResult = useQuery(api.customFields.list);
+  const loadingFields = customFieldsResult === undefined;
+  const customFields = useMemo<CustomField[]>(
+    () => (customFieldsResult ?? []).map(toUiCustomField),
+    [customFieldsResult],
+  );
 
-      setCustomFields(fieldsRes.data ?? []);
-      setLoadingFields(false);
+  // A representative contact for the live preview — the account's most
+  // recently created contact, same as the original's
+  // `.order('created_at', {ascending:false}).limit(1).maybeSingle()`.
+  // `contacts.list` is pagination-only on the Convex side, so a 1-item
+  // page (newest-first, its default order) stands in for that single
+  // read. Falls back to SAMPLE_CONTACT below when the account has no
+  // contacts yet.
+  const contactsPreview = usePaginatedQuery(
+    api.contacts.list,
+    {},
+    { initialNumItems: 1 },
+  );
+  const loadingPreviewContact = contactsPreview.status === 'LoadingFirstPage';
+  const firstContact = useMemo(() => {
+    const doc = contactsPreview.results[0];
+    return doc ? toUiContact(doc) : null;
+  }, [contactsPreview.results]);
 
-      const contact = contactRes.data ?? null;
-      setFirstContact(contact);
+  const customValuesResult = useQuery(
+    api.customFields.getForContact,
+    firstContact ? { contactId: firstContact.id as Id<'contacts'> } : 'skip',
+  );
+  const loadingCustomValues = !!firstContact && customValuesResult === undefined;
+  const firstContactCustomValues = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const row of customValuesResult ?? []) {
+      const uiValue = toUiContactCustomValue(row);
+      map.set(uiValue.custom_field_id, uiValue.value ?? '');
+    }
+    return map;
+  }, [customValuesResult]);
 
-      if (contact) {
-        const { data: customVals } = await supabase
-          .from('contact_custom_values')
-          .select('custom_field_id, value')
-          .eq('contact_id', contact.id);
-        if (!cancelled) {
-          const map = new Map<string, string>();
-          for (const row of customVals ?? []) {
-            map.set(row.custom_field_id, row.value ?? '');
-          }
-          setFirstContactCustomValues(map);
-        }
-      }
-      setLoadingPreview(false);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const loadingPreview = loadingPreviewContact || loadingCustomValues;
 
   const placeholders = useMemo(() => {
     const matches = template.body_text.match(/\{\{(\d+)\}\}/g);

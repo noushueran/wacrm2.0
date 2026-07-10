@@ -14,7 +14,6 @@ import {
   toUiMessage,
   toUiReaction,
 } from "@/lib/convex/adapters";
-import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
@@ -509,27 +508,18 @@ export function MessageThread({
   );
 
   const assignMutation = useMutation(api.conversations.assign);
+  const unassignMutation = useMutation(api.conversations.unassign);
   const handleAssignChange = useCallback(
     async (agentId: string | null) => {
       if (!conversation) return;
 
       if (agentId === null) {
-        // TODO(P8-T4): `api.conversations.assign` requires a concrete
-        // `userId` — Convex has no "unassign" mutation yet, so this
-        // branch is left on the legacy Supabase write (unchanged
-        // behavior) until that primitive exists. Note this now writes
-        // to the OLD Supabase `conversations` row, which the
-        // Convex-backed reads above no longer look at, so unassigning
-        // has no visible effect in this UI until a Convex equivalent
-        // ships.
-        const supabase = createClient();
-        const { error } = await supabase
-          .from("conversations")
-          .update({ assigned_agent_id: null })
-          .eq("id", conversation.id);
-
-        if (error) {
-          console.error("Failed to update assignment:", error);
+        try {
+          await unassignMutation({
+            conversationId: conversation.id as Id<"conversations">,
+          });
+        } catch (err) {
+          console.error("Failed to update assignment:", err);
           toast.error("Failed to update assignment");
         }
         return;
@@ -545,7 +535,7 @@ export function MessageThread({
         toast.error("Failed to update assignment");
       }
     },
-    [conversation, assignMutation],
+    [conversation, assignMutation, unassignMutation],
   );
 
   // Empty state — same WhatsApp-style doodle background as the active

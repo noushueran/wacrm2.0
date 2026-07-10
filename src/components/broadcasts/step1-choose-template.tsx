@@ -1,7 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
+import { useMemo } from 'react';
+import { useQuery } from 'convex/react';
+import { api } from '../../../convex/_generated/api';
+import { toUiTemplate } from '@/lib/convex/adapters';
 import { MessageTemplate } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Loader2, FileText, ArrowRight } from 'lucide-react';
@@ -22,47 +24,27 @@ interface Step1Props {
 
 export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack }: Step1Props) {
   const t = useTranslations('Broadcasts.wizard');
-  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    async function fetchTemplates() {
-      try {
-        const supabase = createClient();
-        // Only APPROVED templates can be sent via Meta — anything else
-        // would 400 at broadcast time. Hide them rather than letting
-        // the user pick a template that will fail.
-        const { data, error: fetchError } = await supabase
-          .from('message_templates')
-          .select('*')
-          .eq('status', 'APPROVED')
-          .order('created_at', { ascending: false });
-
-        if (fetchError) throw fetchError;
-        setTemplates(data ?? []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : t('chooseTemplate.errorLoad'));
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    fetchTemplates();
-  }, []);
+  const templatesResult = useQuery(api.templates.list);
+  const loading = templatesResult === undefined;
+  // Only APPROVED templates can be sent via Meta — anything else would
+  // 400 at broadcast time. Hide them rather than letting the user pick a
+  // template that will fail. `api.templates.list` has no server-side
+  // status filter (it returns every status, newest-first), so the
+  // APPROVED-only narrowing that used to be a Supabase `.eq('status',
+  // 'APPROVED')` happens here instead.
+  const templates = useMemo(
+    () =>
+      (templatesResult ?? [])
+        .map(toUiTemplate)
+        .filter((template) => template.status === 'APPROVED'),
+    [templatesResult],
+  );
 
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
         <Loader2 className="h-6 w-6 animate-spin text-primary" />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-2">
-        <p className="text-sm text-red-400">{error}</p>
       </div>
     );
   }

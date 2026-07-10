@@ -1,18 +1,18 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAction, useMutation, useQuery } from 'convex/react';
-import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
 import { toast } from 'sonner';
-import type { Deal, MessageTemplate } from '@/types';
+import type { MessageTemplate } from '@/types';
 import {
   convexErrorMessage,
   toUiContactCustomValue,
   toUiContactNote,
   toUiCustomField,
   toUiContact,
+  toUiDeal,
   toUiTag,
 } from '@/lib/convex/adapters';
 import {
@@ -64,9 +64,6 @@ export function ContactDetailView({
   onUpdated,
 }: ContactDetailViewProps) {
   const t = useTranslations('Contacts.detailView');
-  // Deals are a separate vertical (Phase 8 Task 3 — pipelines/deals
-  // board), out of scope here; the Deals tab below stays on Supabase.
-  const supabase = createClient();
   const { defaultCurrency } = useAuth();
 
   const [copiedPhone, setCopiedPhone] = useState(false);
@@ -94,10 +91,6 @@ export function ContactDetailView({
   // Custom fields tab
   const [customValues, setCustomValues] = useState<Record<string, string>>({});
   const [savingCustom, setSavingCustom] = useState(false);
-
-  // Deals tab
-  const [deals, setDeals] = useState<Deal[]>([]);
-  const [loadingDeals, setLoadingDeals] = useState(false);
 
   // Only subscribe while the sheet is actually showing a contact — mirrors
   // the original's `if (open && contactId)` fetch gate.
@@ -136,6 +129,12 @@ export function ContactDetailView({
   const customValuesResult = useQuery(api.customFields.getForContact, idArg);
   const loadingCustom = shouldLoad && customValuesResult === undefined;
 
+  // Deals tab — `deals.listByContact` already embeds each deal's stage
+  // (see convex/deals.ts), the same shape `toUiDeal` expects.
+  const dealsResult = useQuery(api.deals.listByContact, idArg);
+  const deals = useMemo(() => (dealsResult ?? []).map(toUiDeal), [dealsResult]);
+  const loadingDeals = shouldLoad && dealsResult === undefined;
+
   // Seed the editable custom-values map from the reactive read — mirrors
   // the original `fetchCustomFields`'s one-time seed of local form state.
   useEffect(() => {
@@ -166,24 +165,6 @@ export function ContactDetailView({
       setEditCompany(contact.company ?? '');
     }
   }, [contact]);
-
-  const fetchDeals = useCallback(async () => {
-    if (!contactId) return;
-    setLoadingDeals(true);
-    const { data } = await supabase
-      .from('deals')
-      .select('*, stage:pipeline_stages(*)')
-      .eq('contact_id', contactId)
-      .order('created_at', { ascending: false });
-    setDeals((data ?? []) as Deal[]);
-    setLoadingDeals(false);
-  }, [contactId, supabase]);
-
-  useEffect(() => {
-    if (open && contactId) {
-      fetchDeals();
-    }
-  }, [open, contactId, fetchDeals]);
 
   async function copyPhone() {
     if (!contact) return;
