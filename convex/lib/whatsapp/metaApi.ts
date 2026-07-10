@@ -8,14 +8,10 @@
  * codebase's `convex/` convention); behavior otherwise unchanged for
  * everything kept.
  *
- * NOT ported (out of scope — registration/media-download, not the
- * send+persist engine primitives or Phase 8 Task 4's template
- * management): `registerPhoneNumber`, `subscribeWabaToApp`,
- * `uploadResumableMedia`, `editMessageTemplate`, `deleteMessageTemplate`,
- * `getMediaUrl`, `downloadMedia` (the last also uses Node's `Buffer`,
- * unavailable outside a `"use node"` action — not needed here since
- * `convex/files.ts`'s `storeFromUrl` uses `fetch()` + `Response#blob()`
- * instead).
+ * NOT ported (out of scope — registration, not the send+persist
+ * engine primitives or Phase 8 Task 4's template management):
+ * `registerPhoneNumber`, `subscribeWabaToApp`, `uploadResumableMedia`,
+ * `editMessageTemplate`, `deleteMessageTemplate`.
  *
  * `verifyPhoneNumber`/`getSubscribedApps` WERE ported (AI/WhatsApp
  * backend gap-fill task) — `convex/whatsappConfig.ts`'s
@@ -25,6 +21,22 @@
  * SUBSCRIBES a number — a write, unlike these two GETs) remains
  * unported: it belongs to the config save/POST route, not
  * `verifyRegistration`, which never writes to Meta.
+ *
+ * `getMediaUrl`/`downloadMedia` WERE ALSO ported (inbound-media-proxy
+ * migration): `convex/whatsappConfig.ts`'s `fetchMedia` action needs
+ * both so the Meta media fetch happens INSIDE Convex, right next to
+ * the just-decrypted access token, instead of back in the Next.js
+ * route (`src/app/api/whatsapp/media/[mediaId]/route.ts`) — the
+ * decrypted token should never have to travel back out to Next.js
+ * just to make this call. One deliberate deviation from `src/lib/
+ * whatsapp/meta-api.ts`'s originals: `downloadMedia` here returns an
+ * `ArrayBuffer` (`Response#arrayBuffer()`), not a Node `Buffer` — this
+ * file's functions run in Convex's default V8-isolate runtime (no
+ * `"use node"`, matching every other function here, same as `convex/
+ * files.ts`'s `storeFromUrl`), where `Buffer` doesn't exist, and
+ * Convex's wire format carries binary return values as `ArrayBuffer`
+ * (`v.bytes()`) anyway — so `fetchMedia` would have had to convert
+ * back out of `Buffer` regardless.
  *
  * `sendReactionMessage` WAS ported (Phase 8, Task 4) — `convex/
  * metaSend.ts`'s `sendReaction` needs it for the public `reactToMeta`
@@ -145,6 +157,72 @@ export async function getSubscribedApps(
   }
   const data = (await response.json()) as { data?: SubscribedApp[] };
   return data.data ?? [];
+}
+
+// ============================================================
+// Media — the two-step inbound-media-proxy flow for `convex/
+// whatsappConfig.ts`'s `fetchMedia` action: resolve a Meta media id to
+// its short-lived authenticated CDN URL + MIME type, then download
+// the bytes from that URL (same Bearer token both times). See this
+// file's header comment for why `downloadMedia` returns an
+// `ArrayBuffer` rather than the Node `Buffer` its `src/lib/whatsapp/
+// meta-api.ts` counterpart returns.
+// ============================================================
+
+export interface GetMediaUrlArgs {
+  mediaId: string;
+  accessToken: string;
+}
+
+/**
+ * Resolve a media ID to Meta's (short-lived, authenticated) CDN URL
+ * plus the MIME type. Step one of the media-proxy flow. Convex port
+ * of `src/lib/whatsapp/meta-api.ts`'s function of the same name —
+ * ported verbatim (quote style aside).
+ */
+export async function getMediaUrl(
+  args: GetMediaUrlArgs,
+): Promise<{ url: string; mimeType: string }> {
+  const { mediaId, accessToken } = args;
+  const response = await fetch(`${META_API_BASE}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Media fetch failed: ${response.status}`);
+  }
+  const data = await response.json();
+  if (!data.url) throw new Error("Media URL not found in Meta response");
+  return {
+    url: data.url,
+    mimeType: data.mime_type || "application/octet-stream",
+  };
+}
+
+export interface DownloadMediaArgs {
+  downloadUrl: string;
+  accessToken: string;
+}
+
+/**
+ * Fetch the binary bytes for a media URL obtained from `getMediaUrl`.
+ * Step two of the media-proxy flow. Returns an `ArrayBuffer` (via
+ * `Response#arrayBuffer()`) rather than the source's Node `Buffer` —
+ * see this file's header comment.
+ */
+export async function downloadMedia(
+  args: DownloadMediaArgs,
+): Promise<{ buffer: ArrayBuffer; contentType: string }> {
+  const { downloadUrl, accessToken } = args;
+  const response = await fetch(downloadUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    throw new Error(`Media download failed: ${response.status}`);
+  }
+  const contentType =
+    response.headers.get("content-type") || "application/octet-stream";
+  const buffer = await response.arrayBuffer();
+  return { buffer, contentType };
 }
 
 // ============================================================

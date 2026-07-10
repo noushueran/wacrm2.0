@@ -1,8 +1,23 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
-import { decrypt } from '@/lib/whatsapp/encryption'
+import { ConvexHttpClient } from 'convex/browser'
+import { convexAuthNextjsToken } from '@convex-dev/auth/nextjs/server'
+import { api } from '@/lib/convex/server-client'
 
+// Inbound-media proxy — the browser can't hold the decrypted WhatsApp
+// access token (message-bubble.tsx just wants an authenticated blob
+// URL), so this route stays server-side. All the account/config/
+// decrypt work that used to happen here via Supabase now happens
+// inside Convex's `whatsappConfig.fetchMedia` action, along with the
+// Meta round-trip itself — this route's only remaining job is to
+// bridge the caller's own Convex auth token through and stream back
+// the bytes the action returns. The decrypted token never crosses
+// back out to Next.js.
+//
+// A FRESH `ConvexHttpClient` per request — deliberately NOT the shared
+// `getConvexClient()` singleton from `@/lib/convex/server-client`,
+// which is reused across concurrent requests in this server process.
+// Calling `.setAuth()` on that shared instance would leak one caller's
+// identity onto another's concurrent request.
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ mediaId: string }> }
@@ -17,66 +32,25 @@ export async function GET(
       )
     }
 
-    const supabase = await createClient()
-
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    const token = await convexAuthNextjsToken()
+    if (!token) {
       return NextResponse.json(
         { error: 'Unauthorized' },
         { status: 401 }
       )
     }
 
-    // Resolve the caller's account_id — whatsapp_config is one-per-
-    // account post-multi-user, so a teammate fetching media for a
-    // conversation in the shared inbox needs the account's config,
-    // not their personal (non-existent) row.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    const client = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!)
+    client.setAuth(token)
 
-    // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
-
-    if (configError || !config) {
-      return NextResponse.json(
-        { error: 'WhatsApp not configured' },
-        { status: 400 }
-      )
-    }
-
-    const accessToken = decrypt(config.access_token)
-
-    // Get the download URL from Meta
-    const mediaInfo = await getMediaUrl({ mediaId, accessToken })
-
-    // Download the binary data
-    const { buffer, contentType } = await downloadMedia({
-      downloadUrl: mediaInfo.url,
-      accessToken,
+    const result = await client.action(api.whatsappConfig.fetchMedia, {
+      mediaId,
     })
 
-    return new Response(new Uint8Array(buffer), {
+    return new Response(new Uint8Array(result.data), {
       status: 200,
       headers: {
-        'Content-Type': contentType || mediaInfo.mimeType || 'application/octet-stream',
+        'Content-Type': result.contentType,
         'Cache-Control': 'public, max-age=86400',
       },
     })

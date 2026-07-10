@@ -830,3 +830,113 @@ test("cross-account isolation: verifyRegistration never reads a different accoun
 
   delete process.env.CONVEX_META_DRY_RUN;
 });
+
+// ============================================================
+// fetchMedia — inbound-media-proxy action
+// ============================================================
+
+test("fetchMedia resolves an agent teammate's media via a mocked two-step Meta fetch, without ever returning the access token", async () => {
+  const t = convexTest(schema, modules);
+  // Admin sets up the WhatsApp config (`upsert` itself is admin-gated)...
+  const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAdmin.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  // ...but `fetchMedia`'s own floor is "agent": a non-admin teammate
+  // viewing an inbox attachment must still succeed.
+  const bobUserId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const asBob = t.withIdentity({ subject: `${bobUserId}|session-Bob` });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      // Step one — `getMediaUrl`: resolve the media id against Meta's
+      // Graph API to a short-lived CDN URL + MIME type.
+      if (url.includes("graph.facebook.com")) {
+        return new Response(
+          JSON.stringify({
+            url: "https://cdn.example.com/media/abc",
+            mime_type: "image/png",
+          }),
+          { status: 200 },
+        );
+      }
+      // Step two — `downloadMedia`: download the bytes from that CDN URL.
+      return new Response(new Uint8Array([1, 2, 3, 4]).buffer, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    }),
+  );
+
+  const result = await asBob.action(api.whatsappConfig.fetchMedia, {
+    mediaId: "media-123",
+  });
+
+  expect(result.contentType).toBe("image/png");
+  expect(new Uint8Array(result.data)).toEqual(new Uint8Array([1, 2, 3, 4]));
+  // The decrypted access token must never be part of the return value.
+  expect(Object.keys(result).sort()).toEqual(["contentType", "data"]);
+
+  vi.unstubAllGlobals();
+});
+
+test("fetchMedia throws FORBIDDEN for a caller below the agent role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "viewer",
+  });
+
+  await expect(
+    asUser.action(api.whatsappConfig.fetchMedia, { mediaId: "media-123" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+test("fetchMedia throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.action(api.whatsappConfig.fetchMedia, { mediaId: "media-123" }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("fetchMedia throws a clear error when the caller's own account has no WhatsApp config (also proves cross-account isolation)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "alice-token",
+    status: "connected",
+  });
+  // Bob is a different account with no WhatsApp config of his own —
+  // he must never be served Alice's media.
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asBob.action(api.whatsappConfig.fetchMedia, { mediaId: "media-123" }),
+  ).rejects.toThrow(/WhatsApp not configured/);
+});

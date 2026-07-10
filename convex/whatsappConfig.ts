@@ -5,7 +5,12 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { encrypt, decrypt } from "./lib/whatsappEncryption";
 import { hasMinRole } from "./lib/roles";
-import { verifyPhoneNumber, getSubscribedApps } from "./lib/whatsapp/metaApi";
+import {
+  verifyPhoneNumber,
+  getSubscribedApps,
+  getMediaUrl,
+  downloadMedia,
+} from "./lib/whatsapp/metaApi";
 import type { Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -409,6 +414,85 @@ export const verifyRegistration = action({
       last_registration_error: config.lastRegistrationError ?? null,
       registered_at: config.registeredAt ?? null,
       subscribed_apps_at: config.subscribedAppsAt ?? null,
+    };
+  },
+});
+
+// ============================================================
+// fetchMedia — public authed action backing the inbound-media proxy
+// (`GET /api/whatsapp/media/[mediaId]`, `src/app/api/whatsapp/media/
+// [mediaId]/route.ts`). Every Supabase call that route used to make
+// (`getUser`, `profiles.account_id`, `whatsapp_config`, `decrypt`) now
+// happens here instead, PLUS the two-step Meta media fetch itself
+// (`getMediaUrl` → `downloadMedia`) — so the decrypted WhatsApp access
+// token never has to cross back out to Next.js; only the downloaded
+// bytes + content type do. The route's job shrinks to bridging the
+// caller's own Convex auth token through via a per-request
+// `ConvexHttpClient` (never the shared singleton — see that file).
+//
+// Auth mirrors `verifyRegistration` above (`getAuthUserId` +
+// `internal.accounts.accountContextForUser`), but gates at "agent"
+// rather than "admin" — viewing an already-received inbox attachment
+// is a routine agent action (the same floor `convex/files.ts`'s
+// `generateUploadUrl` uses for attaching OUTBOUND media), not an
+// admin-only diagnostic like `verifyRegistration`.
+//
+// No DRY-RUN branch (unlike `verifyRegistration`/`metaSend.ts`): this
+// is a synchronous read the UI is actively waiting on to render an
+// image/audio/document bubble, not a background diagnostic or a send
+// — there's no meaningful synthetic response to fake here.
+// ============================================================
+
+/**
+ * Resolve a Meta media id to its bytes, for the caller's own account's
+ * WhatsApp config: decrypt the stored access token, ask Meta for the
+ * short-lived CDN URL (`getMediaUrl`), then download it
+ * (`downloadMedia`). Always throws on failure (missing config,
+ * undecryptable token, or the Meta calls themselves failing) rather
+ * than a soft `null`/`live:false` — unlike `verifyRegistration` there
+ * is no partial-diagnostic UI to render into; the route's only move on
+ * any failure is a 500.
+ */
+export const fetchMedia = action({
+  args: { mediaId: v.string() },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ data: ArrayBuffer; contentType: string }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId,
+    });
+    if (!config) {
+      // Matches `convex/metaSend.ts`'s exact wording for the same
+      // "never configured" condition.
+      throw new Error("WhatsApp not configured for this account");
+    }
+
+    const accessToken = await decrypt(config.accessToken);
+
+    const mediaInfo = await getMediaUrl({ mediaId: args.mediaId, accessToken });
+    const { buffer, contentType } = await downloadMedia({
+      downloadUrl: mediaInfo.url,
+      accessToken,
+    });
+
+    // Exactly these two fields — `accessToken` (or anything else
+    // derived from it) never joins this object, so it can't leave
+    // Convex via the action's return value.
+    return {
+      data: buffer,
+      contentType: contentType || mediaInfo.mimeType,
     };
   },
 });
