@@ -88,6 +88,14 @@ const nestedSteps = [
   },
 ];
 
+// A minimal structurally-valid step set for the activation-validation
+// tests below: `send_message` needs non-empty text, and the
+// `new_message_received` trigger needs no config, so an automation built
+// from these passes `convex/lib/automations/validate.ts`. `invalidSteps`
+// trips that same validator (empty message text).
+const validSteps = [{ step_type: "send_message", step_config: { text: "hi" } }];
+const invalidSteps = [{ step_type: "send_message", step_config: { text: "" } }];
+
 // ============================================================
 // create
 // ============================================================
@@ -227,6 +235,77 @@ test("create's out_of_office template nests its send_message step under the cond
   expect(steps[0]!.branches.yes).toHaveLength(1);
   expect(steps[0]!.branches.yes[0]!.step_type).toBe("send_message");
   expect(steps[0]!.branches.no).toHaveLength(0);
+});
+
+test("create rejects activating (isActive:true) an automation whose steps are structurally invalid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const error: unknown = await asUser
+    .mutation(api.automations.create, {
+      name: "Broken",
+      triggerType: "new_message_received",
+      isActive: true,
+      steps: invalidSteps,
+    })
+    .catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(ConvexError);
+  const data = (error as { data: { code: string; issues: Array<{ path: string; message: string }> } }).data;
+  expect(data.code).toBe("VALIDATION_FAILED");
+  expect(data.issues.length).toBeGreaterThan(0);
+
+  // The whole mutation aborted before writing anything.
+  expect(await t.run((ctx) => ctx.db.query("automations").collect())).toHaveLength(0);
+  expect(await t.run((ctx) => ctx.db.query("automationSteps").collect())).toHaveLength(0);
+});
+
+test("create allows activating (isActive:true) an automation whose steps and trigger are valid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Live",
+    triggerType: "new_message_received",
+    isActive: true,
+    steps: validSteps,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(automationId));
+  expect(row!.isActive).toBe(true);
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("automationSteps")
+      .withIndex("by_automation", (q) => q.eq("automationId", automationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+});
+
+test("create still saves a structurally-broken automation as an inactive draft (no validation)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Draft",
+    triggerType: "new_message_received",
+    isActive: false,
+    steps: invalidSteps,
+  });
+
+  expect((await t.run((ctx) => ctx.db.get(automationId)))!.isActive).toBe(false);
 });
 
 // ============================================================
@@ -493,6 +572,112 @@ test("update throws FORBIDDEN for a caller below the agent role", async () => {
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });
 
+test("update rejects flipping isActive to true when the trigger config is structurally invalid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  // keyword_match with no keywords is invalid; the steps are fine, so only
+  // the trigger fails — proving validateTriggerForActivation is wired in.
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Kw",
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: [] },
+    steps: validSteps,
+    isActive: false,
+  });
+
+  const error: unknown = await asUser
+    .mutation(api.automations.update, { automationId, isActive: true })
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ConvexError);
+  const data = (error as { data: { code: string; issues: Array<{ path: string }> } }).data;
+  expect(data.code).toBe("VALIDATION_FAILED");
+  expect(data.issues.some((i) => i.path === "trigger.keywords")).toBe(true);
+
+  // The failed activation left it inactive — no patch landed.
+  expect((await t.run((ctx) => ctx.db.get(automationId)))!.isActive).toBe(false);
+});
+
+test("update rejects editing an already-active automation into a broken state, leaving its steps intact", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Live",
+    triggerType: "new_message_received",
+    isActive: true,
+    steps: validSteps,
+  });
+
+  // isActive isn't in the args, but the automation is already active, so the
+  // *resulting* state is still active and the new (broken) steps are validated.
+  const error: unknown = await asUser
+    .mutation(api.automations.update, { automationId, steps: invalidSteps })
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ConvexError);
+  expect((error as { data: { code: string } }).data.code).toBe("VALIDATION_FAILED");
+
+  // replaceSteps never ran — the original valid step survives untouched.
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("automationSteps")
+      .withIndex("by_automation", (q) => q.eq("automationId", automationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.stepConfig).toEqual({ text: "hi" });
+});
+
+test("update allows flipping isActive to true when the resulting config is valid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Draft",
+    triggerType: "new_message_received",
+    steps: validSteps,
+    isActive: false,
+  });
+
+  await asUser.mutation(api.automations.update, { automationId, isActive: true });
+  expect((await t.run((ctx) => ctx.db.get(automationId)))!.isActive).toBe(true);
+});
+
+test("update does not validate a steps edit while the automation stays inactive", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Draft",
+    triggerType: "new_message_received",
+    steps: validSteps,
+    isActive: false,
+  });
+
+  // Broken steps are fine on an inactive draft — saved, not rejected.
+  await asUser.mutation(api.automations.update, { automationId, steps: invalidSteps });
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("automationSteps")
+      .withIndex("by_automation", (q) => q.eq("automationId", automationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.stepConfig).toEqual({ text: "" });
+});
+
 // ============================================================
 // setActive
 // ============================================================
@@ -508,6 +693,7 @@ test("setActive toggles isActive and stamps updatedAt", async () => {
     name: "x",
     triggerType: "new_message_received",
     isActive: false,
+    steps: validSteps,
   });
 
   await asUser.mutation(api.automations.setActive, { automationId, isActive: true });
@@ -538,6 +724,49 @@ test("setActive throws NOT_FOUND for another account's automation", async () => 
   await expect(
     asBob.mutation(api.automations.setActive, { automationId, isActive: true }),
   ).rejects.toMatchObject({ data: { code: "NOT_FOUND" } });
+});
+
+test("setActive rejects activating a structurally invalid automation and leaves it inactive", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  // No steps at all -> validateStepsForActivation flags "needs at least one step".
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Empty",
+    triggerType: "new_message_received",
+    isActive: false,
+  });
+
+  const error: unknown = await asUser
+    .mutation(api.automations.setActive, { automationId, isActive: true })
+    .catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(ConvexError);
+  expect((error as { data: { code: string } }).data.code).toBe("VALIDATION_FAILED");
+
+  expect((await t.run((ctx) => ctx.db.get(automationId)))!.isActive).toBe(false);
+});
+
+test("setActive can always deactivate (isActive:false) even a structurally-broken automation", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  // Broken but still inactive (it could never have been activated).
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "Broken",
+    triggerType: "new_message_received",
+    steps: invalidSteps,
+    isActive: false,
+  });
+
+  // Deactivation must never run the activation validator.
+  await asUser.mutation(api.automations.setActive, { automationId, isActive: false });
+  expect((await t.run((ctx) => ctx.db.get(automationId)))!.isActive).toBe(false);
 });
 
 // ============================================================

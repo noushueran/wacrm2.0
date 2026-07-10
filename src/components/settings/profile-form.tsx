@@ -128,6 +128,10 @@ export function ProfileForm() {
         const { storageId } = (await response.json()) as {
           storageId: Id<'_storage'>;
         };
+        // Record ownership before resolving — `api.files.getUrl` now
+        // asserts the caller's account owns the storage id (mirrors
+        // `src/lib/storage/upload-media.ts`).
+        await convex.mutation(api.files.registerUpload, { storageId });
         const resolvedUrl = await convex.query(api.files.getUrl, {
           storageId,
         });

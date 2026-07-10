@@ -8,6 +8,10 @@ import {
   type BuilderStepInput,
   type StepRow,
 } from "./lib/automations/stepsTree";
+import {
+  validateStepsForActivation,
+  validateTriggerForActivation,
+} from "./lib/automations/validate";
 
 // ============================================================
 // Automations config CRUD — the account-scoped builder-facing
@@ -28,13 +32,16 @@ import {
 // every mutation. Reads (`list`/`get`/`logs`) have no role gate in the
 // source beyond "is logged in", matching `accountQuery`'s default.
 //
-// Deliberately NOT ported: the source's `validateStepsForActivation`/
-// `validateTriggerForActivation` gate that blocks saving/activating a
-// broken config (400 with `issues`). That's a business-rule guard on
-// top of the CRUD this task builds, not part of it — left for the UI
-// rewire task (or a follow-up) to wire in explicitly; the already-ported
-// `convex/lib/automations/validate.ts` is ready for it when that
-// happens.
+// Activation guard: `create`/`update`/`setActive` run the source's
+// `validateStepsForActivation`/`validateTriggerForActivation` gate
+// (reusing `convex/lib/automations/validate.ts` verbatim, never
+// reimplemented) whenever a write would leave the automation ACTIVE,
+// refusing a malformed step/trigger structure with a `VALIDATION_FAILED`
+// `ConvexError` — the same shape `flows.activate` throws via
+// `convex/lib/flows/validate.ts`. Draft saves and deactivations are never
+// validated, so work-in-progress can still be saved and a running
+// automation can still be paused without first fixing it. See
+// `assertActivatable` below.
 // ============================================================
 
 /**
@@ -246,6 +253,46 @@ async function replaceSteps(
   await insertStepsTree(ctx, accountId, automationId, tree, undefined, undefined);
 }
 
+/**
+ * Refuses to *activate* a structurally-broken automation, reusing the
+ * already-ported pure validators in `convex/lib/automations/validate.ts`
+ * verbatim (never reimplemented) — the same guard `flows.activate` runs
+ * via `convex/lib/flows/validate.ts`. An automation whose trigger/steps
+ * are malformed (a `keyword_match` with no keywords, an `add_tag` with no
+ * `tag_id`, zero steps, ...) used to activate silently and then no-op on
+ * every trigger, surfacing only as cryptic failed log rows; this makes
+ * the write refuse with a `VALIDATION_FAILED` `ConvexError` at save time.
+ * Unlike `flows`' validator there is no `severity` axis here — every
+ * issue these two functions return is a blocker.
+ *
+ * Callers invoke this ONLY when a write would leave the automation ACTIVE
+ * — draft saves and deactivations are never validated, so users can save
+ * broken work-in-progress and pause a running automation without first
+ * fixing it (mirroring `flows.activate`'s "drafts/archives are
+ * unconditional" rule).
+ */
+function assertActivatable(
+  steps: BuilderStepInput[],
+  triggerType: string,
+  triggerConfig: unknown,
+): void {
+  const issues = [
+    ...validateTriggerForActivation(triggerType, triggerConfig),
+    ...validateStepsForActivation(steps),
+  ];
+  if (issues.length > 0) {
+    throw new ConvexError({
+      code: "VALIDATION_FAILED",
+      message: "Cannot activate automation — fix the issues below first.",
+      // Spread each issue into a fresh object literal so the array
+      // structurally satisfies Convex's `Value` type (which needs an
+      // index signature) — a bare `ValidationIssue[]` interface doesn't
+      // get that bypass. Same trick as `flows.activate`.
+      issues: issues.map((issue) => ({ ...issue })),
+    });
+  }
+}
+
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
@@ -318,6 +365,21 @@ export const create = accountMutation({
       });
     }
 
+    // Normalize once so the SAME tree is both validated (below) and
+    // inserted (further down): the validator walks `branches`, so it must
+    // see the nested shape `insertStepsTree` stores, not the flat
+    // template-seed form `normalizeStepsInput` converts.
+    const tree: BuilderStepInput[] =
+      effectiveSteps && effectiveSteps.length > 0
+        ? normalizeStepsInput(effectiveSteps)
+        : [];
+
+    // Creating an automation already switched ON runs the same activation
+    // validation as `update`/`setActive` and `flows.activate`.
+    if (args.isActive) {
+      assertActivatable(tree, effectiveTriggerType, effectiveTriggerConfig ?? {});
+    }
+
     const automationId = await ctx.db.insert("automations", {
       accountId: ctx.accountId,
       createdByUserId: ctx.userId,
@@ -330,8 +392,7 @@ export const create = accountMutation({
       updatedAt: Date.now(),
     });
 
-    if (effectiveSteps && effectiveSteps.length > 0) {
-      const tree = normalizeStepsInput(effectiveSteps);
+    if (tree.length > 0) {
       await insertStepsTree(ctx, ctx.accountId, automationId, tree, undefined, undefined);
     }
 
@@ -352,7 +413,27 @@ export const update = accountMutation({
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
     const { automationId, steps, ...rest } = args;
-    await requireOwnAutomation(ctx, automationId);
+    const existing = await requireOwnAutomation(ctx, automationId);
+
+    // If this PATCH would leave the automation ACTIVE — either it flips
+    // `isActive` on, or it's already on and staying on while its
+    // steps/trigger change — validate the *resulting* config (new fields
+    // where supplied, the stored ones otherwise), so an active automation
+    // can't be quietly edited into a broken state and a broken one can't
+    // be switched on. Deactivations and edits to an inactive draft skip
+    // this. See `assertActivatable`.
+    const willBeActive = rest.isActive !== undefined ? rest.isActive : existing.isActive;
+    if (willBeActive) {
+      const resultingTriggerType =
+        rest.triggerType !== undefined ? rest.triggerType : existing.triggerType;
+      const resultingTriggerConfig =
+        rest.triggerConfig !== undefined ? rest.triggerConfig : existing.triggerConfig;
+      const resultingSteps =
+        steps !== undefined
+          ? normalizeStepsInput(steps as BuilderStepInput[])
+          : buildStepsTree((await loadOrderedSteps(ctx, automationId)).map(toStepRow));
+      assertActivatable(resultingSteps, resultingTriggerType, resultingTriggerConfig ?? {});
+    }
 
     // Only ever patch fields the caller actually supplied — mirrors the
     // source PATCH's `for (const k of [...]) if (k in body) update[k] =
@@ -391,7 +472,18 @@ export const setActive = accountMutation({
   args: { automationId: v.id("automations"), isActive: v.boolean() },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnAutomation(ctx, args.automationId);
+    const existing = await requireOwnAutomation(ctx, args.automationId);
+
+    // Switching ON runs the same activation validation as create/update
+    // and flows.activate; switching OFF is unconditional (you can always
+    // pause a running automation). See `assertActivatable`.
+    if (args.isActive) {
+      const steps = buildStepsTree(
+        (await loadOrderedSteps(ctx, args.automationId)).map(toStepRow),
+      );
+      assertActivatable(steps, existing.triggerType, existing.triggerConfig ?? {});
+    }
+
     await ctx.db.patch(args.automationId, {
       isActive: args.isActive,
       updatedAt: Date.now(),

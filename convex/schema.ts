@@ -1003,4 +1003,21 @@ export default defineSchema({
       dimensions: 1536,
       filterFields: ["accountId"],
     }),
+
+  // Ownership record tying a client-uploaded Convex storage object to the
+  // account that minted it. Convex `_storage` carries no `accountId` of
+  // its own — a storage id, once minted, resolves for anyone holding it —
+  // so this table is the ONLY place a storage id is bound to a tenant.
+  // `files.getUrl`/`files.remove` consult it (via `by_storage`) so one
+  // account can't resolve or delete another's uploads;
+  // `files.registerUpload` writes the row right after the client-upload
+  // POST hands back a storage id. `by_account` follows the section
+  // convention (every account-scoped table carries an accountId index)
+  // and supports future per-account storage GC.
+  fileOwners: defineTable({
+    accountId: v.id("accounts"),
+    storageId: v.id("_storage"),
+  })
+    .index("by_storage", ["storageId"])
+    .index("by_account", ["accountId"]),
 });

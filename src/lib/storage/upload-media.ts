@@ -7,16 +7,17 @@ import type { Id } from "../../../convex/_generated/dataModel";
  * module's Supabase Storage version (account-scoped bucket paths, RLS
  * write policies). Convex's storage model needs no bucket/path
  * convention of its own: every stored file gets an opaque
- * `Id<"_storage">`, minted via `api.files.generateUploadUrl` and
- * resolved to a fetchable URL via `api.files.getUrl` — see
- * `convex/files.ts`'s header comment.
+ * `Id<"_storage">`, minted via `api.files.generateUploadUrl`, its
+ * ownership recorded via `api.files.registerUpload`, and resolved to a
+ * fetchable URL via `api.files.getUrl` — see `convex/files.ts`'s header
+ * comment.
  *
  * Both functions below are plain (non-hook) functions — they run inside
  * event handlers / callbacks, not render bodies, so they can't call
  * `useConvex()`/`useMutation()` themselves. Callers thread in the Convex
  * handles they already hold from their OWN hooks instead: a
- * `ConvexReactClient` (from `useConvex()`) for the `getUrl`/`remove`
- * calls, plus the `generateUploadUrl` mutation fn (from
+ * `ConvexReactClient` (from `useConvex()`) for the `registerUpload`/
+ * `getUrl`/`remove` calls, plus the `generateUploadUrl` mutation fn (from
  * `useMutation(api.files.generateUploadUrl)`) for minting the upload
  * URL. This mirrors `src/components/settings/profile-form.tsx`'s
  * avatar-upload flow exactly (see its `onSubmit`, ~L115-140).
@@ -57,9 +58,10 @@ type GenerateUploadUrlMutation = ReactMutation<typeof api.files.generateUploadUr
 /**
  * Upload a file to Convex storage and resolve it to a fetchable URL.
  * The Convex client-upload flow: mint a short-lived upload URL, POST the
- * file bytes to it directly, then resolve the returned storage id to a
- * URL. Throws with a user-facing message on upload / resolution
- * failure — callers surface it via a toast.
+ * file bytes to it directly, record the returned storage id's ownership
+ * (`api.files.registerUpload`), then resolve it to a URL. Throws with a
+ * user-facing message on upload / resolution failure — callers surface
+ * it via a toast.
  *
  * Size validation is the caller's responsibility (limits can differ per
  * feature); `MEDIA_MAX_BYTES`/`MEDIA_MAX_BYTES_BY_KIND` are exported for
@@ -80,6 +82,12 @@ export async function uploadAccountMedia(
     throw new Error("Upload failed.");
   }
   const { storageId } = (await response.json()) as { storageId: Id<"_storage"> };
+
+  // Record ownership (storageId → the caller's account) before resolving
+  // the URL: `api.files.getUrl` now asserts the caller's account owns the
+  // id (see `convex/files.ts`), so the ownership row must land first or
+  // the resolve comes back null.
+  await convex.mutation(api.files.registerUpload, { storageId });
 
   const url = await convex.query(api.files.getUrl, { storageId });
   if (!url) {

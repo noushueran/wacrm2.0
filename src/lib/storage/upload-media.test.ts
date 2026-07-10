@@ -61,7 +61,8 @@ describe("uploadAccountMedia", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const queryMock = vi.fn(async () => "https://cdn.example.com/resolved.png");
-    const convex = fakeConvex({ query: queryMock });
+    const mutationMock = vi.fn(async () => undefined);
+    const convex = fakeConvex({ query: queryMock, mutation: mutationMock });
 
     const result = await uploadAccountMedia(
       convex,
@@ -70,6 +71,15 @@ describe("uploadAccountMedia", () => {
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Ownership is recorded for the returned storage id...
+    expect(mutationMock).toHaveBeenCalledWith(api.files.registerUpload, {
+      storageId: STORAGE_ID,
+    });
+    // ...before the URL is resolved — `getUrl` now rejects an id whose
+    // ownership hasn't been recorded, so the order matters.
+    expect(mutationMock.mock.invocationCallOrder[0]).toBeLessThan(
+      queryMock.mock.invocationCallOrder[0],
+    );
     expect(queryMock).toHaveBeenCalledWith(api.files.getUrl, {
       storageId: STORAGE_ID,
     });
