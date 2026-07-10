@@ -14,6 +14,7 @@ import type * as aiKnowledge from "../aiKnowledge.js";
 import type * as aiReply from "../aiReply.js";
 import type * as aiUsage from "../aiUsage.js";
 import type * as apiKeys from "../apiKeys.js";
+import type * as apiV1 from "../apiV1.js";
 import type * as auth from "../auth.js";
 import type * as automations from "../automations.js";
 import type * as automationsEngine from "../automationsEngine.js";
@@ -89,6 +90,7 @@ declare const fullApi: ApiFromModules<{
   aiReply: typeof aiReply;
   aiUsage: typeof aiUsage;
   apiKeys: typeof apiKeys;
+  apiV1: typeof apiV1;
   auth: typeof auth;
   automations: typeof automations;
   automationsEngine: typeof automationsEngine;

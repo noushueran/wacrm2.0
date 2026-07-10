@@ -15,3 +15,16 @@ export function normalizePhone(phone: string): string {
   if (!phone) return "";
   return phone.replace(/\D/g, "");
 }
+
+/**
+ * Validate a (digits-only, post-`normalizePhone`) phone as E.164-like:
+ * 7-15 digits, no leading zero. Ported (not re-exported — see this
+ * file's header on why) from `src/lib/whatsapp/phone-utils.ts`'s
+ * `isValidE164`, for `convex/apiV1.ts`'s public-API contact/message/
+ * broadcast recipient validation, which needs the exact same "is this a
+ * plausible phone number" check the REST layer always ran before this
+ * migration.
+ */
+export function isValidE164(phone: string): boolean {
+  return /^\+?[1-9]\d{6,14}$/.test(phone);
+}

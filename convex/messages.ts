@@ -311,6 +311,32 @@ export const getForAccount = internalQuery({
  * accountId on hand. Omitted, it falls back to the source's own
  * account-agnostic sweep.
  */
+/**
+ * The newest message in `conversationId` (scoped to `accountId`) — used
+ * by `convex/apiV1.ts`'s `sendMessage` action to recover the persisted
+ * `messages` row `metaSend.*`'s send actions just inserted via
+ * `appendInternal` (those actions return only `{whatsappMessageId}`, not
+ * the new row's own `_id`, and the public REST send endpoint's response
+ * needs BOTH). Reads the same `by_conversation` index + `.order("desc")`
+ * as `listByConversation` above, so "newest" here means the same thing
+ * it means there. Relies on nothing else concurrently inserting into
+ * this exact conversation between the send and this read — true for the
+ * single request/response cycle `sendMessage` uses this in.
+ */
+export const latestForConversationInternal = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    await requireOwnConversation(ctx, args.accountId, args.conversationId);
+    return await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .first();
+  },
+});
+
 export const updateDeliveryStatusByWamid = internalMutation({
   args: {
     wamid: v.string(),

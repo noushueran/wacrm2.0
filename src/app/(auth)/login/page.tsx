@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useTranslations } from "next-intl";
 import { useAuthActions } from "@convex-dev/auth/react";
-import { ConvexError } from "convex/values";
+import { authErrorMessage } from "@/lib/auth/auth-error-message";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,17 +17,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { MessageSquare, UsersRound } from "lucide-react";
-
-// A ConvexError carries a structured `.data` payload that survives the
-// client boundary (a plain Error is sanitized to "Server Error"), so
-// prefer it; otherwise fall back to the Error message, then a generic.
-function authErrorMessage(err: unknown): string {
-  if (err instanceof ConvexError) {
-    return typeof err.data === "string" ? err.data : JSON.stringify(err.data);
-  }
-  if (err instanceof Error) return err.message;
-  return "Something went wrong. Please try again.";
-}
 
 // `useSearchParams` opts the component out of static prerendering
 // unless it sits under a Suspense boundary. We split the form into
@@ -65,10 +54,10 @@ function LoginPageInner() {
     try {
       await signIn("password", { email, password, flow: "signIn" });
     } catch (err) {
-      // A ConvexError's `.data` survives the client boundary intact; a
-      // plain Error (e.g. bad credentials from the auth backend) is
-      // sanitized to its message.
-      setError(authErrorMessage(err));
+      // Bad credentials surface as a plain Error from the auth backend;
+      // `authErrorMessage` collapses those to a friendly message and never
+      // leaks the raw server error / stack trace (see the helper).
+      setError(authErrorMessage(err, "signIn"));
       setLoading(false);
       return;
     }

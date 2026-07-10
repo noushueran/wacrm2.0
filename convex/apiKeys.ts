@@ -1,7 +1,9 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalQuery } from "./_generated/server";
+import { internalQuery, query, mutation } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { generateApiKey } from "./lib/apiKey";
+import type { Doc } from "./_generated/dataModel";
+import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
 // API keys — machine credentials for the public REST API (`/api/v1/*`,
@@ -137,34 +139,114 @@ export const revoke = accountMutation({
 });
 
 /**
+ * Shared "is this key hash still live" lookup — the one place that
+ * decides what "active" means (unrevoked, unexpired), reused by
+ * `lookupByHash` (below), the public `resolveByHash` (below), and
+ * `convex/apiV1.ts`'s per-op scope check. Returns the FULL key doc (not
+ * just `{accountId, scopes}`) so callers that need more (e.g.
+ * `apiV1.getMe`'s `key._id`, `apiV1.createWebhook`'s
+ * `key.createdByUserId`) don't need a second lookup — `lookupByHash`/
+ * `resolveByHash` simply narrow it down to the public `{accountId,
+ * scopes}` contract before returning. Returns `null` (never throws) for
+ * "no such key", a revoked key, or an expired key, so every caller gets
+ * one uniform "not usable" signal instead of re-deriving liveness itself
+ * — same contract `src/lib/api-keys/store.ts`'s `findActiveKeyByHash`
+ * establishes on the Supabase side.
+ *
+ * Typed to accept any ctx with a `db` (only `db.get`/`db.query` are
+ * used), so it works unmodified from a `query`, `mutation`, or
+ * `internalQuery` handler alike (see `contacts.ts`'s `requireOwnContact`
+ * for the same typing convention).
+ */
+export async function loadActiveApiKey(
+  ctx: { db: QueryCtx["db"] },
+  keyHash: string,
+): Promise<Doc<"apiKeys"> | null> {
+  const key = await ctx.db
+    .query("apiKeys")
+    .withIndex("by_key_hash", (q) => q.eq("keyHash", keyHash))
+    .first();
+  if (!key) return null;
+
+  // Liveness checks mirror `findActiveKeyByHash`'s own comment: kept as
+  // explicit JS checks rather than folded into the index query, so the
+  // failure modes stay obvious and the index itself stays a simple
+  // equality lookup.
+  if (key.revokedAt !== undefined) return null;
+  if (key.expiresAt !== undefined && key.expiresAt <= Date.now()) {
+    return null;
+  }
+
+  return key;
+}
+
+/**
  * Server-only lookup by hash — the Convex counterpart to
  * `src/lib/api-keys/store.ts`'s `findActiveKeyByHash`. An `internalQuery`
- * (never exposed to any client): a future public-API HTTP handler
- * hashes the caller-supplied key (`convex/lib/apiKey.ts`'s `hashApiKey`)
- * and calls this via `ctx.runQuery(internal.apiKeys.lookupByHash, {
- * keyHash })` to resolve which account — and which scopes — the key
- * authenticates. Returns `null` (never throws) for "no such key", a
- * revoked key, or an expired key, so callers never have to re-check
- * liveness themselves — same contract as `findActiveKeyByHash`.
+ * (never exposed to any client): called via
+ * `ctx.runQuery(internal.apiKeys.lookupByHash, { keyHash })` from an
+ * `action`/`httpAction` context (which has no `ctx.db` of its own) —
+ * `convex/apiV1.ts`'s action-shaped ops (`sendMessage`, `createBroadcast`)
+ * are exactly that. Query/mutation-shaped `apiV1.ts` ops call
+ * `loadActiveApiKey` directly instead (they already have a `ctx.db`, so
+ * the extra `runQuery` hop buys nothing) — see that module's own comment.
  */
 export const lookupByHash = internalQuery({
+  args: { keyHash: v.string() },
+  handler: async (ctx, args) => {
+    const key = await loadActiveApiKey(ctx, args.keyHash);
+    if (!key) return null;
+    return { accountId: key.accountId, scopes: key.scopes };
+  },
+});
+
+/**
+ * PUBLIC by-secret resolver — the Convex counterpart to
+ * `src/lib/api-keys/store.ts`'s `findActiveKeyByHash`, callable directly
+ * from `src/lib/auth/api-context.ts`'s `requireApiKey` via
+ * `ConvexHttpClient` (a Next.js server route has no Convex Auth session
+ * to authenticate a `query` call — the key HASH is the credential that
+ * establishes the account, exactly like `invitations.ts`'s `peek` is
+ * public because the invite TOKEN hash is its own credential). Safe to
+ * expose with NO auth check for the same reason `peek` is: the caller
+ * already possesses the one secret (the plaintext key, hashed
+ * client-side before this call) that makes the lookup meaningful — an
+ * attacker without a valid key learns nothing more than "no such key"
+ * from a wrong guess, exactly like a probing `peek` call. Returns
+ * `{accountId, scopes}` for an active key, `null` for anything else
+ * (unknown/revoked/expired) — deliberately nothing more (no `name`, no
+ * `keyPrefix`, no `_id`): every other `apiV1.*` op re-derives whatever
+ * else it needs from its OWN `loadActiveApiKey` call rather than
+ * threading extra fields through this shared resolver.
+ */
+export const resolveByHash = query({
+  args: { keyHash: v.string() },
+  handler: async (ctx, args) => {
+    const key = await loadActiveApiKey(ctx, args.keyHash);
+    if (!key) return null;
+    return { accountId: key.accountId, scopes: key.scopes };
+  },
+});
+
+/**
+ * Best-effort `lastUsedAt` bump by hash — the Convex counterpart to
+ * `src/lib/api-keys/store.ts`'s `touchLastUsed`, called fire-and-forget
+ * from `requireApiKey` on every authenticated request (never awaited,
+ * never allowed to fail the caller's actual request). PUBLIC (not
+ * internal) for the same reason `resolveByHash` is: `requireApiKey` runs
+ * in a Next.js route with no Convex Auth session, only the key hash —
+ * and, as with `resolveByHash`, presenting a valid hash IS the
+ * credential. A miss (unknown/already-revoked hash) is silently a no-op,
+ * not an error — a lagging `lastUsedAt` on a dead key is harmless.
+ */
+export const touchLastUsedByHash = mutation({
   args: { keyHash: v.string() },
   handler: async (ctx, args) => {
     const key = await ctx.db
       .query("apiKeys")
       .withIndex("by_key_hash", (q) => q.eq("keyHash", args.keyHash))
       .first();
-    if (!key) return null;
-
-    // Liveness checks mirror `findActiveKeyByHash`'s own comment: kept
-    // as explicit JS checks rather than folded into the index query, so
-    // the failure modes stay obvious and the index itself stays a
-    // simple equality lookup.
-    if (key.revokedAt !== undefined) return null;
-    if (key.expiresAt !== undefined && key.expiresAt <= Date.now()) {
-      return null;
-    }
-
-    return { accountId: key.accountId, scopes: key.scopes };
+    if (!key) return;
+    await ctx.db.patch(key._id, { lastUsedAt: Date.now() });
   },
 });

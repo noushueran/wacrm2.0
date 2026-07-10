@@ -342,6 +342,64 @@ export const create = accountMutation({
   },
 });
 
+/**
+ * `action`-callable counterpart to `create` above, for `convex/apiV1
+ * .createBroadcast` (Phase 8, Task 5) — an `action` has no `ctx.db`/user
+ * session of its own (same reasoning as `conversations
+ * .findOrCreateForContactInternal`), so `accountId` is an explicit,
+ * caller-supplied argument instead of `ctx.accountId`/`ctx.userId`, and
+ * there is no `requireRole` (the public API's own scope check —
+ * `apiV1.ts`'s `requireScope`/`requireScopeAction` — already gated this
+ * before `createBroadcast` ever calls here). Every `contactId` is
+ * assumed already resolved + verified to belong to `accountId` by the
+ * caller (`apiV1.createBroadcast` does this via `contacts
+ * .findOrCreateByPhoneInternal`) — unlike the public `create`, this does
+ * NOT re-check `requireOwnContact` per id, since `apiV1.createBroadcast`
+ * only ever passes ids it JUST resolved/created for this exact
+ * `accountId` in the same call. `createdByUserId` stays unset — there is
+ * no user behind an API-key-authenticated write (mirrors the public
+ * REST layer's pre-migration `resolveAuditUserId` being simplified away
+ * for this migration; see the Phase 8 Task 5 report for the full
+ * rationale). Always starts "sending" (never "draft"), matching the
+ * REST contract's own immediate-fan-out behavior.
+ */
+export const createInternal = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    name: v.string(),
+    templateName: v.string(),
+    templateLanguage: v.string(),
+    contactIds: v.array(v.id("contacts")),
+    templateVariables: v.optional(v.any()),
+  },
+  handler: async (ctx, args) => {
+    const { accountId, contactIds, ...rest } = args;
+
+    const broadcastId = await ctx.db.insert("broadcasts", {
+      accountId,
+      ...rest,
+      status: "sending",
+      totalRecipients: contactIds.length,
+      sentCount: 0,
+      deliveredCount: 0,
+      readCount: 0,
+      repliedCount: 0,
+      failedCount: 0,
+    });
+
+    for (const contactId of contactIds) {
+      await ctx.db.insert("broadcastRecipients", {
+        accountId,
+        broadcastId,
+        contactId,
+        status: "pending",
+      });
+    }
+
+    return broadcastId;
+  },
+});
+
 export const setRecipientStatus = accountMutation({
   args: {
     recipientId: v.id("broadcastRecipients"),

@@ -366,3 +366,111 @@ test("lookupByHash returns null for an expired key", async () => {
   const result = await t.query(internal.apiKeys.lookupByHash, { keyHash });
   expect(result).toBeNull();
 });
+
+// ============================================================
+// resolveByHash — PUBLIC by-secret query (Phase 8, Task 5), the
+// counterpart `src/lib/auth/api-context.ts`'s `requireApiKey` calls via
+// `ConvexHttpClient` from a Next.js route (which has no Convex Auth
+// session). Same liveness contract as `lookupByHash` above — these
+// tests mirror that suite's own active/revoked/expired/foreign cases,
+// plus confirm nothing beyond `{accountId, scopes}` ever leaks.
+// ============================================================
+
+test("resolveByHash returns the account + scopes for an active key", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { plaintext } = await asUser.mutation(api.apiKeys.create, {
+    name: "CI bot",
+    scopes: ["contacts:read", "messages:send"],
+  });
+
+  const keyHash = await hashApiKey(plaintext);
+  const result = await t.query(api.apiKeys.resolveByHash, { keyHash });
+  expect(result).toEqual({ accountId, scopes: ["contacts:read", "messages:send"] });
+  // Nothing beyond the two documented fields — no `name`/`keyPrefix`/`_id`.
+  expect(Object.keys(result!).sort()).toEqual(["accountId", "scopes"]);
+});
+
+test("resolveByHash returns null for an unknown hash, a revoked key, and an expired key", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  expect(await t.query(api.apiKeys.resolveByHash, { keyHash: "never-existed" })).toBeNull();
+
+  const revoked = await asUser.mutation(api.apiKeys.create, { name: "Revoked", scopes: [] });
+  await asUser.mutation(api.apiKeys.revoke, { apiKeyId: revoked.apiKeyId });
+  expect(
+    await t.query(api.apiKeys.resolveByHash, { keyHash: await hashApiKey(revoked.plaintext) }),
+  ).toBeNull();
+
+  const expired = await asUser.mutation(api.apiKeys.create, {
+    name: "Expired",
+    scopes: [],
+    expiresInDays: 1,
+  });
+  await t.run((ctx) => ctx.db.patch(expired.apiKeyId, { expiresAt: Date.now() - 1_000 }));
+  expect(
+    await t.query(api.apiKeys.resolveByHash, { keyHash: await hashApiKey(expired.plaintext) }),
+  ).toBeNull();
+});
+
+test("resolveByHash never returns a foreign account's key for another account's hash", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob, accountId: bobAccount } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.apiKeys.create, { name: "Alice key", scopes: [] });
+  const { plaintext } = await asBob.mutation(api.apiKeys.create, { name: "Bob key", scopes: [] });
+
+  const result = await t.query(api.apiKeys.resolveByHash, { keyHash: await hashApiKey(plaintext) });
+  expect(result).toEqual({ accountId: bobAccount, scopes: [] });
+});
+
+// ============================================================
+// touchLastUsedByHash — best-effort lastUsedAt bump by hash, PUBLIC for
+// the same reason `resolveByHash` is (no Convex Auth session in the
+// Next.js route that calls it; the hash itself is the credential).
+// ============================================================
+
+test("touchLastUsedByHash bumps lastUsedAt for the matching key", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { plaintext, apiKeyId } = await asUser.mutation(api.apiKeys.create, {
+    name: "CI bot",
+    scopes: [],
+  });
+  const keyHash = await hashApiKey(plaintext);
+
+  expect((await t.run((ctx) => ctx.db.get(apiKeyId)))!.lastUsedAt).toBeUndefined();
+
+  const before = Date.now();
+  await t.mutation(api.apiKeys.touchLastUsedByHash, { keyHash });
+  const after = await t.run((ctx) => ctx.db.get(apiKeyId));
+  expect(after!.lastUsedAt).toBeGreaterThanOrEqual(before);
+});
+
+test("touchLastUsedByHash is a silent no-op for an unknown hash", async () => {
+  const t = convexTest(schema, modules);
+  await expect(
+    t.mutation(api.apiKeys.touchLastUsedByHash, { keyHash: "never-existed" }),
+  ).resolves.toBeUndefined();
+});

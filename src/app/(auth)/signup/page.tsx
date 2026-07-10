@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { useMutation } from "convex/react";
-import { ConvexError } from "convex/values";
+import { authErrorMessage } from "@/lib/auth/auth-error-message";
 import { api } from "../../../../convex/_generated/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,18 +18,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { MessageSquare, UsersRound } from "lucide-react";
-
-// A ConvexError carries a structured `.data` payload that survives the
-// client boundary (a plain Error is sanitized to "Server Error"); prefer
-// it, then the Error message, then a generic string. The password-length
-// rule in `convex/auth.ts` throws exactly such a ConvexError.
-function authErrorMessage(err: unknown): string {
-  if (err instanceof ConvexError) {
-    return typeof err.data === "string" ? err.data : JSON.stringify(err.data);
-  }
-  if (err instanceof Error) return err.message;
-  return "Something went wrong. Please try again.";
-}
 
 // `useSearchParams` opts the component out of static prerendering
 // unless wrapped in Suspense — same pattern as /login.
@@ -88,7 +76,7 @@ function SignupPageInner() {
         name: fullName,
       });
     } catch (err) {
-      setError(authErrorMessage(err));
+      setError(authErrorMessage(err, "signUp"));
       setLoading(false);
       return;
     }

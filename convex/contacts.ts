@@ -1,9 +1,10 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalMutation } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { normalizePhone } from "./lib/phone";
 import type { Doc, Id } from "./_generated/dataModel";
-import type { QueryCtx } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 
 // ============================================================
 // Contacts — the reference vertical for the account-isolation model.
@@ -368,5 +369,75 @@ export const unassignTag = accountMutation({
       )
       .first();
     if (link) await ctx.db.delete(link._id);
+  },
+});
+
+// ============================================================
+// Public-API (Phase 8, Task 5) find-or-create by phone — the account-
+// explicit counterpart `convex/apiV1.ts`'s `createContact`/`sendMessage`/
+// `createBroadcast` need. Deliberately separate from `create` above
+// (which THROWS `DUPLICATE_PHONE` on a match, the right UX for the
+// dashboard's manual contact form): the public REST API's contract is
+// silent find-or-create (`POST /api/v1/contacts` returns 200
+// `created:false` on a match, never an error), matching
+// `src/lib/api/v1/contacts.ts`'s old `findOrCreateContact`. Dedup is
+// EXACT `phoneNormalized` match via `by_account_phone` — the same
+// index/convention `create` already established for this table in
+// Convex (the old Postgres-side `findOrCreateContact` did fuzzy
+// trunk-prefix matching via `findExistingContact`; this migration
+// keeps the exact-match convention `create` already set, rather than
+// reintroducing the fuzzy behavior for just this one caller).
+// ============================================================
+
+/**
+ * Find (by exact normalized-phone match) or create a contact in
+ * `accountId`. Returns the contact id and whether it was created. Typed
+ * to accept any ctx with a `db` (only `db.get`/`db.query`/`db.insert`
+ * are used), so it works unmodified from a `mutation` handler (`apiV1
+ * .createContact`) or from `findOrCreateByPhoneInternal` below (an
+ * `internalMutation`, for the `action`-shaped `apiV1.sendMessage`/
+ * `apiV1.createBroadcast`, which have no `ctx.db` of their own).
+ */
+export async function findOrCreateContactByPhone(
+  ctx: { db: MutationCtx["db"] },
+  accountId: Id<"accounts">,
+  input: { phone: string; name?: string; email?: string; company?: string },
+): Promise<{ contactId: Id<"contacts">; created: boolean }> {
+  const phoneNormalized = normalizePhone(input.phone);
+  const existing = await ctx.db
+    .query("contacts")
+    .withIndex("by_account_phone", (q) =>
+      q.eq("accountId", accountId).eq("phoneNormalized", phoneNormalized),
+    )
+    .first();
+  if (existing) return { contactId: existing._id, created: false };
+
+  const contactId = await ctx.db.insert("contacts", {
+    accountId,
+    phone: input.phone,
+    phoneNormalized,
+    name: input.name ?? input.phone,
+    email: input.email,
+    company: input.company,
+  });
+  return { contactId, created: true };
+}
+
+/**
+ * `action`-callable counterpart to `findOrCreateContactByPhone` above —
+ * see that function's own doc comment for why a second entry point is
+ * needed (an `action` has no `ctx.db`, only `ctx.runMutation`).
+ */
+export const findOrCreateByPhoneInternal = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    phone: v.string(),
+    name: v.optional(v.string()),
+    email: v.optional(v.string()),
+    company: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { accountId, ...input } = args;
+    return await findOrCreateContactByPhone(ctx, accountId, input);
   },
 });
