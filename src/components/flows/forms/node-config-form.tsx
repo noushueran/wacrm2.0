@@ -24,7 +24,8 @@
  * renders the advanced rows.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useQuery } from "convex/react";
 import {
   Loader2,
   Paperclip,
@@ -49,6 +50,8 @@ import { cn } from "@/lib/utils";
 import { uploadAccountMedia, MEDIA_MAX_BYTES } from "@/lib/storage/upload-media";
 import { slugify, type BuilderNode } from "../shared";
 import { NextNodeRow, NodeKeySelect, TextRow } from "./fields";
+import { api } from "../../../../convex/_generated/api";
+import { toUiTag } from "@/lib/convex/adapters";
 
 interface NodeConfigFormProps {
   node: BuilderNode;
@@ -837,29 +840,16 @@ function SetTagForm({
 }
 
 /**
- * Shared loader for both `condition` (subject=tag) and `set_tag`.
- * Falls back to raw UUID input if the endpoint is absent on older
- * deployments — the form remains authorable in that case.
+ * Shared loader for both `condition` (subject=tag) and `set_tag` — the
+ * account's tag catalog (`api.tags.list`), used to render a picker
+ * instead of a raw UUID input. `useQuery` returns `undefined` while
+ * loading; both callers already treat an empty `UserTag[]` as "fall
+ * back to raw input", so that transient state needs no separate
+ * handling here.
  */
 function useUserTags(): UserTag[] {
-  const [tags, setTags] = useState<UserTag[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/tags").catch(() => null);
-        if (!res || !res.ok) return;
-        const json = (await res.json()) as { tags?: UserTag[] };
-        if (!cancelled) setTags(json.tags ?? []);
-      } catch {
-        // Tags endpoint absent — caller falls back to raw input.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return tags;
+  const tags = useQuery(api.tags.list);
+  return useMemo(() => (tags ?? []).map(toUiTag), [tags]);
 }
 
 // ============================================================

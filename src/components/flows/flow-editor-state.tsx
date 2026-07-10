@@ -43,6 +43,7 @@ import {
   type ReactNode,
 } from "react";
 import { useRouter } from "next/navigation";
+import { useMutation } from "convex/react";
 import { toast } from "sonner";
 
 import {
@@ -53,6 +54,9 @@ import { useTranslations } from "next-intl";
 import { unlinkNodeReferences } from "@/lib/flows/edges";
 import type { FlowNodeRow, FlowRow } from "@/lib/flows/types";
 import { NODE_META, slugify, type BuilderNode, type NodeType } from "./shared";
+import { api } from "../../../convex/_generated/api";
+import type { Id } from "../../../convex/_generated/dataModel";
+import { convexErrorData } from "@/lib/convex/adapters";
 
 // ============================================================
 // State shape
@@ -256,6 +260,10 @@ export function FlowEditorProvider({
     })),
   }));
 
+  const updateFlowMutation = useMutation(api.flows.update);
+  const activateFlowMutation = useMutation(api.flows.activate);
+  const removeFlowMutation = useMutation(api.flows.remove);
+
   const [saving, setSaving] = useState(false);
   const [activating, setActivating] = useState(false);
   // dirty flips on user edits; status-only updates (after the activate
@@ -328,35 +336,47 @@ export function FlowEditorProvider({
     [issues],
   );
 
-  // ---- Save (PUT) ----
+  // ---- Save ----
+  // `entryNodeId`/`description` are both `v.optional(v.string())` on
+  // `api.flows.update` (no `v.null()` union), so there's no way to send
+  // an explicit "clear it" value distinct from "omitted, don't touch
+  // it" — `""` is sent instead (the engine's `nodeKey`s are never
+  // empty, so it can't collide with a real entry node), and
+  // `toUiFlow` reads it back as `null` via `||`. See that adapter's
+  // doc comment in `src/lib/convex/adapters.ts`.
   const save = useCallback(async () => {
     setSaving(true);
     try {
-      const res = await fetch(`/api/flows/${initialFlow.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: state.name,
-          description: state.description || null,
-          trigger_type: state.trigger_type,
-          trigger_config: state.trigger_config,
-          entry_node_id: state.entry_node_id,
-          nodes: state.nodes,
-        }),
+      await updateFlowMutation({
+        flowId: initialFlow.id as Id<"flows">,
+        name: state.name,
+        description: state.description,
+        triggerType: state.trigger_type,
+        triggerConfig: state.trigger_config,
+        entryNodeId: state.entry_node_id ?? "",
+        nodes: state.nodes.map((n) => ({
+          nodeKey: n.node_key,
+          nodeType: n.node_type,
+          config: n.config,
+          positionX: n.position_x,
+          positionY: n.position_y,
+        })),
       });
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(json.error ?? `Save failed: ${res.status}`);
-      }
       setDirty(false);
       toast.success(t("saved"));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Save failed";
+      const data = convexErrorData(err);
+      const msg =
+        typeof data?.message === "string"
+          ? data.message
+          : err instanceof Error
+            ? err.message
+            : "Save failed";
       toast.error(msg);
     } finally {
       setSaving(false);
     }
-  }, [initialFlow.id, state]);
+  }, [initialFlow.id, state, updateFlowMutation, t]);
 
   // ---- Activate / Pause / Archive ----
   const setStatus = useCallback(
@@ -373,15 +393,10 @@ export function FlowEditorProvider({
         if (next === "active") {
           await save();
         }
-        const res = await fetch(`/api/flows/${initialFlow.id}/activate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: next }),
+        await activateFlowMutation({
+          flowId: initialFlow.id as Id<"flows">,
+          status: next,
         });
-        if (!res.ok) {
-          const json = await res.json().catch(() => ({}));
-          throw new Error(json.error ?? `Status update failed: ${res.status}`);
-        }
         setStateRaw((s) => ({ ...s, status: next }));
         toast.success(
           next === "active"
@@ -391,13 +406,19 @@ export function FlowEditorProvider({
               : t("statusDraft")
         );
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Status update failed";
+        const data = convexErrorData(err);
+        const msg =
+          typeof data?.message === "string"
+            ? data.message
+            : err instanceof Error
+              ? err.message
+              : "Status update failed";
         toast.error(msg);
       } finally {
         setActivating(false);
       }
     },
-    [canActivate, save, initialFlow.id],
+    [canActivate, save, initialFlow.id, activateFlowMutation, t],
   );
 
   // ---- Delete ----
@@ -407,16 +428,19 @@ export function FlowEditorProvider({
     );
     if (!yes) return;
     try {
-      const res = await fetch(`/api/flows/${initialFlow.id}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+      await removeFlowMutation({ flowId: initialFlow.id as Id<"flows"> });
       router.push("/flows");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Delete failed";
+      const data = convexErrorData(err);
+      const msg =
+        typeof data?.message === "string"
+          ? data.message
+          : err instanceof Error
+            ? err.message
+            : "Delete failed";
       toast.error(msg);
     }
-  }, [initialFlow.id, router, state.name]);
+  }, [initialFlow.id, router, state.name, removeFlowMutation]);
 
   // ---- Node mutations ----
   const updateNode = useCallback(

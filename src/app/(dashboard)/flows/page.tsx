@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useMutation, useQuery } from "convex/react";
 import { toast } from "sonner";
 import {
   Workflow,
@@ -33,6 +34,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { api } from "../../../../convex/_generated/api";
+import type { Id } from "../../../../convex/_generated/dataModel";
+import {
+  convexErrorData,
+  toUiFlow,
+  toUiFlowTemplate,
+} from "@/lib/convex/adapters";
 
 /**
  * Flows list page.
@@ -86,66 +94,37 @@ export default function FlowsPage() {
   const router = useRouter();
   const canCreate = useCan("send-messages");
   const t = useTranslations("Flows.list");
-  const [flows, setFlows] = useState<FlowRow[]>([]);
-  const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
-  const [templates, setTemplates] = useState<TemplateSummary[]>([]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [flowsRes, tmplRes] = await Promise.all([
-          fetch("/api/flows"),
-          fetch("/api/flows/templates"),
-        ]);
-        if (!flowsRes.ok) {
-          throw new Error(`Failed to load flows: ${flowsRes.status}`);
-        }
-        const flowsJson = (await flowsRes.json()) as { flows: FlowRow[] };
-        if (!cancelled) setFlows(flowsJson.flows ?? []);
-        // Templates endpoint is forward-looking — if it 404s on an
-        // older deployment, gracefully fall through.
-        if (tmplRes.ok) {
-          const tmplJson = (await tmplRes.json()) as {
-            templates: TemplateSummary[];
-          };
-          if (!cancelled) setTemplates(tmplJson.templates ?? []);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          console.error(err);
-          toast.error(t("loadError"));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const flowsData = useQuery(api.flows.list);
+  const templatesData = useQuery(api.flows.templates);
+  const loading = flowsData === undefined;
+  const flows = useMemo<FlowRow[]>(
+    () => (flowsData ?? []).map(toUiFlow),
+    [flowsData],
+  );
+  const templates = useMemo<TemplateSummary[]>(
+    () => (templatesData ?? []).map(toUiFlowTemplate),
+    [templatesData],
+  );
+
+  const createFlow = useMutation(api.flows.create);
+  const removeFlow = useMutation(api.flows.remove);
 
   async function handleCreate() {
     if (!newName.trim()) return;
     setCreating(true);
     try {
-      const res = await fetch("/api/flows", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: newName.trim(),
-          trigger_type: "keyword",
-          trigger_config: { keywords: [] },
-        }),
+      const flowId = await createFlow({
+        name: newName.trim(),
+        triggerType: "keyword",
+        triggerConfig: { keywords: [] },
       });
-      if (!res.ok) throw new Error(`Create failed: ${res.status}`);
-      const json = (await res.json()) as { flow: FlowRow };
       setCreateOpen(false);
       setNewName("");
-      router.push(`/flows/${json.flow.id}`);
+      router.push(`/flows/${flowId}`);
     } catch (err) {
       console.error(err);
       toast.error(t("createError"));
@@ -157,20 +136,12 @@ export default function FlowsPage() {
   async function handleUseTemplate(slug: string) {
     setCreating(true);
     try {
-      const res = await fetch("/api/flows", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ template_slug: slug }),
-      });
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(json.error ?? `Clone failed: ${res.status}`);
-      }
-      const json = (await res.json()) as { flow: FlowRow };
+      const flowId = await createFlow({ template: slug });
       setCreateOpen(false);
-      router.push(`/flows/${json.flow.id}`);
+      router.push(`/flows/${flowId}`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : t("cloneError");
+      const data = convexErrorData(err);
+      const msg = typeof data?.message === "string" ? data.message : t("cloneError");
       toast.error(msg);
     } finally {
       setCreating(false);
@@ -181,9 +152,7 @@ export default function FlowsPage() {
     const yes = window.confirm(t("deleteConfirm", { name: flow.name }));
     if (!yes) return;
     try {
-      const res = await fetch(`/api/flows/${flow.id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
-      setFlows((prev) => prev.filter((f) => f.id !== flow.id));
+      await removeFlow({ flowId: flow.id as Id<"flows"> });
       toast.success(t("deleteSuccess"));
     } catch (err) {
       console.error(err);

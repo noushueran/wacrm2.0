@@ -29,6 +29,20 @@ import type {
   TemplateButton,
   WhatsAppConfig,
 } from "@/types";
+// Flows vertical UI types live in `src/lib/flows/types.ts`, NOT
+// `@/types` — that module predates the accounts model and is still the
+// single source of truth the client-side validator
+// (`src/lib/flows/validate.ts`) and node-config forms type against, so
+// the adapters below reuse it directly rather than duplicating a
+// parallel snake_case shape into `@/types`.
+import { DEFAULT_FALLBACK_POLICY } from "@/lib/flows/types";
+import type {
+  FlowFallbackPolicy,
+  FlowNodeRow,
+  FlowNodeType,
+  FlowRow,
+  FlowRunRow,
+} from "@/lib/flows/types";
 
 // ============================================================
 // Shape-mapping adapters — Convex docs (camelCase, `_id`/`_creationTime`)
@@ -745,6 +759,181 @@ export function toUiAutomationLog(
     error_message: doc.errorMessage,
     created_at: new Date(doc._creationTime).toISOString(),
     contact,
+  };
+}
+
+// ============================================================
+// Flows vertical adapters (Phase 8, Task 5 / P8-T5) — the visual flow
+// builder's definition envelope (`flows`), its graph nodes
+// (`flowNodes`), and per-contact runtime state (`flowRuns` +
+// `flowRunEvents`). Same rename + `_creationTime`/epoch-ms -> ISO-string
+// convention as every adapter above.
+// ============================================================
+
+/** `flows.description`/`flows.entryNodeId` are both `v.optional(v.string())`
+ *  on the Convex side — no `v.null()` union — so there is no way to send
+ *  an explicit "clear this back to unset" value distinct from "field
+ *  omitted, don't touch it" through `api.flows.update`'s validator.
+ *  `flow-editor-state.tsx`'s `save()` therefore always sends a
+ *  (possibly-empty) STRING for both, using `""` as the "none" sentinel
+ *  for `entry_node_id`; this adapter reads it back with `||` (not `??`)
+ *  so an empty string round-trips to the same `null` the rest of the
+ *  flows UI already treats as "unset" (`validate.ts` and the entry-node
+ *  pickers only ever do falsy checks on `entry_node_id`, never
+ *  `=== null`). A freshly created flow's `fallbackPolicy` is `undefined`
+ *  until the first save (the source Postgres column had a DB default;
+ *  Convex has none) — backfilled from the engine's own
+ *  `DEFAULT_FALLBACK_POLICY` constant, never invented here. */
+export function toUiFlow(doc: Doc<"flows">): FlowRow {
+  const createdAt = new Date(doc._creationTime).toISOString();
+  return {
+    id: doc._id,
+    account_id: doc.accountId,
+    user_id: doc.createdByUserId ?? "",
+    name: doc.name,
+    description: doc.description ?? null,
+    status: doc.status,
+    trigger_type: doc.triggerType,
+    trigger_config: (doc.triggerConfig ?? {}) as FlowRow["trigger_config"],
+    entry_node_id: doc.entryNodeId || null,
+    fallback_policy: (doc.fallbackPolicy ??
+      DEFAULT_FALLBACK_POLICY) as FlowFallbackPolicy,
+    execution_count: doc.executionCount,
+    last_executed_at: doc.lastExecutedAt
+      ? new Date(doc.lastExecutedAt).toISOString()
+      : null,
+    created_at: createdAt,
+    updated_at: doc.updatedAt
+      ? new Date(doc.updatedAt).toISOString()
+      : createdAt,
+  };
+}
+
+/** `flowNodes.nodeType` carries an 11th literal (`http_fetch`, reserved
+ *  for a not-yet-built v1.5 node type — see schema.ts's own comment on
+ *  this column) that the builder's `FlowNodeType` union deliberately
+ *  excludes until that node type ships a form/executor; the cast is
+ *  safe because the v1 builder never reads or writes that value. */
+export function toUiFlowNode(doc: Doc<"flowNodes">): FlowNodeRow {
+  return {
+    id: doc._id,
+    flow_id: doc.flowId,
+    node_key: doc.nodeKey,
+    node_type: doc.nodeType as FlowNodeType,
+    config: (doc.config ?? {}) as Record<string, unknown>,
+    position_x: doc.positionX,
+    position_y: doc.positionY,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `api.flows.runs` embeds a lightweight per-run contact snapshot
+ *  server-side (`{_id, name, phone}`, NOT a full `Doc<"contacts">` — see
+ *  that query's handler in convex/flows.ts), so — unlike
+ *  `toUiBroadcastRecipient`/`toUiAutomationLog` above, which take an
+ *  optional contact the CALLER resolves separately — this adapter takes
+ *  the already-joined doc directly, the same single-param convention
+ *  `toUiConversation`/`toUiDeal` use for a server-side embed. Extends
+ *  the engine's own `FlowRunRow` (which has no `contact` field) with
+ *  that embed rather than duplicating the rest of the row's fields into
+ *  a parallel local type. `started_at` is backfilled from
+ *  `_creationTime` (never its own column — see schema.ts's comment on
+ *  this table for why), matching the source Postgres row's own
+ *  behaviour (`started_at` is set once at INSERT and never updated). */
+export function toUiFlowRun(
+  doc: Doc<"flowRuns"> & {
+    contact: { _id: Id<"contacts">; name?: string; phone: string } | null;
+  },
+): FlowRunRow & {
+  contact: { id: string; name: string | null; phone: string } | null;
+} {
+  const startedAt = new Date(doc._creationTime).toISOString();
+  return {
+    id: doc._id,
+    flow_id: doc.flowId,
+    account_id: doc.accountId,
+    user_id: doc.createdByUserId ?? "",
+    contact_id: doc.contactId ?? null,
+    conversation_id: doc.conversationId ?? null,
+    status: doc.status,
+    current_node_key: doc.currentNodeKey ?? null,
+    last_prompt_message_id: doc.lastPromptMessageId ?? null,
+    vars: (doc.vars ?? {}) as Record<string, unknown>,
+    reprompt_count: doc.repromptCount,
+    started_at: startedAt,
+    last_advanced_at: doc.lastAdvancedAt
+      ? new Date(doc.lastAdvancedAt).toISOString()
+      : startedAt,
+    ended_at: doc.endedAt ? new Date(doc.endedAt).toISOString() : null,
+    end_reason: doc.endReason ?? null,
+    contact: doc.contact
+      ? {
+          id: doc.contact._id,
+          name: doc.contact.name ?? null,
+          phone: doc.contact.phone,
+        }
+      : null,
+  };
+}
+
+/** `flowRunEvents` has no dedicated UI type in `src/lib/flows/types.ts`
+ *  (only the runtime/engine ever read raw event rows pre-Convex) — same
+ *  "no `@/types` entry, declare it here" precedent as `ApiKeyView`/
+ *  `AiConfigView` above. Append-only audit trail, so (like `flowRuns`
+ *  above) there is no separate timestamp column to prefer over
+ *  `_creationTime`. */
+export interface FlowRunEventView {
+  flow_run_id: string;
+  event_type: string;
+  node_key: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export function toUiFlowRunEvent(doc: Doc<"flowRunEvents">): FlowRunEventView {
+  return {
+    flow_run_id: doc.flowRunId,
+    event_type: doc.eventType,
+    node_key: doc.nodeKey ?? null,
+    payload: (doc.payload ?? {}) as Record<string, unknown>,
+    created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+/** `api.flows.templates`'s per-item shape — a hand-shaped projection
+ *  (slug + a few `FlowTemplate` fields), NOT a raw doc (templates are a
+ *  static in-code catalog, not a table — see convex/flows.ts). No
+ *  `@/types`/`src/lib/flows/types.ts` entry exists for this either, same
+ *  "declare it locally" precedent as `FlowRunEventView` above. `icon` is
+ *  narrowed to the flows list page's actual icon set (every registered
+ *  template uses one of these three — see `FLOW_TEMPLATES` in
+ *  convex/flows.ts) rather than left a bare `string`, so the list page's
+ *  `TEMPLATE_ICONS` lookup keeps working with no extra cast at the call
+ *  site. */
+export interface FlowTemplateView {
+  slug: string;
+  name: string;
+  description: string;
+  icon: "MessageSquare" | "HelpCircle" | "UserPlus";
+  trigger_type: string;
+  node_count: number;
+}
+
+export function toUiFlowTemplate(tpl: {
+  slug: string;
+  name: string;
+  description: string;
+  icon: string;
+  triggerType: string;
+  nodeCount: number;
+}): FlowTemplateView {
+  return {
+    slug: tpl.slug,
+    name: tpl.name,
+    description: tpl.description,
+    icon: tpl.icon as FlowTemplateView["icon"],
+    trigger_type: tpl.triggerType,
+    node_count: tpl.nodeCount,
   };
 }
 

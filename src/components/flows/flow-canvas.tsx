@@ -391,10 +391,10 @@ function FlowCanvasInner() {
   // Drag-to-position: React-Flow tracks the visual drag internally and
   // fires this once on release. We write the final coordinate back to
   // the editor context (which flips `dirty`); save then ships the new
-  // positions in the existing PUT /api/flows/[id] body (the route
-  // already destructures position_x / position_y per migration 010).
-  // Writing only on dragStop (not on every position-change tick during
-  // the drag) keeps state updates cheap on long drags.
+  // positions in the `nodes` array of the `api.flows.update` mutation
+  // call (positionX / positionY per convex/schema.ts's `flowNodes`
+  // table). Writing only on dragStop (not on every position-change
+  // tick during the drag) keeps state updates cheap on long drags.
   const handleNodeDragStop = useCallback<OnNodeDrag<RfNode<NodeData>>>(
     (_event, node) => {
       updateNodePosition(node.id, node.position.x, node.position.y);

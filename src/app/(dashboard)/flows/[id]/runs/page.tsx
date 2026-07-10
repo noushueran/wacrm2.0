@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Component, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { useQuery } from "convex/react";
 import {
   ArrowLeft,
   Loader2,
@@ -14,22 +15,24 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-import { toast } from "sonner";
 import { format, formatDistanceToNow } from "date-fns";
 
 import { useTranslations } from "next-intl";
 
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { toUiFlow, toUiFlowRun, toUiFlowRunEvent } from "@/lib/convex/adapters";
+import { api } from "../../../../../../convex/_generated/api";
+import type { Id } from "../../../../../../convex/_generated/dataModel";
 
 /**
  * Run history viewer.
  *
- * Lists the 50 most recent runs for a flow, newest first. Each row
- * collapses to a one-liner (contact + status + time); expanding shows
- * the full `flow_run_events` timeline for that run — useful for
- * debugging "why didn't my flow advance?" by surfacing the engine's
- * own log.
+ * Lists the 50 most recent runs for a flow, newest first (`api.flows.runs`'
+ * default `limit`). Each row collapses to a one-liner (contact + status +
+ * time); expanding shows the full `flowRunEvents` timeline for that run —
+ * useful for debugging "why didn't my flow advance?" by surfacing the
+ * engine's own log.
  */
 
 interface RunRow {
@@ -95,53 +98,47 @@ const STATUS_META: Record<
   },
 };
 
-export default function FlowRunsPage() {
+/**
+ * Class-based error boundary — catches the render-time throw from
+ * `useQuery(api.flows.runs, ...)` when the flow id is malformed or
+ * belongs to another account. Mirrors `broadcasts/[id]/page.tsx`'s
+ * `BroadcastNotFoundBoundary` (and this vertical's own
+ * `flows/[id]/page.tsx`'s `FlowNotFoundBoundary`) — the established
+ * pattern in this codebase for this exact problem.
+ */
+class FlowRunsNotFoundBoundary extends Component<
+  { fallback: React.ReactNode; children: React.ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  render() {
+    if (this.state.hasError) return this.props.fallback;
+    return this.props.children;
+  }
+}
+
+function FlowRunsContent({ flowId }: { flowId: string }) {
   const router = useRouter();
-  const params = useParams<{ id: string }>();
   const t = useTranslations("Flows.logs");
-  const tEdit = useTranslations("Flows.edit");
-
-  const [flow, setFlow] = useState<{ id: string; name: string } | null>(null);
-  const [runs, setRuns] = useState<RunRow[]>([]);
-  const [events, setEvents] = useState<EventRow[]>([]);
-  const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [notFound, setNotFound] = useState(false);
 
-  useEffect(() => {
-    if (!params.id) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch(`/api/flows/${params.id}/runs`);
-        if (res.status === 404) {
-          if (!cancelled) setNotFound(true);
-          return;
-        }
-        if (!res.ok) throw new Error(`Failed: ${res.status}`);
-        const json = (await res.json()) as {
-          flow: { id: string; name: string };
-          runs: RunRow[];
-          events: EventRow[];
-        };
-        if (!cancelled) {
-          setFlow(json.flow);
-          setRuns(json.runs ?? []);
-          setEvents(json.events ?? []);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          console.error(err);
-          toast.error(t("loadError"));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [params.id]);
+  const result = useQuery(api.flows.runs, { flowId: flowId as Id<"flows"> });
+  const loading = result === undefined;
+
+  const flow = useMemo(() => (result ? toUiFlow(result.flow) : null), [result]);
+  const runs = useMemo(
+    () => (result ? result.runs.map(toUiFlowRun) : []),
+    [result],
+  );
+  const events = useMemo(
+    () => (result ? result.events.map(toUiFlowRunEvent) : []),
+    [result],
+  );
 
   function toggle(runId: string) {
     setExpanded((prev) => {
@@ -159,20 +156,11 @@ export default function FlowRunsPage() {
       </div>
     );
   }
-  if (notFound || !flow) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-3">
-        <p className="text-sm text-muted-foreground">{tEdit("notFound")}</p>
-        <button
-          type="button"
-          onClick={() => router.push("/flows")}
-          className="text-sm text-primary hover:opacity-80"
-        >
-          {tEdit("backToFlows")}
-        </button>
-      </div>
-    );
-  }
+
+  // Unreachable in practice once `loading` is false — see
+  // `FlowNotFoundBoundary`'s doc comment in `flows/[id]/page.tsx` for
+  // why. Kept so TypeScript narrows `flow` for everything below.
+  if (!flow) return null;
 
   return (
     <div className="mx-auto max-w-4xl p-6">
@@ -208,6 +196,31 @@ export default function FlowRunsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function FlowRunsPage() {
+  const router = useRouter();
+  const params = useParams<{ id: string }>();
+  const tEdit = useTranslations("Flows.edit");
+
+  return (
+    <FlowRunsNotFoundBoundary
+      fallback={
+        <div className="flex h-full flex-col items-center justify-center gap-3">
+          <p className="text-sm text-muted-foreground">{tEdit("notFound")}</p>
+          <button
+            type="button"
+            onClick={() => router.push("/flows")}
+            className="text-sm text-primary hover:opacity-80"
+          >
+            {tEdit("backToFlows")}
+          </button>
+        </div>
+      }
+    >
+      <FlowRunsContent flowId={params.id} />
+    </FlowRunsNotFoundBoundary>
   );
 }
 
