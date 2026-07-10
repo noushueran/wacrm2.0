@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest, type TestConvex } from "convex-test";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -64,18 +64,19 @@ async function seedAccountMember(
 }
 
 /** Adds a second membership row to an *existing* account — for the
- *  configured `handoffAgentId` target. Matches `aiKnowledge.test.ts`'s
- *  own `seedTeammate`. */
+ *  configured `handoffAgentId` target (defaults to "agent") and, with an
+ *  explicit `role`, for role-gating tests (matches `conversations.test
+ *  .ts`'s own parametrized `seedTeammate`). */
 async function seedTeammate(
   t: TestConvex<typeof schema>,
-  opts: { accountId: Id<"accounts">; name: string; email: string },
+  opts: { accountId: Id<"accounts">; name: string; email: string; role?: AccountRole },
 ) {
   return await t.run(async (ctx) => {
     const userId = await ctx.db.insert("users", { name: opts.name, email: opts.email });
     await ctx.db.insert("memberships", {
       userId,
       accountId: opts.accountId,
-      role: "agent" as AccountRole,
+      role: opts.role ?? ("agent" as AccountRole),
       fullName: opts.name,
       email: opts.email,
     });
@@ -424,4 +425,266 @@ test("account isolation: a cross-account id mix-up is a safe no-op", async () =>
 
   expect(await messagesFor(t, aliceThread.conversationId)).toHaveLength(1); // untouched
   expect((await getConversation(t, aliceThread.conversationId))!.aiReplyCount ?? 0).toBe(0);
+});
+
+// ============================================================
+// playground / draft — public, authed AI entry points (transitive-
+// Supabase gap-fill task). Unlike `dispatchInbound` above, these never
+// check `CONVEX_AI_DRY_RUN` — they always call the real `generateReply`,
+// so every test that reaches it stubs `global.fetch` directly (the
+// brief's own "(mock provider)" test strategy), rather than relying on
+// the file-level DRY-RUN `beforeEach`/`afterEach` above (which only
+// gates `dispatchInbound`'s own synthetic-generation branch and is
+// otherwise inert for these two actions).
+// ============================================================
+
+function okChatCompletion(content: string): Response {
+  return new Response(
+    JSON.stringify({
+      choices: [{ message: { content } }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    }),
+    { status: 200 },
+  );
+}
+
+// ------------------------------------------------------------
+// playground
+// ------------------------------------------------------------
+
+test("playground generates a reply from the mocked provider, in the route's shape", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => okChatCompletion("Sure, happy to help!")));
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [{ role: "user", content: "What are your hours?" }],
+  });
+
+  expect(result).toEqual({ reply: "Sure, happy to help!", handoff: false });
+  vi.unstubAllGlobals();
+});
+
+test("playground returns ai_not_configured (never throws) when the account has no AI config", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [{ role: "user", content: "Hello?" }],
+  });
+
+  expect(result).toEqual({
+    error: "No agent configured yet. Add your provider key in Setup.",
+    code: "ai_not_configured",
+  });
+});
+
+test("playground returns an error (never throws) when every message is blank", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [{ role: "user", content: "   " }],
+  });
+
+  expect(result).toEqual({ error: "Send a message to test the agent." });
+});
+
+test("playground throws FORBIDDEN for a viewer (below the agent role floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const vicUserId = await seedTeammate(t, {
+    accountId,
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+  const asVic = t.withIdentity({ subject: `${vicUserId}|session-Vic` });
+
+  await expect(
+    asVic.action(api.aiReply.playground, {
+      messages: [{ role: "user", content: "Hello?" }],
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+test("playground throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.action(api.aiReply.playground, {
+      messages: [{ role: "user", content: "Hello?" }],
+    }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("account isolation: playground never falls back to a different account's AI config", async () => {
+  const t = convexTest(schema, modules);
+  const alice = await seedAccountMember(t, { name: "Alice", email: "alice@example.com" });
+  await configureAi(alice.asUser);
+  const bob = await seedAccountMember(t, { name: "Bob", email: "bob@example.com" });
+
+  // Bob has no config of his own — must get ai_not_configured, never
+  // silently generate using Alice's saved provider/key.
+  const result = await bob.asUser.action(api.aiReply.playground, {
+    messages: [{ role: "user", content: "Hello?" }],
+  });
+
+  expect(result).toMatchObject({ code: "ai_not_configured" });
+});
+
+// ------------------------------------------------------------
+// draft
+// ------------------------------------------------------------
+
+test("draft generates a suggested reply from the mocked provider, without sending or persisting a message", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => okChatCompletion("Our hours are 9-5 Mon-Fri.")));
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "What are your hours?",
+  });
+
+  const result = await asUser.action(api.aiReply.draft, { conversationId });
+
+  expect(result).toEqual({ draft: "Our hours are 9-5 Mon-Fri." });
+  // Read-only — no message was appended by the draft itself.
+  expect(await messagesFor(t, conversationId)).toHaveLength(1); // only the seeded customer message
+
+  // Usage is logged (mirrors the route's own best-effort `logAiUsage`).
+  const usageRows = await t.run((ctx) =>
+    ctx.db
+      .query("aiUsageLog")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(usageRows).toHaveLength(1);
+  expect(usageRows[0]!.mode).toBe("draft");
+  vi.unstubAllGlobals();
+});
+
+test("draft throws NOT_FOUND for a conversation belonging to a different account, without generating anything", async () => {
+  const t = convexTest(schema, modules);
+  const alice = await seedAccountMember(t, { name: "Alice", email: "alice@example.com" });
+  await configureAi(alice.asUser);
+  const aliceThread = await seedInboundThread(t, alice.asUser, {
+    accountId: alice.accountId,
+    phone: "15551234567",
+    messageText: "Alice's customer says hi",
+  });
+  const bob = await seedAccountMember(t, { name: "Bob", email: "bob@example.com" });
+
+  await expect(
+    bob.asUser.action(api.aiReply.draft, {
+      conversationId: aliceThread.conversationId,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("draft throws FORBIDDEN for a viewer (below the agent role floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+  const vicUserId = await seedTeammate(t, {
+    accountId,
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+  const asVic = t.withIdentity({ subject: `${vicUserId}|session-Vic` });
+
+  await expect(
+    asVic.action(api.aiReply.draft, { conversationId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+test("draft throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+
+  await expect(
+    t.action(api.aiReply.draft, { conversationId }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("draft returns no_messages (never throws) for a brand-new conversation with no text history", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15559998888",
+  });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+
+  const result = await asUser.action(api.aiReply.draft, { conversationId });
+
+  expect(result).toEqual({
+    error: "No messages to draft from yet.",
+    code: "no_messages",
+  });
+});
+
+test("draft returns ai_not_configured (never throws) when the account has no AI config", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+
+  const result = await asUser.action(api.aiReply.draft, { conversationId });
+
+  expect(result).toEqual({
+    error: "AI assistant is not set up. Enable it in Settings → AI Assistant.",
+    code: "ai_not_configured",
+  });
 });

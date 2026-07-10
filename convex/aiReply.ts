@@ -1,12 +1,15 @@
-import { internalAction, internalMutation, internalQuery } from "./_generated/server";
+import { action, internalAction, internalMutation, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { v } from "convex/values";
+import { getAuthUserId } from "@convex-dev/auth/server";
+import { v, ConvexError } from "convex/values";
+import { hasMinRole } from "./lib/roles";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
 import { buildHandoffSummary } from "./lib/ai/handoff";
 import { toChatMessages, type HistoryMessage } from "./lib/ai/context";
 import { generateReply, parseGeneration } from "./lib/ai/generate";
+import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
 
 // ============================================================
@@ -124,6 +127,25 @@ export const loadDispatchContext = internalQuery({
     const contact = await ctx.db.get(args.contactId);
     if (!contact || contact.accountId !== args.accountId) return null;
     return { conversation, to: contact.phone };
+  },
+});
+
+/**
+ * Loads a conversation and re-verifies it belongs to `accountId`,
+ * returning `null` on any mismatch — for the `draft` action below.
+ * `loadDispatchContext` (above) does the same ownership check but ALSO
+ * requires a `contactId` (it fetches the contact's phone for the
+ * eventual `metaSend`); `draft` never sends anything and is only ever
+ * given a `conversationId` (matching `src/app/api/ai/draft/route.ts`'s
+ * `{ conversation_id }` body), so it has no `contactId` on hand to pass
+ * in. This is the same lookup, minus that requirement.
+ */
+export const getConversationForAccount = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args): Promise<Doc<"conversations"> | null> => {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) return null;
+    return conversation;
   },
 });
 
@@ -414,5 +436,232 @@ export const dispatchInbound = internalAction({
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
     }
+  },
+});
+
+// ============================================================
+// playground / draft — public, authed AI entry points (transitive-
+// Supabase gap-fill task). Unlike `dispatchInbound` above (an
+// `internalAction` with no user session), both derive the caller's
+// account/role the same way `send.ts`/`broadcasts.ts`'s `send` and
+// `reactions.ts`'s `reactToMeta` do: `getAuthUserId` +
+// `internal.accounts.accountContextForUser` (a plain `action` has no
+// `ctx.db` to run `lib/auth.ts`'s own membership lookup inline, and
+// there is no `accountAction` helper in this codebase). Neither
+// mutates/sends anything — see each action's own comment.
+// ============================================================
+
+const PLAYGROUND_MAX_TURNS = 20;
+
+const playgroundMessageValidator = v.object({
+  role: v.union(v.literal("user"), v.literal("assistant")),
+  content: v.string(),
+});
+
+/** Matches `src/app/api/ai/playground/route.ts`'s JSON body exactly
+ *  (`{reply, handoff}` on success; `{error, code?}` — never thrown —
+ *  for the same domain failures the route itself returns as a body
+ *  rather than raising). */
+type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; code?: string };
+
+/**
+ * Agent+ "test-chat with the agent" action — Convex port of `POST
+ * /api/ai/playground`. Runs the EXACT path the auto-reply bot uses
+ * (knowledge retrieval + `auto_reply` system prompt + the account's
+ * configured provider) against a client-supplied transcript, so what's
+ * seen here is what a real customer would get. Reads the config even
+ * when the master switch is off (`loadDecrypted` has no `requireActive`
+ * gate — see that function's own doc comment), matching the route's own
+ * `requireActive:false`. Stateless: never persists anything — the
+ * client resends the running transcript every turn, same as the route.
+ *
+ * The route accepts no config/system-prompt overrides beyond `messages`
+ * (checked against the actual route, not just the task brief's
+ * paraphrase) — so neither does this action.
+ */
+export const playground = action({
+  args: { messages: v.array(playgroundMessageValidator) },
+  handler: async (ctx, args): Promise<PlaygroundResult> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    // Bound the transcript + drop blank turns — the same two real (not
+    // just shape-validation) rules the route's own filter/slice apply;
+    // role/content shape itself is already enforced by the args
+    // validator above, unlike the route's defensive re-check.
+    const messages = args.messages
+      .filter((m) => m.content.trim().length > 0)
+      .slice(-PLAYGROUND_MAX_TURNS);
+    if (messages.length === 0) {
+      return { error: "Send a message to test the agent." };
+    }
+
+    let config;
+    try {
+      config = await ctx.runQuery(internal.aiConfig.loadDecrypted, { accountId });
+    } catch {
+      return { error: "Stored API key could not be decrypted.", code: "key_decrypt_failed" };
+    }
+    if (!config) {
+      return {
+        error: "No agent configured yet. Add your provider key in Setup.",
+        code: "ai_not_configured",
+      };
+    }
+
+    const queryText = latestUserMessage(messages);
+    let knowledge: string[] = [];
+    const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, { accountId });
+    if (hasKb) {
+      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, { accountId, queryText });
+    }
+
+    const systemPrompt = buildSystemPrompt({
+      userPrompt: config.systemPrompt ?? null,
+      mode: "auto_reply",
+      knowledge,
+    });
+
+    try {
+      const { text, handoff } = await generateReply({
+        provider: config.provider,
+        model: config.model,
+        apiKey: config.apiKey,
+        systemPrompt,
+        messages,
+      });
+      return { reply: text, handoff };
+    } catch (err) {
+      if (err instanceof AiError) return { error: err.message, code: err.code };
+      throw err;
+    }
+  },
+});
+
+/** Matches `src/app/api/ai/draft/route.ts`'s JSON body exactly
+ *  (`{draft}` on success; `{error, code?}` for the same domain failures
+ *  the route itself returns as a body rather than raising — ownership
+ *  is the one exception, which throws `NOT_FOUND` like every other
+ *  cross-account check in this codebase; see the handler below). */
+type DraftResult = { draft: string } | { error: string; code?: string };
+
+/**
+ * Agent+ "suggest a reply" action — Convex port of `POST /api/ai/draft`.
+ * Body: `{conversationId}` (matches the route's `{conversation_id}`).
+ * Loads the account's config + the conversation's recent text history
+ * (REUSING `recentMessages`/`toChatMessages`, the same internals
+ * `dispatchInbound` above uses), grounds the reply in the knowledge
+ * base, and generates a SUGGESTED reply — it never sends or persists a
+ * message, only hands text back for the agent to edit (same contract as
+ * the route's own doc comment: "Read-only… just hands text back to the
+ * composer").
+ *
+ * Ownership is asserted via `getConversationForAccount` (this file) and
+ * throws `ConvexError({code:"NOT_FOUND", entity:"conversation"})` on any
+ * mismatch — the same "doesn't exist" / "isn't yours" conflation
+ * `conversations.ts`'s `requireOwnConversation` uses everywhere else in
+ * this codebase (the route's own RLS-scoped 404 is this same idea,
+ * enforced at the SQL layer instead). Usage is logged via
+ * `internal.aiUsage.log` — awaited (not fire-and-forget: an action's
+ * lifecycle ends when its handler returns, same reasoning as
+ * `dispatchInbound`'s own usage-log comment) but best-effort, matching
+ * the route's own resilience around `logAiUsage`.
+ */
+export const draft = action({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args): Promise<DraftResult> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    const conversation = await ctx.runQuery(internal.aiReply.getConversationForAccount, {
+      accountId,
+      conversationId: args.conversationId,
+    });
+    if (!conversation) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+
+    let config;
+    try {
+      config = await ctx.runQuery(internal.aiConfig.loadDecrypted, { accountId });
+    } catch {
+      return { error: "Stored API key could not be decrypted.", code: "key_decrypt_failed" };
+    }
+    if (!config) {
+      return {
+        error: "AI assistant is not set up. Enable it in Settings → AI Assistant.",
+        code: "ai_not_configured",
+      };
+    }
+
+    const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
+      accountId,
+      conversationId: args.conversationId,
+      limit: aiContextMessageLimit(),
+    });
+    const messages = toChatMessages(historyRows);
+    if (messages.length === 0) {
+      return { error: "No messages to draft from yet.", code: "no_messages" };
+    }
+
+    const queryText = latestUserMessage(messages);
+    let knowledge: string[] = [];
+    const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, { accountId });
+    if (hasKb) {
+      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, { accountId, queryText });
+    }
+
+    const systemPrompt = buildSystemPrompt({
+      userPrompt: config.systemPrompt ?? null,
+      mode: "draft",
+      knowledge,
+    });
+
+    let generation: GenerateResult;
+    try {
+      generation = await generateReply({
+        provider: config.provider,
+        model: config.model,
+        apiKey: config.apiKey,
+        systemPrompt,
+        messages,
+      });
+    } catch (err) {
+      if (err instanceof AiError) return { error: err.message, code: err.code };
+      throw err;
+    }
+
+    try {
+      await ctx.runMutation(internal.aiUsage.log, {
+        accountId,
+        conversationId: args.conversationId,
+        mode: "draft",
+        provider: config.provider,
+        model: config.model,
+        promptTokens: generation.usage?.promptTokens ?? 0,
+        completionTokens: generation.usage?.completionTokens ?? 0,
+        totalTokens: generation.usage?.totalTokens ?? 0,
+      });
+    } catch (err) {
+      console.warn("[ai draft] usage log failed:", err);
+    }
+
+    return { draft: generation.text };
   },
 });

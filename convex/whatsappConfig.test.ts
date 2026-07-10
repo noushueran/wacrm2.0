@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { AccountRole } from "./lib/roles";
@@ -662,4 +662,171 @@ test("matchVerifyToken scans past non-matching rows (incl. one with no verifyTok
     verifyToken: "healthy-verify-token",
   });
   expect(matched).toBe(healthyAccountId);
+});
+
+// ============================================================
+// verifyRegistration — admin-gated diagnostic action (transitive-
+// Supabase gap-fill task). Convex port of `GET /api/whatsapp/config/
+// verify-registration`.
+// ============================================================
+
+test("verifyRegistration in DRY-RUN reports a synthetic success, without ever calling Meta", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  // Any network attempt is a bug in the DRY-RUN branch — fail loudly and
+  // fast instead of hanging on a real request with no network access.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("fetch should never be called in DRY-RUN");
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+    registeredAt: 1000,
+  });
+
+  const result = await asUser.action(api.whatsappConfig.verifyRegistration, {});
+
+  expect(result).toMatchObject({
+    live: true,
+    checks: {
+      config_exists: true,
+      token_decryptable: true,
+      phone_metadata_ok: true,
+      waba_subscribed_to_app: true,
+      locally_marked_registered: true,
+    },
+    errors: [],
+    registered_at: 1000,
+  });
+
+  vi.unstubAllGlobals();
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("verifyRegistration reports config_exists:false (never throws) when nothing is saved yet", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.verifyRegistration, {});
+
+  expect(result).toEqual({
+    live: false,
+    checks: { config_exists: false },
+    message: "No WhatsApp configuration saved yet.",
+  });
+});
+
+test("verifyRegistration performs the real Meta calls when not in DRY-RUN, via a mocked fetch", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/subscribed_apps")) {
+        return new Response(
+          JSON.stringify({ data: [{ whatsapp_business_api_data: { id: "app-1" } }] }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ id: "1000000000", display_phone_number: "+15551234567" }),
+        { status: 200 },
+      );
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+    registeredAt: 1000,
+  });
+
+  const result = await asUser.action(api.whatsappConfig.verifyRegistration, {});
+
+  expect(result).toMatchObject({
+    live: true,
+    checks: {
+      phone_metadata_ok: true,
+      waba_subscribed_to_app: true,
+      locally_marked_registered: true,
+    },
+    errors: [],
+  });
+
+  vi.unstubAllGlobals();
+});
+
+test("verifyRegistration throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.whatsappConfig.verifyRegistration, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("verifyRegistration throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.action(api.whatsappConfig.verifyRegistration, {}),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("cross-account isolation: verifyRegistration never reads a different account's config", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "alice-token",
+    status: "connected",
+    registeredAt: 1000,
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  const result = await asBob.action(api.whatsappConfig.verifyRegistration, {});
+
+  expect(result).toEqual({
+    live: false,
+    checks: { config_exists: false },
+    message: "No WhatsApp configuration saved yet.",
+  });
+
+  delete process.env.CONVEX_META_DRY_RUN;
 });

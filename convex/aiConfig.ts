@@ -1,7 +1,12 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalQuery } from "./_generated/server";
+import { action, internalQuery } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { encrypt, decrypt } from "./lib/whatsappEncryption";
+import { hasMinRole } from "./lib/roles";
+import { generateReply } from "./lib/ai/generate";
+import { AiError } from "./lib/ai/types";
 
 // ============================================================
 // AI assistant configuration — one row per account (`convex/schema.ts`'s
@@ -206,5 +211,94 @@ export const loadDecrypted = internalQuery({
       handoffAgentId: config.handoffAgentId,
       embeddingsApiKey,
     };
+  },
+});
+
+/**
+ * Result shape mirrors `src/app/api/ai/test/route.ts`'s JSON body
+ * exactly (minus its HTTP status, which has no Convex counterpart) —
+ * `{ok:true}` on success, `{error, code?}` on any validation/provider
+ * failure. Callers (the settings "Test key" button) branch on `ok`
+ * rather than a thrown rejection, same as the route's own `res.ok`
+ * check — auth/role gating is the one exception, which throws
+ * `ConvexError` like every other function in this codebase.
+ */
+type TestConnectionResult = { ok: true } | { error: string; code?: string };
+
+/**
+ * Admin+ "Test key" action — Convex port of `POST /api/ai/test`.
+ * Validates a provider/model/key combo WITHOUT saving it: when `apiKey`
+ * is omitted, the account's own saved (decrypted) key is used instead,
+ * so an admin can re-test an existing config (e.g. after changing the
+ * model) without retyping the secret. `provider`/`model` are ALWAYS
+ * required from the caller — matching the route's own body reads
+ * (`body.provider`/`body.model`), which never fall back to a saved
+ * config for those two fields, only for `api_key`.
+ *
+ * "Call the provider minimally" is `generate.ts`'s `generateReply` with
+ * the exact ping the source's `validateAiCredentials`
+ * (`src/lib/ai/validate.ts`) uses: a fixed system prompt + a `"ping"`
+ * user turn. Any `AiError` (invalid key, rate limit, network, empty
+ * response) is caught and reported via `{error, code}` — never thrown —
+ * matching the route's own `catch (err) { if (err instanceof AiError)
+ * return NextResponse.json({error: err.message, code: err.code}, ...) }`.
+ *
+ * Rate limiting (`RATE_LIMITS.adminAction` in the source route) has no
+ * Convex counterpart in this codebase yet and is NOT ported here.
+ */
+export const testConnection = action({
+  args: {
+    provider: providerValidator,
+    model: v.string(),
+    apiKey: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<TestConnectionResult> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+    const { accountId } = context;
+
+    const model = args.model.trim();
+    if (!model) return { error: "model is required" };
+
+    let apiKeyPlain = args.apiKey?.trim() ?? "";
+    if (!apiKeyPlain) {
+      let saved: { apiKey: string } | null;
+      try {
+        saved = await ctx.runQuery(internal.aiConfig.loadDecrypted, { accountId });
+      } catch {
+        return {
+          error: "Stored API key could not be decrypted — re-enter your key.",
+        };
+      }
+      if (!saved?.apiKey) {
+        return { error: "Enter an API key to test." };
+      }
+      apiKeyPlain = saved.apiKey;
+    }
+
+    try {
+      await generateReply({
+        provider: args.provider,
+        model,
+        apiKey: apiKeyPlain,
+        systemPrompt: "You are a connectivity check. Reply with the single word: OK.",
+        messages: [{ role: "user", content: "ping" }],
+      });
+    } catch (err) {
+      if (err instanceof AiError) {
+        return { error: err.message, code: err.code };
+      }
+      console.error("[ai/test] validation error:", err);
+      return { error: "Could not validate the API key." };
+    }
+
+    return { ok: true };
   },
 });

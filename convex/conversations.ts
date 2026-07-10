@@ -360,6 +360,59 @@ export const unassign = accountMutation({
   },
 });
 
+/**
+ * Toggle the AI auto-reply bot for one conversation — the Inbox's
+ * "Take over" / "Resume AI" banner. Convex port of `src/app/api/ai/
+ * autoreply/[conversationId]/route.ts`'s POST handler (lines ~44-99).
+ *
+ * `paused: true` (Take over) — sets `aiAutoreplyDisabled`; when
+ * `assignToMe` is also set, assigns the thread to the caller too
+ * (mirrors the route's `if (assign_to_me) update.assigned_agent_id =
+ * userId`). Since the assignee here is ALWAYS the caller themselves,
+ * this is exactly the self-assignment case `conversations.assign`'s own
+ * notification step exempts — see that mutation's doc comment — so no
+ * `insertNotification` call is needed here either; it would only ever
+ * no-op.
+ *
+ * `paused: false` (Resume AI) — clears the pause, releases ANY
+ * assignment (not just the caller's own — the route's own comment: a
+ * stale assignee from a prior handoff would otherwise keep the "human
+ * owns this" eligibility gate tripped and make Resume AI a no-op), and
+ * gives the bot a fresh reply budget (`aiReplyCount: 0`) + clears the
+ * handoff note. `status` is deliberately left untouched in BOTH
+ * branches, exactly like the route — unlike `assign`, which bumps it to
+ * "pending".
+ */
+export const setAutoreplyPaused = accountMutation({
+  args: {
+    conversationId: v.id("conversations"),
+    paused: v.boolean(),
+    assignToMe: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnConversation(ctx, args.conversationId);
+
+    if (args.paused) {
+      await ctx.db.patch(args.conversationId, {
+        aiAutoreplyDisabled: true,
+        updatedAt: Date.now(),
+        ...(args.assignToMe ? { assignedToUserId: ctx.userId } : {}),
+      });
+    } else {
+      await ctx.db.patch(args.conversationId, {
+        aiAutoreplyDisabled: false,
+        assignedToUserId: undefined,
+        aiReplyCount: 0,
+        aiHandoffSummary: undefined,
+        updatedAt: Date.now(),
+      });
+    }
+
+    return { success: true as const, paused: args.paused };
+  },
+});
+
 export const setStatus = accountMutation({
   args: {
     conversationId: v.id("conversations"),

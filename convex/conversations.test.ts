@@ -1221,3 +1221,174 @@ test("resolveSendTarget throws NOT_FOUND for a replyToMessageId belonging to a d
     data: { code: "NOT_FOUND", entity: "replyToMessage" },
   });
 });
+
+// ============================================================
+// setAutoreplyPaused — the Inbox "Take over" / "Resume AI" banner
+// (transitive-Supabase gap-fill task). Convex port of `POST /api/ai/
+// autoreply/[conversationId]` (lines ~44-99).
+// ============================================================
+
+test("setAutoreplyPaused(paused:true) disables auto-reply and bumps updatedAt, without touching assignment", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const beforeUpdate = Date.now();
+  const result = await asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: true,
+  });
+  expect(result).toEqual({ success: true, paused: true });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.aiAutoreplyDisabled).toBe(true);
+  expect(row!.assignedToUserId).toBeUndefined();
+  expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeUpdate);
+});
+
+test("setAutoreplyPaused(paused:true, assignToMe:true) also assigns the conversation to the caller", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  const result = await asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: true,
+    assignToMe: true,
+  });
+  expect(result).toEqual({ success: true, paused: true });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.aiAutoreplyDisabled).toBe(true);
+  expect(row!.assignedToUserId).toBe(userId);
+});
+
+test("setAutoreplyPaused(paused:false) clears the pause, releases any assignment, resets the reply count, and clears the handoff summary — leaving status untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const carolUserId = await seedTeammate(t, {
+    accountId,
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    status: "pending",
+  });
+  // Simulate a prior handoff: paused, assigned to Carol (NOT the caller),
+  // a reply count, and a handoff summary already on the row.
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, {
+      aiAutoreplyDisabled: true,
+      assignedToUserId: carolUserId,
+      aiReplyCount: 2,
+      aiHandoffSummary: "handed off: pricing question",
+    }),
+  );
+
+  const beforeUpdate = Date.now();
+  const result = await asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: false,
+  });
+  expect(result).toEqual({ success: true, paused: false });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.aiAutoreplyDisabled).toBe(false);
+  // Released even though it wasn't the CALLER's own assignment — the
+  // bot needs a clear "human owns this" gate to stand down (route's own
+  // comment: any stale assignee would otherwise make Resume AI a no-op).
+  expect(row!.assignedToUserId).toBeUndefined();
+  expect(row!.aiReplyCount).toBe(0);
+  expect(row!.aiHandoffSummary).toBeUndefined();
+  // status is deliberately left untouched, exactly like the route.
+  expect(row!.status).toBe("pending");
+  expect(row!.updatedAt).toBeGreaterThanOrEqual(beforeUpdate);
+});
+
+test("setAutoreplyPaused throws NOT_FOUND for a conversation belonging to a different account, and leaves it untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } =
+    await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+
+  await expect(
+    asBob.mutation(api.conversations.setAutoreplyPaused, {
+      conversationId,
+      paused: true,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.aiAutoreplyDisabled).toBeUndefined();
+});
+
+test("setAutoreplyPaused is rejected for a viewer (below the agent role floor), leaving the conversation untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const vicUserId = await seedTeammate(t, {
+    accountId,
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+  const asVic = t.withIdentity({ subject: `${vicUserId}|session-Vic` });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  await expect(
+    asVic.mutation(api.conversations.setAutoreplyPaused, {
+      conversationId,
+      paused: true,
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row!.aiAutoreplyDisabled).toBeUndefined();
+});

@@ -10,13 +10,21 @@
  *
  * NOT ported (out of scope — registration/media-download, not the
  * send+persist engine primitives or Phase 8 Task 4's template
- * management): `verifyPhoneNumber`, `registerPhoneNumber`,
- * `subscribeWabaToApp`, `getSubscribedApps`, `uploadResumableMedia`,
- * `editMessageTemplate`, `deleteMessageTemplate`, `getMediaUrl`,
- * `downloadMedia` (the last also uses Node's `Buffer`, unavailable
- * outside a `"use node"` action — not needed here since
+ * management): `registerPhoneNumber`, `subscribeWabaToApp`,
+ * `uploadResumableMedia`, `editMessageTemplate`, `deleteMessageTemplate`,
+ * `getMediaUrl`, `downloadMedia` (the last also uses Node's `Buffer`,
+ * unavailable outside a `"use node"` action — not needed here since
  * `convex/files.ts`'s `storeFromUrl` uses `fetch()` + `Response#blob()`
  * instead).
+ *
+ * `verifyPhoneNumber`/`getSubscribedApps` WERE ported (AI/WhatsApp
+ * backend gap-fill task) — `convex/whatsappConfig.ts`'s
+ * `verifyRegistration` action needs both for its read-only Meta-side
+ * diagnostic checks (phone metadata + WABA app-subscription).
+ * `registerPhoneNumber` (the POST /register call that actually
+ * SUBSCRIBES a number — a write, unlike these two GETs) remains
+ * unported: it belongs to the config save/POST route, not
+ * `verifyRegistration`, which never writes to Meta.
  *
  * `sendReactionMessage` WAS ported (Phase 8, Task 4) — `convex/
  * metaSend.ts`'s `sendReaction` needs it for the public `reactToMeta`
@@ -63,6 +71,80 @@ async function throwMetaError(
     // response body wasn't JSON — keep the fallback
   }
   throw new Error(message);
+}
+
+// ============================================================
+// Phone number / account — read-only diagnostic GETs for
+// `convex/whatsappConfig.ts`'s `verifyRegistration` action. Neither
+// call writes anything on Meta's side, unlike `registerPhoneNumber`/
+// `subscribeWabaToApp` (still NOT ported — see this file's header).
+// ============================================================
+
+export interface MetaPhoneInfo {
+  id: string;
+  display_phone_number: string;
+  verified_name?: string;
+  quality_rating?: string;
+}
+
+export interface VerifyPhoneNumberArgs {
+  phoneNumberId: string;
+  accessToken: string;
+}
+
+/**
+ * Verify a Meta phone number ID by fetching its public metadata
+ * (display_phone_number, verified_name, quality_rating). Convex port of
+ * `src/lib/whatsapp/meta-api.ts`'s function of the same name — ported
+ * verbatim (quote style aside).
+ */
+export async function verifyPhoneNumber(
+  args: VerifyPhoneNumberArgs,
+): Promise<MetaPhoneInfo> {
+  const { phoneNumberId, accessToken } = args;
+  const url = `${META_API_BASE}/${phoneNumberId}?fields=id,display_phone_number,verified_name,quality_rating`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  return response.json();
+}
+
+export interface GetSubscribedAppsArgs {
+  wabaId: string;
+  accessToken: string;
+}
+
+export interface SubscribedApp {
+  whatsapp_business_api_data?: {
+    id?: string;
+    name?: string;
+    link?: string;
+  };
+}
+
+/**
+ * Diagnostic — fetch the list of apps currently subscribed to this
+ * WABA. `verifyRegistration` treats any non-empty result as proof OUR
+ * app is subscribed (the access token used to ask belongs to our app —
+ * Meta wouldn't return data for an app the token can't see). Convex
+ * port of `src/lib/whatsapp/meta-api.ts`'s function of the same name.
+ */
+export async function getSubscribedApps(
+  args: GetSubscribedAppsArgs,
+): Promise<SubscribedApp[]> {
+  const { wabaId, accessToken } = args;
+  const url = `${META_API_BASE}/${wabaId}/subscribed_apps`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = (await response.json()) as { data?: SubscribedApp[] };
+  return data.data ?? [];
 }
 
 // ============================================================

@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
@@ -472,4 +472,163 @@ test("cross-account denial: B's get never sees A's config, and B's upsert never 
   );
   expect(aliceRows).toHaveLength(1);
   expect(aliceRows[0]!.provider).toBe("openai");
+});
+
+// ============================================================
+// testConnection — admin-gated "Test key" action (transitive-Supabase
+// gap-fill task). Convex port of `POST /api/ai/test`: validates a
+// provider/model/key combo WITHOUT saving it, falling back to the
+// account's own saved (decrypted) key when `apiKey` is omitted.
+// ============================================================
+
+function okChatCompletion(content: string): Response {
+  return new Response(
+    JSON.stringify({
+      choices: [{ message: { content } }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    }),
+    { status: 200 },
+  );
+}
+
+function errChatCompletion(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: { message } }), { status });
+}
+
+test("testConnection returns {ok:true} when the provider accepts a body-supplied key", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => okChatCompletion("OK")));
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.aiConfig.testConnection, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    apiKey: "sk-fresh-key",
+  });
+
+  expect(result).toEqual({ ok: true });
+  vi.unstubAllGlobals();
+});
+
+test("testConnection falls back to the account's saved (decrypted) key when apiKey is omitted", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => okChatCompletion("OK")));
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.aiConfig.upsert, {
+    ...BASE_ARGS,
+    apiKey: "sk-saved-key",
+  });
+
+  const result = await asUser.action(api.aiConfig.testConnection, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+  });
+
+  expect(result).toEqual({ ok: true });
+  vi.unstubAllGlobals();
+});
+
+test("testConnection returns an error (never throws) when no apiKey is supplied and none is saved", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.aiConfig.testConnection, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+  });
+
+  expect(result).toEqual({ error: "Enter an API key to test." });
+});
+
+test("testConnection returns {error, code} on a bad key (provider 401), without throwing", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => errChatCompletion(401, "Incorrect API key provided")),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.aiConfig.testConnection, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    apiKey: "sk-bad-key",
+  });
+
+  expect(result).toMatchObject({ code: "invalid_key" });
+  expect((result as { error: string }).error).toContain("Incorrect API key provided");
+  vi.unstubAllGlobals();
+});
+
+test("testConnection throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.aiConfig.testConnection, {
+      provider: "openai",
+      model: "gpt-4o-mini",
+      apiKey: "sk-whatever",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("testConnection throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+
+  await expect(
+    t.action(api.aiConfig.testConnection, {
+      provider: "openai",
+      model: "gpt-4o-mini",
+      apiKey: "sk-whatever",
+    }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("cross-account isolation: testConnection never falls back to a different account's saved key", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => okChatCompletion("OK")));
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.aiConfig.upsert, {
+    ...BASE_ARGS,
+    apiKey: "alice-saved-key",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+
+  // Bob has no config of his own — must get "Enter an API key", never
+  // silently succeed by falling back to Alice's saved key.
+  const result = await asBob.action(api.aiConfig.testConnection, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+  });
+
+  expect(result).toEqual({ error: "Enter an API key to test." });
+  vi.unstubAllGlobals();
 });

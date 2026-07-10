@@ -1,7 +1,11 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalQuery } from "./_generated/server";
+import { action, internalQuery } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
-import { encrypt } from "./lib/whatsappEncryption";
+import { encrypt, decrypt } from "./lib/whatsappEncryption";
+import { hasMinRole } from "./lib/roles";
+import { verifyPhoneNumber, getSubscribedApps } from "./lib/whatsapp/metaApi";
 import type { Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -252,5 +256,159 @@ export const matchVerifyToken = internalQuery({
       }
     }
     return null;
+  },
+});
+
+// ============================================================
+// verifyRegistration — admin-gated diagnostic action (transitive-
+// Supabase gap-fill task). Convex port of `GET /api/whatsapp/config/
+// verify-registration`: confirms the account's saved phone number is
+// actually reachable/subscribed on Meta's side ("UI says Connected but
+// Meta isn't delivering events"). A plain `action` (like `send.ts`/
+// `broadcasts.ts`'s `send`, `reactions.ts`'s `reactToMeta`) since it has
+// no `ctx.db` of its own — `getAuthUserId` + `internal.accounts
+// .accountContextForUser` derive the caller's account/role, same as
+// those. The source route itself has NO role check at all (any
+// authenticated member of the account can view the diagnostic); this
+// action deliberately tightens that to admin+, matching this task's own
+// brief.
+//
+// DRY-RUN aware, mirroring `convex/metaSend.ts`'s own
+// `CONVEX_META_DRY_RUN` convention: ONLY the two outbound Meta calls
+// (`verifyPhoneNumber`/`getSubscribedApps`) are skipped and replaced
+// with a synthetic success — the "does a config exist"/"can we decrypt
+// the token" checks are local, network-free work and always run for
+// real, dry-run or not (exactly like `metaSend.ts`'s own config-load +
+// decrypt steps aren't skipped either).
+// ============================================================
+
+function isDryRun(): boolean {
+  return !!process.env.CONVEX_META_DRY_RUN;
+}
+
+interface VerifyRegistrationChecks {
+  config_exists: boolean;
+  token_decryptable?: boolean;
+  phone_metadata_ok?: boolean;
+  waba_subscribed_to_app?: boolean | null;
+  locally_marked_registered?: boolean;
+}
+
+interface VerifyRegistrationResult {
+  live: boolean;
+  checks: VerifyRegistrationChecks;
+  errors?: string[];
+  message?: string;
+  last_registration_error?: string | null;
+  registered_at?: number | null;
+  subscribed_apps_at?: number | null;
+}
+
+/**
+ * Admin+ diagnostic — verifies the account's saved WhatsApp phone
+ * number against Meta: phone metadata reachability, WABA app
+ * subscription, and the locally-recorded registration timestamp. Every
+ * failure mode returns `live: false` with a `checks`/`message` (or
+ * `errors`) breakdown rather than throwing, exactly matching the
+ * route's own "always 200 with diagnostic detail" contract — the UI
+ * renders per-check pass/fail rather than a generic error toast. Only
+ * auth/role gating throws (`ConvexError`, matching every other function
+ * in this codebase).
+ */
+export const verifyRegistration = action({
+  args: {},
+  handler: async (ctx): Promise<VerifyRegistrationResult> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+    const { accountId } = context;
+
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId,
+    });
+    if (!config) {
+      return {
+        live: false,
+        checks: { config_exists: false },
+        message: "No WhatsApp configuration saved yet.",
+      };
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = await decrypt(config.accessToken);
+    } catch {
+      return {
+        live: false,
+        checks: { config_exists: true, token_decryptable: false },
+        message:
+          "Stored access token can't be decrypted — likely ENCRYPTION_KEY changed. Re-enter the token to repair.",
+      };
+    }
+
+    const checks: Required<VerifyRegistrationChecks> = {
+      config_exists: true,
+      token_decryptable: true,
+      phone_metadata_ok: false,
+      waba_subscribed_to_app: null,
+      locally_marked_registered: config.registeredAt != null,
+    };
+    const errors: string[] = [];
+
+    if (isDryRun()) {
+      // Skip the network entirely — same convention as `metaSend.ts`'s
+      // own DRY-RUN branch — and report as if both Meta calls succeeded.
+      checks.phone_metadata_ok = true;
+      checks.waba_subscribed_to_app = true;
+    } else {
+      try {
+        await verifyPhoneNumber({ phoneNumberId: config.phoneNumberId, accessToken });
+        checks.phone_metadata_ok = true;
+      } catch (err) {
+        errors.push(
+          `Phone metadata check failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      if (config.wabaId) {
+        try {
+          const subs = await getSubscribedApps({ wabaId: config.wabaId, accessToken });
+          checks.waba_subscribed_to_app = subs.length > 0;
+          if (!checks.waba_subscribed_to_app) {
+            errors.push(
+              "WABA has no subscribed apps. Re-save the configuration to subscribe.",
+            );
+          }
+        } catch (err) {
+          errors.push(
+            `WABA subscription check failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else {
+        errors.push(
+          "No WABA ID on file — webhooks can't be wired without it. Add it in the form and re-save.",
+        );
+      }
+    }
+
+    const live =
+      checks.phone_metadata_ok &&
+      (checks.waba_subscribed_to_app ?? false) &&
+      checks.locally_marked_registered;
+
+    return {
+      live,
+      checks,
+      errors,
+      last_registration_error: config.lastRegistrationError ?? null,
+      registered_at: config.registeredAt ?? null,
+      subscribed_apps_at: config.subscribedAppsAt ?? null,
+    };
   },
 });
