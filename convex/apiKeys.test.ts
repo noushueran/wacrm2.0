@@ -470,7 +470,9 @@ test("touchLastUsedByHash bumps lastUsedAt for the matching key", async () => {
 
 test("touchLastUsedByHash is a silent no-op for an unknown hash", async () => {
   const t = convexTest(schema, modules);
+  // Convex serializes a handler's `undefined` return as `null` over the
+  // wire — this IS the "no-op, no throw" contract, not a bug.
   await expect(
     t.mutation(api.apiKeys.touchLastUsedByHash, { keyHash: "never-existed" }),
-  ).resolves.toBeUndefined();
+  ).resolves.toBeNull();
 });
