@@ -227,6 +227,10 @@ test("send with a conversationId sends text and persists the outbound message (D
   expect(messages[0]!.contentType).toBe("text");
   expect(messages[0]!.contentText).toBe("Hello from the dashboard");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
+  // Dashboard/agent-initiated send — must persist as "agent", not the
+  // metaSend default "bot", or the inbox would render it as a bot/AI
+  // message (Phase 8, Task 4).
+  expect(messages[0]!.senderType).toBe("agent");
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

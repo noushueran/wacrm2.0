@@ -1,7 +1,12 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { useMutation, useQuery, usePaginatedQuery } from "convex/react";
+import {
+  useAction,
+  useMutation,
+  useQuery,
+  usePaginatedQuery,
+} from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
 import {
@@ -179,39 +184,13 @@ export function MessageThread({
     [msg.results],
   );
 
-  // Optimistic local-only messages for the send handlers below. Message
-  // SEND still goes through the legacy `/api/whatsapp/send` route (see
-  // the `TODO(P8-T4)` comments on each call below) rather than a Convex
-  // mutation, so a sent message never comes back through
-  // `api.messages.listByConversation` — these optimistic bubbles are the
-  // only record of it until that route moves to Convex. Cleared on
-  // conversation switch so a bubble from thread A never bleeds into B.
-  const [optimisticMessages, setOptimisticMessages] = useState<Message[]>([]);
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot reset on conversation switch, not a per-render derivation
-    setOptimisticMessages([]);
-  }, [conversationId]);
-
-  const onNewMessage = useCallback((message: Message) => {
-    setOptimisticMessages((prev) => {
-      if (prev.some((m) => m.id === message.id)) return prev;
-      return [...prev, message];
-    });
-  }, []);
-
-  const onUpdateMessage = useCallback(
-    (id: string, updates: Partial<Message>) => {
-      setOptimisticMessages((prev) =>
-        prev.map((m) => (m.id === id ? { ...m, ...updates } : m)),
-      );
-    },
-    [],
-  );
-
-  const messages = useMemo(
-    () => [...convexMessages, ...optimisticMessages],
-    [convexMessages, optimisticMessages],
-  );
+  // Message send now goes straight through `api.send.send` (a Convex
+  // action — see the handlers below), which persists via
+  // `messages.appendInternal` before returning. The reactive
+  // `usePaginatedQuery` above already re-renders with the new row the
+  // moment it lands, so there's no separate optimistic-bubble state to
+  // maintain here anymore (Phase 8, Task 4).
+  const messages = convexMessages;
 
   // Reactions — reactive; Convex updates the pills automatically on
   // every set/remove, no optimistic snapshot/rollback needed.
@@ -284,64 +263,28 @@ export function MessageThread({
     }
   }, [messages]);
 
+  const sendMessage = useAction(api.send.send);
+
   const handleSend = useCallback(
     async (text: string, replyToId?: string) => {
       if (!conversation) return;
 
-      const tempId = `temp-${Date.now()}`;
-
-      // Optimistic update — shows the message immediately with "sending" status
-      const optimisticMsg: Message = {
-        id: tempId,
-        conversation_id: conversation.id,
-        sender_type: "agent",
-        content_type: "text",
-        content_text: text,
-        status: "sending",
-        created_at: new Date().toISOString(),
-        reply_to_message_id: replyToId,
-      };
-      onNewMessage(optimisticMsg);
       setReplyTo(null);
 
       try {
-        // TODO(P8-T4): route send through Convex; currently the
-        // Supabase-backed /api/whatsapp/send route.
-        const res = await fetch("/api/whatsapp/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: "text",
-            content_text: text,
-            reply_to_message_id: replyToId,
-          }),
+        await sendMessage({
+          conversationId: conversation.id as Id<"conversations">,
+          messageType: "text",
+          contentText: text,
+          replyToMessageId: replyToId as Id<"messages"> | undefined,
         });
-
-        const payload = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          const reason = payload?.error || `HTTP ${res.status}`;
-          console.error("Failed to send message:", reason);
-          toast.error(`Failed to send: ${reason}`);
-          // Mark the optimistic bubble as failed so the user sees what happened
-          onUpdateMessage(tempId, { status: "failed" });
-          return;
-        }
-
-        // Success. Unlike the old Supabase realtime INSERT, nothing will
-        // replace this temp bubble with a persisted row today — see the
-        // TODO above — so just flip it to 'sent' so the UI stops
-        // showing "sending".
-        onUpdateMessage(tempId, { status: "sent" });
       } catch (err) {
         console.error("Failed to send message:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send: ${reason}`);
-        onUpdateMessage(tempId, { status: "failed" });
       }
     },
-    [conversation, onNewMessage, onUpdateMessage]
+    [conversation, sendMessage]
   );
 
   const handleSendMedia = useCallback(
@@ -356,115 +299,47 @@ export function MessageThread({
           ? payload.caption || payload.filename || "Document"
           : payload.caption;
 
-      const tempId = `temp-${Date.now()}`;
-      const optimisticMsg: Message = {
-        id: tempId,
-        conversation_id: conversation.id,
-        sender_type: "agent",
-        content_type: payload.kind,
-        content_text: contentText,
-        media_url: payload.mediaUrl,
-        status: "sending",
-        created_at: new Date().toISOString(),
-        reply_to_message_id: payload.replyToId,
-      };
-      onNewMessage(optimisticMsg);
       setReplyTo(null);
 
       try {
-        // TODO(P8-T4): route send through Convex; currently the
-        // Supabase-backed /api/whatsapp/send route.
-        const res = await fetch("/api/whatsapp/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: payload.kind,
-            media_url: payload.mediaUrl,
-            content_text: contentText,
-            filename: payload.filename,
-            reply_to_message_id: payload.replyToId,
-          }),
+        await sendMessage({
+          conversationId: conversation.id as Id<"conversations">,
+          messageType: payload.kind,
+          mediaUrl: payload.mediaUrl,
+          contentText,
+          filename: payload.filename,
+          replyToMessageId: payload.replyToId as Id<"messages"> | undefined,
         });
-
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          const reason = data?.error || `HTTP ${res.status}`;
-          console.error("Failed to send media:", reason);
-          toast.error(`Failed to send: ${reason}`);
-          onUpdateMessage(tempId, { status: "failed" });
-          // The upload never reached the recipient — GC the orphaned
-          // object rather than leaving it in the public bucket forever.
-          void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
-          return;
-        }
-
-        onUpdateMessage(tempId, { status: "sent" });
       } catch (err) {
         console.error("Failed to send media:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send: ${reason}`);
-        onUpdateMessage(tempId, { status: "failed" });
+        // The upload never reached the recipient — GC the orphaned
+        // object rather than leaving it in the public bucket forever.
         void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
       }
     },
-    [conversation, onNewMessage, onUpdateMessage],
+    [conversation, sendMessage],
   );
 
   const handleSendInteractive = useCallback(
     async (payload: InteractiveMessagePayload, replyToId?: string) => {
       if (!conversation) return;
 
-      const tempId = `temp-${Date.now()}`;
-      // Optimistic bubble — renders the buttons/list immediately via the
-      // interactive_payload, same as the persisted row will.
-      const optimisticMsg: Message = {
-        id: tempId,
-        conversation_id: conversation.id,
-        sender_type: "agent",
-        content_type: "interactive",
-        content_text: payload.body,
-        interactive_payload: payload,
-        status: "sending",
-        created_at: new Date().toISOString(),
-        reply_to_message_id: replyToId,
-      };
-      onNewMessage(optimisticMsg);
-
       try {
-        // TODO(P8-T4): route send through Convex; currently the
-        // Supabase-backed /api/whatsapp/send route.
-        const res = await fetch("/api/whatsapp/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: "interactive",
-            interactive_payload: payload,
-            reply_to_message_id: replyToId,
-          }),
+        await sendMessage({
+          conversationId: conversation.id as Id<"conversations">,
+          messageType: "interactive",
+          interactivePayload: payload,
+          replyToMessageId: replyToId as Id<"messages"> | undefined,
         });
-
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          const reason = data?.error || `HTTP ${res.status}`;
-          console.error("Failed to send interactive message:", reason);
-          toast.error(`Failed to send: ${reason}`);
-          onUpdateMessage(tempId, { status: "failed" });
-          return;
-        }
-
-        onUpdateMessage(tempId, { status: "sent" });
       } catch (err) {
         console.error("Failed to send interactive message:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send: ${reason}`);
-        onUpdateMessage(tempId, { status: "failed" });
       }
     },
-    [conversation, onNewMessage, onUpdateMessage],
+    [conversation, sendMessage],
   );
 
   const setStatusMutation = useMutation(api.conversations.setStatus);
@@ -501,64 +376,30 @@ export function MessageThread({
       if (!conversation) return;
 
       const renderedBody = renderTemplateBody(template.body_text, values.body);
-      const tempId = `temp-${Date.now()}`;
-
-      const optimisticMsg: Message = {
-        id: tempId,
-        conversation_id: conversation.id,
-        sender_type: "agent",
-        content_type: "template",
-        content_text: renderedBody,
-        template_name: template.name,
-        status: "sending",
-        created_at: new Date().toISOString(),
-      };
-      onNewMessage(optimisticMsg);
 
       try {
-        // TODO(P8-T4): route send through Convex; currently the
-        // Supabase-backed /api/whatsapp/send route.
-        const res = await fetch("/api/whatsapp/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            conversation_id: conversation.id,
-            message_type: "template",
-            template_name: template.name,
-            template_language: template.language,
-            // Structured params drive the new send-builder path
-            // (header media + URL button substitution). Body values
-            // are mirrored under both shapes so the route can fall
-            // back if the template row isn't found locally.
-            template_message_params: {
-              body: values.body,
-              headerText: values.headerText,
-              buttonParams: values.buttonParams,
-            },
-            template_params: values.body,
-            content_text: renderedBody,
-          }),
+        await sendMessage({
+          conversationId: conversation.id as Id<"conversations">,
+          messageType: "template",
+          templateName: template.name,
+          templateLanguage: template.language,
+          // `api.send.send` → `metaSend.sendTemplate` only threads body
+          // variables through today (mirrors `lib/whatsapp/metaApi.ts`'s
+          // simplified, body-params-only sender) — there's no Convex-side
+          // equivalent yet for `values.headerText`/`values.buttonParams`
+          // (header text + URL-button substitution), so those are
+          // dropped here rather than silently mismapped onto the wrong
+          // field.
+          templateParams: values.body,
+          contentText: renderedBody,
         });
-
-        const payload = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          const reason = payload?.error || `HTTP ${res.status}`;
-          console.error("Failed to send template:", reason);
-          toast.error(`Failed to send template: ${reason}`);
-          onUpdateMessage(tempId, { status: "failed" });
-          return;
-        }
-
-        onUpdateMessage(tempId, { status: "sent" });
       } catch (err) {
         console.error("Failed to send template:", err);
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send template: ${reason}`);
-        onUpdateMessage(tempId, { status: "failed" });
       }
     },
-    [conversation, onNewMessage, onUpdateMessage],
+    [conversation, sendMessage],
   );
 
   // Build a quick id → Message map so reply quotes can be rendered without
@@ -612,14 +453,11 @@ export function MessageThread({
   // snapshot/rollback needed.
   const setReactionMutation = useMutation(api.reactions.set);
   const removeReactionMutation = useMutation(api.reactions.remove);
+  const reactToMetaAction = useAction(api.reactions.reactToMeta);
   const postReaction = useCallback(
     async (messageId: string, emoji: string) => {
       if (!user?.id || !conversation) {
         console.warn("[reactions] missing user or conversation");
-        return;
-      }
-      if (messageId.startsWith("temp-")) {
-        toast.error("Wait for the message to finish sending");
         return;
       }
 
@@ -641,13 +479,33 @@ export function MessageThread({
       } catch (err) {
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Reaction failed: ${reason}`);
+        return;
+      }
+
+      // Notify Meta best-effort. The DB row above (our own reaction
+      // pill's source of truth) is already written — a Meta-side failure
+      // here shouldn't roll it back, just surface a toast.
+      try {
+        await reactToMetaAction({
+          messageId: messageId as Id<"messages">,
+          emoji,
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "network error";
+        toast.error(`Failed to notify WhatsApp of the reaction: ${reason}`);
       }
     },
     // Dep is the whole `user` object (not `user?.id`) so the React
     // Compiler's inference agrees with the manual dep list — same
     // `preserve-manual-memoization` fix as `contact-sidebar.tsx`'s
     // `handleCopyPhone`.
-    [conversation, user, setReactionMutation, removeReactionMutation],
+    [
+      conversation,
+      user,
+      setReactionMutation,
+      removeReactionMutation,
+      reactToMetaAction,
+    ],
   );
 
   const assignMutation = useMutation(api.conversations.assign);

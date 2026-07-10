@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useMutation, useQuery } from 'convex/react';
+import { useAction, useMutation, useQuery } from 'convex/react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
@@ -150,6 +150,7 @@ export function ContactDetailView({
     }
   }, [customValuesResult]);
 
+  const sendMessage = useAction(api.send.send);
   const updateContact = useMutation(api.contacts.update);
   const assignTag = useMutation(api.contacts.assignTag);
   const unassignTag = useMutation(api.contacts.unassignTag);
@@ -292,36 +293,23 @@ export function ContactDetailView({
     if (!contactId) return;
     setSendingTemplate(true);
     try {
-      const res = await fetch('/api/whatsapp/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          // No conversation_id — the route find-or-creates one for this
-          // contact, mirroring the inbox template-send payload otherwise.
-          contact_id: contactId,
-          message_type: 'template',
-          template_name: template.name,
-          template_language: template.language,
-          template_message_params: {
-            body: values.body,
-            headerText: values.headerText,
-            buttonParams: values.buttonParams,
-          },
-          template_params: values.body,
-        }),
+      await sendMessage({
+        // No conversationId — the action find-or-creates one for this
+        // contact, mirroring the inbox template-send payload otherwise.
+        contactId: contactId as Id<'contacts'>,
+        messageType: 'template',
+        templateName: template.name,
+        templateLanguage: template.language,
+        // `api.send.send` only threads body variables through today — see
+        // `src/components/inbox/message-thread.tsx`'s own comment on why
+        // `values.headerText`/`values.buttonParams` have no Convex-side
+        // equivalent yet.
+        templateParams: values.body,
       });
-
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const reason = payload?.error || `HTTP ${res.status}`;
-        toast.error(t('toastTemplateFailed', { reason }));
-        return;
-      }
 
       toast.success(t('toastTemplateSent', { name: template.name }));
     } catch (err) {
-      const reason = err instanceof Error ? err.message : 'network error';
-      toast.error(`Failed to send template: ${reason}`);
+      toast.error(t('toastTemplateFailed', { reason: convexErrorMessage(err) }));
     } finally {
       setSendingTemplate(false);
     }

@@ -119,6 +119,47 @@ test("sendText in DRY-RUN persists a bot message and updates the conversation, w
   delete process.env.CONVEX_META_DRY_RUN;
 });
 
+// ============================================================
+// sendText — senderType override (Phase 8, Task 4). `senderType` is
+// optional and defaults to "bot" (asserted above); a caller acting on a
+// human agent's behalf (`convex/send.ts`'s `send`) passes "agent"
+// explicitly so the persisted message isn't indistinguishable from an
+// automation's.
+// ============================================================
+
+test("sendText persists senderType 'agent' when explicitly passed", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  await t.action(internal.metaSend.sendText, {
+    accountId,
+    conversationId,
+    to: "15551234567",
+    text: "Hi, this is your agent",
+    senderType: "agent",
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+  expect(messages[0]!.senderType).toBe("agent");
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
 test("sendText is account-scoped: cannot persist against another account's conversation", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);

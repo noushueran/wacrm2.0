@@ -113,6 +113,9 @@ export const send = action({
           caption: args.contentText,
           filename: args.filename,
           contextMessageId,
+          // Dashboard sends are agent-initiated, not automation/flow bot
+          // sends — see `metaSend.ts`'s own doc comment on the default.
+          senderType: "agent",
         });
       }
       case "template": {
@@ -127,6 +130,9 @@ export const send = action({
           language: args.templateLanguage,
           params: args.templateParams,
           contextMessageId,
+          // Dashboard sends are agent-initiated, not automation/flow bot
+          // sends — see `metaSend.ts`'s own doc comment on the default.
+          senderType: "agent",
         });
       }
       case "interactive": {
@@ -141,6 +147,9 @@ export const send = action({
           to,
           payload: args.interactivePayload,
           contextMessageId,
+          // Dashboard sends are agent-initiated, not automation/flow bot
+          // sends — see `metaSend.ts`'s own doc comment on the default.
+          senderType: "agent",
         });
       }
       case "text": {
@@ -153,6 +162,9 @@ export const send = action({
           to,
           text: args.contentText,
           contextMessageId,
+          // Dashboard sends are agent-initiated, not automation/flow bot
+          // sends — see `metaSend.ts`'s own doc comment on the default.
+          senderType: "agent",
         });
       }
     }

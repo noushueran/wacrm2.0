@@ -46,8 +46,11 @@ import {
 //      denorm), never on an actual Meta response.
 //   4. persists via `messages.appendInternal` (Phase 2's `append`,
 //      minus the auth wrapper — see that function's own doc comment)
-//      with `senderType: "bot"`, so the send shows up in the Inbox
-//      exactly like a real agent/customer message would.
+//      with `senderType` defaulting to `"bot"` (automations/flows),
+//      overridable to `"agent"` by a caller acting on a human's behalf
+//      (`convex/send.ts`'s dashboard-initiated `send`, Phase 8 Task 4)
+//      — either way the send shows up in the Inbox exactly like a real
+//      agent/customer message would.
 //
 // Intentionally NOT reproduced from the original engine senders: the
 // contact-phone lookup + phone-variant retry (trunk-0 dialing quirks)
@@ -110,6 +113,10 @@ export const sendText = internalAction({
     to: v.string(),
     text: v.string(),
     contextMessageId: v.optional(v.string()),
+    // Defaults to "bot" (automations/flows engines); dashboard-initiated
+    // sends (`convex/send.ts`) pass "agent" so the message persists as a
+    // human send rather than an automation's.
+    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -133,7 +140,7 @@ export const sendText = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: "bot",
+      senderType: args.senderType ?? "bot",
       contentType: "text",
       contentText: args.text,
       messageId: whatsappMessageId,
@@ -152,6 +159,10 @@ export const sendTemplate = internalAction({
     language: v.optional(v.string()),
     params: v.optional(v.array(v.string())),
     contextMessageId: v.optional(v.string()),
+    // Defaults to "bot" (automations/flows engines); dashboard-initiated
+    // sends (`convex/send.ts`) pass "agent" so the message persists as a
+    // human send rather than an automation's.
+    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -177,7 +188,7 @@ export const sendTemplate = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: "bot",
+      senderType: args.senderType ?? "bot",
       contentType: "template",
       templateName: args.templateName,
       messageId: whatsappMessageId,
@@ -194,6 +205,10 @@ export const sendInteractive = internalAction({
     to: v.string(),
     payload: v.any(),
     contextMessageId: v.optional(v.string()),
+    // Defaults to "bot" (automations/flows engines); dashboard-initiated
+    // sends (`convex/send.ts`) pass "agent" so the message persists as a
+    // human send rather than an automation's.
+    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     // Validate before send (dry-run or not) so a misconfigured
@@ -245,7 +260,7 @@ export const sendInteractive = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: "bot",
+      senderType: args.senderType ?? "bot",
       contentType: "interactive",
       contentText: payload.body,
       interactivePayload: payload,
@@ -271,6 +286,10 @@ export const sendMedia = internalAction({
     caption: v.optional(v.string()),
     filename: v.optional(v.string()),
     contextMessageId: v.optional(v.string()),
+    // Defaults to "bot" (automations/flows engines); dashboard-initiated
+    // sends (`convex/send.ts`) pass "agent" so the message persists as a
+    // human send rather than an automation's.
+    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -297,7 +316,7 @@ export const sendMedia = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: "bot",
+      senderType: args.senderType ?? "bot",
       // `MediaKind` ("image"/"video"/"document"/"audio") is a strict
       // subset of `messages.contentType` — every value maps straight
       // across with no translation.
