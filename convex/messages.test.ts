@@ -373,3 +373,149 @@ test("getForAccount throws NOT_FOUND for a message belonging to a different acco
     }),
   ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "message" } });
 });
+
+// ============================================================
+// updateDeliveryStatusByWamid — Meta delivery-status webhook handler
+// (Phase 8, Task 4), ported from route.ts's `handleStatusUpdate` step 1
+// ============================================================
+
+test("updateDeliveryStatusByWamid patches the status of the message matching the wamid", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "111" });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  const messageId = await asUser.mutation(api.messages.append, {
+    conversationId,
+    senderType: "bot",
+    contentType: "text",
+    contentText: "Your order shipped!",
+    messageId: "wamid.STATUS1",
+  });
+
+  const result = await t.mutation(internal.messages.updateDeliveryStatusByWamid, {
+    wamid: "wamid.STATUS1",
+    status: "delivered",
+    accountId,
+  });
+  expect(result).toEqual({ matched: 1, updated: 1 });
+
+  const message = await t.run((ctx) => ctx.db.get(messageId));
+  expect(message!.status).toBe("delivered");
+});
+
+test("updateDeliveryStatusByWamid is a safe no-op when no message matches the wamid", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await t.mutation(internal.messages.updateDeliveryStatusByWamid, {
+    wamid: "wamid.NEVER_SEEN",
+    status: "read",
+    accountId,
+  });
+  expect(result).toEqual({ matched: 0, updated: 0 });
+});
+
+test("updateDeliveryStatusByWamid is cross-account safe: when two accounts' messages coincidentally share a wamid, only the caller's own accountId's row is patched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, { phone: "111" });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const aliceMessageId = await asAlice.mutation(api.messages.append, {
+    conversationId: aliceConversationId,
+    senderType: "bot",
+    contentType: "text",
+    contentText: "Alice's message",
+    messageId: "wamid.SHARED",
+  });
+  const bobContactId = await asBob.mutation(api.contacts.create, { phone: "222" });
+  const bobConversationId = await seedConversation(t, {
+    accountId: bobAccountId,
+    contactId: bobContactId,
+  });
+  const bobMessageId = await asBob.mutation(api.messages.append, {
+    conversationId: bobConversationId,
+    senderType: "bot",
+    contentType: "text",
+    contentText: "Bob's message",
+    messageId: "wamid.SHARED",
+  });
+
+  const result = await t.mutation(internal.messages.updateDeliveryStatusByWamid, {
+    wamid: "wamid.SHARED",
+    status: "read",
+    accountId: aliceAccountId,
+  });
+  expect(result).toEqual({ matched: 2, updated: 1 });
+
+  const aliceMessage = await t.run((ctx) => ctx.db.get(aliceMessageId));
+  expect(aliceMessage!.status).toBe("read");
+  const bobMessage = await t.run((ctx) => ctx.db.get(bobMessageId));
+  expect(bobMessage!.status).not.toBe("read");
+});
+
+test("updateDeliveryStatusByWamid without accountId updates every matching row (mirrors the source's own account-agnostic sweep)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, { phone: "111" });
+  const aliceConversationId = await seedConversation(t, {
+    accountId: aliceAccountId,
+    contactId: aliceContactId,
+  });
+  const aliceMessageId = await asAlice.mutation(api.messages.append, {
+    conversationId: aliceConversationId,
+    senderType: "bot",
+    contentType: "text",
+    contentText: "Alice's message",
+    messageId: "wamid.SHARED2",
+  });
+  const bobContactId = await asBob.mutation(api.contacts.create, { phone: "222" });
+  const bobConversationId = await seedConversation(t, {
+    accountId: bobAccountId,
+    contactId: bobContactId,
+  });
+  const bobMessageId = await asBob.mutation(api.messages.append, {
+    conversationId: bobConversationId,
+    senderType: "bot",
+    contentType: "text",
+    contentText: "Bob's message",
+    messageId: "wamid.SHARED2",
+  });
+
+  const result = await t.mutation(internal.messages.updateDeliveryStatusByWamid, {
+    wamid: "wamid.SHARED2",
+    status: "failed",
+  });
+  expect(result).toEqual({ matched: 2, updated: 2 });
+
+  expect((await t.run((ctx) => ctx.db.get(aliceMessageId)))!.status).toBe("failed");
+  expect((await t.run((ctx) => ctx.db.get(bobMessageId)))!.status).toBe("failed");
+});

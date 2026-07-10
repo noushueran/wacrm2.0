@@ -1,11 +1,11 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
-import { colsForStatus } from "./broadcasts";
+import { colsForStatus, isValidStatusTransition } from "./broadcasts";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches
@@ -681,4 +681,211 @@ test("remove throws NOT_FOUND for a broadcast belonging to a different account, 
   // Positive control.
   await asAlice.mutation(api.broadcasts.remove, { broadcastId });
   expect(await t.run((ctx) => ctx.db.get(broadcastId))).toBeNull();
+});
+
+// ============================================================
+// isValidStatusTransition — pure function, direct unit test (ported
+// verbatim from route.ts's own RECIPIENT_STATUS_LADDER/
+// isValidStatusTransition), mirrors colsForStatus's own treatment above
+// ============================================================
+
+test("isValidStatusTransition allows only forward moves along the pending -> sent -> delivered -> read -> replied ladder", () => {
+  expect(isValidStatusTransition("pending", "sent")).toBe(true);
+  expect(isValidStatusTransition("sent", "delivered")).toBe(true);
+  expect(isValidStatusTransition("delivered", "read")).toBe(true);
+  expect(isValidStatusTransition("read", "replied")).toBe(true);
+  expect(isValidStatusTransition("pending", "replied")).toBe(true); // skipping ahead is fine
+
+  // Regressions (an out-of-order webhook redelivery) are refused.
+  expect(isValidStatusTransition("read", "sent")).toBe(false);
+  expect(isValidStatusTransition("delivered", "pending")).toBe(false);
+  expect(isValidStatusTransition("replied", "delivered")).toBe(false);
+});
+
+test("isValidStatusTransition: failed is accepted only from pending/sent, and is terminal once reached", () => {
+  expect(isValidStatusTransition("pending", "failed")).toBe(true);
+  expect(isValidStatusTransition("sent", "failed")).toBe(true);
+  expect(isValidStatusTransition("delivered", "failed")).toBe(false);
+  expect(isValidStatusTransition("read", "failed")).toBe(false);
+  expect(isValidStatusTransition("replied", "failed")).toBe(false);
+
+  // Once failed, nothing can move it anywhere else.
+  expect(isValidStatusTransition("failed", "sent")).toBe(false);
+  expect(isValidStatusTransition("failed", "delivered")).toBe(false);
+});
+
+// ============================================================
+// recordRecipientStatusByWamid — Meta delivery-status webhook handler
+// (Phase 8, Task 4), ported from route.ts's `handleStatusUpdate` step 2
+// ============================================================
+
+test("recordRecipientStatusByWamid finds the recipient by wamid, advances its status, and updates the parent broadcast's counts", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 1);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+  const [recipient] = await recipientsOf(asUser, broadcastId);
+  await asUser.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: recipient!._id,
+    status: "sent",
+    whatsappMessageId: "wamid.WEBHOOK1",
+  });
+
+  const result = await t.mutation(internal.broadcasts.recordRecipientStatusByWamid, {
+    wamid: "wamid.WEBHOOK1",
+    status: "delivered",
+  });
+  expect(result).toBe(recipient!._id);
+
+  const recipientRow = await t.run((ctx) => ctx.db.get(recipient!._id));
+  expect(recipientRow!.status).toBe("delivered");
+  expect(recipientRow!.deliveredAt).toBeDefined();
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.sentCount).toBe(1);
+  expect(broadcast!.deliveredCount).toBe(1);
+});
+
+test("recordRecipientStatusByWamid is a safe no-op (returns null) when no recipient matches the wamid", async () => {
+  const t = convexTest(schema, modules);
+
+  const result = await t.mutation(internal.broadcasts.recordRecipientStatusByWamid, {
+    wamid: "wamid.NEVER_SEEN",
+    status: "delivered",
+  });
+  expect(result).toBeNull();
+});
+
+test("recordRecipientStatusByWamid refuses an out-of-order regression: 'sent' arriving after 'read' already landed leaves the recipient and counts untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 1);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+  const [recipient] = await recipientsOf(asUser, broadcastId);
+  await asUser.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: recipient!._id,
+    status: "sent",
+    whatsappMessageId: "wamid.OUTOFORDER",
+  });
+  await asUser.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: recipient!._id,
+    status: "read",
+  });
+
+  // A stale/out-of-order "sent" webhook redelivery arrives after "read"
+  // already landed — must be ignored entirely (no regression, no count
+  // churn).
+  const result = await t.mutation(internal.broadcasts.recordRecipientStatusByWamid, {
+    wamid: "wamid.OUTOFORDER",
+    status: "sent",
+  });
+  expect(result).toBe(recipient!._id);
+
+  const recipientRow = await t.run((ctx) => ctx.db.get(recipient!._id));
+  expect(recipientRow!.status).toBe("read");
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.sentCount).toBe(1);
+  expect(broadcast!.deliveredCount).toBe(1);
+  expect(broadcast!.readCount).toBe(1);
+});
+
+test("recordRecipientStatusByWamid records an errorMessage on 'failed' and bumps only failedCount", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 1);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+  const [recipient] = await recipientsOf(asUser, broadcastId);
+  await asUser.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: recipient!._id,
+    status: "sent",
+    whatsappMessageId: "wamid.FAILME",
+  });
+
+  await t.mutation(internal.broadcasts.recordRecipientStatusByWamid, {
+    wamid: "wamid.FAILME",
+    status: "failed",
+    errorMessage: "Recipient number invalid",
+  });
+
+  const recipientRow = await t.run((ctx) => ctx.db.get(recipient!._id));
+  expect(recipientRow!.status).toBe("failed");
+  expect(recipientRow!.errorMessage).toBe("Recipient number invalid");
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.sentCount).toBe(0);
+  expect(broadcast!.failedCount).toBe(1);
+});
+
+test("recordRecipientStatusByWamid targets exactly the matching recipient: a different broadcast's recipient with a distinct wamid is never touched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactIds = await seedContacts(asAlice, 1);
+  const aliceBroadcastId = await asAlice.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: aliceContactIds,
+  });
+  const [aliceRecipient] = await recipientsOf(asAlice, aliceBroadcastId);
+  await asAlice.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: aliceRecipient!._id,
+    status: "sent",
+    whatsappMessageId: "wamid.ALICE1",
+  });
+
+  const bobContactIds = await seedContacts(asBob, 1);
+  const bobBroadcastId = await asBob.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: bobContactIds,
+  });
+  const [bobRecipient] = await recipientsOf(asBob, bobBroadcastId);
+  await asBob.mutation(api.broadcasts.setRecipientStatus, {
+    recipientId: bobRecipient!._id,
+    status: "sent",
+    whatsappMessageId: "wamid.BOB1",
+  });
+
+  await t.mutation(internal.broadcasts.recordRecipientStatusByWamid, {
+    wamid: "wamid.ALICE1",
+    status: "delivered",
+  });
+
+  const aliceRow = await t.run((ctx) => ctx.db.get(aliceRecipient!._id));
+  expect(aliceRow!.status).toBe("delivered");
+  const bobRow = await t.run((ctx) => ctx.db.get(bobRecipient!._id));
+  expect(bobRow!.status).toBe("sent"); // untouched
+
+  const aliceBroadcast = await t.run((ctx) => ctx.db.get(aliceBroadcastId));
+  expect(aliceBroadcast!.deliveredCount).toBe(1);
+  const bobBroadcast = await t.run((ctx) => ctx.db.get(bobBroadcastId));
+  expect(bobBroadcast!.deliveredCount).toBe(0);
 });

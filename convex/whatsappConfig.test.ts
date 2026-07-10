@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { AccountRole } from "./lib/roles";
 import { decrypt } from "./lib/whatsappEncryption";
@@ -513,4 +513,153 @@ test("cross-account denial: remove only clears the caller's own account's config
   expect(await asBob.query(api.whatsappConfig.get, {})).toBeNull();
   const alicesConfig = await asAlice.query(api.whatsappConfig.get, {});
   expect(alicesConfig!.phoneNumberId).toBe("1000000000");
+});
+
+// ============================================================
+// accountByPhoneNumberId — the webhook's own tenancy lookup (Phase 8,
+// Task 4): every inbound Meta delivery carries phone_number_id
+// ============================================================
+
+test("accountByPhoneNumberId returns the config row (encrypted accessToken as-is) for a matching phoneNumberId", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token-v1",
+    status: "connected",
+  });
+
+  const config = await t.query(internal.whatsappConfig.accountByPhoneNumberId, {
+    phoneNumberId: "1000000000",
+  });
+
+  expect(config).not.toBeNull();
+  expect(config!.accountId).toBe(accountId);
+  expect(config!.phoneNumberId).toBe("1000000000");
+  // Returned as-is — still ciphertext, never decrypted by this query.
+  expect(config!.accessToken).not.toBe("plaintext-token-v1");
+  await expect(decrypt(config!.accessToken)).resolves.toBe("plaintext-token-v1");
+});
+
+test("accountByPhoneNumberId returns null when no config matches", async () => {
+  const t = convexTest(schema, modules);
+
+  const config = await t.query(internal.whatsappConfig.accountByPhoneNumberId, {
+    phoneNumberId: "unknown-number",
+  });
+  expect(config).toBeNull();
+});
+
+// ============================================================
+// matchVerifyToken — the GET-verification check (Phase 8, Task 4),
+// ported from route.ts's GET handler
+// ============================================================
+
+test("matchVerifyToken returns the accountId of the config whose decrypted verifyToken matches, and null otherwise", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  await asAlice.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "alice-token",
+    verifyToken: "alices-secret-verify-token",
+    status: "connected",
+  });
+  await asBob.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "2000000000",
+    accessToken: "bob-token",
+    verifyToken: "bobs-secret-verify-token",
+    status: "connected",
+  });
+
+  const matched = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "alices-secret-verify-token",
+  });
+  expect(matched).toBe(aliceAccountId);
+
+  const noMatch = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "some-random-token-nobody-has",
+  });
+  expect(noMatch).toBeNull();
+});
+
+test("matchVerifyToken skips a config with no verifyToken set at all", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  // No `verifyToken` supplied.
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "alice-token",
+    status: "connected",
+  });
+
+  const matched = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "anything",
+  });
+  expect(matched).toBeNull();
+});
+
+test("matchVerifyToken scans past non-matching rows (incl. one with no verifyToken at all) to find the right one", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: unconfiguredAccountId } = await seedAccountMember(t, {
+    name: "Unconfigured",
+    email: "unconfigured@example.com",
+    role: "admin",
+  });
+  // A row with no verifyToken at all — inserted directly since `upsert`
+  // requires one on first save only when `accessToken` needs a
+  // fallback; simplest to just seed the shape directly here.
+  await t.run((ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId: unconfiguredAccountId,
+      phoneNumberId: "9999999999",
+      accessToken: "irrelevant-for-this-test",
+      status: "connected",
+      updatedAt: Date.now(),
+    }),
+  );
+  const { asUser: asOther } = await seedAccountMember(t, {
+    name: "Other",
+    email: "other@example.com",
+    role: "admin",
+  });
+  await asOther.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "8888888888",
+    accessToken: "other-token",
+    verifyToken: "some-other-unrelated-token",
+    status: "connected",
+  });
+
+  const { asUser: asHealthy, accountId: healthyAccountId } = await seedAccountMember(t, {
+    name: "Healthy",
+    email: "healthy@example.com",
+    role: "admin",
+  });
+  await asHealthy.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "healthy-token",
+    verifyToken: "healthy-verify-token",
+    status: "connected",
+  });
+
+  const matched = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "healthy-verify-token",
+  });
+  expect(matched).toBe(healthyAccountId);
 });

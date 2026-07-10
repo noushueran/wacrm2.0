@@ -1,8 +1,9 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalMutation } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Doc, Id } from "./_generated/dataModel";
-import type { QueryCtx } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 
 // ============================================================
 // Broadcasts + recipients — a bulk template send (`broadcasts`) and its
@@ -85,6 +86,123 @@ const COUNT_COLUMNS: (keyof BroadcastCounts)[] = [
   "repliedCount",
   "failedCount",
 ];
+
+// The happy-path status ladder — pending -> sent -> delivered -> read ->
+// replied. Ported verbatim from `src/app/api/whatsapp/webhook/route.ts`'s
+// `RECIPIENT_STATUS_LADDER`/`isValidStatusTransition` (lines ~310-350) —
+// used ONLY by `recordRecipientStatusByWamid` below (Phase 8, Task 4),
+// the webhook-driven mirror. `setRecipientStatus` (agent-facing, already
+// existed) never had this guard and keeps not having it here: an agent
+// setting a status by hand is a deliberate override, not a possibly
+// out-of-order Meta redelivery. Webhook status deliveries CAN arrive out
+// of order (Meta gives no ordering guarantee), so a regression (e.g.
+// "sent" arriving after "read" already landed) must be refused there.
+// `failed` is a terminal side branch, valid only from the early
+// (pending/sent) states — once a recipient has reached any success
+// state, a later "failed" is either a bug in Meta's pipeline or a spoof
+// and must be ignored.
+const RECIPIENT_STATUS_LADDER = [
+  "pending",
+  "sent",
+  "delivered",
+  "read",
+  "replied",
+] as const;
+
+function ladderLevel(status: string): number {
+  const idx = (RECIPIENT_STATUS_LADDER as readonly string[]).indexOf(status);
+  return idx < 0 ? -1 : idx;
+}
+
+/**
+ * Can a recipient transition from `current` to `incoming`? Exported so
+ * `convex/broadcasts.test.ts` can unit-test it directly, matching
+ * `colsForStatus`'s own treatment.
+ */
+export function isValidStatusTransition(
+  current: string,
+  incoming: string,
+): boolean {
+  if (incoming === "failed") {
+    return current === "pending" || current === "sent";
+  }
+  if (current === "failed") {
+    return false; // failed is terminal
+  }
+  const ci = ladderLevel(current);
+  const ii = ladderLevel(incoming);
+  if (ii < 0) return false; // unknown incoming status
+  if (ci < 0) return true; // unknown current — accept anything on the ladder
+  return ii > ci;
+}
+
+/**
+ * Shared core for both `setRecipientStatus` (accountMutation, below) and
+ * `recordRecipientStatusByWamid` (internalMutation, Phase 8 webhook
+ * status handler, further below): applies a recipient status transition
+ * plus the migration-005 incremental count model on the parent
+ * broadcast — the exact count-delta logic `setRecipientStatus` always
+ * had, factored out so both entry points share one implementation
+ * rather than drift. A total no-op (returns `false`, no count math, no
+ * patch) when `status` hasn't actually changed — a duplicate webhook
+ * delivery (or a duplicate manual call) replaying the same status must
+ * never double-count or overwrite fields.
+ */
+async function applyRecipientStatusChange(
+  ctx: { db: MutationCtx["db"] },
+  recipient: Doc<"broadcastRecipients">,
+  status: Doc<"broadcastRecipients">["status"],
+  extra: { whatsappMessageId?: string; errorMessage?: string },
+): Promise<boolean> {
+  if (status === recipient.status) {
+    return false;
+  }
+
+  // Incrementally adjust the parent broadcast's counts: -1 for every
+  // column the OLD status counted toward, +1 for every column the NEW
+  // status counts toward. A column present in both (e.g. `sentCount`
+  // when moving between two "in flight" statuses) nets to zero,
+  // matching the cumulative count model. Clamped at 0 defensively.
+  const broadcast = await ctx.db.get(recipient.broadcastId);
+  if (broadcast) {
+    const delta: Record<keyof BroadcastCounts, number> = {
+      sentCount: 0,
+      deliveredCount: 0,
+      readCount: 0,
+      repliedCount: 0,
+      failedCount: 0,
+    };
+    for (const col of colsForStatus(recipient.status)) delta[col] -= 1;
+    for (const col of colsForStatus(status)) delta[col] += 1;
+
+    const countPatch: Partial<BroadcastCounts> = {};
+    for (const col of COUNT_COLUMNS) {
+      if (delta[col] !== 0) {
+        countPatch[col] = Math.max(0, broadcast[col] + delta[col]);
+      }
+    }
+    if (Object.keys(countPatch).length > 0) {
+      await ctx.db.patch(recipient.broadcastId, countPatch);
+    }
+  }
+
+  const patch: Partial<{
+    status: Doc<"broadcastRecipients">["status"];
+    whatsappMessageId: string;
+    errorMessage: string;
+    sentAt: number;
+    deliveredAt: number;
+    readAt: number;
+    repliedAt: number;
+  }> = { status, ...extra };
+  if (status === "sent") patch.sentAt = Date.now();
+  else if (status === "delivered") patch.deliveredAt = Date.now();
+  else if (status === "read") patch.readAt = Date.now();
+  else if (status === "replied") patch.repliedAt = Date.now();
+
+  await ctx.db.patch(recipient._id, patch);
+  return true;
+}
 
 /**
  * Loads a broadcast and throws `NOT_FOUND` unless it belongs to the
@@ -242,57 +360,52 @@ export const setRecipientStatus = accountMutation({
       });
     }
 
-    // A total no-op (not just skipping the count math) when the status
-    // hasn't actually changed — a duplicate webhook delivery replaying
-    // the same status must never double-count or overwrite fields.
-    if (status === recipient.status) {
-      return recipientId;
-    }
-
-    // Incrementally adjust the parent broadcast's counts: -1 for every
-    // column the OLD status counted toward, +1 for every column the NEW
-    // status counts toward. A column present in both (e.g. `sentCount`
-    // when moving between two "in flight" statuses) nets to zero,
-    // matching the cumulative count model. Clamped at 0 defensively.
-    const broadcast = await ctx.db.get(recipient.broadcastId);
-    if (broadcast) {
-      const delta: Record<keyof BroadcastCounts, number> = {
-        sentCount: 0,
-        deliveredCount: 0,
-        readCount: 0,
-        repliedCount: 0,
-        failedCount: 0,
-      };
-      for (const col of colsForStatus(recipient.status)) delta[col] -= 1;
-      for (const col of colsForStatus(status)) delta[col] += 1;
-
-      const countPatch: Partial<BroadcastCounts> = {};
-      for (const col of COUNT_COLUMNS) {
-        if (delta[col] !== 0) {
-          countPatch[col] = Math.max(0, broadcast[col] + delta[col]);
-        }
-      }
-      if (Object.keys(countPatch).length > 0) {
-        await ctx.db.patch(recipient.broadcastId, countPatch);
-      }
-    }
-
-    const patch: Partial<{
-      status: Doc<"broadcastRecipients">["status"];
-      whatsappMessageId: string;
-      errorMessage: string;
-      sentAt: number;
-      deliveredAt: number;
-      readAt: number;
-      repliedAt: number;
-    }> = { status, ...rest };
-    if (status === "sent") patch.sentAt = Date.now();
-    else if (status === "delivered") patch.deliveredAt = Date.now();
-    else if (status === "read") patch.readAt = Date.now();
-    else if (status === "replied") patch.repliedAt = Date.now();
-
-    await ctx.db.patch(recipientId, patch);
+    await applyRecipientStatusChange(ctx, recipient, status, rest);
     return recipientId;
+  },
+});
+
+/**
+ * Meta delivery-status webhook handler (Phase 8, Task 4) — Convex port
+ * of the `broadcast_recipients` mirror in `src/app/api/whatsapp/webhook/
+ * route.ts`'s `handleStatusUpdate` (step 2, lines ~376-409). `by_wamid`
+ * was reserved on `broadcastRecipients.whatsappMessageId` for exactly
+ * this lookup (schema.ts's own comment on that index/migration 003). A
+ * no-op (no throw, `null`) when no recipient matches — most inbound
+ * status webhooks don't correspond to a broadcast send at all, only to
+ * an ordinary conversational message. Forward-only on the status ladder
+ * (`isValidStatusTransition` above) — an out-of-order webhook delivery
+ * must never regress a recipient that already advanced further, exactly
+ * like the source; a rejected transition is a silent no-op (mirrors the
+ * source's own `else if` — logging happens at the caller/httpAction
+ * layer, not this internal mutation).
+ */
+export const recordRecipientStatusByWamid = internalMutation({
+  args: {
+    wamid: v.string(),
+    status: v.union(
+      v.literal("sent"),
+      v.literal("delivered"),
+      v.literal("read"),
+      v.literal("failed"),
+    ),
+    errorMessage: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const recipient = await ctx.db
+      .query("broadcastRecipients")
+      .withIndex("by_wamid", (q) => q.eq("whatsappMessageId", args.wamid))
+      .first();
+    if (!recipient) return null;
+
+    if (!isValidStatusTransition(recipient.status, args.status)) {
+      return recipient._id;
+    }
+
+    await applyRecipientStatusChange(ctx, recipient, args.status, {
+      errorMessage: args.errorMessage,
+    });
+    return recipient._id;
   },
 });
 

@@ -1,8 +1,16 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
+import {
+  buildFlowDispatchMessage,
+  buildMessageReceivedPayload,
+  determineAutomationTriggers,
+  runBestEffort,
+} from "./ingest";
+import { encrypt } from "./lib/whatsappEncryption";
+import type { Id } from "./_generated/dataModel";
 
 // Convex function modules for convex-test to resolve `internal.*`
 // references against. Absolute, from-project-root pattern (matches
@@ -315,4 +323,579 @@ test("ingestInbound persists mediaUrl for a media message and interactiveReplyId
   const replyMessage = await t.run((ctx) => ctx.db.get(replyResult.messageId));
   expect(replyMessage!.contentType).toBe("interactive");
   expect(replyMessage!.interactiveReplyId).toBe("btn_yes");
+});
+
+// ============================================================
+// processInbound — the inbound-processing orchestrator (Phase 8, Task 4)
+// ============================================================
+
+afterEach(() => {
+  // Belt-and-suspenders, matching every other DRY-RUN suite's own
+  // afterEach (`flowsEngine.test.ts`/`automationsEngine.test.ts`/
+  // `aiReply.test.ts`): a thrown assertion could skip a test's own
+  // cleanup otherwise.
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.CONVEX_AI_DRY_RUN;
+});
+
+// ------------------------------------------------------------
+// Seed helpers for the engines processInbound fans out to
+// (flows/automations/AI reply/webhook delivery) — duplicated from
+// `flowsEngine.test.ts`/`automationsEngine.test.ts`/`aiReply.test.ts`/
+// `webhookDelivery.test.ts` rather than imported, matching this
+// codebase's established per-suite-owns-its-own-helpers convention
+// (see this file's own `seedAccount` comment). Every insert is a direct
+// `t.run`, no membership/identity seeded — every engine
+// `processInbound` calls is itself session-less, exactly like
+// `ingestInbound` above.
+// ------------------------------------------------------------
+
+async function seedFlow(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    triggerType: "keyword" | "first_inbound_message" | "manual";
+    triggerConfig?: unknown;
+    entryNodeId: string;
+  },
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("flows", {
+      accountId: opts.accountId,
+      name: "Test flow",
+      status: "active",
+      triggerType: opts.triggerType,
+      triggerConfig: opts.triggerConfig,
+      entryNodeId: opts.entryNodeId,
+      fallbackPolicy: {
+        on_unknown_reply: "reprompt",
+        max_reprompts: 2,
+        on_timeout_hours: 24,
+        on_exhaust: "handoff",
+      },
+      executionCount: 0,
+    }),
+  );
+}
+
+async function seedNode(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    flowId: Id<"flows">;
+    nodeKey: string;
+    nodeType: "start" | "end";
+    config?: unknown;
+  },
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("flowNodes", {
+      accountId: opts.accountId,
+      flowId: opts.flowId,
+      nodeKey: opts.nodeKey,
+      nodeType: opts.nodeType,
+      config: opts.config ?? {},
+      positionX: 0,
+      positionY: 0,
+    }),
+  );
+}
+
+async function seedAutomationWithAddTag(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    triggerType: string;
+    triggerConfig?: unknown;
+    tagId: Id<"tags">;
+  },
+) {
+  const automationId = await t.run((ctx) =>
+    ctx.db.insert("automations", {
+      accountId: opts.accountId,
+      name: `Test automation (${opts.triggerType})`,
+      triggerType: opts.triggerType,
+      triggerConfig: opts.triggerConfig,
+      isActive: true,
+      executionCount: 0,
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("automationSteps", {
+      accountId: opts.accountId,
+      automationId,
+      stepType: "add_tag",
+      stepConfig: { tag_id: opts.tagId },
+      position: 0,
+    }),
+  );
+  return automationId;
+}
+
+async function seedTag(t: ReturnType<typeof convexTest>, accountId: Id<"accounts">, name: string) {
+  return await t.run((ctx) => ctx.db.insert("tags", { accountId, name, color: "#000000" }));
+}
+
+// Scans (not `.withIndex`) — a helper parameter typed as the bare
+// `ReturnType<typeof convexTest>` loses this suite's concrete index
+// names (see `flowsEngine.test.ts`'s own `messagesFor`/
+// `automationsEngine.test.ts`'s own `tagLink` for the identical,
+// already-documented gotcha).
+async function tagLink(t: ReturnType<typeof convexTest>, contactId: Id<"contacts">, tagId: Id<"tags">) {
+  return await t.run((ctx) =>
+    ctx.db
+      .query("contactTags")
+      .filter((q) => q.and(q.eq(q.field("contactId"), contactId), q.eq(q.field("tagId"), tagId)))
+      .first(),
+  );
+}
+
+async function messagesFor(t: ReturnType<typeof convexTest>, conversationId: Id<"conversations">) {
+  return await t.run((ctx) =>
+    ctx.db.query("messages").filter((q) => q.eq(q.field("conversationId"), conversationId)).collect(),
+  );
+}
+
+/** Active + auto-reply-enabled AI config, seeded directly (bypassing
+ *  `aiConfig.upsert`'s own admin-role gate — this suite has no
+ *  membership/identity, matching every helper above) with a genuinely
+ *  encrypted `apiKey` (`aiConfig.loadDecrypted` always decrypts it, dry
+ *  run or not). */
+async function seedAiConfig(t: ReturnType<typeof convexTest>, accountId: Id<"accounts">) {
+  const apiKey = await encrypt("sk-test-key");
+  return await t.run((ctx) =>
+    ctx.db.insert("aiConfigs", {
+      accountId,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      apiKey,
+      isActive: true,
+      autoReplyEnabled: true,
+      autoReplyMaxPerConversation: 3,
+    }),
+  );
+}
+
+async function seedWebhookEndpoint(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; events: string[] },
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("webhookEndpoints", {
+      accountId: opts.accountId,
+      url: "https://example.com/hook",
+      secret: "whsec_test_plaintext",
+      events: opts.events,
+      isActive: true,
+      failureCount: 0,
+    }),
+  );
+}
+
+// ------------------------------------------------------------
+// Pure-helper tests — determineAutomationTriggers/buildFlowDispatchMessage/
+// buildMessageReceivedPayload/runBestEffort, ported byte-faithfully from
+// route.ts's own precedence (see `ingest.ts`'s header comment on
+// `processInbound` for the exact line refs). Mirrors this codebase's
+// established convention of unit-testing extracted pure decision logic
+// directly (`colsForStatus`, `triggerMatches`, `matchesKeywordTrigger`).
+// ------------------------------------------------------------
+
+test("determineAutomationTriggers: not consumed, plain text — only the two content triggers", () => {
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: false,
+      wasCreated: false,
+      isFirstInboundMessage: false,
+    }),
+  ).toEqual(["new_message_received", "keyword_match"]);
+});
+
+test("determineAutomationTriggers: not consumed, interactive tap — content triggers plus interactive_reply", () => {
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: false,
+      wasCreated: false,
+      isFirstInboundMessage: false,
+      interactiveReplyId: "btn_yes",
+    }),
+  ).toEqual(["new_message_received", "keyword_match", "interactive_reply"]);
+});
+
+test("determineAutomationTriggers: consumed — content triggers (incl. interactive_reply) are suppressed entirely", () => {
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: true,
+      wasCreated: false,
+      isFirstInboundMessage: false,
+      interactiveReplyId: "btn_yes",
+    }),
+  ).toEqual([]);
+});
+
+test("determineAutomationTriggers: relationship triggers (new_contact_created/first_inbound_message) fire regardless of flowConsumed", () => {
+  // Consumed: content triggers suppressed, relationship triggers still
+  // present — and in the exact source order (wasCreated unshifted
+  // first, then isFirstInboundMessage, so the latter ends up at index 0
+  // when both are true — route.ts:782-783).
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: true,
+      wasCreated: true,
+      isFirstInboundMessage: true,
+    }),
+  ).toEqual(["first_inbound_message", "new_contact_created"]);
+
+  // Not consumed: relationship triggers lead, content triggers follow.
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: false,
+      wasCreated: true,
+      isFirstInboundMessage: true,
+    }),
+  ).toEqual([
+    "first_inbound_message",
+    "new_contact_created",
+    "new_message_received",
+    "keyword_match",
+  ]);
+});
+
+test("determineAutomationTriggers: only wasCreated true — new_contact_created alone leads", () => {
+  expect(
+    determineAutomationTriggers({
+      flowConsumed: false,
+      wasCreated: true,
+      isFirstInboundMessage: false,
+    }),
+  ).toEqual(["new_contact_created", "new_message_received", "keyword_match"]);
+});
+
+test("buildFlowDispatchMessage: plain text vs. an interactive tap", () => {
+  expect(
+    buildFlowDispatchMessage({ text: "hi there", wamid: "wamid-1" }),
+  ).toEqual({ kind: "text", text: "hi there", metaMessageId: "wamid-1" });
+
+  // No `text` supplied — falls back to "", mirrors the source's
+  // `contentText ?? message.text?.body ?? ''`.
+  expect(buildFlowDispatchMessage({ wamid: "wamid-2" })).toEqual({
+    kind: "text",
+    text: "",
+    metaMessageId: "wamid-2",
+  });
+
+  expect(
+    buildFlowDispatchMessage({
+      text: "Yes please",
+      wamid: "wamid-3",
+      interactiveReplyId: "btn_yes",
+    }),
+  ).toEqual({
+    kind: "interactive_reply",
+    replyId: "btn_yes",
+    replyTitle: "Yes please",
+    metaMessageId: "wamid-3",
+  });
+});
+
+test("buildMessageReceivedPayload: matches the public message.received contract, text defaults to null (not undefined)", () => {
+  const conversationId = "conv_1" as Id<"conversations">;
+  const contactId = "contact_1" as Id<"contacts">;
+
+  expect(
+    buildMessageReceivedPayload({
+      conversationId,
+      contactId,
+      wamid: "wamid-1",
+      contentType: "text",
+      text: "hello",
+    }),
+  ).toEqual({
+    conversation_id: conversationId,
+    contact_id: contactId,
+    whatsapp_message_id: "wamid-1",
+    content_type: "text",
+    text: "hello",
+  });
+
+  expect(
+    buildMessageReceivedPayload({
+      conversationId,
+      contactId,
+      wamid: "wamid-2",
+      contentType: "image",
+    }),
+  ).toMatchObject({ text: null });
+});
+
+test("runBestEffort: swallows a rejection and logs instead of throwing", async () => {
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  await expect(
+    runBestEffort("some-step", () => Promise.reject(new Error("boom"))),
+  ).resolves.toBeUndefined();
+  expect(errorSpy).toHaveBeenCalledWith(
+    "[webhook] some-step failed:",
+    "boom",
+  );
+  errorSpy.mockRestore();
+});
+
+test("runBestEffort: a resolving fn completes normally with no error logged", async () => {
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  let ran = false;
+  await runBestEffort("some-step", async () => {
+    ran = true;
+  });
+  expect(ran).toBe(true);
+  expect(errorSpy).not.toHaveBeenCalled();
+  errorSpy.mockRestore();
+});
+
+// ------------------------------------------------------------
+// processInbound — integration tests via convex-test, real engines,
+// DRY-RUN throughout (both CONVEX_META_DRY_RUN, for flows/AI-send/
+// webhook delivery, and CONVEX_AI_DRY_RUN for the LLM call itself —
+// same two-flag convention `aiReply.test.ts` documents).
+// ------------------------------------------------------------
+
+test("processInbound on a brand-new contact runs the full fan-out in order: ingest -> flows (no match) -> automations (all four triggers) -> AI reply -> webhook delivery", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const newContactTag = await seedTag(t, accountId, "new-contact");
+  const firstInboundTag = await seedTag(t, accountId, "first-inbound");
+  const newMessageTag = await seedTag(t, accountId, "new-message");
+  const keywordTag = await seedTag(t, accountId, "keyword");
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_contact_created", tagId: newContactTag });
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "first_inbound_message", tagId: firstInboundTag });
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_message_received", tagId: newMessageTag });
+  await seedAutomationWithAddTag(t, {
+    accountId,
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: ["help"], match_type: "contains" },
+    tagId: keywordTag,
+  });
+  await seedAiConfig(t, accountId);
+  const endpointId = await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    name: "Jamie Customer",
+    message: { type: "text", text: "hi, need some help please", wamid: "wamid.FULL" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(result.flowConsumed).toBe(false);
+
+  const ingested = await t.run((ctx) =>
+    ctx.db
+      .query("contacts")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  const contactId = ingested!._id;
+  expect(await tagLink(t, contactId, newContactTag)).not.toBeNull();
+  expect(await tagLink(t, contactId, firstInboundTag)).not.toBeNull();
+  expect(await tagLink(t, contactId, newMessageTag)).not.toBeNull();
+  expect(await tagLink(t, contactId, keywordTag)).not.toBeNull();
+
+  const conversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .filter((q) => q.eq(q.field("contactId"), contactId))
+      .first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  const botMessages = messages.filter((m) => m.senderType === "bot");
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0]!.aiGenerated).toBe(true);
+
+  const endpoint = await t.run((ctx) => ctx.db.get(endpointId));
+  expect(endpoint!.lastDeliveryAt).toBeDefined();
+});
+
+test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const tagId = await seedTag(t, accountId, "greeted");
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_message_received", tagId });
+  await seedAiConfig(t, accountId);
+  const endpointId = await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const first = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello there", wamid: "wamid.DUPETEST" },
+  });
+  expect(first.duplicate).toBe(false);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messagesAfterFirst = await messagesFor(t, conversation!._id);
+  const botMessagesAfterFirst = messagesAfterFirst.filter((m) => m.senderType === "bot");
+  const endpointAfterFirst = await t.run((ctx) => ctx.db.get(endpointId));
+
+  // Meta redelivers the identical webhook (same wamid).
+  const second = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello there", wamid: "wamid.DUPETEST" },
+  });
+  expect(second.duplicate).toBe(true);
+  expect(second.flowConsumed).toBe(false);
+
+  // No SECOND automation run, AI reply, or webhook delivery attempt —
+  // every observable side effect is identical to right after the FIRST
+  // call.
+  const messagesAfterSecond = await messagesFor(t, conversation!._id);
+  expect(messagesAfterSecond).toHaveLength(messagesAfterFirst.length);
+  const botMessagesAfterSecond = messagesAfterSecond.filter((m) => m.senderType === "bot");
+  expect(botMessagesAfterSecond).toHaveLength(botMessagesAfterFirst.length);
+  const endpointAfterSecond = await t.run((ctx) => ctx.db.get(endpointId));
+  expect(endpointAfterSecond!.lastDeliveryAt).toBe(endpointAfterFirst!.lastDeliveryAt);
+});
+
+test("a flow that consumes the inbound suppresses new_message_received/keyword_match automations and the AI reply, but relationship-trigger automations and webhook delivery still fire", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  // A minimal flow (start -> end, no sends) that matches the inbound
+  // text and consumes it outright.
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["hi"], match_type: "contains" },
+    entryNodeId: "start",
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "end1" } });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const contentTag = await seedTag(t, accountId, "content-trigger");
+  const relationshipTag = await seedTag(t, accountId, "relationship-trigger");
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_message_received", tagId: contentTag });
+  await seedAutomationWithAddTag(t, { accountId, triggerType: "new_contact_created", tagId: relationshipTag });
+  await seedAiConfig(t, accountId);
+  const endpointId = await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hi there", wamid: "wamid.FLOWCONSUMED" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(result.flowConsumed).toBe(true);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  // Content-level trigger suppressed...
+  expect(await tagLink(t, contact!._id, contentTag)).toBeNull();
+  // ...but the relationship trigger (unaffected by consumption) still fired.
+  expect(await tagLink(t, contact!._id, relationshipTag)).not.toBeNull();
+
+  // No AI-generated reply — the flow (which sends nothing itself, just
+  // start -> end) consumed the message, so only the original inbound
+  // customer message exists in the thread.
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+
+  // webhook delivery still fires regardless of consumption.
+  const endpoint = await t.run((ctx) => ctx.db.get(endpointId));
+  expect(endpoint!.lastDeliveryAt).toBeDefined();
+});
+
+test("an interactive reply dispatches the interactive_reply automation trigger (when not consumed by a flow) and never reaches the AI reply", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const replyTag = await seedTag(t, accountId, "interactive-reply");
+  await seedAutomationWithAddTag(t, {
+    accountId,
+    triggerType: "interactive_reply",
+    triggerConfig: { reply_ids: ["btn_yes"] },
+    tagId: replyTag,
+  });
+  await seedAiConfig(t, accountId);
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "interactive",
+      text: "Yes please",
+      interactiveReplyId: "btn_yes",
+      wamid: "wamid.INTERACTIVE",
+    },
+  });
+
+  expect(result.flowConsumed).toBe(false);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  expect(await tagLink(t, contact!._id, replyTag)).not.toBeNull();
+
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  // Only the original inbound interactive-reply message — the AI reply
+  // gate (`!interactiveReplyId`) never opens for an interactive tap.
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+});
+
+test("processInbound: an automations phase matching zero automations (nothing to do) still lets the AI reply and webhook delivery run to completion", async () => {
+  // No automation seeded at all — `automationsEngine.runForTrigger`
+  // legitimately no-ops for every trigger in the set. This proves the
+  // fan-out steps are independent: an earlier step doing nothing useful
+  // must never prevent a later step from running. (A literal THROW from
+  // one of the four engines `processInbound` calls is a separate
+  // concern, covered by the `runBestEffort` unit tests above with a
+  // manufactured rejection — all four engines are documented to never
+  // throw by design, each owning its own top-level try/catch, so that
+  // failure mode isn't reachable through real engine behavior here.)
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  const endpointId = await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello, anyone there?", wamid: "wamid.ISOLATION" },
+  });
+
+  expect(result.duplicate).toBe(false);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(1);
+
+  const endpoint = await t.run((ctx) => ctx.db.get(endpointId));
+  expect(endpoint!.lastDeliveryAt).toBeDefined();
 });

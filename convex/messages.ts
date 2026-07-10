@@ -287,3 +287,53 @@ export const getForAccount = internalQuery({
     return message;
   },
 });
+
+/**
+ * Meta delivery-status webhook handler (Phase 8, Task 4) — Convex port
+ * of the `messages` mirror in `src/app/api/whatsapp/webhook/route.ts`'s
+ * `handleStatusUpdate` (step 1, lines ~358-370). Meta's own status
+ * values (`sent`/`delivered`/`read`/`failed`) already match this
+ * table's `status` union 1:1 — no translation table needed, same as
+ * the source's own comment on this ("Meta's status values already
+ * match the CHECK constraint on messages.status").
+ *
+ * `wamid` (`messages.messageId`) is NOT unique — `by_message_id` has no
+ * uniqueness guarantee (see `ingest.ts`'s own comment on this exact
+ * index: Meta ids can repeat across different WhatsApp numbers /
+ * accounts) — so this matches 0..N rows via `.collect()`, mirroring the
+ * source's own "updates 0..N rows and must not assume a single row".
+ * `accountId` is OPTIONAL and, when supplied, filters out any row that
+ * doesn't belong to it — an IMPROVEMENT over the source (whose
+ * `handleStatusUpdate` has no accountId in scope at all for this call,
+ * see `processWebhook`) that keeps a same-string wamid collision across
+ * two tenants from ever patching the wrong one's message once the
+ * caller (the httpAction, resolved via `phone_number_id`) has an
+ * accountId on hand. Omitted, it falls back to the source's own
+ * account-agnostic sweep.
+ */
+export const updateDeliveryStatusByWamid = internalMutation({
+  args: {
+    wamid: v.string(),
+    status: v.union(
+      v.literal("sent"),
+      v.literal("delivered"),
+      v.literal("read"),
+      v.literal("failed"),
+    ),
+    accountId: v.optional(v.id("accounts")),
+  },
+  handler: async (ctx, args) => {
+    const matches = await ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("messageId", args.wamid))
+      .collect();
+
+    let updated = 0;
+    for (const message of matches) {
+      if (args.accountId && message.accountId !== args.accountId) continue;
+      await ctx.db.patch(message._id, { status: args.status });
+      updated += 1;
+    }
+    return { matched: matches.length, updated };
+  },
+});

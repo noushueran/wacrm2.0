@@ -1,6 +1,7 @@
 import { accountMutation, accountQuery } from "./lib/auth";
+import { internalMutation } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
@@ -201,5 +202,99 @@ export const remove = accountMutation({
     ctx.requireRole("agent");
     await requireOwnTemplate(ctx, args.templateId);
     await ctx.db.delete(args.templateId);
+  },
+});
+
+type TemplateStatus = NonNullable<Doc<"messageTemplates">["status"]>;
+
+const TEMPLATE_STATUS_VALUES: ReadonlySet<string> = new Set([
+  "DRAFT",
+  "PENDING",
+  "APPROVED",
+  "REJECTED",
+  "PAUSED",
+  "DISABLED",
+  "IN_APPEAL",
+  "PENDING_DELETION",
+]);
+
+/**
+ * Normalizes a raw Meta template-lifecycle event string into
+ * `messageTemplates.status`'s own enum. Convex port of
+ * `src/lib/whatsapp/template-status-normalize.ts`'s `normalizeStatus`:
+ * Meta's Cloud API sometimes sends `PENDING_REVIEW` where the docs say
+ * `PENDING` — mapped through explicitly; anything else unrecognised
+ * falls back to `PENDING` so the row stays visible rather than silently
+ * dropped. Exported for direct unit testing, mirroring
+ * `template-status-normalize.test.ts`'s own dedicated coverage of the
+ * source function.
+ */
+export function normalizeTemplateStatus(raw: string): TemplateStatus {
+  const upper = (raw ?? "").toUpperCase();
+  if (upper === "PENDING_REVIEW") return "PENDING";
+  return TEMPLATE_STATUS_VALUES.has(upper) ? (upper as TemplateStatus) : "PENDING";
+}
+
+/**
+ * Meta template-lifecycle webhook handler (Phase 8, Task 4) — Convex
+ * port of `src/lib/whatsapp/template-webhook.ts`'s `handleStatusUpdate`
+ * (the `message_template_status_update` branch only; DETECTING that
+ * field — as opposed to the sibling quality/components fields — is the
+ * caller/httpAction's job, the same division of labor
+ * `isTemplateWebhookField`/`handleTemplateWebhookChange` have in the
+ * source).
+ *
+ * `by_meta_template_id` is NOT account-scoped (schema.ts's own comment
+ * on this index) and this handler has no session/account to filter by
+ * either — a webhook-triggered dispatch, exactly like every other
+ * internal handler in this phase. Mirrors the source's own
+ * account-agnostic behavior exactly (rather than `updateStatusByMetaId`'s
+ * `ctx.accountId` filter, which only applies when there IS a session):
+ * EVERY row sharing `metaTemplateId` gets patched (0..N), with a
+ * `console.warn` if more than one matched ("investigate"), same as the
+ * source. `rejectionReason` is unconditionally set-or-cleared alongside
+ * `status` (cleared — `undefined` — on any non-REJECTED status, exactly
+ * like the source clears it to `null`) and `submissionError` is always
+ * cleared too, matching `handleStatusUpdate`'s own update object
+ * byte-for-byte.
+ */
+export const applyMetaStatusWebhook = internalMutation({
+  args: {
+    metaTemplateId: v.string(),
+    event: v.string(),
+    reason: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const status = normalizeTemplateStatus(args.event);
+
+    const candidates = await ctx.db
+      .query("messageTemplates")
+      .withIndex("by_meta_template_id", (q) =>
+        q.eq("metaTemplateId", args.metaTemplateId),
+      )
+      .collect();
+
+    if (candidates.length === 0) {
+      console.warn(
+        "[template-webhook] status update received for unknown template:",
+        args.metaTemplateId,
+      );
+      return;
+    }
+    if (candidates.length > 1) {
+      console.warn(
+        `[template-webhook] status update matched ${candidates.length} rows for meta_template_id ${args.metaTemplateId} — investigate.`,
+      );
+    }
+
+    for (const template of candidates) {
+      await ctx.db.patch(template._id, {
+        status,
+        rejectionReason:
+          status === "REJECTED" ? args.reason ?? "Rejected by Meta" : undefined,
+        submissionError: undefined,
+        updatedAt: Date.now(),
+      });
+    }
   },
 });

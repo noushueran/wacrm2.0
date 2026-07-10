@@ -1,4 +1,5 @@
-import { internalMutation } from "./_generated/server";
+import { internalAction, internalMutation } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import {
@@ -46,41 +47,45 @@ import type { Doc, Id } from "./_generated/dataModel";
 // reads `isFirstInboundMessage` to decide whether to run it at all.
 // ============================================================
 
+// Flattened inbound-message shape, modeled after what `processMessage`'s
+// `parseMessageContent` resolves a raw WhatsApp webhook payload down to
+// (`contentText`/`mediaUrl`/`interactiveReplyId`) rather than the nested
+// Meta JSON itself — the caller (webhook route) does that flattening,
+// same as it already does today. `mediaId` (Meta's raw, unresolved
+// media-object id) is accepted for shape-fidelity with `processMessage`'s
+// inbound payload, but NOT resolved here: turning it into a fetchable
+// `mediaUrl` needs a signed Meta Graph API call with the account's access
+// token — real network I/O a plain `internalMutation` can't do (no
+// `fetch` inside a mutation). A caller that only has `mediaId` and needs
+// `mediaUrl` persisted must resolve it first (e.g. via an action, the
+// same `getMediaUrl` Meta call `processMessage` itself makes) and pass
+// the result as `mediaUrl`. Extracted to a module-level const (rather
+// than declared inline in `ingestInbound`'s own args) so `processInbound`
+// below can share the identical validator instead of a second,
+// drift-prone copy.
+const inboundMessageValidator = v.object({
+  type: v.union(
+    v.literal("text"),
+    v.literal("image"),
+    v.literal("document"),
+    v.literal("audio"),
+    v.literal("video"),
+    v.literal("location"),
+    v.literal("interactive"),
+  ),
+  text: v.optional(v.string()),
+  mediaId: v.optional(v.string()),
+  mediaUrl: v.optional(v.string()),
+  wamid: v.string(),
+  interactiveReplyId: v.optional(v.string()),
+});
+
 export const ingestInbound = internalMutation({
   args: {
     accountId: v.id("accounts"),
     from: v.string(),
     name: v.optional(v.string()),
-    // Flattened inbound-message shape, modeled after what
-    // `processMessage`'s `parseMessageContent` resolves a raw WhatsApp
-    // webhook payload down to (`contentText`/`mediaUrl`/
-    // `interactiveReplyId`) rather than the nested Meta JSON itself —
-    // the caller (webhook route) does that flattening, same as it
-    // already does today. `mediaId` (Meta's raw, unresolved media-object
-    // id) is accepted for shape-fidelity with `processMessage`'s inbound
-    // payload, but NOT resolved here: turning it into a fetchable
-    // `mediaUrl` needs a signed Meta Graph API call with the account's
-    // access token — real network I/O a plain `internalMutation` can't
-    // do (no `fetch` inside a mutation). A caller that only has
-    // `mediaId` and needs `mediaUrl` persisted must resolve it first
-    // (e.g. via an action, the same `getMediaUrl` Meta call
-    // `processMessage` itself makes) and pass the result as `mediaUrl`.
-    message: v.object({
-      type: v.union(
-        v.literal("text"),
-        v.literal("image"),
-        v.literal("document"),
-        v.literal("audio"),
-        v.literal("video"),
-        v.literal("location"),
-        v.literal("interactive"),
-      ),
-      text: v.optional(v.string()),
-      mediaId: v.optional(v.string()),
-      mediaUrl: v.optional(v.string()),
-      wamid: v.string(),
-      interactiveReplyId: v.optional(v.string()),
-    }),
+    message: inboundMessageValidator,
   },
   handler: async (ctx, args) => {
     const { accountId, from, name, message } = args;
@@ -234,5 +239,294 @@ export const ingestInbound = internalMutation({
       isFirstInboundMessage,
       duplicate: false,
     };
+  },
+});
+
+// ============================================================
+// Inbound-processing orchestrator (Phase 8, Task 4) — Convex port of
+// `src/app/api/whatsapp/webhook/route.ts`'s `processMessage` fan-out
+// (lines ~710-826, AFTER the message row itself is inserted, which
+// `ingestInbound` above already owns): ingest, then Flows -> (if not
+// consumed) Automations + AI reply -> webhook delivery, in that exact
+// order. Called by the (not-yet-built) httpAction webhook entrypoint;
+// this file has no knowledge of Meta's raw JSON or signature
+// verification — same trust boundary `ingestInbound` already documents.
+//
+// Precedence ported EXACTLY from the source (confirmed against
+// route.ts's actual line numbers, not just the plan doc's approximate
+// range):
+//   - route.ts:729-749  Flows dispatch runs FIRST and is AWAITED — the
+//     `consumed` result gates what follows.
+//   - route.ts:764-775  Content-level automation triggers
+//     (`new_message_received`, `keyword_match`, and — only for an
+//     interactive tap — `interactive_reply`) are pushed ONLY when
+//     `!flowConsumed`. Relationship triggers are NOT gated on
+//     `flowConsumed` at all:
+//   - route.ts:782-783  `new_contact_created` (`wasCreated`) and
+//     `first_inbound_message` (`isFirstInboundMessage`) are unshifted
+//     unconditionally, wasCreated first then isFirstInboundMessage
+//     (so when both are true, `first_inbound_message` ends up at index
+//     0) — still fire even when a flow consumed the message, since
+//     they're about WHO is messaging, not what they said.
+//   - route.ts:784-797  Every trigger in the resulting set dispatches to
+//     `runAutomationsForTrigger`. Fire-and-forget in the source
+//     (`.catch()`, never awaited) — see `runBestEffort`'s own comment
+//     below for why this port awaits each one instead.
+//   - route.ts:799-811  AI auto-reply dispatches only when
+//     `!flowConsumed && !interactiveReplyId && inboundText.trim()`.
+//   - route.ts:813-826  The `message.received` webhook fan-out sits
+//     OUTSIDE every one of the guards above — it is the last thing
+//     `processMessage` does and always runs, whether or not a flow
+//     consumed the message, whether or not any automation or AI reply
+//     fired.
+//
+// NOT ported (a pre-existing, already-flagged gap, not an oversight of
+// this task): the "stand down when an active new_message_received/
+// keyword_match automation exists" check inside the SOURCE's
+// `dispatchInboundToAiReply` (src/lib/ai/auto-reply.ts) that avoids
+// double-texting the customer when both an automation and the AI would
+// otherwise reply to the same inbound. `processMessage` itself has NO
+// such check in its own body (it lives one layer deeper, inside the AI
+// reply function) — and `convex/aiReply.ts`'s own header comment
+// documents this exact check as a deliberate Phase 7 scope cut,
+// explicitly deferring the decision of "when to call
+// aiReply.dispatchInbound at all" to "a future integration task". This
+// task's brief calls for exactly the dispatch shape used below (no
+// extra gating query); closing that gap is flagged in this task's own
+// report as a follow-up, not silently absorbed here.
+// ============================================================
+
+type FlowDispatchMessage =
+  | { kind: "text"; text: string; metaMessageId: string }
+  | {
+      kind: "interactive_reply";
+      replyId: string;
+      replyTitle: string;
+      metaMessageId: string;
+    };
+
+/**
+ * route.ts:734-746 — builds the payload `dispatchInboundToFlows` gets,
+ * from the SAME flattened `message` arg `ingestInbound` already
+ * consumed (not a second, independently-parsed shape): an interactive
+ * tap becomes `interactive_reply` (using the tapped option's id +
+ * title), anything else becomes plain `text`. Exported so the mapping
+ * itself is directly unit-testable, matching this codebase's
+ * established convention for pure decision logic (`colsForStatus`,
+ * `triggerMatches`, `matchesKeywordTrigger`, ...).
+ */
+export function buildFlowDispatchMessage(message: {
+  text?: string;
+  wamid: string;
+  interactiveReplyId?: string;
+}): FlowDispatchMessage {
+  return message.interactiveReplyId
+    ? {
+        kind: "interactive_reply",
+        replyId: message.interactiveReplyId,
+        replyTitle: message.text ?? "",
+        metaMessageId: message.wamid,
+      }
+    : {
+        kind: "text",
+        text: message.text ?? "",
+        metaMessageId: message.wamid,
+      };
+}
+
+/**
+ * route.ts:756-783 — the exact trigger-set precedence described in this
+ * file's header comment above, extracted to a pure function so every
+ * combination (consumed/not, created/not, first/not, interactive/not)
+ * is directly unit-testable without spinning up a full convex-test
+ * action run.
+ */
+export function determineAutomationTriggers(input: {
+  flowConsumed: boolean;
+  wasCreated: boolean;
+  isFirstInboundMessage: boolean;
+  interactiveReplyId?: string;
+}): string[] {
+  const triggers: string[] = [];
+  if (!input.flowConsumed) {
+    triggers.push("new_message_received", "keyword_match");
+    // route.ts:768-774 — only meaningful when a button/list reply
+    // actually arrived; skipped (along with its siblings above) when a
+    // Flow consumed the tap instead.
+    if (input.interactiveReplyId) {
+      triggers.push("interactive_reply");
+    }
+  }
+  // route.ts:782-783 — unconditional on `flowConsumed`; `wasCreated`
+  // unshifted before `isFirstInboundMessage`, exactly matching the
+  // source's own order of these two lines.
+  if (input.wasCreated) triggers.unshift("new_contact_created");
+  if (input.isFirstInboundMessage) triggers.unshift("first_inbound_message");
+  return triggers;
+}
+
+/**
+ * route.ts:820-825 — the `message.received` public-webhook payload.
+ * Deliberately snake_case (unlike `AutomationContext`'s camelCase):
+ * this crosses the wire to external subscribers of the ALREADY
+ * documented `message.received` event contract, not an internal
+ * Convex-only shape. `text` defaults to `null` (never `undefined`) so
+ * the field survives `JSON.stringify` for non-text content, matching
+ * `contentText`'s own `string | null` shape in the source.
+ */
+export function buildMessageReceivedPayload(input: {
+  conversationId: Id<"conversations">;
+  contactId: Id<"contacts">;
+  wamid: string;
+  contentType: string;
+  text?: string;
+}): Record<string, unknown> {
+  return {
+    conversation_id: input.conversationId,
+    contact_id: input.contactId,
+    whatsapp_message_id: input.wamid,
+    content_type: input.contentType,
+    text: input.text ?? null,
+  };
+}
+
+/**
+ * Runs `fn` and swallows any rejection, logging instead of throwing.
+ * Every fan-out step in `processInbound` below is wrapped in this: a
+ * throw in one (flows, automations, AI reply, webhook delivery) must
+ * never block the others or bubble into the caller, mirroring
+ * `processMessage`'s own fire-and-forget contract in the source.
+ *
+ * Unlike the source's literal un-awaited `automations(...).catch(...)`
+ * (safe there only because Vercel's `after()` keeps the route's
+ * function alive for a detached promise), every call site below AWAITS
+ * `runBestEffort` instead of firing it loose: a Convex action's
+ * lifecycle ends the moment its handler's returned promise resolves, so
+ * an un-awaited `ctx.runAction`/`ctx.runMutation` inside one is not
+ * guaranteed to complete — see `aiReply.ts`'s own `aiUsage.log` call for
+ * this exact same reasoning applied to a single Convex mutation. In
+ * practice this rarely fires at all: `flowsEngine.dispatchInbound`,
+ * `automationsEngine.runForTrigger`, `aiReply.dispatchInbound`, and
+ * `webhookDelivery.dispatch` each already wrap their own body in a
+ * top-level try/catch and are documented to never throw — this is
+ * belt-and-braces for the one layer none of them own: `ctx.runAction`/
+ * `ctx.runMutation` itself failing (a bad reference, an infra hiccup).
+ * Exported so the isolation behavior itself is directly unit-testable
+ * with a plain rejecting `fn`, independent of any Convex machinery.
+ */
+export async function runBestEffort(
+  label: string,
+  fn: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    console.error(
+      `[webhook] ${label} failed:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+export const processInbound = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    from: v.string(),
+    name: v.optional(v.string()),
+    message: inboundMessageValidator,
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ duplicate: boolean; flowConsumed: boolean }> => {
+    const { accountId, from, name, message } = args;
+
+    const res = await ctx.runMutation(internal.ingest.ingestInbound, {
+      accountId,
+      from,
+      name,
+      message,
+    });
+
+    // route.ts's own comment on `duplicate` (see `ingestInbound` above):
+    // a Meta retry re-delivering an already-persisted wamid — skip ALL
+    // fan-out, not just the insert.
+    if (res.duplicate) {
+      return { duplicate: true, flowConsumed: false };
+    }
+
+    // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
+    // result gates the content-level automation triggers + AI reply
+    // below, so it must be known before either dispatches.
+    let flowConsumed = false;
+    await runBestEffort("flowsEngine.dispatchInbound", async () => {
+      const flowResult = await ctx.runAction(
+        internal.flowsEngine.dispatchInbound,
+        {
+          accountId,
+          contactId: res.contactId,
+          message: buildFlowDispatchMessage(message),
+          isFirstInboundMessage: res.isFirstInboundMessage,
+        },
+      );
+      flowConsumed = flowResult.consumed;
+    });
+
+    // ---- Automations (route.ts:756-797). Every trigger in the set
+    // dispatches independently and best-effort — one failing (or
+    // matching zero automations) must never affect the others.
+    const automationTriggers = determineAutomationTriggers({
+      flowConsumed,
+      wasCreated: res.wasCreated,
+      isFirstInboundMessage: res.isFirstInboundMessage,
+      interactiveReplyId: message.interactiveReplyId,
+    });
+    const inboundText = message.text ?? "";
+    await Promise.all(
+      automationTriggers.map((triggerType) =>
+        runBestEffort(`automationsEngine.runForTrigger(${triggerType})`, () =>
+          ctx.runAction(internal.automationsEngine.runForTrigger, {
+            accountId,
+            triggerType,
+            contactId: res.contactId,
+            context: {
+              messageText: inboundText,
+              conversationId: res.conversationId,
+              interactiveReplyId: message.interactiveReplyId ?? undefined,
+            },
+          }),
+        ),
+      ),
+    );
+
+    // ---- AI auto-reply (route.ts:799-811) — flows win over the LLM,
+    // and an interactive tap never reaches the LLM either.
+    if (!flowConsumed && !message.interactiveReplyId && inboundText.trim()) {
+      await runBestEffort("aiReply.dispatchInbound", () =>
+        ctx.runAction(internal.aiReply.dispatchInbound, {
+          accountId,
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+        }),
+      );
+    }
+
+    // ---- message.received webhook (route.ts:813-826) — OUTSIDE every
+    // guard above; always fires, flow-consumed or not.
+    await runBestEffort("webhookDelivery.dispatch", () =>
+      ctx.runAction(internal.webhookDelivery.dispatch, {
+        accountId,
+        event: "message.received",
+        payload: buildMessageReceivedPayload({
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+          wamid: message.wamid,
+          contentType: message.type,
+          text: message.text,
+        }),
+      }),
+    );
+
+    return { duplicate: false, flowConsumed };
   },
 });

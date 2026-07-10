@@ -2,6 +2,7 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { encrypt } from "./lib/whatsappEncryption";
+import type { Id } from "./_generated/dataModel";
 
 // ============================================================
 // WhatsApp Cloud API connection — one row per account
@@ -179,5 +180,77 @@ export const getForAccount = internalQuery({
       .query("whatsappConfig")
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .first();
+  },
+});
+
+/**
+ * Server-only tenancy lookup for the inbound webhook (Phase 8, Task 4):
+ * every Meta delivery (message OR status change) carries `value.metadata
+ * .phone_number_id`, and this is how the httpAction maps that back to
+ * the owning account/config before calling `ingest.processInbound` (or
+ * the status/template handlers). Mirrors `getForAccount`'s exact "never
+ * throws, `null` for not-configured" contract, just keyed by
+ * `by_phone_number_id` instead of `by_account` — `wacrm` is
+ * single-tenant-per-WhatsApp-number (see `upsert`'s own comment on this),
+ * so at most one row can ever match.
+ *
+ * Returns the row AS-IS, including the encrypted `accessToken`
+ * ciphertext — this is a `query`; decrypting it is the caller's job (an
+ * action, since whatever needs the plaintext token also needs `fetch`
+ * for the downstream Meta call). This function itself never decrypts
+ * anything.
+ */
+export const accountByPhoneNumberId = internalQuery({
+  args: { phoneNumberId: v.string() },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_phone_number_id", (q) =>
+        q.eq("phoneNumberId", args.phoneNumberId),
+      )
+      .first();
+  },
+});
+
+/**
+ * Server-only counterpart to the webhook GET-verification check in
+ * `src/app/api/whatsapp/webhook/route.ts` (lines ~117-132): Meta's
+ * subscribe handshake carries a plaintext `hub.verify_token` query
+ * param, matched here against every stored config's `verifyToken`.
+ *
+ * IMPORTANT deviation from the source: the source's `verify_token`
+ * column is ENCRYPTED at rest, so its GET handler decrypts each stored
+ * row before comparing. This Convex table's `verifyToken` is stored as
+ * plain text — `upsert` above (`convex/whatsappConfig.ts`) never
+ * encrypts it (only `accessToken` gets that treatment), confirmed by
+ * `whatsappConfig.test.ts`'s own existing assertion
+ * (`expect(row!.verifyToken).toBe("verify-1")`, no `decrypt()` in
+ * sight). Matching against THIS codebase's actual current data model
+ * means a plain equality check, not a decrypt-then-compare — decrypting
+ * a plaintext value would throw on every row and never match anything.
+ * (Whether `verifyToken` SHOULD be encrypted like `accessToken` is a
+ * pre-existing question for `upsert`, not something this read-only
+ * lookup can fix — see this task's own report.)
+ *
+ * There's no index to look this up by (the plaintext token is only
+ * known at verification time, never stored elsewhere), so this is a
+ * full table scan, mirroring the source's own unfiltered `SELECT id,
+ * verify_token FROM whatsapp_config`. A config with no `verifyToken` set
+ * is skipped. Returns the matched config's `accountId`, or `null` for no
+ * match. Does NOT port the source's opportunistic legacy-format-to-GCM
+ * token upgrade (a write, and moot besides — there is no encrypted
+ * format here to upgrade FROM).
+ */
+export const matchVerifyToken = internalQuery({
+  args: { verifyToken: v.string() },
+  handler: async (ctx, args): Promise<Id<"accounts"> | null> => {
+    const configs = await ctx.db.query("whatsappConfig").collect();
+    for (const config of configs) {
+      if (!config.verifyToken) continue;
+      if (config.verifyToken === args.verifyToken) {
+        return config.accountId;
+      }
+    }
+    return null;
   },
 });

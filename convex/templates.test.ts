@@ -1,9 +1,10 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { expect, test, vi } from "vitest";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { AccountRole } from "./lib/roles";
+import { normalizeTemplateStatus } from "./templates";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches
@@ -364,4 +365,158 @@ test("updateStatusByMetaId throws NOT_FOUND when no template in the caller's own
   });
   const row = await t.run((ctx) => ctx.db.get(aliceTemplateId));
   expect(row!.status).toBe("APPROVED");
+});
+
+// ============================================================
+// normalizeTemplateStatus — pure function, direct unit test (ported
+// from src/lib/whatsapp/template-status-normalize.ts's own dedicated
+// test file), mirrors updateStatusByMetaId's own statusValidator enum
+// ============================================================
+
+test("normalizeTemplateStatus passes through known Meta statuses verbatim, uppercasing lowercase input", () => {
+  expect(normalizeTemplateStatus("APPROVED")).toBe("APPROVED");
+  expect(normalizeTemplateStatus("PAUSED")).toBe("PAUSED");
+  expect(normalizeTemplateStatus("IN_APPEAL")).toBe("IN_APPEAL");
+  expect(normalizeTemplateStatus("approved")).toBe("APPROVED");
+});
+
+test("normalizeTemplateStatus maps PENDING_REVIEW to PENDING and falls back to PENDING for anything unrecognised", () => {
+  expect(normalizeTemplateStatus("PENDING_REVIEW")).toBe("PENDING");
+  expect(normalizeTemplateStatus("SOMETHING_NEW")).toBe("PENDING");
+  expect(normalizeTemplateStatus("")).toBe("PENDING");
+});
+
+// ============================================================
+// applyMetaStatusWebhook — Meta template-lifecycle webhook handler
+// (Phase 8, Task 4), ported from src/lib/whatsapp/template-webhook.ts's
+// handleStatusUpdate
+// ============================================================
+
+test("applyMetaStatusWebhook flips status to APPROVED and clears any rejectionReason/submissionError", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "REJECTED",
+    metaTemplateId: "12345",
+    submissionError: "earlier transient failure",
+  });
+  await t.run((ctx) => ctx.db.patch(templateId, { rejectionReason: "stale reason" }));
+
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "12345",
+    event: "APPROVED",
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.status).toBe("APPROVED");
+  expect(row!.rejectionReason).toBeUndefined();
+  expect(row!.submissionError).toBeUndefined();
+});
+
+test("applyMetaStatusWebhook persists the reason field on REJECTED, falling back to a generic message when Meta sends none", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    metaTemplateId: "TMPL_99",
+  });
+
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "TMPL_99",
+    event: "REJECTED",
+    reason: "Template uses non-compliant language.",
+  });
+  let row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.status).toBe("REJECTED");
+  expect(row!.rejectionReason).toBe("Template uses non-compliant language.");
+
+  // A later REJECTED with no `reason` at all falls back to the generic
+  // message rather than leaving the previous reason stale.
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "TMPL_99",
+    event: "REJECTED",
+  });
+  row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.rejectionReason).toBe("Rejected by Meta");
+});
+
+test("applyMetaStatusWebhook normalises PENDING_REVIEW to PENDING via normalizeTemplateStatus", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    metaTemplateId: "meta-pr-1",
+  });
+
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "meta-pr-1",
+    event: "PENDING_REVIEW",
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(templateId));
+  expect(row!.status).toBe("PENDING");
+});
+
+test("applyMetaStatusWebhook logs a warning and issues no patch when the metaTemplateId is unknown locally", async () => {
+  const t = convexTest(schema, modules);
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "NEVER_SEEN",
+    event: "APPROVED",
+  });
+
+  expect(warnSpy).toHaveBeenCalled();
+  expect(await t.run((ctx) => ctx.db.query("messageTemplates").collect())).toHaveLength(0);
+  warnSpy.mockRestore();
+});
+
+test("applyMetaStatusWebhook has no session/account to filter by: it patches EVERY row sharing metaTemplateId across different accounts, and warns when more than one matched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceTemplateId = await asAlice.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "PENDING",
+    metaTemplateId: "shared-webhook-id",
+  });
+  const bobTemplateId = await asBob.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "PENDING",
+    metaTemplateId: "shared-webhook-id",
+  });
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+  await t.mutation(internal.templates.applyMetaStatusWebhook, {
+    metaTemplateId: "shared-webhook-id",
+    event: "APPROVED",
+  });
+
+  expect(warnSpy).toHaveBeenCalledWith(
+    expect.stringContaining("matched 2 rows"),
+  );
+  expect((await t.run((ctx) => ctx.db.get(aliceTemplateId)))!.status).toBe("APPROVED");
+  expect((await t.run((ctx) => ctx.db.get(bobTemplateId)))!.status).toBe("APPROVED");
+  warnSpy.mockRestore();
 });
