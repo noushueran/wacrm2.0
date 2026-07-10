@@ -1,11 +1,21 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 import { colsForStatus, isValidStatusTransition } from "./broadcasts";
+
+// Belt-and-suspenders cleanup for the delivery (`send`/`deliverOne`)
+// tests further below, which opt into `vi.useFakeTimers()` +
+// `CONVEX_META_DRY_RUN` — mirrors `automationsEngine.test.ts`'s own
+// file-level `afterEach`, so a thrown assertion mid-test can never leak
+// either into a later test in this file.
+afterEach(() => {
+  vi.useRealTimers();
+  delete process.env.CONVEX_META_DRY_RUN;
+});
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches
@@ -888,4 +898,297 @@ test("recordRecipientStatusByWamid targets exactly the matching recipient: a dif
   expect(aliceBroadcast!.deliveredCount).toBe(1);
   const bobBroadcast = await t.run((ctx) => ctx.db.get(bobBroadcastId));
   expect(bobBroadcast!.deliveredCount).toBe(0);
+});
+
+// ============================================================
+// send / deliverOne — the delivery path (Phase 8, Task 4). Every test
+// that reaches `metaSend` sets `CONVEX_META_DRY_RUN`, mirroring
+// `convex/metaSend.test.ts`'s/`convex/send.test.ts`'s own convention.
+// Scheduled `deliverOne` calls never run inline — draining them needs
+// `vi.useFakeTimers()` + `t.finishAllScheduledFunctions(vi.runAllTimers)`,
+// the exact pattern `automationsEngine.test.ts`'s own wait-step test
+// uses for the same reason.
+// ============================================================
+
+test("send schedules one deliverOne per pending recipient and flips the broadcast to 'sending' — nothing has actually delivered until the schedule drains", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 3);
+  // Created as "draft" so the assertion below actually demonstrates
+  // `send` performing the flip, rather than merely leaving `create`'s
+  // own default ("sending") untouched.
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+    status: "draft",
+  });
+
+  const result = await asUser.action(api.broadcasts.send, { broadcastId });
+  expect(result).toEqual({ scheduled: 3 });
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.accountId).toBe(accountId);
+  expect(broadcast!.status).toBe("sending");
+  const recipientsBefore = await recipientsOf(asUser, broadcastId);
+  expect(recipientsBefore.every((r) => r.status === "pending")).toBe(true);
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const recipientsAfter = await recipientsOf(asUser, broadcastId);
+  expect(recipientsAfter.every((r) => r.status === "sent")).toBe(true);
+  expect(
+    recipientsAfter.every((r) =>
+      /^dry-run-[0-9a-f]{16}$/.test(r.whatsappMessageId ?? ""),
+    ),
+  ).toBe(true);
+
+  const finalBroadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(finalBroadcast!.status).toBe("sent");
+});
+
+test("deliverOne in DRY-RUN sends the template, stamps the recipient 'sent', records the wamid, and bumps sentCount via the count model", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const [contactId] = await seedContacts(asUser, 1);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: [contactId!],
+  });
+
+  // No conversation exists yet — deliverOne must find-or-create one.
+  const before = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId!))
+      .first(),
+  );
+  expect(before).toBeNull();
+
+  await asUser.action(api.broadcasts.send, { broadcastId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const [recipient] = await recipientsOf(asUser, broadcastId);
+  expect(recipient!.status).toBe("sent");
+  expect(recipient!.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+  expect(recipient!.sentAt).toBeDefined();
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.status).toBe("sent");
+  expect(broadcast!.sentCount).toBe(1); // count model — bumped, not seeded
+
+  // The template landed in the Inbox as a bot-sent message on a
+  // freshly find-or-created conversation.
+  const conversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId!))
+      .first(),
+  );
+  expect(conversation).not.toBeNull();
+  expect(conversation!.accountId).toBe(accountId);
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", conversation!._id),
+      )
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+  expect(messages[0]!.senderType).toBe("bot"); // broadcasts are bot-sent
+  expect(messages[0]!.contentType).toBe("template");
+  expect(messages[0]!.templateName).toBe(baseBroadcast.templateName);
+  expect(messages[0]!.messageId).toBe(recipient!.whatsappMessageId);
+});
+
+test("a per-recipient failure (its contact deleted before delivery) stamps 'failed' without affecting the other recipient, and the broadcast finalizes 'sent'", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const [okContactId, goneContactId] = await seedContacts(asUser, 2);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: [okContactId!, goneContactId!],
+  });
+  // Simulate the contact having been deleted sometime between broadcast
+  // creation and delivery — `broadcastRecipients.contactId` has no
+  // cascade (schema.ts's own comment), so the recipient row survives,
+  // now pointing at a missing contact.
+  await t.run((ctx) => ctx.db.delete(goneContactId!));
+
+  await asUser.action(api.broadcasts.send, { broadcastId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  const ok = recipients.find((r) => r.contactId === okContactId);
+  const gone = recipients.find((r) => r.contactId === goneContactId);
+  expect(ok!.status).toBe("sent");
+  expect(ok!.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+  expect(gone!.status).toBe("failed");
+  expect(gone!.errorMessage).toBe("Contact no longer exists");
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  // A partial send (one succeeded) is still "sent" — matches
+  // deliverBroadcast's own terminal-status rule.
+  expect(broadcast!.status).toBe("sent");
+  expect(broadcast!.sentCount).toBe(1);
+  expect(broadcast!.failedCount).toBe(1);
+});
+
+test("finalizes 'failed' when every recipient fails", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 2);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+  for (const contactId of contactIds) {
+    await t.run((ctx) => ctx.db.delete(contactId));
+  }
+
+  await asUser.action(api.broadcasts.send, { broadcastId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  expect(recipients.every((r) => r.status === "failed")).toBe(true);
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.status).toBe("failed");
+  expect(broadcast!.sentCount).toBe(0);
+  expect(broadcast!.failedCount).toBe(2);
+});
+
+test("send with zero pending recipients finalizes immediately rather than staying stuck at 'sending'", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const broadcastId = await t.run((ctx) =>
+    ctx.db.insert("broadcasts", {
+      accountId,
+      name: "Empty broadcast",
+      templateName: "spring_sale",
+      templateLanguage: "en_US",
+      status: "draft",
+      totalRecipients: 0,
+      sentCount: 0,
+      deliveredCount: 0,
+      readCount: 0,
+      repliedCount: 0,
+      failedCount: 0,
+    }),
+  );
+
+  const result = await asUser.action(api.broadcasts.send, { broadcastId });
+  expect(result).toEqual({ scheduled: 0 });
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  // Nothing ever sent, so the sentCount>0 rule resolves this straight
+  // to "failed" instead of leaving it stuck "sending" forever.
+  expect(broadcast!.status).toBe("failed");
+});
+
+test("send throws NOT_FOUND for a broadcast belonging to a different account, and schedules nothing", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const aliceContactIds = await seedContacts(asAlice, 1);
+  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: aliceContactIds,
+  });
+
+  await expect(
+    asBob.action(api.broadcasts.send, { broadcastId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "broadcast" } });
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.status).toBe("sending"); // create's default, untouched
+  const recipients = await recipientsOf(asAlice, broadcastId);
+  expect(recipients.every((r) => r.status === "pending")).toBe(true);
+});
+
+test("send throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactIds = await seedContacts(asUser, 1);
+  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+
+  await expect(
+    t.action(api.broadcasts.send, { broadcastId }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("send throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Vera",
+    email: "vera@example.com",
+    role: "viewer",
+  });
+  // A viewer can't call the agent-gated `create` mutation itself — seed
+  // a broadcast directly, mirroring `send.test.ts`'s own FORBIDDEN test.
+  const broadcastId = await t.run((ctx) =>
+    ctx.db.insert("broadcasts", {
+      accountId,
+      name: "Spring Sale",
+      templateName: "spring_sale",
+      templateLanguage: "en_US",
+      status: "draft",
+      totalRecipients: 0,
+      sentCount: 0,
+      deliveredCount: 0,
+      readCount: 0,
+      repliedCount: 0,
+      failedCount: 0,
+    }),
+  );
+
+  await expect(
+    asUser.action(api.broadcasts.send, { broadcastId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });

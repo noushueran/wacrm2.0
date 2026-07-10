@@ -1,7 +1,15 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalMutation } from "./_generated/server";
+import {
+  action,
+  internalAction,
+  internalMutation,
+  internalQuery,
+} from "./_generated/server";
+import { internal } from "./_generated/api";
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
+import { hasMinRole } from "./lib/roles";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -446,5 +454,336 @@ export const remove = accountMutation({
       await ctx.db.delete(recipient._id);
     }
     await ctx.db.delete(args.broadcastId);
+  },
+});
+
+// ============================================================
+// Delivery (Phase 8, Task 4) — the public `send` action that actually
+// fans a persisted broadcast out to Meta, ported from
+// `src/lib/whatsapp/broadcast-core.ts`'s `deliverBroadcast` +
+// `src/hooks/use-broadcast-sending.ts`'s send loop. `create` above only
+// ever PERSISTS the broadcast + its "pending" recipients (exactly like
+// the source's own `createBroadcast` phase) — nothing is actually sent
+// until `send` is called. The composer UI wiring that will call it is
+// a SEPARATE later task; this is the backend delivery path on its own.
+//
+// `send` is a plain `action` (not `accountMutation`) because fanning
+// out has to reach the scheduler (`ctx.scheduler.runAfter`, only
+// available off an action/mutation ctx, never a query) AND, per
+// recipient, ultimately calls `metaSend.sendTemplate` (an action) — so
+// the entry point itself must be an action, and (like `send.ts`'s own
+// `send`) derives account+role from the caller's session by hand via
+// `getAuthUserId` + `internal.accounts.accountContextForUser`, since an
+// action has no `ctx.db` to run `lib/auth.ts`'s membership lookup
+// inline.
+//
+// Fan-out shape: `send` does the ownership check + status:"sending"
+// flip + "pending" recipients snapshot in ONE internal mutation
+// (`startSendingInternal`, atomic), then schedules one `deliverOne`
+// internalAction per pending recipient, staggered `DELIVER_STAGGER_MS`
+// apart. `deliverOne` is best-effort per recipient (never throws
+// outward — a scheduled action that throws has nowhere useful to
+// surface the error) and, after stamping its own recipient row, checks
+// whether any "pending" recipients remain for the broadcast; once none
+// do, it finalizes the broadcast's terminal status using the exact
+// same rule the source's `deliverBroadcast` used: `sentCount > 0 ?
+// 'sent' : 'failed'` — a partial send (some recipients failed, at
+// least one succeeded) is still "sent"; only a broadcast where every
+// recipient failed (or, degenerately, had none to send in the first
+// place) is "failed".
+//
+// Deliberately NOT reproduced from the source: the contact-phone
+// lookup + phone-variant retry (trunk-0 dialing quirks) in
+// `deliverBroadcast`'s send loop. `metaSend.sendTemplate`'s own header
+// comment already scoped that out as "an engine-level orchestration
+// nicety" callers can layer on later if they find they need it — this
+// task's design has `deliverOne` send once per recipient, so it isn't
+// reproduced here either.
+// ============================================================
+
+/**
+ * Delay between each per-recipient `deliverOne` schedule. The source's
+ * own UI-side batching (`use-broadcast-sending.ts`'s
+ * `SEND_BATCH_SIZE=10` / `SEND_BATCH_DELAY_MS=1000`) sent 10 messages
+ * then paused a second — a steady-state rate of 10 messages/second.
+ * A flat 100ms per-recipient stagger reproduces that exact same
+ * steady-state throughput without a batch/sleep loop of our own:
+ * Convex's scheduler already IS the queue, so a fixed interval is all
+ * that's needed to stay comfortably under Meta's per-phone-number rate
+ * limit.
+ */
+const DELIVER_STAGGER_MS = 100;
+
+/**
+ * Re-checks whether any "pending" recipients remain for `broadcastId`
+ * and, if none do, patches the broadcast to its terminal status.
+ * Mirrors `deliverBroadcast`'s own terminal-status rule verbatim:
+ * `sentCount > 0 ? 'sent' : 'failed'` (see this section's header
+ * comment). Called from both `startSendingInternal` (covers the
+ * zero-pending-recipients edge case, so a broadcast never gets stuck
+ * at "sending" with nothing left to finish it) and
+ * `setRecipientStatusInternal` (the normal per-recipient completion
+ * path) — a no-op while recipients remain pending.
+ */
+async function maybeFinalizeBroadcast(
+  ctx: { db: MutationCtx["db"] },
+  broadcastId: Id<"broadcasts">,
+): Promise<void> {
+  const stillPending = await ctx.db
+    .query("broadcastRecipients")
+    .withIndex("by_broadcast", (q) => q.eq("broadcastId", broadcastId))
+    .filter((q) => q.eq(q.field("status"), "pending"))
+    .first();
+  if (stillPending) return;
+
+  const broadcast = await ctx.db.get(broadcastId);
+  if (!broadcast) return;
+  await ctx.db.patch(broadcastId, {
+    status: broadcast.sentCount > 0 ? "sent" : "failed",
+    updatedAt: Date.now(),
+  });
+}
+
+/**
+ * Server-only counterpart to `setRecipientStatus` (accountMutation,
+ * above), for `deliverOne` below — an internalAction has no `ctx.db`/
+ * user session of its own (same reasoning as `conversations
+ * .findOrCreateForContactInternal`), so `accountId` is an explicit,
+ * caller-supplied argument instead of `ctx.accountId`, and there is no
+ * `requireRole` call (the only caller is this file's own `deliverOne`,
+ * already gated at `send`'s entry — see that action's own comment).
+ * Reuses `applyRecipientStatusChange` verbatim, so the count-delta math
+ * stays identical to the public mutation's; the one addition is the
+ * `maybeFinalizeBroadcast` check afterward, since only THIS delivery
+ * path (never the public `setRecipientStatus`, never the webhook-driven
+ * `recordRecipientStatusByWamid`) ever resolves a broadcast's initial
+ * "pending" fan-out and can therefore ever be "the last one".
+ */
+export const setRecipientStatusInternal = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    recipientId: v.id("broadcastRecipients"),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("sent"),
+      v.literal("delivered"),
+      v.literal("read"),
+      v.literal("replied"),
+      v.literal("failed"),
+    ),
+    whatsappMessageId: v.optional(v.string()),
+    errorMessage: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const { accountId, recipientId, status, ...rest } = args;
+    const recipient = await ctx.db.get(recipientId);
+    if (!recipient || recipient.accountId !== accountId) {
+      throw new ConvexError({
+        code: "NOT_FOUND",
+        entity: "broadcastRecipient",
+      });
+    }
+
+    await applyRecipientStatusChange(ctx, recipient, status, rest);
+    await maybeFinalizeBroadcast(ctx, recipient.broadcastId);
+    return recipientId;
+  },
+});
+
+/**
+ * Verifies `broadcastId` belongs to `accountId`, flips its status to
+ * "sending" (regardless of its current status — this is the explicit
+ * "actually start delivering now" trigger, independent of whatever
+ * status `create` initialized it with), and returns the ids of its
+ * currently-"pending" recipients for `send` to schedule. Runs as ONE
+ * atomic internal mutation so the ownership check, the status flip,
+ * and the pending snapshot can't race the way three separate
+ * round-trips from the calling action could.
+ *
+ * Also covers the zero-pending-recipients edge case (every recipient
+ * already resolved, or none were ever created) by calling
+ * `maybeFinalizeBroadcast` immediately — otherwise a broadcast with
+ * nothing left to send would flip to "sending" and never be revisited
+ * (no `deliverOne` would ever run for it), stuck forever. Since this
+ * all happens inside one mutation, the "sending" patch is never
+ * externally observable in that case — only the final "sent"/"failed"
+ * patch from `maybeFinalizeBroadcast` commits.
+ */
+export const startSendingInternal = internalMutation({
+  args: { accountId: v.id("accounts"), broadcastId: v.id("broadcasts") },
+  handler: async (ctx, args): Promise<Id<"broadcastRecipients">[]> => {
+    const broadcast = await ctx.db.get(args.broadcastId);
+    if (!broadcast || broadcast.accountId !== args.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "broadcast" });
+    }
+
+    await ctx.db.patch(args.broadcastId, {
+      status: "sending",
+      updatedAt: Date.now(),
+    });
+
+    const pending = await ctx.db
+      .query("broadcastRecipients")
+      .withIndex("by_broadcast", (q) => q.eq("broadcastId", args.broadcastId))
+      .filter((q) => q.eq(q.field("status"), "pending"))
+      .collect();
+
+    if (pending.length === 0) {
+      await maybeFinalizeBroadcast(ctx, args.broadcastId);
+    }
+
+    return pending.map((recipient) => recipient._id);
+  },
+});
+
+/**
+ * Loads a "pending" recipient's contact + parent broadcast in one
+ * round-trip for `deliverOne` below. `null` covers every "nothing to
+ * deliver" case uniformly (foreign/missing recipient, or its broadcast
+ * having vanished) — `deliverOne` treats a `null` result as "nothing to
+ * do", never a throw.
+ */
+export const getRecipientForDeliveryInternal = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    recipientId: v.id("broadcastRecipients"),
+  },
+  handler: async (ctx, args) => {
+    const recipient = await ctx.db.get(args.recipientId);
+    if (!recipient || recipient.accountId !== args.accountId) return null;
+
+    const broadcast = await ctx.db.get(recipient.broadcastId);
+    if (!broadcast) return null;
+
+    const contact = recipient.contactId
+      ? await ctx.db.get(recipient.contactId)
+      : null;
+
+    return { recipient, contact, broadcast };
+  },
+});
+
+/**
+ * PUBLIC, authed entry point that actually delivers a persisted
+ * broadcast (Phase 8, Task 4) — Convex port of
+ * `src/lib/whatsapp/broadcast-core.ts`'s `deliverBroadcast`. See this
+ * section's header comment for the full fan-out design.
+ */
+export const send = action({
+  args: { broadcastId: v.id("broadcasts") },
+  handler: async (ctx, args): Promise<{ scheduled: number }> => {
+    // ---- authenticate + derive account/role — never trust a
+    // client-supplied accountId (there is none in this args validator).
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(
+      internal.accounts.accountContextForUser,
+      { userId },
+    );
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "agent")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    }
+    const { accountId } = context;
+
+    const pendingRecipientIds = await ctx.runMutation(
+      internal.broadcasts.startSendingInternal,
+      { accountId, broadcastId: args.broadcastId },
+    );
+
+    for (const [i, recipientId] of pendingRecipientIds.entries()) {
+      await ctx.scheduler.runAfter(
+        i * DELIVER_STAGGER_MS,
+        internal.broadcasts.deliverOne,
+        { accountId, recipientId },
+      );
+    }
+
+    return { scheduled: pendingRecipientIds.length };
+  },
+});
+
+/**
+ * Delivers a single recipient's template send — scheduled once per
+ * "pending" recipient by `send` above. Best-effort: every code path
+ * ends in a `setRecipientStatusInternal` call (never a throw), since a
+ * scheduled action failing has no caller to usefully propagate to.
+ * `senderType: "bot"` (never "agent") — broadcasts are an automated
+ * bulk send, not a human agent typing in the Inbox, matching
+ * `automationsEngine`'s/`flowsEngine`'s own `metaSend` calls.
+ */
+export const deliverOne = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    recipientId: v.id("broadcastRecipients"),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const loaded = await ctx.runQuery(
+      internal.broadcasts.getRecipientForDeliveryInternal,
+      { accountId: args.accountId, recipientId: args.recipientId },
+    );
+    // Nothing to do: the recipient/broadcast vanished, or this
+    // recipient already left "pending" (e.g. a duplicate schedule) —
+    // either way, silently skip rather than throw.
+    if (!loaded || loaded.recipient.status !== "pending") return;
+    const { contact, broadcast } = loaded;
+
+    if (!contact) {
+      await ctx.runMutation(internal.broadcasts.setRecipientStatusInternal, {
+        accountId: args.accountId,
+        recipientId: args.recipientId,
+        status: "failed",
+        errorMessage: "Contact no longer exists",
+      });
+      return;
+    }
+
+    try {
+      const conversationId = await ctx.runMutation(
+        internal.conversations.findOrCreateForContactInternal,
+        { accountId: args.accountId, contactId: contact._id },
+      );
+
+      // `broadcasts.templateVariables` is `v.any()` — only usable
+      // directly as `metaSend.sendTemplate`'s positional `params:
+      // string[]` when it already IS a plain string array. Per-contact
+      // personalization (the source hook's `resolveVariables`,
+      // resolving `{type:'field'|'custom_field'|'static'}` mappings per
+      // recipient) has no Convex data model yet — the composer UI
+      // rewire (a separate later task) owns wiring that up; until then
+      // every recipient gets the same broadcast-level params, or none.
+      const params =
+        Array.isArray(broadcast.templateVariables) &&
+        broadcast.templateVariables.every(
+          (value: unknown) => typeof value === "string",
+        )
+          ? (broadcast.templateVariables as string[])
+          : undefined;
+
+      const result = await ctx.runAction(internal.metaSend.sendTemplate, {
+        accountId: args.accountId,
+        conversationId,
+        to: contact.phone,
+        templateName: broadcast.templateName,
+        language: broadcast.templateLanguage,
+        params,
+        senderType: "bot",
+      });
+
+      await ctx.runMutation(internal.broadcasts.setRecipientStatusInternal, {
+        accountId: args.accountId,
+        recipientId: args.recipientId,
+        status: "sent",
+        whatsappMessageId: result.whatsappMessageId,
+      });
+    } catch (err) {
+      await ctx.runMutation(internal.broadcasts.setRecipientStatusInternal, {
+        accountId: args.accountId,
+        recipientId: args.recipientId,
+        status: "failed",
+        errorMessage: err instanceof Error ? err.message : "Unknown error",
+      });
+    }
   },
 });
