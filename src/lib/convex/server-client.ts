@@ -3,10 +3,9 @@
 // `src/app/ConvexClientProvider.tsx`'s `ConvexReactClient`, for Next.js
 // server code that needs a one-shot Convex call rather than a live
 // subscription. Used by `src/lib/auth/api-context.ts`'s `requireApiKey`
-// (the `/api/v1/*` auth path) and `src/lib/api/v1/*.ts`'s data helpers
-// (the `/api/v1/*` data path) — the public REST API's two Next.js
-// server surfaces that talk to Convex over plain HTTP instead of
-// through a React hook.
+// (the `/api/v1/*` auth path) and every `/api/v1/*` route (the data
+// path) — the public REST API's two Next.js server surfaces that talk
+// to Convex over plain HTTP instead of through a React hook.
 //
 // `ConvexHttpClient` has no React lifecycle (unlike `ConvexReactClient`,
 // a browser-persistent singleton per tab): each call is its own HTTP
@@ -14,9 +13,20 @@
 // concurrent requests in the same server process — mirrors
 // `ConvexClientProvider.tsx`'s own module-level singleton, minus the
 // per-tab concern that motivates that file's specific provider choice.
+//
+// Also re-exports `api` (typed Convex function references) from this
+// one `@/lib/...`-aliased module, so the 11 `/api/v1/*` route files
+// don't each need their own fragile `../../../../../convex/_generated/
+// api` relative path (the depth differs per route file, e.g.
+// `contacts/route.ts` vs `contacts/[id]/route.ts` vs `conversations/
+// [id]/messages/route.ts`) — one correct relative import here, reused
+// everywhere via the `@/*` alias.
 // ============================================================
 
 import { ConvexHttpClient } from 'convex/browser';
+
+export { api } from '../../../convex/_generated/api';
+export type { Id } from '../../../convex/_generated/dataModel';
 
 let client: ConvexHttpClient | null = null;
 

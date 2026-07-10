@@ -16,6 +16,7 @@
 
 import { NextResponse } from 'next/server';
 import type { RateLimitResult } from '@/lib/rate-limit';
+import { convexErrorData } from '@/lib/convex/adapters';
 
 export type ApiErrorCode =
   | 'unauthorized' // missing / malformed / unknown / revoked / expired key
@@ -114,9 +115,50 @@ export function fail(
 }
 
 /**
+ * Maps the `{code, ...extra}` payload of a `ConvexError` thrown by
+ * `convex/apiV1.ts` (or `convex/apiKeys.ts`'s `resolveByHash`) onto this
+ * envelope's `(code, message, status)` — the one place that translates
+ * Convex's error vocabulary for THIS surface into the public API's own
+ * (distinct from `ApiErrorCode` and from the dashboard's own
+ * `isConvexErrorCode` conventions in `src/lib/convex/adapters.ts`,
+ * since the public API's error contract is versioned independently).
+ * Returns `null` for anything that isn't a recognized Convex error code,
+ * so the caller falls through to the generic 500.
+ */
+function convexErrorToApiError(err: unknown): ApiError | null {
+  const data = convexErrorData(err);
+  if (!data) return null;
+
+  switch (data.code) {
+    case 'UNAUTHORIZED':
+      return unauthorized();
+    case 'FORBIDDEN':
+      return forbidden(
+        typeof data.scope === 'string'
+          ? `This API key is missing the '${data.scope}' scope`
+          : 'This API key is not permitted to perform this action'
+      );
+    case 'NOT_FOUND':
+      return new ApiError(
+        'not_found',
+        `${typeof data.entity === 'string' ? data.entity : 'Resource'} not found`,
+        404
+      );
+    case 'BAD_REQUEST':
+      return badRequest(
+        typeof data.message === 'string' ? data.message : 'Invalid request'
+      );
+    default:
+      return null;
+  }
+}
+
+/**
  * Map any thrown value to the failure envelope. `ApiError` keeps its
- * code/status/headers; anything else collapses to a generic 500 so we
- * never leak internal error text onto the public wire.
+ * code/status/headers; a `ConvexError` from an `api.apiV1.*` call is
+ * translated via `convexErrorToApiError`; anything else collapses to a
+ * generic 500 so we never leak internal error text onto the public
+ * wire.
  */
 export function toApiErrorResponse(err: unknown): NextResponse {
   if (err instanceof ApiError) {
@@ -125,6 +167,15 @@ export function toApiErrorResponse(err: unknown): NextResponse {
       { status: err.status, headers: err.headers }
     );
   }
+
+  const mapped = convexErrorToApiError(err);
+  if (mapped) {
+    return NextResponse.json(
+      { error: { code: mapped.code, message: mapped.message } },
+      { status: mapped.status, headers: mapped.headers }
+    );
+  }
+
   console.error('[api/v1] uncategorized error:', err);
   return NextResponse.json(
     { error: { code: 'internal', message: 'Internal server error' } },

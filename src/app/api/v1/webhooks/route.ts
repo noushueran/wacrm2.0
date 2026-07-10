@@ -4,43 +4,26 @@
 //
 // POST returns the signing `secret` in plaintext exactly once — store
 // it to verify the `X-Wacrm-Signature` on deliveries. wacrm keeps only
-// an encrypted copy and can never show it again.
+// an encrypted copy (generated + encrypted inside Convex — see
+// `convex/apiV1.ts`'s `createWebhook`) and can never show it again.
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
+import { getConvexClient, api } from '@/lib/convex/server-client';
 import { ok, okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
-import { encrypt } from '@/lib/whatsapp/encryption';
-import { normalizeEvents } from '@/lib/webhooks/events';
-import {
-  WEBHOOK_PUBLIC_COLUMNS,
-  serializeWebhookEndpoint,
-  generateWebhookSecret,
-  normalizeWebhookUrl,
-} from '@/lib/webhooks/endpoints';
+import { serializeWebhookEndpoint } from '@/lib/webhooks/endpoints';
 
 export async function GET(request: Request) {
   try {
     const ctx = await requireApiKey(request, 'webhooks:manage');
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .eq('account_id', ctx.accountId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('[api/v1/webhooks] list error:', error);
-      return fail('internal', 'Failed to list webhooks', 500);
-    }
+    const endpoints = await getConvexClient().query(api.apiV1.listWebhooks, {
+      keyHash: ctx.keyHash,
+    });
 
     // The roster is small and settings-class — return it whole (the
     // list envelope's cursor is always null here).
-    return okList(
-      (data ?? []).map((r) =>
-        serializeWebhookEndpoint(r as Record<string, unknown>)
-      ),
-      null
-    );
+    return okList(endpoints.map(serializeWebhookEndpoint), null);
   } catch (err) {
     return toApiErrorResponse(err);
   }
@@ -58,13 +41,14 @@ export async function POST(request: Request) {
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
-    const url = normalizeWebhookUrl(body.url);
-    if (!url) {
+    if (typeof body.url !== 'string') {
       return fail('bad_request', "'url' must be a valid https:// URL", 400);
     }
-
-    const events = normalizeEvents(body.events);
-    if (!events) {
+    if (
+      !Array.isArray(body.events) ||
+      body.events.length === 0 ||
+      body.events.some((e) => typeof e !== 'string')
+    ) {
       return fail(
         'bad_request',
         "'events' must be a non-empty array of known event names",
@@ -72,30 +56,14 @@ export async function POST(request: Request) {
       );
     }
 
-    const secret = generateWebhookSecret();
-
-    const { data: created, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .insert({
-        account_id: ctx.accountId,
-        created_by: ctx.createdBy,
-        url,
-        secret: encrypt(secret),
-        events,
-      })
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .single();
-
-    if (error || !created) {
-      console.error('[api/v1/webhooks] create error:', error);
-      return fail('internal', 'Failed to create webhook', 500);
-    }
+    const created = await getConvexClient().mutation(api.apiV1.createWebhook, {
+      keyHash: ctx.keyHash,
+      url: body.url,
+      events: body.events as string[],
+    });
 
     // Secret shown exactly once.
-    return ok(
-      { ...serializeWebhookEndpoint(created as Record<string, unknown>), secret },
-      201
-    );
+    return ok({ ...serializeWebhookEndpoint(created), secret: created.secret }, 201);
   } catch (err) {
     return toApiErrorResponse(err);
   }

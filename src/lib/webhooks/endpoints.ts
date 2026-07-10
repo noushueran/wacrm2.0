@@ -1,22 +1,16 @@
 // ============================================================
-// Webhook endpoint store helpers — secret generation + the public
-// (secret-free) serialization used by the management API.
+// Webhook endpoint serialization for the public management API.
 //
-// The signing secret is stored AES-256-GCM-encrypted at rest (see
-// migration 028) and returned in plaintext exactly once, at creation.
+// Secret generation + encryption now happen inside Convex
+// (`convex/apiV1.ts`'s `createWebhook`, Web-Crypto based — see that
+// function's own doc comment) rather than here with Node's
+// `node:crypto`; URL/event-vocabulary validation likewise now lives
+// there (`normalizeWebhookUrl`/`normalizeWebhookEvents`, duplicated
+// Convex-side per `convex/lib/phone.ts`'s "can't cross-import src/"
+// convention — see `convex/apiV1.ts`'s own comment). This module is
+// down to the one thing the Next layer still owns: projecting a Convex
+// `webhookEndpoints` doc into the public (secret-free) wire shape.
 // ============================================================
-
-import { randomBytes } from 'node:crypto';
-
-/** Secret prefix — self-identifying, like `wacrm_live_` for keys. */
-export const WEBHOOK_SECRET_PREFIX = 'whsec_';
-
-/**
- * Columns safe to return over the API — everything except the
- * (encrypted) `secret`, which is only ever surfaced once at creation.
- */
-export const WEBHOOK_PUBLIC_COLUMNS =
-  'id, url, events, is_active, last_delivery_at, failure_count, created_at';
 
 export interface ApiWebhookEndpoint {
   id: string;
@@ -28,39 +22,32 @@ export interface ApiWebhookEndpoint {
   created_at: string;
 }
 
-/** Generate a fresh signing secret (full-entropy, URL/header-safe). */
-export function generateWebhookSecret(): string {
-  return `${WEBHOOK_SECRET_PREFIX}${randomBytes(32).toString('base64url')}`;
+/** The shape `convex/apiV1.ts`'s webhook ops return: a bare
+ *  `webhookEndpoints` doc (never including the plaintext secret — only
+ *  `createWebhook`'s response splices that in separately, once). */
+export interface ConvexApiWebhookEndpoint {
+  _id: string;
+  _creationTime: number;
+  url: string;
+  events: string[];
+  isActive: boolean;
+  lastDeliveryAt?: number;
+  failureCount: number;
 }
 
-/** Project a `WEBHOOK_PUBLIC_COLUMNS` row into the API shape. */
+/** Project a Convex webhook endpoint doc into the public shape. */
 export function serializeWebhookEndpoint(
-  row: Record<string, unknown>
+  doc: ConvexApiWebhookEndpoint
 ): ApiWebhookEndpoint {
   return {
-    id: row.id as string,
-    url: row.url as string,
-    events: (row.events as string[] | null) ?? [],
-    is_active: Boolean(row.is_active),
-    last_delivery_at: (row.last_delivery_at as string | null) ?? null,
-    failure_count: (row.failure_count as number | null) ?? 0,
-    created_at: row.created_at as string,
+    id: doc._id,
+    url: doc.url,
+    events: doc.events,
+    is_active: doc.isActive,
+    last_delivery_at: doc.lastDeliveryAt
+      ? new Date(doc.lastDeliveryAt).toISOString()
+      : null,
+    failure_count: doc.failureCount,
+    created_at: new Date(doc._creationTime).toISOString(),
   };
-}
-
-/**
- * Validate a webhook target URL: must be a well-formed absolute
- * `https://` URL (an unencrypted `http://` sink would leak signed
- * event payloads). Returns the normalized string or null.
- */
-export function normalizeWebhookUrl(input: unknown): string | null {
-  if (typeof input !== 'string') return null;
-  const trimmed = input.trim();
-  try {
-    const u = new URL(trimmed);
-    if (u.protocol !== 'https:') return null;
-    return u.toString();
-  } catch {
-    return null;
-  }
 }

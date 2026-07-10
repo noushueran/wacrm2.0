@@ -1,25 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { generateApiKey } from "@/lib/api-keys/keys";
-import type { ApiKeyRow } from "@/lib/api-keys/store";
+import { generateApiKey, hashApiKey } from "@/lib/api-keys/keys";
 import { ApiError } from "@/lib/api/v1/respond";
 import { __resetRateLimitForTests, RATE_LIMITS } from "@/lib/rate-limit";
 
-// Mock the service-role client factory — requireApiKey only stashes
-// the returned client in the context; tests never call through it.
-vi.mock("@/lib/flows/admin-client", () => ({
-  supabaseAdmin: () => ({ __isMockAdminClient: true }),
-}));
+// Mock the Convex HTTP client factory — `requireApiKey` calls
+// `.query(api.apiKeys.resolveByHash, ...)` and (fire-and-forget)
+// `.mutation(api.apiKeys.touchLastUsedByHash, ...)`. Tests control both
+// return values directly rather than spinning up a real Convex backend.
+// `api` itself is kept real (via `importOriginal`) — it's just
+// `anyApi`, a Proxy that returns a valid function-reference-shaped
+// value for any property path with no actual module resolution, so
+// there's nothing meaningful to mock there.
+const queryMock = vi.fn();
+const mutationMock = vi.fn();
+vi.mock("@/lib/convex/server-client", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/convex/server-client")>();
+  return {
+    ...actual,
+    getConvexClient: () => ({ query: queryMock, mutation: mutationMock }),
+  };
+});
 
-// Mock the store so we control which row a hash resolves to.
-const findActiveKeyByHash = vi.fn<(hash: string) => Promise<ApiKeyRow | null>>();
-const touchLastUsed = vi.fn();
-vi.mock("@/lib/api-keys/store", () => ({
-  findActiveKeyByHash: (hash: string) => findActiveKeyByHash(hash),
-  touchLastUsed: (id: string) => touchLastUsed(id),
-}));
-
-// Import AFTER the mocks are registered.
+// Import AFTER the mock is registered.
 const { requireApiKey } = await import("./api-context");
 
 const KEY = generateApiKey().plaintext;
@@ -30,23 +34,16 @@ function reqWith(authHeader?: string): Request {
   });
 }
 
-function row(overrides: Partial<ApiKeyRow> = {}): ApiKeyRow {
-  return {
-    id: "key-1",
-    account_id: "acct-1",
-    created_by: "user-1",
-    name: "Test key",
-    scopes: ["messages:send"],
-    expires_at: null,
-    revoked_at: null,
-    ...overrides,
-  };
+function resolved(
+  overrides: Partial<{ accountId: string; scopes: string[] }> = {}
+) {
+  return { accountId: "acct-1", scopes: ["messages:send"], ...overrides };
 }
 
 beforeEach(() => {
   __resetRateLimitForTests();
-  findActiveKeyByHash.mockReset();
-  touchLastUsed.mockReset();
+  queryMock.mockReset();
+  mutationMock.mockReset().mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -65,7 +62,7 @@ async function expectApiError(p: Promise<unknown>, code: string, status: number)
 describe("requireApiKey", () => {
   it("401s when no Authorization header is present", async () => {
     await expectApiError(requireApiKey(reqWith()), "unauthorized", 401);
-    expect(findActiveKeyByHash).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
   });
 
   it("401s on a token that doesn't look like a wacrm key", async () => {
@@ -74,11 +71,11 @@ describe("requireApiKey", () => {
       "unauthorized",
       401,
     );
-    expect(findActiveKeyByHash).not.toHaveBeenCalled();
+    expect(queryMock).not.toHaveBeenCalled();
   });
 
-  it("401s when the key is unknown / revoked / expired (store returns null)", async () => {
-    findActiveKeyByHash.mockResolvedValue(null);
+  it("401s when the key is unknown / revoked / expired (Convex resolves null)", async () => {
+    queryMock.mockResolvedValue(null);
     await expectApiError(
       requireApiKey(reqWith(`Bearer ${KEY}`)),
       "unauthorized",
@@ -87,23 +84,29 @@ describe("requireApiKey", () => {
   });
 
   it("returns a context for a valid key with no scope required", async () => {
-    findActiveKeyByHash.mockResolvedValue(row());
+    queryMock.mockResolvedValue(resolved());
     const ctx = await requireApiKey(reqWith(`Bearer ${KEY}`));
     expect(ctx.authType).toBe("api_key");
     expect(ctx.accountId).toBe("acct-1");
-    expect(ctx.keyId).toBe("key-1");
+    expect(ctx.keyHash).toBe(hashApiKey(KEY));
     expect(ctx.scopes).toEqual(["messages:send"]);
-    expect(touchLastUsed).toHaveBeenCalledWith("key-1");
+    // The query is hashed, never the plaintext key.
+    expect(queryMock).toHaveBeenCalledWith(expect.anything(), {
+      keyHash: hashApiKey(KEY),
+    });
+    expect(mutationMock).toHaveBeenCalledWith(expect.anything(), {
+      keyHash: hashApiKey(KEY),
+    });
   });
 
   it("accepts a bare key without the 'Bearer ' prefix", async () => {
-    findActiveKeyByHash.mockResolvedValue(row());
+    queryMock.mockResolvedValue(resolved());
     const ctx = await requireApiKey(reqWith(KEY));
     expect(ctx.accountId).toBe("acct-1");
   });
 
   it("403s when the key lacks the required scope", async () => {
-    findActiveKeyByHash.mockResolvedValue(row({ scopes: ["contacts:read"] }));
+    queryMock.mockResolvedValue(resolved({ scopes: ["contacts:read"] }));
     await expectApiError(
       requireApiKey(reqWith(`Bearer ${KEY}`), "messages:send"),
       "forbidden",
@@ -112,13 +115,13 @@ describe("requireApiKey", () => {
   });
 
   it("passes when the key has the required scope", async () => {
-    findActiveKeyByHash.mockResolvedValue(row({ scopes: ["messages:send"] }));
+    queryMock.mockResolvedValue(resolved({ scopes: ["messages:send"] }));
     const ctx = await requireApiKey(reqWith(`Bearer ${KEY}`), "messages:send");
     expect(ctx.accountId).toBe("acct-1");
   });
 
   it("429s once the per-key budget is exhausted", async () => {
-    findActiveKeyByHash.mockResolvedValue(row());
+    queryMock.mockResolvedValue(resolved());
     // Burn the whole window.
     for (let i = 0; i < RATE_LIMITS.publicApi.limit; i++) {
       await requireApiKey(reqWith(`Bearer ${KEY}`));
@@ -128,5 +131,12 @@ describe("requireApiKey", () => {
       "rate_limited",
       429,
     );
+  });
+
+  it("still returns a context when the best-effort lastUsedAt bump rejects", async () => {
+    queryMock.mockResolvedValue(resolved());
+    mutationMock.mockRejectedValue(new Error("network down"));
+    const ctx = await requireApiKey(reqWith(`Bearer ${KEY}`));
+    expect(ctx.accountId).toBe("acct-1");
   });
 });

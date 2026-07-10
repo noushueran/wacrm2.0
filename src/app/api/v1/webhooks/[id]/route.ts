@@ -8,13 +8,9 @@
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
+import { getConvexClient, api } from '@/lib/convex/server-client';
 import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
-import { normalizeEvents } from '@/lib/webhooks/events';
-import {
-  WEBHOOK_PUBLIC_COLUMNS,
-  serializeWebhookEndpoint,
-  normalizeWebhookUrl,
-} from '@/lib/webhooks/endpoints';
+import { serializeWebhookEndpoint } from '@/lib/webhooks/endpoints';
 
 export async function GET(
   request: Request,
@@ -24,20 +20,13 @@ export async function GET(
     const ctx = await requireApiKey(request, 'webhooks:manage');
     const { id } = await params;
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .maybeSingle();
+    const endpoint = await getConvexClient().query(api.apiV1.getWebhook, {
+      keyHash: ctx.keyHash,
+      endpointId: id,
+    });
+    if (!endpoint) return fail('not_found', 'Webhook not found', 404);
 
-    if (error) {
-      console.error('[api/v1/webhooks] read error:', error);
-      return fail('internal', 'Failed to read webhook', 500);
-    }
-    if (!data) return fail('not_found', 'Webhook not found', 404);
-
-    return ok(serializeWebhookEndpoint(data as Record<string, unknown>));
+    return ok(serializeWebhookEndpoint(endpoint));
   } catch (err) {
     return toApiErrorResponse(err);
   }
@@ -59,59 +48,51 @@ export async function PATCH(
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
-    const updates: Record<string, unknown> = {};
+    const args: {
+      keyHash: string;
+      endpointId: string;
+      url?: string;
+      events?: string[];
+      isActive?: boolean;
+    } = { keyHash: ctx.keyHash, endpointId: id };
 
     if ('url' in body) {
-      const url = normalizeWebhookUrl(body.url);
-      if (!url) {
+      if (typeof body.url !== 'string') {
         return fail('bad_request', "'url' must be a valid https:// URL", 400);
       }
-      updates.url = url;
+      args.url = body.url;
     }
 
     if ('events' in body) {
-      const events = normalizeEvents(body.events);
-      if (!events) {
+      if (
+        !Array.isArray(body.events) ||
+        body.events.length === 0 ||
+        body.events.some((e) => typeof e !== 'string')
+      ) {
         return fail(
           'bad_request',
           "'events' must be a non-empty array of known event names",
           400
         );
       }
-      updates.events = events;
+      args.events = body.events as string[];
     }
 
     if ('is_active' in body) {
       if (typeof body.is_active !== 'boolean') {
         return fail('bad_request', "'is_active' must be a boolean", 400);
       }
-      updates.is_active = body.is_active;
-      // Re-enabling a disabled endpoint clears its failure streak so it
-      // isn't instantly re-disabled by a single stale failure.
-      if (body.is_active === true) updates.failure_count = 0;
+      args.isActive = body.is_active;
     }
 
-    if (Object.keys(updates).length === 0) {
+    if (args.url === undefined && args.events === undefined && args.isActive === undefined) {
       return fail('bad_request', 'No updatable fields provided', 400);
     }
 
-    // Scope the update by account_id so a foreign id touches nothing;
-    // the returned row (null when unmatched) drives the 404.
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .update(updates)
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .maybeSingle();
+    const endpoint = await getConvexClient().mutation(api.apiV1.updateWebhook, args);
+    if (!endpoint) return fail('not_found', 'Webhook not found', 404);
 
-    if (error) {
-      console.error('[api/v1/webhooks] update error:', error);
-      return fail('internal', 'Failed to update webhook', 500);
-    }
-    if (!data) return fail('not_found', 'Webhook not found', 404);
-
-    return ok(serializeWebhookEndpoint(data as Record<string, unknown>));
+    return ok(serializeWebhookEndpoint(endpoint));
   } catch (err) {
     return toApiErrorResponse(err);
   }
@@ -125,21 +106,13 @@ export async function DELETE(
     const ctx = await requireApiKey(request, 'webhooks:manage');
     const { id } = await params;
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .delete()
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .select('id')
-      .maybeSingle();
+    const result = await getConvexClient().mutation(api.apiV1.deleteWebhook, {
+      keyHash: ctx.keyHash,
+      endpointId: id,
+    });
+    if (!result) return fail('not_found', 'Webhook not found', 404);
 
-    if (error) {
-      console.error('[api/v1/webhooks] delete error:', error);
-      return fail('internal', 'Failed to delete webhook', 500);
-    }
-    if (!data) return fail('not_found', 'Webhook not found', 404);
-
-    return ok({ id: data.id, deleted: true });
+    return ok({ id: result.id, deleted: true });
   } catch (err) {
     return toApiErrorResponse(err);
   }

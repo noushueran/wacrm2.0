@@ -193,12 +193,14 @@ match returns `200` with the existing contact; a new contact returns
 `201`. The response body is the serialized contact (same shape as the
 list rows above).
 
-### `GET` / `PATCH /api/v1/contacts/{id}`
+### `GET` / `PATCH` / `DELETE /api/v1/contacts/{id}`
 
-Read or update one contact. Scopes: `contacts:read` / `contacts:write`.
-`PATCH` updates only the fields you send (`name`, `email`, `company`);
-pass `tags` (an array of tag names) to replace the contact's tags. A
-contact in another account returns `404`.
+Read, update, or remove one contact. Scopes: `contacts:read` /
+`contacts:write` / `contacts:write`. `PATCH` updates only the fields
+you send (`name`, `email`, `company`); pass `tags` (an array of tag
+names) to replace the contact's tags. `DELETE` returns
+`{ "id": "…", "deleted": true }`. A contact in another account returns
+`404` for any of the three.
 
 ### `GET /api/v1/conversations`
 

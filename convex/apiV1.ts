@@ -464,6 +464,11 @@ export const sendMessage = action({
   args: {
     keyHash: v.string(),
     to: v.string(),
+    // Names a newly-created contact for this phone (ignored when an
+    // existing contact already matches `to`) — mirrors the pre-migration
+    // route's own top-level `name` body field, passed through to
+    // `resolveConversationByPhone`'s `name` param.
+    name: v.optional(v.string()),
     type: v.string(),
     text: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
@@ -512,7 +517,7 @@ export const sendMessage = action({
 
     const { contactId, created: contactCreated } = await ctx.runMutation(
       internal.contacts.findOrCreateByPhoneInternal,
-      { accountId: key.accountId, phone: args.to },
+      { accountId: key.accountId, phone: args.to, name: args.name },
     );
     const conversationId = await ctx.runMutation(
       internal.conversations.findOrCreateForContactInternal,
@@ -799,6 +804,24 @@ export const listWebhooks = query({
 });
 
 /**
+ * Single-endpoint read by id — the backing function for
+ * `GET /api/v1/webhooks/{id}` (not itself named in the task brief's op
+ * list, which only calls out list/create/update/delete, but needed for
+ * parity with that pre-existing REST route — see the Phase 8 Task 5
+ * report). Mirrors `getBroadcast`'s shape exactly.
+ */
+export const getWebhook = query({
+  args: { keyHash: v.string(), endpointId: v.string() },
+  handler: async (ctx, args) => {
+    const key = await requireScope(ctx, args.keyHash, "webhooks:manage");
+    const id = ctx.db.normalizeId("webhookEndpoints", args.endpointId);
+    const endpoint = id ? await ctx.db.get(id) : null;
+    if (!endpoint || endpoint.accountId !== key.accountId) return null;
+    return endpoint;
+  },
+});
+
+/**
  * Generates + AES-256-GCM-encrypts (`convex/lib/whatsappEncryption.ts`'s
  * `encrypt`, Web-Crypto based) the signing secret INLINE — unlike the old
  * Supabase route (which generated + encrypted Node-side before the
@@ -849,7 +872,12 @@ export const updateWebhook = mutation({
     const endpoint = id ? await ctx.db.get(id) : null;
     if (!endpoint || endpoint.accountId !== key.accountId) return null;
 
-    const patch: Partial<{ url: string; events: string[]; isActive: boolean }> = {};
+    const patch: Partial<{
+      url: string;
+      events: string[];
+      isActive: boolean;
+      failureCount: number;
+    }> = {};
     if (args.url !== undefined) {
       const url = normalizeWebhookUrl(args.url);
       if (!url) badRequest("'url' must be a valid https:// URL");
@@ -860,7 +888,13 @@ export const updateWebhook = mutation({
       if (!events) badRequest("'events' must be a non-empty array of known event names");
       patch.events = events;
     }
-    if (args.isActive !== undefined) patch.isActive = args.isActive;
+    if (args.isActive !== undefined) {
+      patch.isActive = args.isActive;
+      // Re-enabling a disabled endpoint clears its failure streak so
+      // it isn't instantly re-disabled by a single stale failure —
+      // mirrors the pre-migration Postgres route's own behavior.
+      if (args.isActive) patch.failureCount = 0;
+    }
 
     if (Object.keys(patch).length > 0) {
       await ctx.db.patch(endpoint._id, patch);

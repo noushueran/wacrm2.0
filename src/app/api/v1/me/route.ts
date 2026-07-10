@@ -8,22 +8,24 @@
 // wiring up real calls.
 //
 // It also exercises the entire public-API stack end to end — bearer
-// parse → hash lookup → liveness → rate limit → envelope — so a
-// green response here means the plumbing every future endpoint
+// parse → hash lookup (via Convex) → liveness → rate limit → envelope
+// — so a green response here means the plumbing every future endpoint
 // depends on is sound.
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
-import { getAccountName } from '@/lib/api-keys/store';
+import { getConvexClient, api } from '@/lib/convex/server-client';
 import { ok, toApiErrorResponse } from '@/lib/api/v1/respond';
 
 export async function GET(request: Request) {
   try {
     const ctx = await requireApiKey(request);
-    const name = await getAccountName(ctx.accountId);
+    const me = await getConvexClient().query(api.apiV1.getMe, {
+      keyHash: ctx.keyHash,
+    });
     return ok({
-      account: { id: ctx.accountId, name },
-      key: { id: ctx.keyId, scopes: ctx.scopes },
+      account: { id: me.accountId, name: me.accountName },
+      key: { id: me.keyId, scopes: me.scopes },
     });
   } catch (err) {
     return toApiErrorResponse(err);

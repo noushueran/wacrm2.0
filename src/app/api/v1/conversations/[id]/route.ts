@@ -4,13 +4,9 @@
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
+import { getConvexClient, api } from '@/lib/convex/server-client';
 import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
-import {
-  CONVERSATION_SELECT,
-  normalizeConversation,
-} from '@/lib/inbox/conversations';
 import { serializeConversation } from '@/lib/api/v1/conversations';
-import type { Conversation } from '@/types';
 
 export async function GET(
   request: Request,
@@ -20,20 +16,13 @@ export async function GET(
     const ctx = await requireApiKey(request, 'conversations:read');
     const { id } = await params;
 
-    const { data, error } = await ctx.supabase
-      .from('conversations')
-      .select(CONVERSATION_SELECT)
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .maybeSingle();
+    const conversation = await getConvexClient().query(api.apiV1.getConversation, {
+      keyHash: ctx.keyHash,
+      conversationId: id,
+    });
+    if (!conversation) return fail('not_found', 'Conversation not found', 404);
 
-    if (error) {
-      console.error('[api/v1/conversations] read error:', error);
-      return fail('internal', 'Failed to read conversation', 500);
-    }
-    if (!data) return fail('not_found', 'Conversation not found', 404);
-
-    return ok(serializeConversation(normalizeConversation(data as Conversation)));
+    return ok(serializeConversation(conversation));
   } catch (err) {
     return toApiErrorResponse(err);
   }

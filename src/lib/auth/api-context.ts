@@ -11,26 +11,29 @@
 //
 //   try {
 //     const ctx = await requireApiKey(request, "messages:send");
-//     // ctx.supabase   — service-role client (no user session exists)
-//     // ctx.accountId  — the key's account; scope every query by it
+//     // ctx.accountId  — the key's account (informational only — every
+//     //                  api.apiV1.* call below re-derives it from
+//     //                  ctx.keyHash server-side, never trusts this)
+//     // ctx.keyHash    — pass this to every api.apiV1.* call so Convex
+//     //                  can re-resolve the account + re-check scope
 //     // ctx.scopes     — granted scopes
-//     // ctx.keyId      — for logging / the rate-limit bucket
 //   } catch (err) {
 //     return toApiErrorResponse(err);   // maps ApiError → envelope
 //   }
 //
-// Why a service-role client: an API caller has no Supabase session,
-// so there's no `auth.uid()` for RLS to match. The key lookup itself
-// establishes the account; from there every downstream query MUST be
-// explicitly filtered by `ctx.accountId` (the same discipline the
-// dashboard's send route already follows). The key never escalates
-// past its own account because the account is fixed at lookup time.
+// Backend: the account + scope lookup itself now lives in Convex
+// (`api.apiKeys.resolveByHash`, a PUBLIC by-secret query — same safety
+// pattern as `invitations.peek`: the key HASH is the credential, so no
+// Convex Auth session is needed or possible here). This module calls it
+// over HTTP via `ConvexHttpClient` (`src/lib/convex/server-client.ts`),
+// the same way `findActiveKeyByHash` used to call Postgres directly.
+// Every downstream `/api/v1/*` data call passes `ctx.keyHash` (NEVER
+// `ctx.accountId`) to its `api.apiV1.*` function, which re-resolves the
+// account and re-checks scope itself — defense-in-depth against a value
+// that crossed a process boundary being trusted blindly.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-
-import { supabaseAdmin } from '@/lib/flows/admin-client';
-import { findActiveKeyByHash, touchLastUsed } from '@/lib/api-keys/store';
+import { api, getConvexClient } from '@/lib/convex/server-client';
 import { hashApiKey, looksLikeApiKey } from '@/lib/api-keys/keys';
 import { hasScope, type ApiScope } from '@/lib/api-keys/scopes';
 import { forbidden, rateLimited, unauthorized } from '@/lib/api/v1/respond';
@@ -39,16 +42,14 @@ import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 export interface ApiKeyContext {
   /** Discriminant — lets shared logic tell key auth from cookie auth. */
   authType: 'api_key';
-  /** Service-role Supabase client. RLS-bypassing; scope by accountId. */
-  supabase: SupabaseClient;
   /** The account this key belongs to. */
   accountId: string;
-  /** The key row id — for audit logging and the rate-limit bucket. */
-  keyId: string;
+  /** SHA-256 hex digest of the presented key — pass to every
+   *  `api.apiV1.*` call; Convex re-resolves the account from this,
+   *  never from `accountId` above directly. */
+  keyHash: string;
   /** Scopes granted to this key. */
   scopes: string[];
-  /** Who minted the key (null if that user was later removed). */
-  createdBy: string | null;
 }
 
 /**
@@ -74,8 +75,8 @@ function extractKey(request: Request): string | null {
  *   403 forbidden    — valid key without the required scope
  *   429 rate_limited — per-key budget exhausted
  *
- * On success, bumps `last_used_at` (fire-and-forget) and returns the
- * account context.
+ * On success, bumps `lastUsedAt` (fire-and-forget, via Convex) and
+ * returns the account context.
  */
 export async function requireApiKey(
   request: Request,
@@ -86,8 +87,11 @@ export async function requireApiKey(
     throw unauthorized();
   }
 
-  const row = await findActiveKeyByHash(hashApiKey(presented));
-  if (!row) {
+  const keyHash = hashApiKey(presented);
+  const resolved = await getConvexClient().query(api.apiKeys.resolveByHash, {
+    keyHash,
+  });
+  if (!resolved) {
     // Covers unknown, revoked, and expired keys alike — we don't
     // distinguish them on the wire so a probe can't learn whether a
     // key ever existed.
@@ -95,24 +99,32 @@ export async function requireApiKey(
   }
 
   // Rate-limit per key, before the scope check, so an unauthorized-
-  // scope caller still can't hammer the endpoint for free.
-  const limit = checkRateLimit(`apikey:${row.id}`, RATE_LIMITS.publicApi);
+  // scope caller still can't hammer the endpoint for free. Bucketed by
+  // the key's hash (a stable, unique-per-key value) rather than a
+  // database row id — `resolveByHash` deliberately never returns one
+  // (see that function's own doc comment on why).
+  const limit = checkRateLimit(`apikey:${keyHash}`, RATE_LIMITS.publicApi);
   if (!limit.success) {
     throw rateLimited(limit);
   }
 
-  if (scope && !hasScope(row.scopes, scope)) {
+  if (scope && !hasScope(resolved.scopes, scope)) {
     throw forbidden(`This API key is missing the '${scope}' scope`);
   }
 
-  touchLastUsed(row.id);
+  // Best-effort `lastUsedAt` bump — never allowed to fail the caller's
+  // actual request (mirrors the old `touchLastUsed`'s own fire-and-
+  // forget contract).
+  void getConvexClient()
+    .mutation(api.apiKeys.touchLastUsedByHash, { keyHash })
+    .catch((err: unknown) => {
+      console.warn('[api-context] touchLastUsedByHash failed:', err);
+    });
 
   return {
     authType: 'api_key',
-    supabase: supabaseAdmin(),
-    accountId: row.account_id,
-    keyId: row.id,
-    scopes: row.scopes,
-    createdBy: row.created_by,
+    accountId: resolved.accountId,
+    keyHash,
+    scopes: resolved.scopes,
   };
 }

@@ -471,6 +471,7 @@ test("listMessages paginates newest-first via Convex's native cursor, and 404s (
   }
 
   const page1 = await t.query(api.apiV1.listMessages, { keyHash, conversationId, limit: 2 });
+  if (!page1) throw new Error("expected a page, got null (conversation not found)");
   expect(page1.items).toHaveLength(2);
   expect(page1.items[0]!.contentText).toBe("msg 2");
   expect(page1.nextCursor).not.toBeNull();
@@ -481,6 +482,7 @@ test("listMessages paginates newest-first via Convex's native cursor, and 404s (
     limit: 2,
     cursor: page1.nextCursor!,
   });
+  if (!page2) throw new Error("expected a page, got null (conversation not found)");
   expect(page2.items).toHaveLength(1);
   expect(page2.nextCursor).toBeNull();
 
@@ -723,6 +725,39 @@ test("createWebhook validates url/events, generates+encrypts a secret, and retur
   const stored = await t.run((ctx) => ctx.db.get(created._id));
   expect(stored?.secret).not.toBe(created.secret); // encrypted at rest
   expect(stored?.secret.split(":")).toHaveLength(3); // GCM wire format
+});
+
+test("getWebhook returns the endpoint for this account, and null for a foreign/missing one", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { accountId: bobAccount } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const { keyHash } = await seedApiKey(t, { accountId, scopes: ["webhooks:manage"] });
+  const { keyHash: bobKey } = await seedApiKey(t, { accountId: bobAccount, scopes: ["webhooks:manage"] });
+
+  const created = await t.mutation(api.apiV1.createWebhook, {
+    keyHash,
+    url: "https://example.com/hook",
+    events: ["message.received"],
+  });
+
+  const found = await t.query(api.apiV1.getWebhook, { keyHash, endpointId: created._id });
+  expect(found?._id).toBe(created._id);
+  expect((found as { secret?: string })?.secret).not.toBe(created.secret);
+
+  expect(
+    await t.query(api.apiV1.getWebhook, { keyHash: bobKey, endpointId: created._id }),
+  ).toBeNull();
+  expect(
+    await t.query(api.apiV1.getWebhook, { keyHash, endpointId: "not-a-real-id" }),
+  ).toBeNull();
 });
 
 test("listWebhooks/updateWebhook/deleteWebhook are account-scoped and patch only provided fields", async () => {
