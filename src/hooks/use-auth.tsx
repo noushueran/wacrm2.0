@@ -20,8 +20,8 @@ import {
   type AccountRole,
 } from "@/lib/auth/roles";
 
-// The current user. Previously the full `@supabase/supabase-js` `User`
-// object; under Convex Auth the hook only ever exposes `id` + `email`.
+// The current user under Convex Auth — the hook only ever exposes `id`
+// + `email`.
 // `created_at` is kept optional purely so the settings "Joined" line
 // (src/components/settings/profile-form.tsx) keeps type-checking — Convex
 // has no equivalent yet, so it is currently always `undefined`.

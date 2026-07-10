@@ -220,7 +220,8 @@ export type FlowTriggerConfig =
   | { trigger_type: "manual"; config: Record<string, never> };
 
 // ============================================================
-// DB-row shapes (read by the engine via supabaseAdmin)
+// Row shapes the flows UI maps Convex docs onto (via the adapters in
+// src/lib/convex/adapters.ts — toUiFlow/toUiFlowNode/toUiFlowRun).
 // ============================================================
 
 export interface FlowRow {
