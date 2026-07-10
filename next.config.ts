@@ -3,6 +3,19 @@ import createNextIntlPlugin from "next-intl/plugin";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
+// The self-hosted Convex deployment the browser actually talks to — the
+// same origin `ConvexReactClient` is constructed with
+// (src/app/ConvexClientProvider.tsx), derived from NEXT_PUBLIC_CONVEX_URL
+// (and mirroring that provider's placeholder fallback) so the CSP can
+// never drift from the URL the client connects to. NEXT_PUBLIC_CONVEX_SITE_URL
+// (the convex-*.site origin) is intentionally absent: it's read server-side
+// only (the WhatsApp webhook proxy), never by the browser.
+const CONVEX_URL =
+  process.env.NEXT_PUBLIC_CONVEX_URL || "https://placeholder.convex.cloud";
+// https:// → wss:// (and http:// → ws:// for local dev) for the Convex
+// reactive-query WebSocket.
+const CONVEX_WS_URL = CONVEX_URL.replace(/^http/, "ws");
+
 /**
  * Baseline security headers applied to every response.
  *
@@ -45,17 +58,21 @@ const SECURITY_HEADERS = [
       "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       // Tailwind + inline style attributes on lots of components.
       "style-src 'self' 'unsafe-inline'",
-      // Supabase public-bucket avatars, contact avatars (arbitrary
-      // https URLs paste-able from the UI), OG images, data URLs for
-      // tiny inline assets.
+      // Contact/agent avatars are arbitrary https URLs (pasteable from
+      // the UI) plus Convex file-storage links, OG images, and data:
+      // URLs for tiny inline assets — so allow any https here.
       "img-src 'self' data: blob: https:",
       // Outbound media previews (blob: from MediaRecorder + file picker)
-      // and Supabase public-bucket audio/video the inbox renders.
-      "media-src 'self' blob: https://*.supabase.co",
+      // and the audio/video the inbox renders, which Convex file storage
+      // (files.getUrl → ctx.storage.getUrl) serves from the deployment
+      // origin.
+      `media-src 'self' blob: ${CONVEX_URL}`,
       "font-src 'self' data:",
-      // Supabase REST + realtime (WSS). All Meta API calls happen
-      // server-side, so graph.facebook.com does not belong here.
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+      // Convex: the https origin (initial handshake, long-poll fallback,
+      // and the file-upload POST files.generateUploadUrl hands back) plus
+      // its wss:// twin for the reactive-query socket. All Meta API calls
+      // happen server-side, so graph.facebook.com does not belong here.
+      `connect-src 'self' ${CONVEX_URL} ${CONVEX_WS_URL}`,
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",
@@ -91,7 +108,7 @@ const nextConfig: NextConfig = {
    *
    *   Note: dynamic dashboard routes (/inbox, /contacts, /pipelines,
    *   /broadcasts, etc.) are server-rendered per request — Next.js
-   *   and Supabase auth already prevent them from being served
+   *   and Convex auth already prevent them from being served
    *   from a shared cache. The s-maxage here is a ceiling; Next.js
    *   and auth middleware still set `private` / `no-store` for
    *   per-user responses.

@@ -45,3 +45,9 @@ next-env.d.ts
 
 # subagent-driven-development scratch (ledger)
 .superpowers/
+
+# Local Netlify folder
+.netlify
+
+# Local CSP-verification build output (ad-hoc `next build` distDir)
+.next-csp-verify/

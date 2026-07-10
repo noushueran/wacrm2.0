@@ -6,8 +6,8 @@ export default defineConfig({
   },
   test: {
     // Dummy secrets — encryption.ts / webhook-signature.ts read these
-    // at module load. Tests never hit a real Meta/Supabase service, so
-    // any 32-byte hex / non-empty string will do; keep them lexically
+    // at module load. Tests never hit a real Meta service, so any
+    // 32-byte hex / non-empty string will do; keep them lexically
     // identical to the CI build env so behaviour matches.
     env: {
       ENCRYPTION_KEY:

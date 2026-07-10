@@ -16,17 +16,13 @@ jobs:
   check:
     name: Lint, typecheck, test, build
     runs-on: ubuntu-latest
-    # Dummy env vars so `next build` doesn't fail when it reads the
-    # public Supabase config at build time. These never leave CI and
-    # never hit a real service — they just satisfy the `!` non-null
-    # assertions in the client factories. ENCRYPTION_KEY and
-    # META_APP_SECRET are read at module-load by lib/whatsapp/*; the
-    # test suite asserts behaviour around these values, so any non-
-    # empty placeholder works as long as it stays consistent with
-    # vitest.config.ts.
+    # Dummy secrets so the test suite / `next build` don't fail at
+    # module load. ENCRYPTION_KEY and META_APP_SECRET are read at
+    # module-load by lib/whatsapp/* (encryption.ts / webhook-signature.ts);
+    # the test suite asserts behaviour around these values, so any
+    # non-empty placeholder works as long as it stays consistent with
+    # vitest.config.ts. They never leave CI and never hit a real service.
     env:
-      NEXT_PUBLIC_SUPABASE_URL: https://ci.example.supabase.co
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-dummy-anon-key
       ENCRYPTION_KEY: '0000000000000000000000000000000000000000000000000000000000000000'
       META_APP_SECRET: 'ci-dummy-meta-secret'
     steps:
