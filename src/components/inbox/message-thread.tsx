@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   useAction,
+  useConvex,
   useMutation,
   useQuery,
   usePaginatedQuery,
@@ -50,11 +51,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { MessageBubble } from "./message-bubble";
 import { MessageActions } from "./message-actions";
-import {
-  MessageComposer,
-  CHAT_MEDIA_BUCKET,
-  type SendMediaPayload,
-} from "./message-composer";
+import { MessageComposer, type SendMediaPayload } from "./message-composer";
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
 import { TemplatePicker } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
@@ -149,6 +146,7 @@ export function MessageThread({
   const tQuote = useTranslations("Inbox.replyQuote");
 
   const { user } = useAuth();
+  const convex = useConvex();
   const { getPresence, getRow, now } = usePresence();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
@@ -314,11 +312,11 @@ export function MessageThread({
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send: ${reason}`);
         // The upload never reached the recipient — GC the orphaned
-        // object rather than leaving it in the public bucket forever.
-        void deleteAccountMedia(CHAT_MEDIA_BUCKET, payload.path).catch(() => {});
+        // object rather than leaving it in storage forever.
+        void deleteAccountMedia(convex, payload.storageId).catch(() => {});
       }
     },
-    [conversation, sendMessage],
+    [conversation, sendMessage, convex],
   );
 
   const handleSendInteractive = useCallback(

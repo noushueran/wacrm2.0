@@ -13,7 +13,7 @@ import {
   RotateCcw,
   Upload,
 } from 'lucide-react';
-import { useAction, useMutation, useQuery } from 'convex/react';
+import { useAction, useConvex, useMutation, useQuery } from 'convex/react';
 import {
   uploadAccountMedia,
   MEDIA_MAX_BYTES_BY_KIND,
@@ -155,6 +155,8 @@ export function TemplateManager() {
   // `editSubmit` action wraps it, replacing the last Supabase-backed
   // per-template lifecycle route caller below.
   const editTemplate = useAction(api.templates.editSubmit);
+  const convex = useConvex();
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -170,9 +172,9 @@ export function TemplateManager() {
   // doesn't take the template off Meta as well as locally.
   const [templateToDelete, setTemplateToDelete] =
     useState<MessageTemplate | null>(null);
-  // Header-image upload (issue #230). Uploads to the account-scoped
-  // chat-media bucket and stores the public URL in header_media_url; the
-  // submit route turns that into a Meta Resumable-Upload handle.
+  // Header-image upload (issue #230). Uploads to Convex storage and
+  // stores the resolved URL in header_media_url; the submit route turns
+  // that into a Meta Resumable-Upload handle.
   const [uploadingHeader, setUploadingHeader] = useState(false);
   const headerFileRef = useRef<HTMLInputElement>(null);
 
@@ -465,8 +467,8 @@ export function TemplateManager() {
     }
     setUploadingHeader(true);
     try {
-      const { publicUrl } = await uploadAccountMedia('chat-media', file);
-      setForm((f) => ({ ...f, header_media_url: publicUrl }));
+      const { url } = await uploadAccountMedia(convex, generateUploadUrl, file);
+      setForm((f) => ({ ...f, header_media_url: url }));
       toast.success(t('toastUploadSuccess'));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t('toastUploadFailed'));

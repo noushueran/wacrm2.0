@@ -8,10 +8,10 @@ import { v } from "convex/values";
 // (`flow-media`/`chat-media`, account-scoped object path, public URL).
 // Convex's storage model needs no bucket/path convention of its own:
 // every stored file gets an opaque `Id<"_storage">`; `generateUploadUrl`/
-// `getUrl` are the client's two entry points, `storeFromUrl` is the
-// engine's (inbound media download).
+// `getUrl`/`remove` are the client's three entry points, `storeFromUrl`
+// is the engine's (inbound media download).
 //
-// `generateUploadUrl`/`getUrl` are built on `accountMutation`/
+// `generateUploadUrl`/`getUrl`/`remove` are built on `accountMutation`/
 // `accountQuery` (never the raw `mutation`/`query`) for the same
 // reason every other tenant-facing function in this codebase is (see
 // `convex/lib/auth.ts`'s header comment) — even though Convex file
@@ -55,6 +55,28 @@ export const getUrl = accountQuery({
   args: { storageId: v.id("_storage") },
   handler: async (ctx, args) => {
     return await ctx.storage.getUrl(args.storageId);
+  },
+});
+
+/**
+ * Delete a previously-uploaded object — GC for media that was staged
+ * (uploaded) but never sent (a cancelled draft, or a failed Meta send),
+ * so abandoned attachments don't accumulate in Convex storage. Callers
+ * (e.g. the inbox composer) fire-and-forget this and swallow errors —
+ * a missed delete is a storage nit, not something to surface to the
+ * user — same best-effort contract `src/lib/storage/upload-media.ts`'s
+ * Supabase-era `deleteAccountMedia` had.
+ *
+ * Role-gated at "agent", the same floor `generateUploadUrl` uses — see
+ * this file's header comment on why "signed-in agent of some account"
+ * is the right floor even though storage has no per-file `accountId`
+ * to scope a stricter ownership check against.
+ */
+export const remove = accountMutation({
+  args: { storageId: v.id("_storage") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await ctx.storage.delete(args.storageId);
   },
 });
 

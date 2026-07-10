@@ -25,7 +25,7 @@
  */
 
 import { useCallback, useMemo, useRef, useState } from "react";
-import { useQuery } from "convex/react";
+import { useConvex, useMutation, useQuery } from "convex/react";
 import {
   Loader2,
   Paperclip,
@@ -864,18 +864,16 @@ interface SendMediaCfg {
   next_node_key?: string;
 }
 
-// Mirrors the bucket's allowed_mime_types from migration 016. Kept in
-// sync with the storage policy so the picker rejects unsupported files
-// before they hit the network rather than failing with a confusing
-// Supabase RLS / mime-type error.
+// Mirrors the previous Supabase bucket's allowed_mime_types (migration
+// 016). Kept in sync with that same MIME set so the picker rejects
+// unsupported files before they hit the network rather than failing
+// with a confusing upload error.
 const MEDIA_ACCEPT: Record<NonNullable<SendMediaCfg["media_type"]>, string> = {
   image: "image/png,image/jpeg,image/webp",
   video: "video/mp4,video/3gpp",
   document:
     "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain",
 };
-
-const FLOW_MEDIA_BUCKET = "flow-media";
 
 function SendMediaForm({
   cfg,
@@ -892,6 +890,8 @@ function SendMediaForm({
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const convex = useConvex();
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
 
   const mediaType = cfg.media_type ?? "image";
   const isDocument = mediaType === "document";
@@ -909,13 +909,11 @@ function SendMediaForm({
       }
       setUploading(true);
       try {
-        // Account-scoped upload (path `account-<id>/...`) — see
-        // uploadAccountMedia + migration 020's flow-media RLS policy.
-        const { publicUrl } = await uploadAccountMedia(FLOW_MEDIA_BUCKET, file);
+        const { url } = await uploadAccountMedia(convex, generateUploadUrl, file);
         // Patch all fields in one call so the form doesn't re-render
         // with a half-uploaded state.
         onUpdateConfig({
-          media_url: publicUrl,
+          media_url: url,
           filename: file.name,
         });
         toast.success("File uploaded.");
@@ -926,7 +924,7 @@ function SendMediaForm({
         setUploading(false);
       }
     },
-    [onUpdateConfig],
+    [onUpdateConfig, convex, generateUploadUrl],
   );
 
   const handleClear = () => {

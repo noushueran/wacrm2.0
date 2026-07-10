@@ -117,6 +117,49 @@ test("getUrl returns null for a storage id that doesn't resolve to a file", asyn
 });
 
 // ============================================================
+// remove — account-gated mutation
+// ============================================================
+
+test("remove deletes a stored file", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const storageId = await t.run((ctx) =>
+    ctx.storage.store(new Blob(["bye"], { type: "text/plain" })),
+  );
+
+  await asUser.mutation(api.files.remove, { storageId });
+
+  const url = await t.run((ctx) => ctx.storage.getUrl(storageId));
+  expect(url).toBeNull();
+});
+
+test("remove rejects a viewer (below the agent role floor)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Vic",
+    email: "vic@example.com",
+    role: "viewer",
+  });
+
+  const storageId = await t.run((ctx) =>
+    ctx.storage.store(new Blob(["safe"], { type: "text/plain" })),
+  );
+
+  await expect(
+    asUser.mutation(api.files.remove, { storageId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+
+  // Rejected mutation must not have deleted the file.
+  const url = await t.run((ctx) => ctx.storage.getUrl(storageId));
+  expect(url).not.toBeNull();
+});
+
+// ============================================================
 // storeFromUrl — internal action, fetch mocked (no real network call)
 // ============================================================
 

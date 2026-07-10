@@ -7,7 +7,7 @@ import {
   useEffect,
   KeyboardEvent,
 } from "react";
-import { useAction, useMutation } from "convex/react";
+import { useAction, useConvex, useMutation } from "convex/react";
 import {
   Send,
   LayoutTemplate,
@@ -63,9 +63,6 @@ import type { Id } from "../../../convex/_generated/dataModel";
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
 
-/** Supabase Storage bucket holding agent-sent chat attachments (migration 023). */
-export const CHAT_MEDIA_BUCKET = "chat-media";
-
 /** Meta caps media captions at 1024 chars. Enforced here and in the send route. */
 export const MEDIA_CAPTION_MAX = 1024;
 
@@ -75,10 +72,10 @@ const MAX_RECORDING_SECONDS = 5 * 60;
 
 export interface SendMediaPayload {
   kind: ComposerMediaKind;
-  /** Public chat-media URL Meta fetches at send time. */
+  /** Fetchable URL Meta fetches at send time. */
   mediaUrl: string;
-  /** Storage object path — lets the caller GC the object if the send fails. */
-  path: string;
+  /** Convex storage id — lets the caller GC the object if the send fails. */
+  storageId: Id<"_storage">;
   /** Optional caption (image/video/document only). */
   caption?: string;
   /** Original file name — surfaced to the recipient for documents. */
@@ -93,10 +90,10 @@ interface ReplyDraft {
   preview: string;
 }
 
-// Mirrors the chat-media bucket's allowed_mime_types (migration 023) for
-// the file picker so unsupported files are rejected before upload rather
-// than failing with a confusing Storage error. Audio has no picker — it's
-// captured via the recorder.
+// Mirrors the previous chat-media bucket's allowed_mime_types (migration
+// 023) for the file picker so unsupported files are rejected before
+// upload rather than failing with a confusing Storage error. Audio has
+// no picker — it's captured via the recorder.
 const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
   image: "image/png,image/jpeg,image/webp",
   video: "video/mp4,video/3gpp",
@@ -107,8 +104,8 @@ const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
 interface MediaDraft {
   kind: ComposerMediaKind;
   mediaUrl: string;
-  /** Storage path — used to GC the object if the draft is discarded. */
-  path: string;
+  /** Convex storage id — used to GC the object if the draft is discarded. */
+  storageId: Id<"_storage">;
   filename: string;
   caption: string;
 }
@@ -149,6 +146,8 @@ export function MessageComposer({
 
   const draftReply = useAction(api.aiReply.draft);
   const createQuickReply = useMutation(api.quickReplies.create);
+  const convex = useConvex();
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -178,10 +177,13 @@ export function MessageComposer({
   }, [draft]);
 
   // Best-effort GC of a staged object the user never sent. Fire-and-forget.
-  const removeStaged = useCallback((path: string | undefined) => {
-    if (!path) return;
-    void deleteAccountMedia(CHAT_MEDIA_BUCKET, path).catch(() => {});
-  }, []);
+  const removeStaged = useCallback(
+    (storageId: Id<"_storage"> | undefined) => {
+      if (!storageId) return;
+      void deleteAccountMedia(convex, storageId).catch(() => {});
+    },
+    [convex],
+  );
 
   // Voice recording state. The recorder encodes Ogg/Opus in-browser
   // (opus-recorder) so there's no server-side transcode.
@@ -215,7 +217,7 @@ export function MessageComposer({
       cancelledRef.current = true;
       // stop() releases the mic stream + audio context inside opus-recorder.
       void recorderRef.current?.stop().catch(() => {});
-      removeStaged(draftRef.current?.path);
+      removeStaged(draftRef.current?.storageId);
     };
   }, [clearTimer, removeStaged]);
 
@@ -394,17 +396,21 @@ export function MessageComposer({
       }
       setBusy(true);
       try {
-        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
+        const { url, storageId } = await uploadAccountMedia(
+          convex,
+          generateUploadUrl,
+          file,
+        );
         // Replacing an existing draft? GC the previous object first.
-        removeStaged(draftRef.current?.path);
-        setDraft({ kind, mediaUrl: publicUrl, path, filename: file.name, caption: "" });
+        removeStaged(draftRef.current?.storageId);
+        setDraft({ kind, mediaUrl: url, storageId, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged],
+    [removeStaged, convex, generateUploadUrl],
   );
 
   const handlePicked = useCallback(
@@ -432,16 +438,20 @@ export function MessageComposer({
       }
       setBusy(true);
       try {
-        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        removeStaged(draftRef.current?.path);
-        setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
+        const { url, storageId } = await uploadAccountMedia(
+          convex,
+          generateUploadUrl,
+          file,
+        );
+        removeStaged(draftRef.current?.storageId);
+        setDraft({ kind: "audio", mediaUrl: url, storageId, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged],
+    [removeStaged, convex, generateUploadUrl],
   );
 
   const startRecording = useCallback(async () => {
@@ -506,7 +516,7 @@ export function MessageComposer({
     onSendMedia({
       kind: draft.kind,
       mediaUrl: draft.mediaUrl,
-      path: draft.path,
+      storageId: draft.storageId,
       // Audio takes no caption (Meta rejects it). Everything else: the
       // trimmed caption, or undefined when blank.
       caption:
@@ -521,9 +531,9 @@ export function MessageComposer({
 
   // Discard GCs the staged object — it was uploaded but never sent.
   const discardDraft = useCallback(() => {
-    removeStaged(draft?.path);
+    removeStaged(draft?.storageId);
     setDraft(null);
-  }, [draft?.path, removeStaged]);
+  }, [draft?.storageId, removeStaged]);
 
   const setCaption = useCallback((caption: string) => {
     setDraft((d) => (d ? { ...d, caption } : d));
