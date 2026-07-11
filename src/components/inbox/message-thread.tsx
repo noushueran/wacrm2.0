@@ -666,30 +666,38 @@ export function MessageThread({
             </button>
           )}
 
-          {/* Status dropdown */}
-          <DropdownMenu>
-            <DropdownMenuTrigger className={cn(
-                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
-                  currentStatus?.color ?? "text-muted-foreground"
-                )}>
-                {currentStatus ? t(`status${currentStatus.label}`) : t("status")}
-                <ChevronDown className="h-3 w-3" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              className="border-border bg-popover"
-            >
-              {STATUS_OPTIONS.map((opt) => (
-                <DropdownMenuItem
-                  key={opt.value}
-                  onClick={() => handleStatusChange(opt.value)}
-                  className={cn("text-sm", opt.color)}
-                >
-                  {t(`status${opt.label}`)}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {/* Status dropdown — hidden for viewers, same as the assign
+              dropdown and AiThreadBanner below. Changing a
+              conversation's status is an agent-class write
+              (`conversations.setStatus` requires requireRole("agent")),
+              which a viewer can never perform — so hide the control
+              rather than let every click fail server-side with a
+              generic "Failed to update status" toast (Task 11). */}
+          {accountRole !== "viewer" && (
+            <DropdownMenu>
+              <DropdownMenuTrigger className={cn(
+                    "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                    currentStatus?.color ?? "text-muted-foreground"
+                  )}>
+                  {currentStatus ? t(`status${currentStatus.label}`) : t("status")}
+                  <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="border-border bg-popover"
+              >
+                {STATUS_OPTIONS.map((opt) => (
+                  <DropdownMenuItem
+                    key={opt.value}
+                    onClick={() => handleStatusChange(opt.value)}
+                    className={cn("text-sm", opt.color)}
+                  >
+                    {t(`status${opt.label}`)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
           {/* Assign dropdown — supervisor+ keeps the full teammate picker.
               An agent gets self-serve Claim/Release only: the server now
