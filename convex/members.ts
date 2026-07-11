@@ -105,6 +105,7 @@ export const setRole = accountMutation({
     role: v.union(
       v.literal("owner"),
       v.literal("admin"),
+      v.literal("supervisor"),
       v.literal("agent"),
       v.literal("viewer"),
     ),

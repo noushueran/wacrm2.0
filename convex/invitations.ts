@@ -144,7 +144,12 @@ export const create = accountMutation({
     // encodes the same way (`convex/schema.ts`'s `accountInvitations`).
     // There is no equivalent runtime guard to port because there is no
     // way to construct an invalid request in the first place.
-    role: v.union(v.literal("admin"), v.literal("agent"), v.literal("viewer")),
+    role: v.union(
+      v.literal("admin"),
+      v.literal("supervisor"),
+      v.literal("agent"),
+      v.literal("viewer"),
+    ),
     expiresInDays: v.optional(v.number()),
     label: v.optional(v.string()),
   },

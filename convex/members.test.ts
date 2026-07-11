@@ -406,3 +406,38 @@ test("remove deletes the target's membership and gives them a fresh personal acc
   expect(memberships[0]!.accountId).toBe(newAccountId);
   expect(memberships[0]!.role).toBe("owner");
 });
+
+test("admin can set a member's role to supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const adminId = await t.run((ctx) => ctx.db.insert("users", { name: "Ad", email: "ad@x.com" }));
+  const targetId = await t.run((ctx) => ctx.db.insert("users", { name: "Ag", email: "ag@x.com" }));
+  const accountId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", { name: "Acme", defaultCurrency: "USD", ownerUserId: adminId });
+    await ctx.db.insert("memberships", { userId: adminId, accountId: id, role: "admin" });
+    await ctx.db.insert("memberships", { userId: targetId, accountId: id, role: "agent" });
+    return id;
+  });
+  const asAdmin = t.withIdentity({ subject: `${adminId}|s` });
+  await asAdmin.mutation(api.members.setRole, { userId: targetId, role: "supervisor" });
+  const m = await t.run((ctx) =>
+    ctx.db.query("memberships")
+      .withIndex("by_user_account", (q) => q.eq("userId", targetId).eq("accountId", accountId))
+      .first(),
+  );
+  expect(m?.role).toBe("supervisor");
+});
+
+test("supervisor cannot change roles", async () => {
+  const t = convexTest(schema, modules);
+  const supId = await t.run((ctx) => ctx.db.insert("users", { name: "Su", email: "su@x.com" }));
+  const targetId = await t.run((ctx) => ctx.db.insert("users", { name: "Ag", email: "ag@x.com" }));
+  await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", { name: "Acme", defaultCurrency: "USD", ownerUserId: supId });
+    await ctx.db.insert("memberships", { userId: supId, accountId: id, role: "supervisor" });
+    await ctx.db.insert("memberships", { userId: targetId, accountId: id, role: "agent" });
+  });
+  const asSup = t.withIdentity({ subject: `${supId}|s` });
+  await expect(
+    asSup.mutation(api.members.setRole, { userId: targetId, role: "viewer" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
