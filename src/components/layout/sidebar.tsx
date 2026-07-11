@@ -18,6 +18,7 @@ import {
   Radio,
   Settings,
   Shield,
+  ShieldCheck,
   User,
   UserCog,
   Users,
@@ -49,6 +50,11 @@ const ROLE_CHIP: Record<
     // Primary-tinted: significant but not as scarce as owner.
     className:
       "border-primary/40 bg-primary/10 text-primary",
+  },
+  supervisor: {
+    icon: ShieldCheck,
+    labelKey: "roleSupervisor",
+    className: "border-cyan-500/40 bg-cyan-500/10 text-cyan-300",
   },
   agent: {
     icon: UserCog,

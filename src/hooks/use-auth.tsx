@@ -14,6 +14,8 @@ import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "../../convex/_generated/api";
 import { DEFAULT_CURRENCY } from "@/lib/currency";
 import {
+  canEditCriticalSettings as canEditCriticalSettingsFor,
+  canEditOperationalSettings as canEditOperationalSettingsFor,
   canEditSettings as canEditSettingsFor,
   canManageMembers as canManageMembersFor,
   canSendMessages as canSendMessagesFor,
@@ -112,6 +114,12 @@ interface AuthContextValue {
   canManageMembers: boolean;
   /** True if the caller can edit account-wide settings (admin+). */
   canEditSettings: boolean;
+  /** True if `accountRole === 'supervisor'`. */
+  isSupervisor: boolean;
+  /** Critical config (WhatsApp, API keys): admin+. */
+  canEditCriticalSettings: boolean;
+  /** Operational config (templates, quick replies, fields, deals): supervisor+. */
+  canEditOperationalSettings: boolean;
   /** True if the caller can send messages and edit operational data (agent+). */
   canSendMessages: boolean;
 }
@@ -220,6 +228,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isViewer: role === "viewer",
       canManageMembers: role ? canManageMembersFor(role) : false,
       canEditSettings: role ? canEditSettingsFor(role) : false,
+      isSupervisor: role === "supervisor",
+      canEditCriticalSettings: role ? canEditCriticalSettingsFor(role) : false,
+      canEditOperationalSettings: role ? canEditOperationalSettingsFor(role) : false,
       canSendMessages: role ? canSendMessagesFor(role) : false,
     };
   }, [me?.accountRole, me?.accountId]);
@@ -273,6 +284,9 @@ export function useAuth(): AuthContextValue {
       isViewer: false,
       canManageMembers: false,
       canEditSettings: false,
+      isSupervisor: false,
+      canEditCriticalSettings: false,
+      canEditOperationalSettings: false,
       canSendMessages: false,
     };
   }

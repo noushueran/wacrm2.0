@@ -3,6 +3,8 @@
 import { useAuth } from "@/hooks/use-auth";
 import {
   canDeleteAccount,
+  canEditCriticalSettings,
+  canEditOperationalSettings,
   canEditSettings,
   canManageMembers,
   canSendMessages,
@@ -19,6 +21,8 @@ import {
 export type CanAction =
   | "manage-members"
   | "edit-settings"
+  | "edit-critical-settings"
+  | "edit-operational-settings"
   | "send-messages"
   | "view-only"
   | "delete-account"
@@ -46,6 +50,10 @@ export function useCan(action: CanAction): boolean {
       return canManageMembers(accountRole);
     case "edit-settings":
       return canEditSettings(accountRole);
+    case "edit-critical-settings":
+      return canEditCriticalSettings(accountRole);
+    case "edit-operational-settings":
+      return canEditOperationalSettings(accountRole);
     case "send-messages":
       return canSendMessages(accountRole);
     case "view-only":

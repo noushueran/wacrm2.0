@@ -1,6 +1,7 @@
 import {
   Crown,
   Shield,
+  ShieldCheck,
   UserCog,
   UserIcon,
   type LucideIcon,
@@ -33,6 +34,12 @@ export const ROLE_META: Record<
     label: 'admin',
     variant: 'admin',
     className: 'border-primary/40 bg-primary/10 text-primary',
+  },
+  supervisor: {
+    icon: ShieldCheck,
+    label: 'supervisor',
+    variant: 'supervisor',
+    className: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300',
   },
   agent: {
     icon: UserCog,
