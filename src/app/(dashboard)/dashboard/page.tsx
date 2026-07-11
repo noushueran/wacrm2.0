@@ -17,6 +17,7 @@ import type { ConversationsSeriesPoint } from '@/lib/dashboard/types'
 
 import { MetricCard } from '@/components/dashboard/metric-card'
 import { SkeletonCard } from '@/components/dashboard/skeleton'
+import { LeadSpendCard } from '@/components/dashboard/lead-spend-card'
 import { QuickActions } from '@/components/dashboard/quick-actions'
 import { ConversationsChart } from '@/components/dashboard/conversations-chart'
 import { PipelineDonut } from '@/components/dashboard/pipeline-donut'
@@ -181,6 +182,10 @@ export default function DashboardPage() {
           </>
         )}
       </div>
+
+      {/* Lead spend — self-hides (renders null) until an admin sets a
+          positive lead value, so no conditional needed here. */}
+      <LeadSpendCard />
 
       {/* Quick actions */}
       <QuickActions />

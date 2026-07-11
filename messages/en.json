@@ -126,6 +126,16 @@
     },
     "emptyState": {
       "title": "Not enough data yet"
+    },
+    "leadSpend": {
+      "title": "Lead spend",
+      "thisMonth": "This month",
+      "allTime": "All time",
+      "agent": "Agent",
+      "leads": "Leads",
+      "spent": "Spent",
+      "yourSpend": "You've spent {amount} on {count} leads",
+      "empty": "No lead spend yet"
     }
   },
   "Inbox": {
