@@ -614,6 +614,70 @@ test("update_contact_field refuses to write a custom field owned by a different 
   expect(values).toHaveLength(0);
 });
 
+// ============================================================
+// 6. assign_conversation step charges the assigned agent when the
+//    account has a lead value set (lead-value fix wave, Task 2b) —
+//    `runDbStep`'s `assign_conversation` case calls the same
+//    `chargeLeadIfAgent` helper `conversations.assign` and
+//    `conversations.setAutoreplyPaused` already use, right after its
+//    own `assignedToUserId` patch. No membership row is seeded by
+//    this suite's own helpers (see header comment), so the assigned
+//    agent's membership is inserted inline here — it's what makes
+//    `chargeLeadIfAgent`'s agents-only check pass.
+// ============================================================
+
+test("assign_conversation step writes a leadCharges row for the assigned agent", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const agentId = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "Agent", email: "agent@example.com" });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: "agent",
+      fullName: "Agent",
+      email: "agent@example.com",
+    });
+    return userId;
+  });
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15559990000");
+
+  const automationId = await seedAutomation(t, {
+    accountId,
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: ["assign"], match_type: "contains" },
+  });
+  await seedStep(t, {
+    accountId,
+    automationId,
+    stepType: "assign_conversation",
+    stepConfig: { mode: "specific", agent_id: agentId },
+    position: 0,
+  });
+
+  await t.action(internal.automationsEngine.runForTrigger, {
+    accountId,
+    triggerType: "keyword_match",
+    contactId,
+    context: { messageText: "please assign this" },
+  });
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.assignedToUserId).toBe(agentId);
+
+  const charges = await t.run((ctx) =>
+    ctx.db
+      .query("leadCharges")
+      .withIndex("by_user_conversation", (q) =>
+        q.eq("userId", agentId).eq("conversationId", conversationId),
+      )
+      .collect(),
+  );
+  expect(charges).toHaveLength(1);
+  expect(charges[0]).toMatchObject({ accountId, value: 5, currency: "USD" });
+});
+
 // ------------------------------------------------------------
 // hasActiveAutoResponder — backs convex/ingest.ts's AI "stand down"
 // precedence (Phase 8, Task 4b). Direct, focused coverage of the

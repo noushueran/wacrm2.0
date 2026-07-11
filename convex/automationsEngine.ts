@@ -8,6 +8,7 @@ import {
   type InteractiveMessagePayload,
 } from "./lib/whatsapp/interactive";
 import { isDeliverableUrl } from "./webhookDelivery";
+import { chargeLeadIfAgent } from "./lib/leadCharge";
 
 // ============================================================
 // Automations engine (Phase 6, Task 3) — Convex port of
@@ -1016,6 +1017,11 @@ export const runDbStep = internalMutation({
           .first();
         if (conversation) {
           await ctx.db.patch(conversation._id, { assignedToUserId: agentId });
+          // Same charge-on-assignment guarantee as `conversations.assign`
+          // and `conversations.setAutoreplyPaused` — feature-off/
+          // agents-only/idempotent, so safe to call unconditionally right
+          // after the patch (lead-value fix wave, Task 2b).
+          await chargeLeadIfAgent(ctx, accountId, agentId, conversation._id);
         }
         return `assigned to ${agentId}`;
       }

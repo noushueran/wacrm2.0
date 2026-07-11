@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
-import { api, internal } from "./_generated/api";
+import { api } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -11,45 +11,6 @@ import type { AccountRole } from "./lib/roles";
 // `convex/contacts.test.ts` — see that file's comment for why this must
 // be absolute rather than a relative "./**").
 const modules = import.meta.glob("/convex/**/*.ts");
-
-/**
- * Seeds a `users` row + an `accounts`/`memberships` row for a fresh
- * account, and returns a convex-test client already authenticated as
- * that user. Duplicated from `convex/contacts.test.ts` rather than
- * imported — each `convex/*.test.ts` suite owns its own copy of this
- * helper (see `convex/contacts.test.ts`'s own comment on
- * `seedAccountMember` and `convex/lib/auth.test.ts`'s `insertUser`/
- * `insertMembership` for the same pattern elsewhere). Bypasses
- * `accounts.bootstrapAccount` on purpose — this suite tests
- * `conversations.ts`, not the bootstrap flow.
- */
-async function seedAccountMember(
-  t: ReturnType<typeof convexTest>,
-  opts: { name: string; email: string; role: AccountRole },
-) {
-  const userId = await t.run((ctx) =>
-    ctx.db.insert("users", { name: opts.name, email: opts.email }),
-  );
-  const accountId = await t.run(async (ctx) => {
-    const id = await ctx.db.insert("accounts", {
-      name: `${opts.name}'s account`,
-      defaultCurrency: "USD",
-      ownerUserId: userId,
-    });
-    await ctx.db.insert("memberships", {
-      userId,
-      accountId: id,
-      role: opts.role,
-      fullName: opts.name,
-      email: opts.email,
-    });
-    return id;
-  });
-  const asUser = t.withIdentity({
-    subject: `${userId}|session-${opts.name}`,
-  });
-  return { userId, accountId, asUser };
-}
 
 async function seedUserInAccount(
   t: ReturnType<typeof convexTest>,
@@ -223,4 +184,63 @@ test("value snapshot survives a later rate change", async () => {
   const all = await rows(t);
   expect(all.find((r) => r.userId === a.userId)?.value).toBe(5);
   expect(all.find((r) => r.userId === b.userId)?.value).toBe(9);
+});
+
+// ============================================================
+// setAutoreplyPaused — the second `chargeLeadIfAgent` call site
+// (Take-over/self-claim while pausing the AI bot). Same helper as
+// `assign` above, so this section only proves the wiring at *this*
+// call site: `paused:true` + `assignToMe:true` self-claims and
+// charges; `assignToMe:false` never assigns, so never charges;
+// `paused:false` (Resume AI) never calls the helper at all (lead-value
+// fix wave, Task 2b — previously zero coverage on this path).
+// ============================================================
+
+test("setAutoreplyPaused(paused:true, assignToMe:true) writes one charge for the claiming agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  await setRate(t, accountId, 5);
+  const a = await seedUserInAccount(t, accountId, { name: "A", email: "a@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "1", name: "L" });
+
+  await a.asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: true,
+    assignToMe: true,
+  });
+
+  const all = await rows(t);
+  expect(all).toHaveLength(1);
+  expect(all[0]).toMatchObject({ userId: a.userId, conversationId, value: 5, currency: "USD" });
+});
+
+test("setAutoreplyPaused(paused:true, assignToMe:false) writes no charge", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  await setRate(t, accountId, 5);
+  const a = await seedUserInAccount(t, accountId, { name: "A", email: "a@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "1", name: "L" });
+
+  await a.asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: true,
+    assignToMe: false,
+  });
+
+  expect(await rows(t)).toHaveLength(0);
+});
+
+test("setAutoreplyPaused(paused:false) resume writes no charge", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  await setRate(t, accountId, 5);
+  const a = await seedUserInAccount(t, accountId, { name: "A", email: "a@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "1", name: "L" });
+
+  await a.asUser.mutation(api.conversations.setAutoreplyPaused, {
+    conversationId,
+    paused: false,
+  });
+
+  expect(await rows(t)).toHaveLength(0);
 });
