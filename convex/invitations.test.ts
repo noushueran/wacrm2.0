@@ -318,6 +318,68 @@ test("redeem moves a fresh personal-account user into the invited account with t
   });
 });
 
+test("redeem creates a membership for an invited user who has no account yet (fresh invited signup), without creating or deleting a personal account", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: targetAccountId, asUser: asTargetOwner } =
+    await seedOwner(t, { name: "Nadia", email: "nadia@example.com" });
+  const created = await asTargetOwner.mutation(api.invitations.create, {
+    role: "agent",
+  });
+  const tokenHash = await hashInviteToken(created.token);
+
+  // A brand-new invitee: the sign-up-with-invite flow deliberately skips
+  // `accounts.bootstrapAccount` (see src/app/(auth)/signup/page.tsx) and
+  // `/join` isn't wrapped by the AuthProvider that would otherwise
+  // bootstrap as a backstop, so this user is authenticated with NO
+  // membership at all when they hit `redeem`. Seed exactly that: a bare
+  // `users` row and an identity, no account, no membership.
+  const newUserId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Femi", email: "femi@example.com" }),
+  );
+  const asNewUser = t.withIdentity({ subject: `${newUserId}|session-femi` });
+
+  const accountsBefore = await t.run((ctx) =>
+    ctx.db.query("accounts").collect(),
+  );
+
+  const joinedAccountId = await asNewUser.mutation(api.invitations.redeem, {
+    tokenHash,
+  });
+
+  expect(joinedAccountId).toBe(targetAccountId);
+
+  const membership = await t.run((ctx) =>
+    ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", newUserId))
+      .first(),
+  );
+  expect(membership).not.toBeNull();
+  expect(membership!.accountId).toBe(targetAccountId);
+  expect(membership!.role).toBe("agent");
+  // Display snapshot carried over from the user doc, same as bootstrap.
+  expect(membership!.fullName).toBe("Femi");
+  expect(membership!.email).toBe("femi@example.com");
+
+  const invitation = await t.run((ctx) =>
+    ctx.db
+      .query("accountInvitations")
+      .withIndex("by_token_hash", (q) => q.eq("tokenHash", tokenHash))
+      .first(),
+  );
+  expect(invitation!.acceptedAt).not.toBeUndefined();
+  expect(invitation!.acceptedByUserId).toBe(newUserId);
+
+  // No throwaway personal account was created (and none deleted): the
+  // only account in existence is still the inviter's target account.
+  const accountsAfter = await t.run((ctx) => ctx.db.query("accounts").collect());
+  expect(accountsAfter.map((a) => a._id)).toEqual(
+    accountsBefore.map((a) => a._id),
+  );
+  expect(accountsAfter).toHaveLength(1);
+  expect(accountsAfter[0]._id).toBe(targetAccountId);
+});
+
 test("redeem rejects an unauthenticated caller", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asOwner } = await seedOwner(t, {

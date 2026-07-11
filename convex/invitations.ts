@@ -318,13 +318,39 @@ export const redeem = mutation({
       .query("memberships")
       .withIndex("by_user", (q) => q.eq("userId", callerId))
       .first();
+
+    // A brand-new invitee has NO membership yet — and that's the EXPECTED
+    // invited-signup happy path here, not an error. The sign-up flow
+    // deliberately skips `accounts.bootstrapAccount` for invitees ("Join
+    // the inviter's account rather than bootstrapping a new one",
+    // src/app/(auth)/signup/page.tsx), and `/join` isn't wrapped by the
+    // AuthProvider that would otherwise bootstrap as a backstop, so the
+    // caller reaches this mutation authenticated-but-membershipless.
+    //
+    // 019 could treat "no profile" as unreachable because Postgres
+    // auto-created a profile + personal account for every user via a
+    // signup trigger; the Convex port makes bootstrap explicit and skips
+    // it for invitees, so that precondition no longer holds. There's
+    // nothing to move or clean up (no personal account was ever created),
+    // so just create the membership straight into the invited account
+    // with the invite's role — snapshotting the display fields the same
+    // way `accounts.bootstrapAccount` does — mark the invite used, and
+    // return. The move-in-place branch below stays for an EXISTING user
+    // (with their own sole-owner personal account) who signs in to redeem.
     if (!callerMembership) {
-      // Defensive — mirrors 019's own "every authenticated user has a
-      // profile" comment. Reuses the same `NO_ACCOUNT` code
-      // `accountQuery`/`accountMutation` throw for "authenticated, no
-      // membership yet" (`convex/lib/auth.ts`) rather than inventing a
-      // parallel vocabulary for the same state.
-      throw new ConvexError({ code: "NO_ACCOUNT" });
+      const user = await ctx.db.get(callerId);
+      await ctx.db.insert("memberships", {
+        userId: callerId,
+        accountId: invitation.accountId,
+        role: invitation.role,
+        fullName: user?.name,
+        email: user?.email,
+      });
+      await ctx.db.patch(invitation._id, {
+        acceptedAt: Date.now(),
+        acceptedByUserId: callerId,
+      });
+      return invitation.accountId;
     }
 
     // Edge case: the inviter sent themselves a link, or the caller is
