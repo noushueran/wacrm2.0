@@ -9,6 +9,7 @@ import { conversationScope, canAccessConversation, canSeeContactPhone, canAssign
 import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { maskPhone } from "./lib/phone";
+import { chargeLeadIfAgent } from "./lib/leadCharge";
 
 // ============================================================
 // Conversations — the Inbox list/thread read (`list`/`get`/
@@ -424,6 +425,8 @@ export const assign = accountMutation({
       updatedAt: Date.now(),
     });
 
+    await chargeLeadIfAgent(ctx, ctx.accountId, args.userId, args.conversationId);
+
     if (args.userId !== ctx.userId) {
       const [contact, actorMembership] = await Promise.all([
         ctx.db.get(conversation.contactId),
@@ -529,6 +532,10 @@ export const setAutoreplyPaused = accountMutation({
         updatedAt: Date.now(),
         ...(args.assignToMe ? { assignedToUserId: ctx.userId } : {}),
       });
+
+      if (args.assignToMe) {
+        await chargeLeadIfAgent(ctx, ctx.accountId, ctx.userId, args.conversationId);
+      }
     } else {
       await ctx.db.patch(args.conversationId, {
         aiAutoreplyDisabled: false,
