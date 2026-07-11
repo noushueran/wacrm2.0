@@ -107,6 +107,14 @@ export interface Contact {
   name?: string;
   email?: string;
   company?: string;
+  /** Extended CRM detail, edited from the inbox contact panel. */
+  alt_phone?: string;
+  address?: string;
+  city?: string;
+  country?: string;
+  nationality?: string;
+  preferred_destination?: string;
+  notes?: string;
   avatar_url?: string;
   created_at: string;
   updated_at: string;

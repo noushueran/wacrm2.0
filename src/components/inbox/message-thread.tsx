@@ -20,6 +20,7 @@ import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
 import { presenceLabel } from "@/lib/presence";
 import { cn } from "@/lib/utils";
+import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import type {
   Conversation,
   Message,
@@ -37,8 +38,7 @@ import {
   Clock,
   ArrowLeft,
   Loader2,
-  PanelRightOpen,
-  PanelRightClose,
+  ChevronRight,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -620,10 +620,24 @@ export function MessageThread({
           <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
             {displayName.charAt(0).toUpperCase()}
           </div>
-          <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold text-foreground">{displayName}</h2>
-            <p className="truncate text-xs text-muted-foreground">{contact.phone}</p>
-          </div>
+          {/* Clicking the name/number opens the contact-details slide-over. */}
+          <button
+            type="button"
+            onClick={() => onToggleContactPanel?.()}
+            aria-label={t("viewContactDetails")}
+            aria-expanded={!!contactPanelOpen}
+            className="group flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted"
+          >
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-semibold text-foreground">
+                {displayName}
+              </span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {formatPhoneIntl(contact.phone)}
+              </span>
+            </span>
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+          </button>
           {/* Session timer badge — hidden on the narrowest phones so
               the name + back arrow keep their room. */}
           <Badge
@@ -639,33 +653,6 @@ export function MessageThread({
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Contact-panel toggle — desktop only. The contact sidebar
-              eats a chunk of horizontal width that crowds the thread on
-              smaller laptops; this lets agents reclaim it when they just
-              want to read and reply. Hidden on mobile, where the sidebar
-              never renders as a permanent panel anyway. Issue #258. */}
-          {onToggleContactPanel && (
-            <button
-              type="button"
-              onClick={onToggleContactPanel}
-              aria-label={
-                contactPanelOpen ? t("hideContactPanel") : t("showContactPanel")
-              }
-              title={contactPanelOpen ? t("hideContact") : t("showContact")}
-              aria-pressed={contactPanelOpen}
-              className={cn(
-                "hidden h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-muted hover:text-foreground lg:inline-flex",
-                contactPanelOpen ? "text-primary" : "text-muted-foreground",
-              )}
-            >
-              {contactPanelOpen ? (
-                <PanelRightClose className="h-4 w-4" />
-              ) : (
-                <PanelRightOpen className="h-4 w-4" />
-              )}
-            </button>
-          )}
-
           {/* Status dropdown — hidden for viewers, same as the assign
               dropdown and AiThreadBanner below. Changing a
               conversation's status is an agent-class write

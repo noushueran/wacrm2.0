@@ -47,6 +47,15 @@ export default defineSchema({
     email: v.optional(v.string()),
     company: v.optional(v.string()),
     avatarUrl: v.optional(v.string()),
+    // Extended CRM detail — all optional, edited from the inbox contact
+    // panel. Additive/backward-compatible; no migration.
+    altPhone: v.optional(v.string()),
+    address: v.optional(v.string()),
+    city: v.optional(v.string()),
+    country: v.optional(v.string()),
+    nationality: v.optional(v.string()),
+    preferredDestination: v.optional(v.string()),
+    notes: v.optional(v.string()),
   })
     .index("by_account", ["accountId"])
     .index("by_account_phone", ["accountId", "phoneNormalized"])

@@ -1157,3 +1157,36 @@ test("filterByTags returns nothing for an empty tagIds list", async () => {
 
   expect(result).toEqual({ items: [], total: 0 });
 });
+
+test("update persists the extended contact fields", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Ana",
+    email: "ana@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "+971501234567",
+    name: "Guest",
+  });
+
+  await asUser.mutation(api.contacts.update, {
+    contactId,
+    altPhone: "+971559876543",
+    address: "12 Marina Walk",
+    city: "Dubai",
+    country: "UAE",
+    nationality: "Indian",
+    preferredDestination: "Maldives",
+    notes: "VIP — prefers window seat",
+  });
+
+  const doc = await t.run((ctx) => ctx.db.get(contactId));
+  expect(doc?.altPhone).toBe("+971559876543");
+  expect(doc?.address).toBe("12 Marina Walk");
+  expect(doc?.city).toBe("Dubai");
+  expect(doc?.country).toBe("UAE");
+  expect(doc?.nationality).toBe("Indian");
+  expect(doc?.preferredDestination).toBe("Maldives");
+  expect(doc?.notes).toBe("VIP — prefers window seat");
+});

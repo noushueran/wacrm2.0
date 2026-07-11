@@ -261,6 +261,7 @@ test("sendTemplate in DRY-RUN persists a template message", async () => {
     templateName: "order_confirmation",
     language: "en_US",
     params: ["12345"],
+    contentText: "Your order 12345 is confirmed.",
   });
 
   const messages = await t.run((ctx) =>
@@ -273,6 +274,14 @@ test("sendTemplate in DRY-RUN persists a template message", async () => {
   expect(messages[0]!.contentType).toBe("template");
   expect(messages[0]!.templateName).toBe("order_confirmation");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
+  // The rendered template body must persist on the row so the bubble
+  // renders text instead of a blank template placeholder.
+  expect(messages[0]!.contentText).toBe("Your order 12345 is confirmed.");
+
+  // ...and surface as the conversation-list preview, not the `[template]`
+  // fallback used when no body text is available.
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.lastMessageText).toBe("Your order 12345 is confirmed.");
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

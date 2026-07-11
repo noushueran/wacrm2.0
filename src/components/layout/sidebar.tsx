@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/use-auth";
 import { useTotalUnread } from "@/hooks/use-total-unread";
@@ -15,6 +15,8 @@ import {
   LayoutDashboard,
   LogOut,
   MessageSquare,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radio,
   Settings,
   Shield,
@@ -83,6 +85,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface NavItem {
   href: string;
@@ -138,6 +145,31 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
     !!account?.name &&
     account.name !== profile?.full_name;
 
+  // Desktop-only rail collapse. Server renders expanded; reconcile from
+  // localStorage after mount to avoid a hydration mismatch (same pattern
+  // as the inbox contact panel). `collapsed` only drives `lg:` styles —
+  // the mobile drawer stays full-width regardless of the stored choice.
+  const [collapsed, setCollapsed] = useState(false);
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("wacrm:sidebar:collapsed");
+      if (stored !== null) setCollapsed(stored === "true");
+    } catch {
+      // localStorage can throw in private-browsing / sandboxed contexts.
+    }
+  }, []);
+  const toggleCollapsed = () => {
+    setCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("wacrm:sidebar:collapsed", String(next));
+      } catch {
+        // Persistence is best-effort; ignore storage failures.
+      }
+      return next;
+    });
+  };
+
   // Close the drawer when route changes — users opened it to navigate,
   // so once they pick a destination the drawer should get out of the way.
   useEffect(() => {
@@ -186,14 +218,23 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
           "transition-transform duration-200 ease-out will-change-transform",
           open ? "translate-x-0" : "-translate-x-full",
           // Desktop: static, always visible — reset all the mobile framing.
-          "lg:static lg:z-0 lg:w-60 lg:translate-x-0 lg:transition-none",
+          "lg:static lg:z-0 lg:translate-x-0 lg:transition-none",
+          collapsed ? "lg:w-16" : "lg:w-60",
         )}
         aria-label="Primary"
       >
         {/* Logo row. On mobile we put a close button here; on desktop the
             close button is hidden since the sidebar is always-visible. */}
-        <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-          <Link href="/dashboard" className="flex items-center gap-2">
+        <div
+          className={cn(
+            "flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4",
+            collapsed && "lg:justify-center lg:px-2",
+          )}
+        >
+          <Link
+            href="/dashboard"
+            className={cn("flex items-center gap-2", collapsed && "lg:hidden")}
+          >
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <MessageSquare className="h-4 w-4" />
             </div>
@@ -201,14 +242,31 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
               {t("title")}
             </span>
           </Link>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label={t("closeMenu")}
-            className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground lg:hidden"
-          >
-            <X className="h-5 w-5" />
-          </button>
+          <div className="flex items-center gap-1">
+            {/* Desktop collapse/expand toggle. */}
+            <button
+              type="button"
+              onClick={toggleCollapsed}
+              aria-label={collapsed ? t("expandMenu") : t("collapseMenu")}
+              title={collapsed ? t("expandMenu") : t("collapseMenu")}
+              className="hidden h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground lg:flex"
+            >
+              {collapsed ? (
+                <PanelLeftOpen className="h-5 w-5" />
+              ) : (
+                <PanelLeftClose className="h-5 w-5" />
+              )}
+            </button>
+            {/* Mobile close. */}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label={t("closeMenu")}
+              className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground lg:hidden"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
         </div>
 
         {/* Main navigation */}
@@ -231,49 +289,68 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                 const showNotificationBadge =
                   item.href === "/notifications" && unreadNotifications > 0;
 
-                return (
-                  <li key={item.href}>
-                    <Link
-                      href={item.href}
-                      className={cn(
-                        // Taller on mobile so fingers can hit the row reliably (≥44px).
-                        "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors lg:py-2",
-                        isActive
-                          ? "bg-primary/10 text-primary"
-                          : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                      )}
-                    >
-                      <item.icon className="h-4 w-4" />
-                      <span className="flex-1">{t(item.labelKey as string)}</span>
-                      {item.beta && (
-                        <span
-                          aria-label={t("beta")}
-                          className="rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300"
+              return (
+                <li key={item.href}>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <Link
+                          href={item.href}
+                          className={cn(
+                            // Taller on mobile so fingers can hit the row reliably (≥44px).
+                            "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors lg:py-2",
+                            collapsed && "lg:justify-center lg:gap-0 lg:px-0",
+                            isActive
+                              ? "bg-primary/10 text-primary"
+                              : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                          )}
                         >
-                          {t("beta")}
-                        </span>
-                      )}
-                      {showUnreadDot && (
-                        <span
-                          aria-label={t("unreadConversations", { count: totalUnread })}
-                          className="relative flex h-2 w-2"
-                        >
-                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
-                          <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-                        </span>
-                      )}
-                      {showNotificationBadge && (
-                        <span
-                          aria-label={t("unreadNotifications", { count: unreadNotifications })}
-                          className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold text-primary-foreground"
-                        >
-                          {unreadNotifications > 9 ? "9+" : unreadNotifications}
-                        </span>
-                      )}
-                    </Link>
-                  </li>
-                );
-              })}
+                          <item.icon className="h-4 w-4 shrink-0" />
+                          <span
+                            className={cn("flex-1", collapsed && "lg:hidden")}
+                          >
+                            {t(item.labelKey as string)}
+                          </span>
+                          {item.beta && (
+                            <span
+                              aria-label={t("beta")}
+                              className={cn(
+                                "rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-300",
+                                collapsed && "lg:hidden",
+                              )}
+                            >
+                              {t("beta")}
+                            </span>
+                          )}
+                          {showUnreadDot && (
+                            <span
+                              aria-label={t("unreadConversations", { count: totalUnread })}
+                              className="relative flex h-2 w-2 shrink-0"
+                            >
+                              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
+                              <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+                            </span>
+                          )}
+                          {showNotificationBadge && (
+                            <span
+                              aria-label={t("unreadNotifications", { count: unreadNotifications })}
+                              className="flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold text-primary-foreground"
+                            >
+                              {unreadNotifications > 9 ? "9+" : unreadNotifications}
+                            </span>
+                          )}
+                        </Link>
+                      }
+                    />
+                    {collapsed && (
+                      <TooltipContent side="right">
+                        {t(item.labelKey as string)}
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </li>
+              );
+            })}
           </ul>
 
           <div className="my-4 border-t border-border" />
@@ -282,24 +359,38 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
             {bottomNavItems
               .filter((item) => accountRole && canAccessNav(accountRole, item.href))
               .map((item) => {
-                const isActive = pathname.startsWith(item.href);
-                return (
-                  <li key={item.href}>
-                    <Link
-                      href={item.href}
-                      className={cn(
-                        "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors lg:py-2",
-                        isActive
-                          ? "bg-primary/10 text-primary"
-                          : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                      )}
-                    >
-                      <item.icon className="h-4 w-4" />
-                      {t(item.labelKey as string)}
-                    </Link>
-                  </li>
-                );
-              })}
+              const isActive = pathname.startsWith(item.href);
+              return (
+                <li key={item.href}>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <Link
+                          href={item.href}
+                          className={cn(
+                            "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors lg:py-2",
+                            collapsed && "lg:justify-center lg:gap-0 lg:px-0",
+                            isActive
+                              ? "bg-primary/10 text-primary"
+                              : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                          )}
+                        >
+                          <item.icon className="h-4 w-4 shrink-0" />
+                          <span className={cn(collapsed && "lg:hidden")}>
+                            {t(item.labelKey as string)}
+                          </span>
+                        </Link>
+                      }
+                    />
+                    {collapsed && (
+                      <TooltipContent side="right">
+                        {t(item.labelKey as string)}
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </li>
+              );
+            })}
           </ul>
         </nav>
 
@@ -312,7 +403,12 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
               below; for renamed or shared accounts it tells the user
               which account they're acting in. */}
           {showAccountStrip && account?.name ? (
-            <div className="mb-2 flex items-center gap-2 px-3 text-xs text-muted-foreground">
+            <div
+              className={cn(
+                "mb-2 flex items-center gap-2 px-3 text-xs text-muted-foreground",
+                collapsed && "lg:hidden",
+              )}
+            >
               <UsersRound className="size-3.5 shrink-0" />
               {/* `title=` exposes the full name on hover when it
                   gets truncated (long account names + narrow
@@ -341,7 +437,12 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
             </div>
           ) : null}
           <DropdownMenu>
-            <DropdownMenuTrigger className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted/60 focus:bg-muted/60 focus:outline-none data-popup-open:bg-muted/60">
+            <DropdownMenuTrigger
+              className={cn(
+                "flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted/60 focus:bg-muted/60 focus:outline-none data-popup-open:bg-muted/60",
+                collapsed && "lg:justify-center lg:px-0",
+              )}
+            >
               <Avatar className="size-8 shrink-0">
                 {profile?.avatar_url ? (
                   <AvatarImage
@@ -355,7 +456,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                     "U"}
                 </AvatarFallback>
               </Avatar>
-              <div className="min-w-0 flex-1">
+              <div className={cn("min-w-0 flex-1", collapsed && "lg:hidden")}>
                 <p className="truncate text-sm font-medium text-foreground">
                   {profile?.full_name ?? t("defaultUser")}
                 </p>

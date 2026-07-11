@@ -357,6 +357,7 @@ test("send routes messageType=template to metaSend.sendTemplate", async () => {
     templateName: "order_confirmation",
     templateLanguage: "en_US",
     templateParams: ["12345"],
+    contentText: "Your order 12345 is confirmed.",
   });
 
   const messages = await t.run((ctx) =>
@@ -369,6 +370,12 @@ test("send routes messageType=template to metaSend.sendTemplate", async () => {
   expect(messages[0]!.contentType).toBe("template");
   expect(messages[0]!.templateName).toBe("order_confirmation");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
+  // The rendered body the composer passes must be threaded through to the
+  // persisted row (was dropped before, leaving the bubble/preview blank).
+  expect(messages[0]!.contentText).toBe("Your order 12345 is confirmed.");
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.lastMessageText).toBe("Your order 12345 is confirmed.");
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

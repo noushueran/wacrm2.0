@@ -158,6 +158,14 @@ export const sendTemplate = internalAction({
     templateName: v.string(),
     language: v.optional(v.string()),
     params: v.optional(v.array(v.string())),
+    // The template body already rendered with `params` substituted in, for
+    // local display only. Meta itself receives the structured
+    // name+params payload (see `sendTemplateMessage`), never this string —
+    // but the persisted row needs it so the chat bubble shows the sent
+    // text and the conversation list preview isn't a bare `[template]`.
+    // Optional: callers without a pre-rendered body (see the broadcast /
+    // automation / REST callers) simply fall back to that placeholder.
+    contentText: v.optional(v.string()),
     contextMessageId: v.optional(v.string()),
     // Defaults to "bot" (automations/flows engines); dashboard-initiated
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
@@ -190,6 +198,7 @@ export const sendTemplate = internalAction({
       conversationId: args.conversationId,
       senderType: args.senderType ?? "bot",
       contentType: "template",
+      contentText: args.contentText,
       templateName: args.templateName,
       messageId: whatsappMessageId,
     });

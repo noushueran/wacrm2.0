@@ -364,3 +364,25 @@ export const updateDeliveryStatusByWamid = internalMutation({
     return { matched: matches.length, updated };
   },
 });
+
+/**
+ * Attach a resolved media URL to an already-persisted message — the
+ * second half of inbound-media resolution. `ingest.processInbound`
+ * inserts an inbound media message with no URL (the webhook carries only
+ * Meta's raw `mediaId`, and turning that into fetchable bytes needs a
+ * signed Graph call an action must make), then calls
+ * `whatsappConfig.resolveInboundMedia` to download + store those bytes,
+ * then calls this to attach the resulting Convex-storage URL so the inbox
+ * can play/show the media. Split out (rather than folded into
+ * `ingestInbound`) precisely because that resolution is async network
+ * I/O that can't run inside the insert mutation. No-op if the message
+ * was deleted between insert and patch.
+ */
+export const setMediaUrl = internalMutation({
+  args: { messageId: v.id("messages"), mediaUrl: v.string() },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message) return;
+    await ctx.db.patch(args.messageId, { mediaUrl: args.mediaUrl });
+  },
+});

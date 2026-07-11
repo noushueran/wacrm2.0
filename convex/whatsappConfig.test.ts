@@ -1780,3 +1780,25 @@ test("cross-account isolation: connectionStatus never reads a different account'
   const result = await asBob.action(api.whatsappConfig.connectionStatus, {});
   expect(result).toMatchObject({ connected: false, reason: "no_config" });
 });
+
+// ============================================================
+// resolveInboundMedia — inbound-media resolver (internal action).
+// Best-effort: returns null (never throws) when the account has no
+// config so a media that can't be fetched degrades to an "unavailable"
+// bubble in the inbox rather than derailing inbound processing.
+// ============================================================
+
+test("resolveInboundMedia returns null when the account has no WhatsApp config", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "owner",
+  });
+
+  const result = await t.action(internal.whatsappConfig.resolveInboundMedia, {
+    accountId,
+    mediaId: "meta-audio-1",
+  });
+  expect(result).toBeNull();
+});

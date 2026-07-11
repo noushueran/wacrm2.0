@@ -337,6 +337,7 @@ afterEach(() => {
   // cleanup otherwise.
   delete process.env.CONVEX_META_DRY_RUN;
   delete process.env.CONVEX_AI_DRY_RUN;
+  vi.unstubAllGlobals();
 });
 
 // ------------------------------------------------------------
@@ -1041,4 +1042,77 @@ test("processInbound: an automations phase matching zero automations (nothing to
 
   const endpoint = await t.run((ctx) => ctx.db.get(endpointId));
   expect(endpoint!.lastDeliveryAt).toBeDefined();
+});
+
+// ============================================================
+// Inbound media resolution — the "follow-up" both webhookParse.ts and
+// files.storeFromUrl flag: an inbound WhatsApp media message arrives as
+// a bare Meta `mediaId` (a signed Graph fetch is real network I/O the
+// mutation can't do), so processInbound must resolve it to a durable
+// Convex-storage URL. Before this, every inbound voice note / video /
+// image rendered "unavailable" in the inbox because `mediaUrl` was never
+// populated.
+// ============================================================
+
+test("processInbound resolves an inbound voice note's media into storage and attaches a playable mediaUrl", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  // The account's WhatsApp config — `resolveInboundMedia` decrypts this
+  // token to authenticate the Meta media fetch.
+  await t.run(async (ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId,
+      phoneNumberId: "pn-acme",
+      accessToken: await encrypt("secret-token"),
+      status: "connected",
+    }),
+  );
+
+  // Mock the two Meta round-trips: getMediaUrl (id -> CDN url + mime),
+  // then the authenticated CDN byte download.
+  const voiceBytes = new TextEncoder().encode("ogg/opus voice-note bytes");
+  const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+    const target = String(url);
+    if (target.includes("meta-audio-1")) {
+      expect(
+        (init?.headers as Record<string, string> | undefined)?.Authorization,
+      ).toBe("Bearer secret-token");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          url: "https://cdn.example/voice.ogg",
+          mime_type: "audio/ogg",
+        }),
+      } as unknown as Response;
+    }
+    return {
+      ok: true,
+      status: 200,
+      blob: async () => new Blob([voiceBytes], { type: "audio/ogg" }),
+    } as unknown as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15559990000",
+    message: { type: "audio", mediaId: "meta-audio-1", wamid: "wamid.VOICE1" },
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("messageId", "wamid.VOICE1"))
+      .first(),
+  );
+  expect(message!.contentType).toBe("audio");
+  // The fix: `mediaUrl` is now a fetchable Convex-storage URL (was
+  // undefined -> "audio unavailable" in the inbox).
+  expect(message!.mediaUrl).toBeTruthy();
+  // Both Meta round-trips happened (resolve id -> url, then download).
+  expect(fetchMock).toHaveBeenCalledTimes(2);
 });
