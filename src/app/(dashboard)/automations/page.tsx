@@ -2,7 +2,8 @@
 
 import { useMemo, useState } from "react"
 import { useRouter } from "next/navigation"
-import { useMutation, useQuery } from "convex/react"
+import { useMutation } from "convex/react"
+import { useQuery } from "@/lib/convex/cached"
 import { toast } from "sonner"
 import {
   Zap,

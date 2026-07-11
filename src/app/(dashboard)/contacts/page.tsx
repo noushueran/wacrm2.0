@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { useMutation, usePaginatedQuery, useQuery } from 'convex/react';
+import { useMutation } from 'convex/react';
+import { usePaginatedQuery, useQuery } from '@/lib/convex/cached';
 import { toast } from 'sonner';
 import type { Contact, Tag } from '@/types';
 import { toUiContact, toUiTag } from '@/lib/convex/adapters';

@@ -2,6 +2,7 @@
 
 import { ConvexAuthNextjsProvider } from "@convex-dev/auth/nextjs";
 import { ConvexReactClient } from "convex/react";
+import { ConvexQueryCacheProvider } from "convex-helpers/react/cache/provider";
 
 // Module-level singleton — created once per browser tab/module load, not
 // per render. Next.js App Router pattern for Client Component context
@@ -41,7 +42,26 @@ export function ConvexClientProvider({
 }) {
   return (
     <ConvexAuthNextjsProvider client={convex}>
-      {children}
+      {/*
+        `ConvexQueryCacheProvider` keeps each `useQuery` /
+        `usePaginatedQuery` subscription (the cached variants from
+        `@/lib/convex/cached`) alive for a few minutes AFTER the
+        component using it unmounts, instead of tearing it down
+        immediately. That's what makes navigating back to an
+        already-visited section (Inbox, Contacts, Dashboard, …) render
+        its last data instantly rather than re-fetching from scratch —
+        every fresh fetch is a full round-trip to the self-hosted Convex
+        backend, which is the bulk of the per-section load time.
+
+        It must sit UNDER `ConvexAuthNextjsProvider` (which supplies the
+        `ConvexProvider` the cache reads via `useConvex()`) and ABOVE the
+        app tree so every page shares one cache. Idle subscriptions still
+        cost an open reactive subscription on the backend, so the
+        defaults are deliberately bounded (`expiration` 5 min,
+        `maxIdleEntries` 250) — plenty to cover normal back-and-forth
+        navigation without leaking subscriptions unboundedly.
+      */}
+      <ConvexQueryCacheProvider>{children}</ConvexQueryCacheProvider>
     </ConvexAuthNextjsProvider>
   );
 }

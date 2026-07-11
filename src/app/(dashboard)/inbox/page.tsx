@@ -3,7 +3,8 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
-import { usePaginatedQuery, useQuery, useMutation } from "convex/react";
+import { useMutation } from "convex/react";
+import { usePaginatedQuery, useQuery } from "@/lib/convex/cached";
 import { api } from "../../../../convex/_generated/api";
 import type { Id } from "../../../../convex/_generated/dataModel";
 import { toUiConversation } from "@/lib/convex/adapters";

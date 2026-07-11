@@ -1,7 +1,7 @@
 "use client"
 
 import { useMemo, useState } from 'react'
-import { useQuery } from 'convex/react'
+import { useQuery } from '@/lib/convex/cached'
 import { api } from '../../../../convex/_generated/api'
 import { useAuth } from '@/hooks/use-auth'
 import { formatCurrency } from '@/lib/currency'

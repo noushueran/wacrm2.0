@@ -2,7 +2,7 @@
 
 import { useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import { useQuery } from 'convex/react';
+import { useQuery } from '@/lib/convex/cached';
 import { toUiBroadcast } from '@/lib/convex/adapters';
 import {
   Table,

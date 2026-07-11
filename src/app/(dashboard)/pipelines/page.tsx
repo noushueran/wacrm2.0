@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, usePaginatedQuery, useQuery } from "convex/react";
+import { useMutation } from "convex/react";
+import { usePaginatedQuery, useQuery } from "@/lib/convex/cached";
 import type { Contact, Deal, Profile } from "@/types";
 import {
   toUiContact,
