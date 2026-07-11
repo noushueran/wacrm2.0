@@ -2,7 +2,8 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { internalMutation } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
-import { normalizePhone } from "./lib/phone";
+import { normalizePhone, maskPhone } from "./lib/phone";
+import { hasMinRole } from "./lib/roles";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -32,6 +33,20 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
     await Promise.all(links.map((link) => ctx.db.get(link.tagId)))
   ).filter((tag): tag is Doc<"tags"> => tag !== null);
   return { ...contact, tags };
+}
+
+/**
+ * Strips a contact's real number for callers below `supervisor` — the
+ * same masking `conversations.ts`'s `embedContact` applies to the Inbox,
+ * duplicated here (byte-for-byte, same one-helper-per-file reasoning as
+ * `embedTags` above) as defense-in-depth: agents/viewers have no
+ * Contacts UI today, but `list`/`get` below are still directly callable
+ * regardless of what the UI exposes.
+ */
+function maskContactPhone<T extends { phone: string; phoneNormalized: string }>(
+  contact: T,
+): T {
+  return { ...contact, phone: maskPhone(contact.phone), phoneNormalized: "" };
 }
 
 /**
@@ -109,7 +124,12 @@ export const list = accountQuery({
           .paginate(paginationOpts);
 
     const page = await Promise.all(
-      result.page.map((contact) => embedTags(ctx, contact)),
+      result.page.map(async (contact) => {
+        const withTags = await embedTags(ctx, contact);
+        return hasMinRole(ctx.role, "supervisor")
+          ? withTags
+          : maskContactPhone(withTags);
+      }),
     );
     return { ...result, page };
   },
@@ -130,7 +150,10 @@ export const get = accountQuery({
   args: { contactId: v.id("contacts") },
   handler: async (ctx, args) => {
     const contact = await requireOwnContact(ctx, args.contactId);
-    return await embedTags(ctx, contact);
+    const withTags = await embedTags(ctx, contact);
+    return hasMinRole(ctx.role, "supervisor")
+      ? withTags
+      : maskContactPhone(withTags);
   },
 });
 

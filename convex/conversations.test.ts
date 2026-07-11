@@ -1518,3 +1518,34 @@ test("get denies an out-of-scope conversation with NOT_FOUND", async () => {
     a.asUser.query(api.conversations.get, { conversationId: bsConv }),
   ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
 });
+
+// ============================================================
+// server-side phone masking (Task 5) — `embedContact` applies
+// `canSeeContactPhone` (`convex/lib/roles.ts`) via the new
+// `maskContactPhone` helper. agent: real on their own assigned chat,
+// masked on the pool; viewer: always masked; supervisor+: never masked.
+// ============================================================
+
+test("phone is masked on the pool and unmasked on an agent's own chat", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const v = await seedUserInAccount(t, accountId, { name: "Vic", email: "v@x.com", role: "viewer" });
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+
+  await seedConv(t, accountId, { phone: "+15551230148", name: "Mine", assignedToUserId: a.userId });
+  await seedConv(t, accountId, { phone: "+15551230199", name: "Pool" });
+
+  const asA = await a.asUser.query(api.conversations.list, onePage);
+  const mine = asA.page.find((c) => c.contact?.name === "Mine");
+  const pool = asA.page.find((c) => c.contact?.name === "Pool");
+  expect(mine?.contact?.phone).toBe("+15551230148"); // own chat: real
+  expect(pool?.contact?.phone).toMatch(/^•+99$/); // pool: masked
+  expect(pool?.contact?.phoneNormalized).toBe("");
+
+  const asV = await v.asUser.query(api.conversations.list, onePage);
+  expect(asV.page[0]?.contact?.phone).toMatch(/^•+99$/); // viewer: masked
+
+  const asS = await s.asUser.query(api.conversations.list, onePage);
+  expect(asS.page.find((c) => c.contact?.name === "Mine")?.contact?.phone).toBe("+15551230148");
+});

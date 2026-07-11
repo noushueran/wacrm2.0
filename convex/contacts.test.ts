@@ -1122,6 +1122,24 @@ test("get throws NOT_FOUND when the contact belongs to a different account", asy
   });
 });
 
+// ============================================================
+// server-side phone masking (Task 5, defense-in-depth) — agents/
+// viewers have no Contacts UI, but `list`/`get` are still directly
+// callable, so they mask below `supervisor` the same way
+// `conversations.ts`'s `embedContact` does.
+// ============================================================
+
+test("contacts.get masks the phone for agent and viewer", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Ag", email: "ag@x.com", role: "agent" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+15551230148", phoneNormalized: "15551230148", name: "X" }),
+  );
+  const got = await asUser.query(api.contacts.get, { contactId });
+  expect(got.phone).toMatch(/^•+48$/);
+  expect(got.phoneNormalized).toBe("");
+});
+
 test("filterByTags returns nothing for an empty tagIds list", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {

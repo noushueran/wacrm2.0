@@ -5,8 +5,10 @@ import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
-import { conversationScope, canAccessConversation } from "./lib/roles";
+import { conversationScope, canAccessConversation, canSeeContactPhone } from "./lib/roles";
+import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
+import { maskPhone } from "./lib/phone";
 
 // ============================================================
 // Conversations — the Inbox list/thread read (`list`/`get`/
@@ -39,6 +41,13 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
   return { ...contact, tags };
 }
 
+/** Strips a contact's real number for callers not allowed to see it. */
+function maskContactPhone<T extends { phone: string; phoneNormalized: string }>(
+  contact: T,
+): T {
+  return { ...contact, phone: maskPhone(contact.phone), phoneNormalized: "" };
+}
+
 /**
  * Embeds a conversation's `contact` (+ that contact's `tags`) for
  * display, so the Inbox list/thread view never needs a second
@@ -46,15 +55,29 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
  * Convex (and `contacts.remove` has no cascade onto `conversations`
  * today), so the contact can in principle be missing — `contact: null`
  * covers that defensively rather than throwing.
+ *
+ * Also enforces server-side phone masking (Task 5): the real number is
+ * only ever embedded for a caller `canSeeContactPhone` allows — owner/
+ * admin/supervisor always, an agent only on a conversation assigned to
+ * them. Everyone else gets `maskContactPhone`'s last-2-digits mask, with
+ * `phoneNormalized` dropped — CSS/JS hiding is not acceptable here since
+ * it would still leak via the network tab, so the strip happens before
+ * the contact ever leaves this function.
  */
 async function embedContact(
-  ctx: QueryCtx,
+  ctx: QueryCtx & { role: AccountRole; userId: Id<"users"> },
   conversation: Doc<"conversations">,
 ) {
   const contact = await ctx.db.get(conversation.contactId);
+  if (!contact) return { ...conversation, contact: null };
+  const withTags = await embedTags(ctx, contact);
+  const canSee = canSeeContactPhone(
+    ctx.role,
+    conversation.assignedToUserId === ctx.userId,
+  );
   return {
     ...conversation,
-    contact: contact ? await embedTags(ctx, contact) : null,
+    contact: canSee ? withTags : maskContactPhone(withTags),
   };
 }
 
