@@ -113,6 +113,90 @@ async function seedTeammate(
   });
 }
 
+/**
+ * Seeds a teammate onto an existing account with a chosen role and
+ * returns an authenticated client for them — unlike `seedTeammate`
+ * above (bare `userId`, no client) or `seedAccountMember` (always
+ * mints a fresh account). Used by the role-scoped visibility tests
+ * (Task 4) below, which need several differently-roled teammates on
+ * the SAME account.
+ */
+async function seedUserInAccount(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: { name: string; email: string; role: AccountRole },
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: opts.name, email: opts.email }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    }),
+  );
+  return { userId, asUser: t.withIdentity({ subject: `${userId}|s-${opts.name}` }) };
+}
+
+/**
+ * Seeds a contact + its conversation in one call, optionally
+ * pre-assigned — unlike `seedConversation` above, which takes an
+ * already-created `contactId` and has no `assignedToUserId` knob. Used
+ * by the role-scoped visibility tests to seed "mine" / "pool" /
+ * "a teammate's" conversations.
+ */
+async function seedConv(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: { phone: string; name: string; assignedToUserId?: Id<"users"> },
+) {
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: opts.phone,
+      phoneNormalized: opts.phone.replace(/\D/g, ""),
+      name: opts.name,
+    }),
+  );
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+      ...(opts.assignedToUserId
+        ? { assignedToUserId: opts.assignedToUserId }
+        : {}),
+    }),
+  );
+  return { contactId, conversationId };
+}
+
+/**
+ * Seeds a bare account + its owner membership with no `asUser` client
+ * of its own — the role-scoped visibility tests build their own
+ * differently-roled teammates via `seedUserInAccount` and never need
+ * to act as the owner directly.
+ */
+async function seedAccountWithOwner(t: ReturnType<typeof convexTest>) {
+  const ownerId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Owner", email: "owner@x.com" }),
+  );
+  const accountId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", {
+      name: "Acme",
+      defaultCurrency: "USD",
+      ownerUserId: ownerId,
+    });
+    await ctx.db.insert("memberships", { userId: ownerId, accountId: id, role: "owner" });
+    return id;
+  });
+  return { ownerId, accountId };
+}
+
 const onePage = { paginationOpts: { numItems: 50, cursor: null } };
 
 // ============================================================
@@ -1391,4 +1475,46 @@ test("setAutoreplyPaused is rejected for a viewer (below the agent role floor), 
 
   const row = await t.run((ctx) => ctx.db.get(conversationId));
   expect(row!.aiAutoreplyDisabled).toBeUndefined();
+});
+
+// ============================================================
+// role-scoped visibility (Task 4) — `conversationScope`/
+// `canAccessConversation` (`convex/lib/roles.ts`) applied to `list`/
+// `get` via the shared `requireConversationAccess` guard
+// (`convex/lib/conversationAccess.ts`). agent = own + unassigned pool;
+// viewer = unassigned pool only; supervisor+ = everything.
+// ============================================================
+
+test("list scopes conversations by role", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const v = await seedUserInAccount(t, accountId, { name: "Vic", email: "v@x.com", role: "viewer" });
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+
+  await seedConv(t, accountId, { phone: "111", name: "Mine", assignedToUserId: a.userId });
+  await seedConv(t, accountId, { phone: "222", name: "Pool" });
+  await seedConv(t, accountId, { phone: "333", name: "Bees", assignedToUserId: b.userId });
+
+  const asA = await a.asUser.query(api.conversations.list, onePage);
+  expect(asA.page.map((c) => c.contact?.name).sort()).toEqual(["Mine", "Pool"]);
+
+  const asV = await v.asUser.query(api.conversations.list, onePage);
+  expect(asV.page.map((c) => c.contact?.name)).toEqual(["Pool"]);
+
+  const asS = await s.asUser.query(api.conversations.list, onePage);
+  expect(asS.page).toHaveLength(3);
+});
+
+test("get denies an out-of-scope conversation with NOT_FOUND", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const { conversationId: bsConv } = await seedConv(t, accountId, { phone: "333", name: "Bees", assignedToUserId: b.userId });
+
+  await expect(
+    a.asUser.query(api.conversations.get, { conversationId: bsConv }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
 });

@@ -5,6 +5,8 @@ import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
+import { conversationScope, canAccessConversation } from "./lib/roles";
+import { requireConversationAccess } from "./lib/conversationAccess";
 
 // ============================================================
 // Conversations — the Inbox list/thread read (`list`/`get`/
@@ -65,24 +67,38 @@ export const list = accountQuery({
   },
   handler: async (ctx, args) => {
     const { status, paginationOpts } = args;
+    const scope = conversationScope(ctx.role);
 
-    // `by_account_last_message` ranges over every conversation in the
-    // caller's own account (only `accountId` is bound in the index
-    // callback below), then `.order("desc")` sorts by the index's
-    // trailing field, `lastMessageAt` — see the schema comment for why
-    // a conversation with no messages yet (an unset `lastMessageAt`)
-    // deterministically sorts last rather than needing special-cased
-    // fallback logic here.
-    const ordered = ctx.db
+    const base = ctx.db
       .query("conversations")
       .withIndex("by_account_last_message", (q) =>
         q.eq("accountId", ctx.accountId),
       )
       .order("desc");
 
-    const result = await (
-      status ? ordered.filter((q) => q.eq(q.field("status"), status)) : ordered
-    ).paginate(paginationOpts);
+    // Compose the optional status filter with the role visibility scope.
+    // `own_and_pool` = assigned to me OR unassigned; `unassigned` = the
+    // pool only; `all` = no extra predicate.
+    const query =
+      status || scope !== "all"
+        ? base.filter((q) => {
+            const parts = [];
+            if (status) parts.push(q.eq(q.field("status"), status));
+            if (scope === "own_and_pool") {
+              parts.push(
+                q.or(
+                  q.eq(q.field("assignedToUserId"), ctx.userId),
+                  q.eq(q.field("assignedToUserId"), undefined),
+                ),
+              );
+            } else if (scope === "unassigned") {
+              parts.push(q.eq(q.field("assignedToUserId"), undefined));
+            }
+            return parts.reduce((a, b) => q.and(a, b));
+          })
+        : base;
+
+    const result = await query.paginate(paginationOpts);
 
     const page = await Promise.all(
       result.page.map((conversation) => embedContact(ctx, conversation)),
@@ -94,13 +110,11 @@ export const list = accountQuery({
 export const get = accountQuery({
   args: { conversationId: v.id("conversations") },
   handler: async (ctx, args) => {
-    const conversation = await ctx.db.get(args.conversationId);
-    // Same error for "doesn't exist" and "exists but isn't yours" on
-    // purpose (mirrors `contacts.ts`'s `requireOwnContact`), so a
-    // cross-account probe can't distinguish the two.
-    if (!conversation || conversation.accountId !== ctx.accountId) {
-      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
-    }
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "view",
+    );
     return await embedContact(ctx, conversation);
   },
 });
@@ -130,7 +144,15 @@ export const getByContact = accountQuery({
       .filter((q) => q.eq(q.field("accountId"), ctx.accountId))
       .first();
     if (!conversation) return null;
-
+    const allowed = canAccessConversation(
+      ctx.role,
+      {
+        isMine: conversation.assignedToUserId === ctx.userId,
+        isUnassigned: conversation.assignedToUserId === undefined,
+      },
+      "view",
+    );
+    if (!allowed) return null;
     return await embedContact(ctx, conversation);
   },
 });
@@ -150,12 +172,18 @@ export const getByContact = accountQuery({
 export const unreadTotal = accountQuery({
   args: {},
   handler: async (ctx) => {
+    const scope = conversationScope(ctx.role);
     const conversations = await ctx.db
       .query("conversations")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .collect();
-    return conversations.filter((conversation) => conversation.unreadCount > 0)
-      .length;
+    return conversations.filter((c) => {
+      if (c.unreadCount <= 0) return false;
+      if (scope === "all") return true;
+      if (scope === "own_and_pool")
+        return c.assignedToUserId === ctx.userId || c.assignedToUserId === undefined;
+      return c.assignedToUserId === undefined; // viewer: pool only
+    }).length;
   },
 });
 
