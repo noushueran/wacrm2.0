@@ -216,8 +216,8 @@ export const setDefaultCurrency = mutation({
       .first();
     if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
 
-    if (!hasMinRole(membership.role, "admin")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    if (!hasMinRole(membership.role, "supervisor")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
     }
 
     if (!KNOWN_CURRENCY_CODES.has(args.currency)) {

@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
+import type { AccountRole } from "./lib/roles";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against (mirrors the pattern from the Convex testing docs).
@@ -28,14 +29,17 @@ async function insertUser(
 
 /**
  * Adds a second membership row to an *existing* account, bypassing any
- * invite flow — used only by `updateProfile`'s isolation test, which
- * needs a real teammate row on the SAME account to prove the mutation
- * patches only the CALLER's own membership. Mirrors every other
- * `convex/*.test.ts` suite's own `seedTeammate` helper.
+ * invite flow — used by `updateProfile`'s isolation test (which needs a
+ * real teammate row on the SAME account to prove the mutation patches
+ * only the CALLER's own membership) and by `setDefaultCurrency`'s
+ * role-floor tests below. Mirrors every other `convex/*.test.ts`
+ * suite's own `seedTeammate` helper. `role` defaults to `"agent"` —
+ * every pre-existing call site relied on that implicit default before
+ * this param was added, so they're unaffected.
  */
 async function insertTeammate(
   t: ReturnType<typeof convexTest>,
-  opts: { accountId: Id<"accounts">; name: string; email: string },
+  opts: { accountId: Id<"accounts">; name: string; email: string; role?: AccountRole },
 ) {
   return await t.run(async (ctx) => {
     const userId = await ctx.db.insert("users", {
@@ -45,7 +49,7 @@ async function insertTeammate(
     const membershipId = await ctx.db.insert("memberships", {
       userId,
       accountId: opts.accountId,
-      role: "agent",
+      role: opts.role ?? "agent",
       fullName: opts.name,
       email: opts.email,
     });
@@ -281,7 +285,7 @@ test("setDefaultCurrency updates the caller's account defaultCurrency", async ()
   expect(profile!.account.defaultCurrency).toBe("EUR");
 });
 
-test("setDefaultCurrency is denied for a non-admin (agent) member", async () => {
+test("setDefaultCurrency is denied for a non-supervisor (agent) member", async () => {
   const t = convexTest(schema, modules);
   const userId = await insertUser(t, {
     name: "Sarah",
@@ -298,10 +302,41 @@ test("setDefaultCurrency is denied for a non-admin (agent) member", async () => 
 
   await expect(
     asAgent.mutation(api.accounts.setDefaultCurrency, { currency: "EUR" }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 
   const account = await t.run((ctx) => ctx.db.get(accountId));
   expect(account!.defaultCurrency).toBe("USD");
+});
+
+test("supervisor can set the default currency; agent cannot", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const { userId: supUserId } = await insertTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSup = t.withIdentity({ subject: `${supUserId}|session-sup` });
+
+  await expect(
+    asSup.mutation(api.accounts.setDefaultCurrency, { currency: "EUR" }),
+  ).resolves.toBe(accountId);
+
+  const { userId: agentUserId } = await insertTeammate(t, {
+    accountId,
+    name: "Agent Andy",
+    email: "andy@example.com",
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|session-andy` });
+  await expect(
+    asAgent.mutation(api.accounts.setDefaultCurrency, { currency: "GBP" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("setDefaultCurrency only touches the caller's own account, not another account's", async () => {

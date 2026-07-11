@@ -102,7 +102,7 @@ export const list = accountQuery({
 export const create = accountMutation({
   args: { fieldName: v.string(), fieldType: v.string() },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
 
     const dup = await findDuplicateFieldName(ctx, args.fieldName);
     if (dup) {
@@ -121,7 +121,7 @@ export const create = accountMutation({
 export const rename = accountMutation({
   args: { fieldId: v.id("customFields"), fieldName: v.string() },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnCustomField(ctx, args.fieldId);
 
     // Re-check the invariant `create` establishes — without this, two
@@ -141,7 +141,7 @@ export const rename = accountMutation({
 export const remove = accountMutation({
   args: { fieldId: v.id("customFields") },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnCustomField(ctx, args.fieldId);
 
     // Explicit cascade: Postgres had `contact_custom_values.custom_

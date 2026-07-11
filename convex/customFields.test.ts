@@ -112,7 +112,7 @@ test("create inserts a custom field scoped to the caller's own account, from ctx
   expect(row!.fieldType).toBe("text");
 });
 
-test("create throws FORBIDDEN for a caller below the admin role", async () => {
+test("create throws FORBIDDEN for a caller below the supervisor role", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -125,7 +125,34 @@ test("create throws FORBIDDEN for a caller below the admin role", async () => {
       fieldName: "Birthday",
       fieldType: "text",
     }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("supervisor can create a custom field; agent cannot", async () => {
+  const t = convexTest(schema, modules);
+  const s = await seedAccountMember(t, {
+    name: "Sup",
+    email: "s@x.com",
+    role: "supervisor",
+  });
+  await expect(
+    s.asUser.mutation(api.customFields.create, {
+      fieldName: "Birthday",
+      fieldType: "text",
+    }),
+  ).resolves.not.toBeNull();
+
+  const ag = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  await expect(
+    ag.asUser.mutation(api.customFields.create, {
+      fieldName: "Nope",
+      fieldType: "text",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("create throws DUPLICATE_FIELD for a case-insensitive name clash in the same account", async () => {

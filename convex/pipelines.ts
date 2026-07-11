@@ -89,7 +89,7 @@ export const list = accountQuery({
 export const create = accountMutation({
   args: { name: v.string() },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
 
     const pipelineId = await ctx.db.insert("pipelines", {
       accountId: ctx.accountId,
@@ -119,7 +119,7 @@ export const create = accountMutation({
 export const rename = accountMutation({
   args: { pipelineId: v.id("pipelines"), name: v.string() },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnPipeline(ctx, args.pipelineId);
 
     await ctx.db.patch(args.pipelineId, { name: args.name });
@@ -134,7 +134,7 @@ export const addStage = accountMutation({
     color: v.string(),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnPipeline(ctx, args.pipelineId);
 
     // Append at max(position)+1 rather than at `existing.length` — a
@@ -167,7 +167,7 @@ export const renameStage = accountMutation({
     color: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnStage(ctx, args.stageId);
 
     const patch: Partial<{ name: string; color: string }> = {
@@ -183,7 +183,7 @@ export const renameStage = accountMutation({
 export const reorderStages = accountMutation({
   args: { stageIds: v.array(v.id("pipelineStages")) },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
 
     // Validate every id belongs to this account *before* patching any
     // of them — a foreign id partway through the array must leave
@@ -200,7 +200,7 @@ export const reorderStages = accountMutation({
 export const deleteStage = accountMutation({
   args: { stageId: v.id("pipelineStages") },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnStage(ctx, args.stageId);
 
     // Refuse when a deal still references this stage — mirrors the UI's
@@ -225,7 +225,7 @@ export const deleteStage = accountMutation({
 export const remove = accountMutation({
   args: { pipelineId: v.id("pipelines") },
   handler: async (ctx, args) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     await requireOwnPipeline(ctx, args.pipelineId);
 
     // Explicit cascade: Postgres declares both `pipeline_stages.pipeline_id`

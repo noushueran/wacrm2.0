@@ -53,7 +53,7 @@ export const create = accountMutation({
     interactivePayload: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     return await ctx.db.insert("quickReplies", {
       accountId: ctx.accountId,
       createdByUserId: ctx.userId,
@@ -81,7 +81,7 @@ export const update = accountMutation({
     interactivePayload: v.optional(v.any()),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     const { quickReplyId, ...rest } = args;
     await requireOwnQuickReply(ctx, quickReplyId);
 
@@ -93,7 +93,7 @@ export const update = accountMutation({
 export const remove = accountMutation({
   args: { quickReplyId: v.id("quickReplies") },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     await requireOwnQuickReply(ctx, args.quickReplyId);
     await ctx.db.delete(args.quickReplyId);
   },

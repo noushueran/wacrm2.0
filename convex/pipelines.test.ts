@@ -123,7 +123,7 @@ test("create inserts a pipeline scoped to the caller's own account and seeds the
   for (const stage of stages) expect(stage.accountId).toBe(accountId);
 });
 
-test("create throws FORBIDDEN for a caller below the admin role", async () => {
+test("create throws FORBIDDEN for a caller below the supervisor role", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -133,7 +133,28 @@ test("create throws FORBIDDEN for a caller below the admin role", async () => {
 
   await expect(
     asUser.mutation(api.pipelines.create, { name: "Sales" }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("supervisor can create a pipeline; agent cannot", async () => {
+  const t = convexTest(schema, modules);
+  const s = await seedAccountMember(t, {
+    name: "Sup",
+    email: "s@x.com",
+    role: "supervisor",
+  });
+  await expect(
+    s.asUser.mutation(api.pipelines.create, { name: "Sales" }),
+  ).resolves.not.toBeNull();
+
+  const ag = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  await expect(
+    ag.asUser.mutation(api.pipelines.create, { name: "Nope" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 // ============================================================
@@ -216,7 +237,7 @@ test("rename updates the pipeline's name", async () => {
   expect(pipeline!.name).toBe("Enterprise Sales");
 });
 
-test("rename throws FORBIDDEN for a caller below the admin role, and leaves the name unmodified", async () => {
+test("rename throws FORBIDDEN for a caller below the supervisor role, and leaves the name unmodified", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -229,7 +250,7 @@ test("rename throws FORBIDDEN for a caller below the admin role, and leaves the 
 
   await expect(
     asUser.mutation(api.pipelines.rename, { pipelineId, name: "Hijacked" }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 
   expect((await t.run((ctx) => ctx.db.get(pipelineId)))!.name).toBe("Sales");
 });
@@ -642,15 +663,15 @@ test("remove throws NOT_FOUND for a pipeline belonging to a different account, a
   expect(await t.run((ctx) => ctx.db.get(alicePipelineId))).toBeNull();
 });
 
-test("remove throws FORBIDDEN for a caller below the admin role", async () => {
+test("remove throws FORBIDDEN for a caller below the supervisor role", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
   });
-  // An agent can't create a pipeline either (both are admin-gated), so
-  // seed one directly, bypassing `pipelines.create` — mirrors
+  // An agent can't create a pipeline either (both are supervisor-gated),
+  // so seed one directly, bypassing `pipelines.create` — mirrors
   // `seedPipelineWithRawStages`'s own raw-insert approach above.
   const pipelineId = await t.run((ctx) =>
     ctx.db.insert("pipelines", { accountId, name: "Sales" }),
@@ -658,7 +679,7 @@ test("remove throws FORBIDDEN for a caller below the admin role", async () => {
 
   await expect(
     asUser.mutation(api.pipelines.remove, { pipelineId }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 
   expect(await t.run((ctx) => ctx.db.get(pipelineId))).not.toBeNull();
 });

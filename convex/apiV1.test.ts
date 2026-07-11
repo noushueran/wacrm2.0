@@ -189,7 +189,7 @@ test("listContacts returns the account's contacts, embedded tags, newest first, 
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { keyHash } = await seedApiKey(t, { accountId, scopes: ["contacts:read"] });
 
@@ -219,7 +219,7 @@ test("listContacts filters by search (name/phone substring) and by tag", async (
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { keyHash } = await seedApiKey(t, { accountId, scopes: ["contacts:read"] });
 
@@ -365,7 +365,7 @@ test("deleteContact removes the contact and cascades its tag links; foreign/miss
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { keyHash } = await seedApiKey(t, { accountId, scopes: ["contacts:write"] });
   const contactId = await asUser.mutation(api.contacts.create, { phone: "15550000008" });

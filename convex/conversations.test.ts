@@ -303,7 +303,7 @@ test("list returns a seeded conversation with its embedded contact and the conta
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {

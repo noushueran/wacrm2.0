@@ -260,7 +260,7 @@ test("filterByTags never returns another account's contacts, even when the calle
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -468,7 +468,7 @@ test("assignTag throws when the contact belongs to a different account than the 
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -502,7 +502,7 @@ test("assignTag throws when the tag belongs to a different account than the call
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const aliceContactId = await asAlice.mutation(api.contacts.create, {
@@ -526,7 +526,7 @@ test("tags.list returns only the caller's own account's tags", async () => {
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -545,12 +545,12 @@ test("tags.remove throws when the tag belongs to a different account, and leaves
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const aliceTagId = await asAlice.mutation(api.tags.create, {
@@ -574,7 +574,7 @@ test("list embeds each contact's tags", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {
@@ -625,7 +625,7 @@ test("assignTag is idempotent — assigning the same tag twice does not duplicat
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {
@@ -648,7 +648,7 @@ test("unassignTag removes a tag from a contact", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {
@@ -671,7 +671,7 @@ test("remove cascades: deletes the contact's contactTags rows along with it, but
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {
@@ -895,7 +895,7 @@ test("tags.remove cascades: deletes the contactTags rows referencing it", async 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {
@@ -954,7 +954,7 @@ test("filterByTags ORs across tags and dedupes a contact matching more than one"
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const tagA = await asUser.mutation(api.tags.create, {
@@ -995,7 +995,7 @@ test("filterByTags applies name/phone/email search on top of the tag match", asy
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const tagA = await asUser.mutation(api.tags.create, {
@@ -1029,7 +1029,7 @@ test("filterByTags paginates with offset/limit while total reflects every match"
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const tagA = await asUser.mutation(api.tags.create, {
@@ -1074,7 +1074,7 @@ test("get returns the contact with embedded tags for the caller's own account", 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const contactId = await asUser.mutation(api.contacts.create, {

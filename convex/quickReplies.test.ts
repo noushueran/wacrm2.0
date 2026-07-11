@@ -56,7 +56,7 @@ test("create inserts a text quick reply scoped to the caller's own account, from
   const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const quickReplyId = await asUser.mutation(api.quickReplies.create, {
@@ -79,7 +79,7 @@ test("create round-trips an interactive quick reply's payload", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const payload = { type: "button", buttons: [{ id: "yes", title: "Yes" }] };
 
@@ -94,7 +94,7 @@ test("create round-trips an interactive quick reply's payload", async () => {
   expect(row!.interactivePayload).toEqual(payload);
 });
 
-test("create throws FORBIDDEN for a caller below the agent role", async () => {
+test("create throws FORBIDDEN for a caller below the supervisor role", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Vera",
@@ -108,7 +108,36 @@ test("create throws FORBIDDEN for a caller below the agent role", async () => {
       kind: "text",
       contentText: "Hi!",
     }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("supervisor can create a quick reply; agent cannot", async () => {
+  const t = convexTest(schema, modules);
+  const s = await seedAccountMember(t, {
+    name: "Sup",
+    email: "s@x.com",
+    role: "supervisor",
+  });
+  await expect(
+    s.asUser.mutation(api.quickReplies.create, {
+      title: "Greeting",
+      kind: "text",
+      contentText: "Hi!",
+    }),
+  ).resolves.not.toBeNull();
+
+  const ag = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  await expect(
+    ag.asUser.mutation(api.quickReplies.create, {
+      title: "Nope",
+      kind: "text",
+      contentText: "Nope!",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 // ============================================================
@@ -120,12 +149,12 @@ test("list returns only the caller's own account's quick replies, newest-first",
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const first = await asAlice.mutation(api.quickReplies.create, {
@@ -160,7 +189,7 @@ test("update patches only the supplied fields, leaving the rest untouched", asyn
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const quickReplyId = await asUser.mutation(api.quickReplies.create, {
     title: "Greeting",
@@ -183,12 +212,12 @@ test("update throws NOT_FOUND (not a silent no-op) for a different account's qui
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const quickReplyId = await asAlice.mutation(api.quickReplies.create, {
     title: "Greeting",
@@ -224,12 +253,12 @@ test("remove throws NOT_FOUND (not a silent no-op) for a different account's qui
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const quickReplyId = await asAlice.mutation(api.quickReplies.create, {
     title: "Greeting",

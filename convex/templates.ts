@@ -176,7 +176,7 @@ export const upsert = accountMutation({
     lastSubmittedAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     const { templateId } = await upsertTemplateRow(
       ctx,
       ctx.accountId,
@@ -273,7 +273,7 @@ export const updateStatusByMetaId = accountMutation({
     ),
   },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
 
     const candidates = await ctx.db
       .query("messageTemplates")
@@ -302,7 +302,7 @@ export const updateStatusByMetaId = accountMutation({
 export const remove = accountMutation({
   args: { templateId: v.id("messageTemplates") },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     await requireOwnTemplate(ctx, args.templateId);
     await ctx.db.delete(args.templateId);
   },
@@ -482,8 +482,8 @@ export const submit = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "agent")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    if (!hasMinRole(context.role, "supervisor")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
     }
     const { accountId } = context;
 
@@ -690,8 +690,8 @@ export const editSubmit = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "admin")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    if (!hasMinRole(context.role, "supervisor")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
     }
     const { accountId } = context;
 
@@ -784,8 +784,8 @@ export const syncFromMeta = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "agent")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    if (!hasMinRole(context.role, "supervisor")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
     }
     const { accountId } = context;
 

@@ -64,7 +64,7 @@ test("upsert inserts a template scoped to the caller's own account, from ctx —
   const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const templateId = await asUser.mutation(api.templates.upsert, baseTemplate);
@@ -79,7 +79,7 @@ test("upsert inserts a template scoped to the caller's own account, from ctx —
   expect(row!.bodyText).toBe("Hello {{1}}");
 });
 
-test("upsert throws FORBIDDEN for a caller below the agent role", async () => {
+test("upsert throws FORBIDDEN for a caller below the supervisor role", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Vera",
@@ -89,7 +89,28 @@ test("upsert throws FORBIDDEN for a caller below the agent role", async () => {
 
   await expect(
     asUser.mutation(api.templates.upsert, baseTemplate),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("supervisor can upsert a template; agent cannot", async () => {
+  const t = convexTest(schema, modules);
+  const s = await seedAccountMember(t, {
+    name: "Sup",
+    email: "s@x.com",
+    role: "supervisor",
+  });
+  await expect(
+    s.asUser.mutation(api.templates.upsert, baseTemplate),
+  ).resolves.not.toBeNull();
+
+  const ag = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  await expect(
+    ag.asUser.mutation(api.templates.upsert, { ...baseTemplate, name: "other" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("upsert with the same (name, language) patches the existing row instead of creating a duplicate", async () => {
@@ -97,7 +118,7 @@ test("upsert with the same (name, language) patches the existing row instead of 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const firstId = await asUser.mutation(api.templates.upsert, baseTemplate);
@@ -122,7 +143,7 @@ test("upsert treats a different language as a distinct template within the same 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const enId = await asUser.mutation(api.templates.upsert, baseTemplate);
@@ -142,12 +163,12 @@ test("upsert creates a separate row per account for the same (name, language)", 
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const aliceId = await asAlice.mutation(api.templates.upsert, baseTemplate);
@@ -167,8 +188,11 @@ test("get returns the caller's own template and throws NOT_FOUND for a different
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
+  // `get` is a plain read with no role floor of its own (unlike
+  // `upsert`), so Bob stays "agent" here — only Alice's `upsert` call
+  // below needs the new supervisor floor.
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
@@ -191,12 +215,12 @@ test("list returns only the caller's own account's templates, newest-first", asy
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const first = await asAlice.mutation(api.templates.upsert, {
@@ -225,12 +249,12 @@ test("remove throws NOT_FOUND (not a silent no-op) for a different account's tem
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const templateId = await asAlice.mutation(api.templates.upsert, baseTemplate);
 
@@ -256,12 +280,12 @@ test("updateStatusByMetaId patches only the caller's own account's row when two 
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   // Contrived: Meta template ids are globally unique per WABA in
@@ -303,7 +327,7 @@ test("updateStatusByMetaId sets rejectionReason on REJECTED and preserves a prev
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const templateId = await asUser.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -332,12 +356,12 @@ test("updateStatusByMetaId throws NOT_FOUND when no template in the caller's own
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   await asBob.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -397,7 +421,7 @@ test("applyMetaStatusWebhook flips status to APPROVED and clears any rejectionRe
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const templateId = await asUser.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -423,7 +447,7 @@ test("applyMetaStatusWebhook persists the reason field on REJECTED, falling back
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const templateId = await asUser.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -454,7 +478,7 @@ test("applyMetaStatusWebhook normalises PENDING_REVIEW to PENDING via normalizeT
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const templateId = await asUser.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -489,12 +513,12 @@ test("applyMetaStatusWebhook has no session/account to filter by: it patches EVE
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceTemplateId = await asAlice.mutation(api.templates.upsert, {
     ...baseTemplate,
@@ -600,7 +624,7 @@ test("submit throws UNAUTHENTICATED when there is no identity", async () => {
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
 });
 
-test("submit throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+test("submit throws FORBIDDEN for a viewer (below the supervisor floor)", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Viewer",
@@ -610,7 +634,20 @@ test("submit throws FORBIDDEN for a viewer (below the agent floor)", async () =>
 
   await expect(
     asUser.action(api.templates.submit, { ...baseTemplate }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("submit throws FORBIDDEN for an agent — this floor was raised from agent to supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Agent",
+    email: "agent@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.templates.submit, { ...baseTemplate }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("submit rejects category: Authentication with the same guidance message as the source route", async () => {
@@ -618,7 +655,7 @@ test("submit rejects category: Authentication with the same guidance message as 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   await expect(
@@ -635,7 +672,7 @@ test("submit in DRY-RUN persists a PENDING row with a synthetic metaTemplateId a
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const result = await asUser.action(api.templates.submit, { ...baseTemplate });
@@ -723,22 +760,31 @@ test("editSubmit throws UNAUTHENTICATED when there is no identity", async () => 
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
 });
 
-test("editSubmit throws FORBIDDEN for a non-admin (agent is below the admin floor, unlike submit)", async () => {
+test("editSubmit throws FORBIDDEN for an agent (below the supervisor floor — submit and editSubmit now share the same floor)", async () => {
   const t = convexTest(schema, modules);
-  const { asUser } = await seedAccountMember(t, {
+  const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
   });
-  const templateId = await asUser.mutation(api.templates.upsert, {
-    ...baseTemplate,
-    status: "APPROVED",
-    metaTemplateId: "meta-1",
-  });
+  // An agent can't `upsert` a template either (both are now
+  // supervisor-gated), so the fixture row is seeded directly, bypassing
+  // `templates.upsert` — mirrors `pipelines.test.ts`'s own
+  // "seed directly, bypassing `create`" pattern for its analogous
+  // below-the-floor test.
+  const templateId = await t.run((ctx) =>
+    ctx.db.insert("messageTemplates", {
+      accountId,
+      ...baseTemplate,
+      status: "APPROVED",
+      metaTemplateId: "meta-1",
+      updatedAt: Date.now(),
+    }),
+  );
 
   await expect(
     asUser.action(api.templates.editSubmit, { templateId, ...baseTemplate }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("editSubmit throws NOT_FOUND when the template belongs to a different account", async () => {
@@ -747,7 +793,7 @@ test("editSubmit throws NOT_FOUND when the template belongs to a different accou
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -936,7 +982,7 @@ test("syncFromMeta throws UNAUTHENTICATED when there is no identity", async () =
   });
 });
 
-test("syncFromMeta throws FORBIDDEN for a viewer (below the agent floor)", async () => {
+test("syncFromMeta throws FORBIDDEN for a viewer (below the supervisor floor)", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
     name: "Viewer",
@@ -946,7 +992,20 @@ test("syncFromMeta throws FORBIDDEN for a viewer (below the agent floor)", async
 
   await expect(
     asUser.action(api.templates.syncFromMeta, {}),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("syncFromMeta throws FORBIDDEN for an agent — this floor was raised from agent to supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Agent",
+    email: "agent@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asUser.action(api.templates.syncFromMeta, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("syncFromMeta in DRY-RUN returns all-zero counts and does not touch the local catalog", async () => {
@@ -955,7 +1014,7 @@ test("syncFromMeta in DRY-RUN returns all-zero counts and does not touch the loc
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
 
   const result = await asUser.action(api.templates.syncFromMeta, {});

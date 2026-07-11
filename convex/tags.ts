@@ -20,7 +20,7 @@ export const list = accountQuery({
 export const create = accountMutation({
   args: { name: v.string(), color: v.string() },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     return await ctx.db.insert("tags", {
       accountId: ctx.accountId,
       name: args.name,
@@ -39,7 +39,7 @@ export const create = accountMutation({
 export const remove = accountMutation({
   args: { tagId: v.id("tags") },
   handler: async (ctx, args) => {
-    ctx.requireRole("agent");
+    ctx.requireRole("supervisor");
     const tag = await ctx.db.get(args.tagId);
     if (!tag || tag.accountId !== ctx.accountId) {
       throw new ConvexError({ code: "NOT_FOUND", entity: "tag" });
