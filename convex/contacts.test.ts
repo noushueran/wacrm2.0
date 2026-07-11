@@ -1213,6 +1213,24 @@ test("byCustomFieldValue masks phone for agent/viewer", async () => {
   expect(result[0]!.phoneNormalized).toBe("");
 });
 
+test("contacts.get masks both phone and altPhone for agent", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Ag", email: "ag@x.com", role: "agent" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15551230148",
+      phoneNormalized: "15551230148",
+      altPhone: "+15551234567",
+      name: "X",
+    }),
+  );
+  const got = await asUser.query(api.contacts.get, { contactId });
+  expect(got.phone).toMatch(/^•+48$/);
+  expect(got.altPhone).toMatch(/^•+67$/);
+  expect(got.phoneNormalized).toBe("");
+});
+
 test("filterByTags returns nothing for an empty tagIds list", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {

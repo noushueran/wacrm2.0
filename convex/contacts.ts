@@ -43,10 +43,15 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
  * Contacts UI today, but `list`/`get` below are still directly callable
  * regardless of what the UI exposes.
  */
-function maskContactPhone<T extends { phone: string; phoneNormalized: string }>(
-  contact: T,
-): T {
-  return { ...contact, phone: maskPhone(contact.phone), phoneNormalized: "" };
+function maskContactPhone<
+  T extends { phone: string; phoneNormalized: string; altPhone?: string },
+>(contact: T): T {
+  return {
+    ...contact,
+    phone: maskPhone(contact.phone),
+    phoneNormalized: "",
+    altPhone: contact.altPhone ? maskPhone(contact.altPhone) : contact.altPhone,
+  };
 }
 
 /**

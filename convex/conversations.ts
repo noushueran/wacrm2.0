@@ -42,10 +42,15 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
 }
 
 /** Strips a contact's real number for callers not allowed to see it. */
-function maskContactPhone<T extends { phone: string; phoneNormalized: string }>(
-  contact: T,
-): T {
-  return { ...contact, phone: maskPhone(contact.phone), phoneNormalized: "" };
+function maskContactPhone<
+  T extends { phone: string; phoneNormalized: string; altPhone?: string },
+>(contact: T): T {
+  return {
+    ...contact,
+    phone: maskPhone(contact.phone),
+    phoneNormalized: "",
+    altPhone: contact.altPhone ? maskPhone(contact.altPhone) : contact.altPhone,
+  };
 }
 
 /**
