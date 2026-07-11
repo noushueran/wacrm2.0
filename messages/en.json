@@ -142,6 +142,9 @@
     "page": {
       "whatsappNotConnected": "WhatsApp® is not connected. Go to Settings to connect your account."
     },
+    "ownSpend": {
+      "line": "This month: {amount} on {count} leads"
+    },
     "conversationList": {
       "searchPlaceholder": "Search conversations...",
       "filterAll": "All",
