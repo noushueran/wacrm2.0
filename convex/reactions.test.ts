@@ -58,12 +58,21 @@ async function seedAccountMember(
  */
 async function seedConversation(
   t: ReturnType<typeof convexTest>,
-  opts: { accountId: Id<"accounts">; contactId: Id<"contacts"> },
+  opts: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    // Optional: many tests in this suite seed a conversation purely so
+    // `api.messages.append` can be called as setup. `append` now requires
+    // "own" access (the caller must be assigned), so callers that append
+    // as an "agent" must pass their own userId here.
+    assignedToUserId?: Id<"users">;
+  },
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("conversations", {
       accountId: opts.accountId,
       contactId: opts.contactId,
+      assignedToUserId: opts.assignedToUserId,
       status: "open",
       unreadCount: 0,
     }),
@@ -84,7 +93,11 @@ test("set inserts a new reaction row scoped to the caller's own account", async 
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -119,7 +132,11 @@ test("set twice for the same (message, actor) patches the emoji on one row inste
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -154,7 +171,7 @@ test("set twice for the same (message, actor) patches the emoji on one row inste
 
 test("set upserts correctly when actorId is omitted (an actor identified by actorType alone)", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -162,7 +179,11 @@ test("set upserts correctly when actorId is omitted (an actor identified by acto
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -197,7 +218,11 @@ test("different actors reacting to the same message each get their own row", asy
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -239,7 +264,11 @@ test("remove deletes the matching reaction row", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -273,7 +302,11 @@ test("remove is a no-op when no reaction exists for that actor", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -307,7 +340,11 @@ test("forMessage returns only the given message's reactions", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -347,8 +384,11 @@ test("forMessage returns only the given message's reactions", async () => {
 
 test("set/remove/forMessage all throw NOT_FOUND for a message belonging to a different account, and no row is created", async () => {
   const t = convexTest(schema, modules);
-  const { asUser: asAlice, accountId: aliceAccountId } =
-    await seedAccountMember(t, {
+  const {
+    asUser: asAlice,
+    accountId: aliceAccountId,
+    userId: aliceUserId,
+  } = await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
       role: "agent",
@@ -364,6 +404,7 @@ test("set/remove/forMessage all throw NOT_FOUND for a message belonging to a dif
   const conversationId = await seedConversation(t, {
     accountId: aliceAccountId,
     contactId: aliceContactId,
+    assignedToUserId: aliceUserId,
   });
   const messageId = await asAlice.mutation(api.messages.append, {
     conversationId,
@@ -425,10 +466,15 @@ test("forConversation returns only the given conversation's reactions", async ()
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const otherConversationId = await seedConversation(t, {
     accountId,
     contactId,
+    assignedToUserId: userId,
   });
   const messageId = await asUser.mutation(api.messages.append, {
     conversationId,
@@ -528,7 +574,7 @@ test("forConversation throws NOT_FOUND for a conversation belonging to a differe
 test("reactToMeta in DRY-RUN does not throw for the caller's own account", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -536,7 +582,11 @@ test("reactToMeta in DRY-RUN does not throw for the caller's own account", async
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const targetMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -558,7 +608,7 @@ test("reactToMeta in DRY-RUN does not throw for the caller's own account", async
 test("reactToMeta supports emoji: '' (removal) without throwing", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -566,7 +616,11 @@ test("reactToMeta supports emoji: '' (removal) without throwing", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const targetMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -588,7 +642,7 @@ test("reactToMeta supports emoji: '' (removal) without throwing", async () => {
 test("reactToMeta throws when the target message has never been sent to WhatsApp (no wamid)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -596,7 +650,11 @@ test("reactToMeta throws when the target message has never been sent to WhatsApp
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const targetMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "agent",
@@ -617,8 +675,11 @@ test("reactToMeta throws when the target message has never been sent to WhatsApp
 test("reactToMeta is account-scoped: rejects a message belonging to a different account", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser: asAlice, accountId: aliceAccountId } =
-    await seedAccountMember(t, {
+  const {
+    asUser: asAlice,
+    accountId: aliceAccountId,
+    userId: aliceUserId,
+  } = await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
       role: "agent",
@@ -634,6 +695,7 @@ test("reactToMeta is account-scoped: rejects a message belonging to a different 
   const aliceConversationId = await seedConversation(t, {
     accountId: aliceAccountId,
     contactId: aliceContactId,
+    assignedToUserId: aliceUserId,
   });
   const aliceMessageId = await asAlice.mutation(api.messages.append, {
     conversationId: aliceConversationId,
@@ -655,7 +717,7 @@ test("reactToMeta is account-scoped: rejects a message belonging to a different 
 
 test("reactToMeta throws UNAUTHENTICATED when there is no identity", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -663,7 +725,11 @@ test("reactToMeta throws UNAUTHENTICATED when there is no identity", async () =>
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const targetMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",

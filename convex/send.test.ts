@@ -53,12 +53,21 @@ async function seedAccountMember(
  */
 async function seedConversation(
   t: ReturnType<typeof convexTest>,
-  opts: { accountId: Id<"accounts">; contactId: Id<"contacts"> },
+  opts: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    // Optional: one test seeds a conversation purely so
+    // `api.messages.append` can be called as setup. `append` now requires
+    // "own" access (the caller must be assigned), so callers that append
+    // as an "agent" must pass their own userId here.
+    assignedToUserId?: Id<"users">;
+  },
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("conversations", {
       accountId: opts.accountId,
       contactId: opts.contactId,
+      assignedToUserId: opts.assignedToUserId,
       status: "open",
       unreadCount: 0,
     }),
@@ -445,7 +454,7 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
 test("send rejects a replyToMessageId that belongs to a different conversation", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -460,6 +469,7 @@ test("send rejects a replyToMessageId that belongs to a different conversation",
   const otherConversationId = await seedConversation(t, {
     accountId,
     contactId: otherContactId,
+    assignedToUserId: userId,
   });
   const otherMessageId = await asUser.mutation(api.messages.append, {
     conversationId: otherConversationId,

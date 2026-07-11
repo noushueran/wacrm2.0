@@ -68,6 +68,11 @@ async function seedConversation(
     status?: "open" | "pending" | "closed";
     lastMessageAt?: number;
     unreadCount?: number;
+    // Optional: a few tests seed a conversation purely so
+    // `api.messages.append` can be called as setup. `append` now requires
+    // "own" access (the caller must be assigned), so callers that append
+    // as an "agent" must pass their own userId here.
+    assignedToUserId?: Id<"users">;
   },
 ) {
   return await t.run((ctx) =>
@@ -77,6 +82,7 @@ async function seedConversation(
       status: opts.status ?? "open",
       lastMessageAt: opts.lastMessageAt,
       unreadCount: opts.unreadCount ?? 0,
+      assignedToUserId: opts.assignedToUserId,
     }),
   );
 }
@@ -1009,7 +1015,7 @@ test("setStatus updates the conversation's status and bumps updatedAt", async ()
 
 test("markRead zeroes unreadCount", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -1017,7 +1023,11 @@ test("markRead zeroes unreadCount", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -1241,7 +1251,7 @@ test("resolveSendTarget throws NOT_FOUND for a conversation belonging to a diffe
 
 test("resolveSendTarget resolves a replyToMessageId in the same conversation to its Meta wamid", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -1249,7 +1259,11 @@ test("resolveSendTarget resolves a replyToMessageId in the same conversation to 
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const parentMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "customer",
@@ -1270,7 +1284,7 @@ test("resolveSendTarget resolves a replyToMessageId in the same conversation to 
 
 test("resolveSendTarget omits contextMessageId (without throwing) when the reply target has no Meta wamid yet", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -1278,7 +1292,11 @@ test("resolveSendTarget omits contextMessageId (without throwing) when the reply
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const parentMessageId = await asUser.mutation(api.messages.append, {
     conversationId,
     senderType: "agent",
@@ -1297,7 +1315,7 @@ test("resolveSendTarget omits contextMessageId (without throwing) when the reply
 
 test("resolveSendTarget throws NOT_FOUND for a replyToMessageId belonging to a different conversation", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -1312,6 +1330,7 @@ test("resolveSendTarget throws NOT_FOUND for a replyToMessageId belonging to a d
   const otherConversationId = await seedConversation(t, {
     accountId,
     contactId: otherContactId,
+    assignedToUserId: userId,
   });
   const otherMessageId = await asUser.mutation(api.messages.append, {
     conversationId: otherConversationId,
