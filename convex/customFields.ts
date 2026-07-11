@@ -4,7 +4,7 @@ import type { Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
-// Custom fields — the account-wide field *catalogue* (admin-gated
+// Custom fields — the account-wide field *catalogue* (supervisor-gated
 // create/rename/remove; any member can read, mirroring Postgres's own
 // `custom_fields_select` policy, which had no role floor) plus the
 // per-contact *values* attached to it (agent-gated write, matching
@@ -79,7 +79,7 @@ async function findDuplicateFieldName(
 }
 
 // ============================================================
-// Field catalogue (admin)
+// Field catalogue (supervisor)
 // ============================================================
 
 export const list = accountQuery({

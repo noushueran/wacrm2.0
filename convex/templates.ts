@@ -556,10 +556,10 @@ export const submit = action({
 // editSubmit — authed PUBLIC action (template-EDIT task), the Convex
 // counterpart to `src/app/api/whatsapp/templates/[id]/route.ts`'s PATCH
 // handler, wrapping `convex/metaTemplates.ts`'s `editOnMeta`
-// internalAction. Unlike `submit` above (role floor "agent"), this
-// requires "admin" — editing a template already live/reviewed on Meta
-// (and capped at 10 edits/30 days, 1/24h while APPROVED) is a bigger
-// blast-radius operation than drafting a brand-new one.
+// internalAction. Like `submit` and `syncFromMeta` above, all share
+// the role floor "supervisor" — editing a template already live/reviewed
+// on Meta (and capped at 10 edits/30 days, 1/24h while APPROVED) is a
+// higher-privilege operation requiring supervisor+ access.
 // ============================================================
 
 const EDITABLE_STATUSES: ReadonlySet<string> = new Set([
@@ -658,7 +658,7 @@ export const applyEditSuccessInternal = internalMutation({
 /**
  * Edit an existing APPROVED/REJECTED/PAUSED template on Meta
  * (edit-by-hsm_id — a different Graph call than `submit`'s create) and
- * persist the result locally. Auth + "admin" role → load the target row
+ * persist the result locally. Auth + "supervisor" role → load the target row
  * and assert the caller's own account owns it → the same three
  * preflight guards the source PATCH route enforced (meta_template_id
  * must already be set; status must be one of `EDITABLE_STATUSES`;

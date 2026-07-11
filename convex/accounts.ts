@@ -182,12 +182,12 @@ const KNOWN_CURRENCY_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Sets the account-wide default currency — an admin+ action
+ * Sets the account-wide default currency — a supervisor+ action
  * (`src/components/settings/deals-settings.tsx`'s "Deals" settings
  * panel gates its own control on `canEditSettings` client-side; this
- * mutation is the server-side enforcement of that same admin-only
+ * mutation is the server-side enforcement of that same supervisor-only
  * rule, the Convex counterpart to the Postgres original's
- * `is_account_member(account_id, 'admin')` RLS policy).
+ * `is_account_member(account_id, 'supervisor')` RLS policy).
  *
  * Same identity derivation as `updateProfile` above — `getAuthUserId`
  * + a direct `memberships.by_user` lookup, not `accountMutation` —

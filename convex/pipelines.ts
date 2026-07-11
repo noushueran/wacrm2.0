@@ -5,7 +5,7 @@ import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
 // Pipelines + stages — the deal board's *structure*. Every mutation
-// here is `requireRole("admin")` (changing a pipeline's shape is a
+// here is `requireRole("supervisor")` (changing a pipeline's shape is a
 // settings-tier action); the *operational* deal writes agent+ callers
 // make against that structure live in `deals.ts`. Built on
 // `accountQuery`/`accountMutation` (never the raw `query`/`mutation`),
@@ -112,7 +112,7 @@ export const create = accountMutation({
 });
 
 /**
- * Renames the pipeline itself — same admin gate + ownership check as
+ * Renames the pipeline itself — same supervisor gate + ownership check as
  * every other structural mutation in this file (mirrors `renameStage`'s
  * shape, one level up: a pipeline rather than one of its stages).
  */
