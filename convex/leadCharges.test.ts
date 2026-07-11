@@ -244,3 +244,44 @@ test("setAutoreplyPaused(paused:false) resume writes no charge", async () => {
 
   expect(await rows(t)).toHaveLength(0);
 });
+
+// ============================================================
+// leadCharges.report (Phase 2, Task 3) — per-agent spend rollup for
+// the Dashboard "Lead spend" card. Role-scoped (supervisor+ see all
+// agents; an agent sees only their own row); `enabled:false` when the
+// account has no positive lead value.
+// ============================================================
+
+test("report aggregates per agent; supervisor sees all, agent sees own", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  await setRate(t, accountId, 5);
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+  const a = await seedUserInAccount(t, accountId, { name: "Alice", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "Bob", email: "b@x.com", role: "agent" });
+  for (const p of ["1", "2", "3"]) {
+    const { conversationId } = await seedConv(t, accountId, { phone: p, name: p });
+    await a.asUser.mutation(api.conversations.assign, { conversationId, userId: a.userId });
+  }
+  const { conversationId } = await seedConv(t, accountId, { phone: "9", name: "9" });
+  await b.asUser.mutation(api.conversations.assign, { conversationId, userId: b.userId });
+
+  const asSupReport = await s.asUser.query(api.leadCharges.report, {});
+  expect(asSupReport.enabled).toBe(true);
+  const alice = asSupReport.rows.find((r) => r.userId === a.userId);
+  expect(alice).toMatchObject({ name: "Alice", leadCount: 3, totalSpent: 15 });
+  expect(asSupReport.rows.find((r) => r.userId === b.userId)).toMatchObject({ leadCount: 1, totalSpent: 5 });
+
+  const asAgentReport = await a.asUser.query(api.leadCharges.report, {});
+  expect(asAgentReport.rows).toHaveLength(1);
+  expect(asAgentReport.rows[0]).toMatchObject({ userId: a.userId, leadCount: 3, totalSpent: 15 });
+});
+
+test("report enabled=false when feature is off", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+  const r = await s.asUser.query(api.leadCharges.report, {});
+  expect(r.enabled).toBe(false);
+  expect(r.rows).toEqual([]);
+});
