@@ -5,7 +5,7 @@ import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
-import { conversationScope, canAccessConversation, canSeeContactPhone } from "./lib/roles";
+import { conversationScope, canAccessConversation, canSeeContactPhone, canAssignToOthers } from "./lib/roles";
 import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { maskPhone } from "./lib/phone";
@@ -213,30 +213,12 @@ export const unreadTotal = accountQuery({
 // ============================================================
 // Conversation mutations (Phase 2, Task 3) — creating a thread for a
 // contact, assigning it, changing its status, and marking it read.
-// Every mutation asserts ownership of its target conversation via
-// `requireOwnConversation` before writing.
+// Every mutation asserts access to its target conversation via the
+// shared `requireConversationAccess` guard (`convex/lib/
+// conversationAccess.ts`) before writing — "view" for reads/toggles
+// that the assigned-or-pool scope should reach, "own" for writes that
+// require the caller to actually hold the assignment (Task 6).
 // ============================================================
-
-/**
- * Loads a conversation and throws `NOT_FOUND` unless it belongs to the
- * caller's own account — the same error for "doesn't exist" and
- * "exists but isn't yours" on purpose (mirrors `get` above and
- * `messages.ts`'s own `requireOwnConversation`). Duplicated from
- * `messages.ts` rather than imported, matching this codebase's
- * one-helper-per-file style (see `embedTags`'s own comment above for
- * the same reasoning) — `messages.ts` needs this to guard message
- * reads/writes, this file needs it to guard the mutations below.
- */
-async function requireOwnConversation(
-  ctx: { db: QueryCtx["db"]; accountId: Id<"accounts"> },
-  conversationId: Id<"conversations">,
-) {
-  const conversation = await ctx.db.get(conversationId);
-  if (!conversation || conversation.accountId !== ctx.accountId) {
-    throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
-  }
-  return conversation;
-}
 
 /**
  * Returns the existing thread for a contact, or opens a new one.
@@ -316,6 +298,15 @@ export const findOrCreateForContactInternal = internalMutation({
  * conversation is, so a cross-account probe can't distinguish "no such
  * user" from "not your teammate".
  *
+ * Claim model (Task 6): access to the conversation itself is checked
+ * in "view" mode (`requireConversationAccess`), so an agent can reach
+ * — and claim — any pool conversation even though they don't yet own
+ * it. `canAssignToOthers` (`convex/lib/roles.ts`) then gates who the
+ * target can be: below supervisor, `userId` must be the caller's own
+ * (self-claim) and the conversation must be unassigned or already
+ * theirs — reassigning a colleague's conversation is a supervisor+
+ * action. supervisor+ may assign anyone to anyone.
+ *
  * Also notifies the assignee (`convex/notifications.ts`'s
  * `insertNotification`) — the Convex counterpart to migration 027's
  * `notify_conversation_assigned` trigger. Skipped for self-assignment
@@ -327,7 +318,23 @@ export const assign = accountMutation({
   args: { conversationId: v.id("conversations"), userId: v.id("users") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    const conversation = await requireOwnConversation(ctx, args.conversationId);
+    // View access reaches the conversation; the claim constraints below
+    // restrict agents to self-claiming the pool.
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "view",
+    );
+
+    if (!canAssignToOthers(ctx.role)) {
+      const notSelf = args.userId !== ctx.userId;
+      const ownedByOther =
+        conversation.assignedToUserId !== undefined &&
+        conversation.assignedToUserId !== ctx.userId;
+      if (notSelf || ownedByOther) {
+        throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
+      }
+    }
 
     const membership = await ctx.db
       .query("memberships")
@@ -402,7 +409,7 @@ export const unassign = accountMutation({
   args: { conversationId: v.id("conversations") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnConversation(ctx, args.conversationId);
+    await requireConversationAccess(ctx, args.conversationId, "own");
     await ctx.db.patch(args.conversationId, {
       assignedToUserId: undefined,
       updatedAt: Date.now(),
@@ -442,7 +449,7 @@ export const setAutoreplyPaused = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnConversation(ctx, args.conversationId);
+    await requireConversationAccess(ctx, args.conversationId, "view");
 
     if (args.paused) {
       await ctx.db.patch(args.conversationId, {
@@ -475,7 +482,7 @@ export const setStatus = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnConversation(ctx, args.conversationId);
+    await requireConversationAccess(ctx, args.conversationId, "own");
     await ctx.db.patch(args.conversationId, {
       status: args.status,
       updatedAt: Date.now(),
@@ -495,7 +502,7 @@ export const markRead = accountMutation({
   args: { conversationId: v.id("conversations") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnConversation(ctx, args.conversationId);
+    await requireConversationAccess(ctx, args.conversationId, "view");
     await ctx.db.patch(args.conversationId, { unreadCount: 0 });
     return args.conversationId;
   },
@@ -516,10 +523,15 @@ export const markRead = accountMutation({
  *
  * Doubles as both callers' tenancy gate: throws the same `NOT_FOUND`
  * "doesn't exist" / "exists but isn't yours" conflation
- * `requireOwnConversation` uses elsewhere in this file, for either a
- * foreign `conversationId` or a `replyToMessageId` that exists but
- * belongs to a different conversation — so a cross-account probe can't
- * distinguish "no such row" from "not yours" via either argument.
+ * `requireConversationAccess`'s own account check
+ * (`convex/lib/conversationAccess.ts`) uses elsewhere in this file, for
+ * either a foreign `conversationId` or a `replyToMessageId` that exists
+ * but belongs to a different conversation — so a cross-account probe
+ * can't distinguish "no such row" from "not yours" via either argument.
+ * This query stays a hand-rolled check rather than calling that helper
+ * directly: it's an `internalQuery` with a caller-supplied `accountId`
+ * and no user session, so it has no `role`/`userId` to satisfy that
+ * helper's ctx shape.
  *
  * A reply target that exists (in this conversation) but has no Meta
  * `messageId` yet (still sending, or failed) is NOT an error —

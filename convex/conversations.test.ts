@@ -756,11 +756,15 @@ test("unreadTotal does not count another account's unread conversations", async 
 
 test("assign rejects a userId that is not a member of the account", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: assigning to someone other than yourself is a
+  // supervisor+-only path under the self-claim model (Task 6) — an
+  // agent would be rejected by the claim guard before ever reaching
+  // this mutation's membership check.
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const { userId: bobUserId } = await seedAccountMember(t, {
     name: "Bob",
@@ -789,11 +793,14 @@ test("assign rejects a userId that is not a member of the account", async () => 
 
 test("assign sets assignedToUserId and status:pending for a real member of the account", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: assigning a conversation to someone other than
+  // yourself (Carol) is a supervisor+-only path under the self-claim
+  // model (Task 6).
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const carolUserId = await seedTeammate(t, {
     accountId: aliceAccountId,
@@ -830,11 +837,16 @@ test("assign sets assignedToUserId and status:pending for a real member of the a
 
 test("unassign clears assignedToUserId and leaves status untouched", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: Alice both assigns to Carol and later unassigns
+  // Carol's conversation — under the self-claim model (Task 6) an
+  // agent could do neither (assign is self-claim-only, and "own" mode
+  // requires the caller to hold the assignment), so this generic
+  // clear-assignment behavior is exercised as a supervisor instead.
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const carolUserId = await seedTeammate(t, {
     accountId: aliceAccountId,
@@ -872,11 +884,15 @@ test("unassign clears assignedToUserId and leaves status untouched", async () =>
 
 test("unassign throws NOT_FOUND for a conversation belonging to a different account, and leaves it untouched", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: Alice assigns to Carol (a cross-user assignment,
+  // supervisor+-only under the self-claim model, Task 6) so the setup
+  // reaches the cross-account `unassign` check below; Bob's role is
+  // irrelevant to that check (it fails on account mismatch first).
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -913,10 +929,14 @@ test("unassign throws NOT_FOUND for a conversation belonging to a different acco
 
 test("unassign is rejected for a viewer (below the agent role floor), leaving the assignment untouched", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: Alice assigns to Carol (a cross-user assignment,
+  // supervisor+-only under the self-claim model, Task 6) so the setup
+  // succeeds; the test itself is about Vic's viewer-role rejection,
+  // unaffected by Alice's role.
   const { asUser: asAlice, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const carolUserId = await seedTeammate(t, {
     accountId,
@@ -954,7 +974,7 @@ test("unassign is rejected for a viewer (below the agent role floor), leaving th
 
 test("setStatus updates the conversation's status and bumps updatedAt", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -967,6 +987,9 @@ test("setStatus updates the conversation's status and bumps updatedAt", async ()
     contactId,
     status: "open",
   });
+  // `setStatus` now requires "own" access (Task 6) — an agent must
+  // hold the assignment, so self-claim it first.
+  await asUser.mutation(api.conversations.assign, { conversationId, userId });
 
   const beforeUpdate = Date.now();
   const result = await asUser.mutation(api.conversations.setStatus, {
@@ -1081,6 +1104,9 @@ test("assign/setStatus/markRead all throw NOT_FOUND for a conversation belonging
 
 test("assign creates a notification for the assignee", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: assigning to Carol (not self) is a supervisor+-only
+  // path under the self-claim model (Task 6); the notification-on-
+  // cross-user-assign behavior under test requires that path.
   const {
     asUser: asAlice,
     accountId: aliceAccountId,
@@ -1088,7 +1114,7 @@ test("assign creates a notification for the assignee", async () => {
   } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const carolUserId = await seedTeammate(t, {
     accountId: aliceAccountId,
@@ -1363,10 +1389,16 @@ test("setAutoreplyPaused(paused:true, assignToMe:true) also assigns the conversa
 
 test("setAutoreplyPaused(paused:false) clears the pause, releases any assignment, resets the reply count, and clears the handoff summary — leaving status untouched", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: the conversation under test is pre-patched assigned to
+  // Carol, not the caller. `setAutoreplyPaused` now requires "view"
+  // access (Task 6), which for an agent means own-or-unassigned — a
+  // colleague's assigned conversation is out of an agent's reach, so
+  // exercising "releases ANY assignee, not just the caller's own"
+  // requires a supervisor+ caller.
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const carolUserId = await seedTeammate(t, {
     accountId,
@@ -1548,4 +1580,88 @@ test("phone is masked on the pool and unmasked on an agent's own chat", async ()
 
   const asS = await s.asUser.query(api.conversations.list, onePage);
   expect(asS.page.find((c) => c.contact?.name === "Mine")?.contact?.phone).toBe("+15551230148");
+});
+
+// ============================================================
+// claim / assign / reassign model (Task 6) — `canAssignToOthers`
+// (`convex/lib/roles.ts`) applied to `assign` via a claim guard that
+// sits after the shared `requireConversationAccess` guard. Agents may
+// only self-claim a conversation that is unassigned or already theirs;
+// supervisor+ may assign anyone to anyone. `unassign`/`setStatus` now
+// require "own"; `markRead`/`setAutoreplyPaused` require "view".
+// ============================================================
+
+test("agent self-claims an unassigned conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "111", name: "Pool" });
+
+  await a.asUser.mutation(api.conversations.assign, { conversationId, userId: a.userId });
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row?.assignedToUserId).toBe(a.userId);
+  expect(row?.status).toBe("pending");
+});
+
+test("agent cannot assign a conversation to another user", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "111", name: "Pool" });
+
+  await expect(
+    a.asUser.mutation(api.conversations.assign, { conversationId, userId: b.userId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("agent cannot grab a conversation owned by another agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "111", name: "Bees", assignedToUserId: b.userId });
+
+  await expect(
+    a.asUser.mutation(api.conversations.assign, { conversationId, userId: a.userId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("supervisor assigns a conversation to any agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "111", name: "Pool" });
+
+  await s.asUser.mutation(api.conversations.assign, { conversationId, userId: a.userId });
+  const row = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(row?.assignedToUserId).toBe(a.userId);
+});
+
+test("agent releases only their own conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const mine = await seedConv(t, accountId, { phone: "111", name: "Mine", assignedToUserId: a.userId });
+  const theirs = await seedConv(t, accountId, { phone: "222", name: "Bees", assignedToUserId: b.userId });
+
+  await a.asUser.mutation(api.conversations.unassign, { conversationId: mine.conversationId });
+  expect((await t.run((ctx) => ctx.db.get(mine.conversationId)))?.assignedToUserId).toBeUndefined();
+
+  await expect(
+    a.asUser.mutation(api.conversations.unassign, { conversationId: theirs.conversationId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("viewer cannot assign", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const v = await seedUserInAccount(t, accountId, { name: "Vic", email: "v@x.com", role: "viewer" });
+  const { conversationId } = await seedConv(t, accountId, { phone: "111", name: "Pool" });
+
+  await expect(
+    v.asUser.mutation(api.conversations.assign, { conversationId, userId: v.userId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });
