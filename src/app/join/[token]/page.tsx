@@ -85,8 +85,9 @@ import { hashInviteToken } from '../../../../convex/lib/inviteToken';
 
 type PeekFailReason = 'not_found' | 'used' | 'expired';
 
-const ROLE_LABEL: Record<'admin' | 'agent' | 'viewer', string> = {
+const ROLE_LABEL: Record<'admin' | 'supervisor' | 'agent' | 'viewer', string> = {
   admin: 'Admin',
+  supervisor: 'Supervisor',
   agent: 'Agent',
   viewer: 'Viewer',
 };

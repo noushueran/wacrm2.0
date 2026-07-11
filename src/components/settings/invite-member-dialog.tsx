@@ -43,7 +43,7 @@ import { convexErrorMessage } from '@/lib/convex/adapters';
 
 import { api } from '../../../convex/_generated/api';
 
-type InviteRole = 'admin' | 'agent' | 'viewer';
+type InviteRole = 'admin' | 'supervisor' | 'agent' | 'viewer';
 
 interface InviteMemberDialogProps {
   open: boolean;
@@ -282,12 +282,13 @@ export function InviteMemberDialog({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="admin">{tRoles('admin')}</SelectItem>
+                    <SelectItem value="supervisor">{tRoles('supervisor')}</SelectItem>
                     <SelectItem value="agent">{tRoles('agent')}</SelectItem>
                     <SelectItem value="viewer">{tRoles('viewer')}</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  {tRoles(`${role}Hint` as 'adminHint' | 'agentHint' | 'viewerHint')}
+                  {tRoles(`${role}Hint` as 'adminHint' | 'supervisorHint' | 'agentHint' | 'viewerHint')}
                 </p>
               </div>
 

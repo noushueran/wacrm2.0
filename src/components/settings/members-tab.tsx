@@ -92,6 +92,7 @@ import type { Id } from '../../../convex/_generated/dataModel';
 // These roles are translated via `useTranslations("Settings.roles")` where they are used.
 const EDITABLE_ROLES: { value: AccountRole }[] = [
   { value: 'admin' },
+  { value: 'supervisor' },
   { value: 'agent' },
   { value: 'viewer' },
 ];
