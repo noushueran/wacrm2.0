@@ -20,12 +20,23 @@ export const report = accountQuery({
 
     const seeAll = hasMinRole(ctx.role, "supervisor");
 
-    let charges = await ctx.db
-      .query("leadCharges")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .collect();
+    // Supervisor+ needs every agent's rows, so it scans the whole
+    // account via `by_account`; an agent only ever needs their own rows,
+    // so it queries directly via the `(userId, accountId)` `by_user_account`
+    // index instead of collecting the whole account and filtering in JS
+    // (lead-value fix wave — final review, Fix 5).
+    let charges = seeAll
+      ? await ctx.db
+          .query("leadCharges")
+          .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+          .collect()
+      : await ctx.db
+          .query("leadCharges")
+          .withIndex("by_user_account", (q) =>
+            q.eq("userId", ctx.userId).eq("accountId", ctx.accountId),
+          )
+          .collect();
 
-    if (!seeAll) charges = charges.filter((c) => c.userId === ctx.userId);
     if (args.from !== undefined) charges = charges.filter((c) => c._creationTime >= args.from!);
     if (args.to !== undefined) charges = charges.filter((c) => c._creationTime <= args.to!);
 
@@ -39,13 +50,22 @@ export const report = accountQuery({
 
     const rows = await Promise.all(
       [...byUser.entries()].map(async ([userId, agg]) => {
-        const m = await ctx.db
-          .query("memberships")
-          .withIndex("by_user_account", (q) =>
-            q.eq("userId", userId).eq("accountId", ctx.accountId),
-          )
-          .first();
-        return { userId, name: m?.fullName ?? "Unknown", ...agg };
+        // Two-level name fallback, mirroring `accounts.me`'s own
+        // `membership.fullName ?? user?.name ?? ...` (lead-value fix
+        // wave — final review, Fix 4): the denormalized membership
+        // snapshot is preferred, but a removed/nameless agent's
+        // historical spend still resolves a real name off `users`
+        // rather than immediately falling back to "Unknown".
+        const [m, user] = await Promise.all([
+          ctx.db
+            .query("memberships")
+            .withIndex("by_user_account", (q) =>
+              q.eq("userId", userId).eq("accountId", ctx.accountId),
+            )
+            .first(),
+          ctx.db.get(userId),
+        ]);
+        return { userId, name: m?.fullName ?? user?.name ?? "Unknown", ...agg };
       }),
     );
     rows.sort((a, b) => b.totalSpent - a.totalSpent);

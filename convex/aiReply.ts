@@ -3,6 +3,7 @@ import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { hasMinRole } from "./lib/roles";
+import { chargeLeadIfAgent } from "./lib/leadCharge";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
@@ -271,6 +272,18 @@ export const markHandoff = internalMutation({
     if (args.handoffAgentId) patch.assignedToUserId = args.handoffAgentId;
 
     await ctx.db.patch(args.conversationId, patch);
+
+    // Same charge-on-assignment guarantee as `conversations.assign`,
+    // `conversations.setAutoreplyPaused`, and `automationsEngine.ts`'s
+    // `assign_conversation` step — feature-off/agents-only/idempotent, so
+    // safe to call unconditionally right after the patch. Guarded on
+    // `handoffAgentId` itself (not just the patch above) since there's
+    // nothing to charge when the bot handed off into the shared
+    // unassigned queue rather than to a specific agent (lead-value fix
+    // wave — final review).
+    if (args.handoffAgentId) {
+      await chargeLeadIfAgent(ctx, args.accountId, args.handoffAgentId, args.conversationId);
+    }
   },
 });
 

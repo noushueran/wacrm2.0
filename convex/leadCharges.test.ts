@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
@@ -284,4 +284,104 @@ test("report enabled=false when feature is off", async () => {
   const r = await s.asUser.query(api.leadCharges.report, {});
   expect(r.enabled).toBe(false);
   expect(r.rows).toEqual([]);
+});
+
+// ============================================================
+// report — name fallback (lead-value fix wave — final review, Fix 4).
+// `seedUserInAccount` above always sets `fullName` on the membership
+// row it inserts, so every test up to this point only ever exercises
+// the FIRST level of `report`'s name resolution. This seeds a
+// membership with no `fullName` directly (bypassing that helper) to
+// prove the second level — `users.name` — actually gets read, mirroring
+// `accounts.me`'s own two-level fallback.
+// ============================================================
+
+test("report falls back to the users table's name when the membership has none", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  await setRate(t, accountId, 5);
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+
+  const agentUserId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Real Name", email: "nameless@x.com" }),
+  );
+  // No `fullName` on this membership — the first fallback level misses.
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", { userId: agentUserId, accountId, role: "agent", email: "nameless@x.com" }),
+  );
+  const { conversationId } = await seedConv(t, accountId, { phone: "1", name: "L" });
+  await t.run((ctx) =>
+    ctx.db.insert("leadCharges", { accountId, userId: agentUserId, conversationId, value: 5, currency: "USD" }),
+  );
+
+  const report = await s.asUser.query(api.leadCharges.report, {});
+  const row = report.rows.find((r) => r.userId === agentUserId);
+  expect(row?.name).toBe("Real Name");
+});
+
+// ============================================================
+// report — `from`/`to` period filter (lead-value fix wave — final
+// review, Fix 6). `_creationTime` can't be patched after insert, and a
+// real wall-clock sleep between seed batches would be both slow and
+// flaky, so this fakes `Date` and drives it forward explicitly —
+// mirrors `aiUsage.test.ts`'s own `makeClock` pattern for the identical
+// "range-filter keyed on `_creationTime`" testing problem (see that
+// file's header comment for the full "clamped forward only" rationale).
+// ============================================================
+
+function makeClock(startMs: number) {
+  let last = startMs - 1;
+  return (ms: number) => {
+    if (ms < last) {
+      throw new Error(`Test bug: tried to seed at ${ms}, but time already moved past ${last}.`);
+    }
+    last = ms;
+    vi.setSystemTime(ms);
+  };
+}
+
+const PERIOD_T0 = Date.parse("2026-06-01T00:00:00.000Z");
+const PERIOD_CUTOFF = Date.parse("2026-07-01T00:00:00.000Z");
+const PERIOD_AFTER = Date.parse("2026-07-05T00:00:00.000Z");
+
+test("report's `from` includes charges at/after the boundary and excludes ones before it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const t = convexTest(schema, modules);
+    const clock = makeClock(PERIOD_T0);
+    clock(PERIOD_T0);
+    const { accountId } = await seedAccountWithOwner(t);
+    await setRate(t, accountId, 5);
+    const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+    const a = await seedUserInAccount(t, accountId, { name: "A", email: "a@x.com", role: "agent" });
+
+    // Charge #1 — strictly before the cutoff (must be excluded).
+    const c1 = await seedConv(t, accountId, { phone: "1", name: "L1" });
+    await a.asUser.mutation(api.conversations.assign, { conversationId: c1.conversationId, userId: a.userId });
+
+    // Charge #2 — exactly AT the cutoff (inclusive — must be included).
+    clock(PERIOD_CUTOFF);
+    const c2 = await seedConv(t, accountId, { phone: "2", name: "L2" });
+    await a.asUser.mutation(api.conversations.assign, { conversationId: c2.conversationId, userId: a.userId });
+
+    // Charge #3 — after the cutoff (must be included).
+    clock(PERIOD_AFTER);
+    const c3 = await seedConv(t, accountId, { phone: "3", name: "L3" });
+    await a.asUser.mutation(api.conversations.assign, { conversationId: c3.conversationId, userId: a.userId });
+
+    const unfiltered = await s.asUser.query(api.leadCharges.report, {});
+    expect(unfiltered.rows.find((r) => r.userId === a.userId)).toMatchObject({ leadCount: 3, totalSpent: 15 });
+
+    const filtered = await s.asUser.query(api.leadCharges.report, { from: PERIOD_CUTOFF });
+    expect(filtered.rows.find((r) => r.userId === a.userId)).toMatchObject({ leadCount: 2, totalSpent: 10 });
+
+    // Same boundary, scoped through the agent's own `by_user_account`
+    // branch (Fix 5) — proves the index swap didn't change the filter's
+    // behavior for that branch either.
+    const filteredAsAgent = await a.asUser.query(api.leadCharges.report, { from: PERIOD_CUTOFF });
+    expect(filteredAsAgent.rows).toHaveLength(1);
+    expect(filteredAsAgent.rows[0]).toMatchObject({ userId: a.userId, leadCount: 2, totalSpent: 10 });
+  } finally {
+    vi.useRealTimers();
+  }
 });

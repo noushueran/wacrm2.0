@@ -489,6 +489,114 @@ test("a handoff node assigns the conversation to the configured agent and ends t
 });
 
 // ============================================================
+// 4b. executeHandoffMutation charges the assigned agent when the
+//     account has a lead value set (lead-value fix wave — final
+//     review, Fix 2). Test 4 above already proves the full
+//     dispatch-through-handoff-node path assigns the conversation;
+//     these call `executeHandoffMutation` itself directly (skipping
+//     the node walk) to focus narrowly on the charge side, mirroring
+//     `automationsEngine.test.ts`'s own focused `assign_conversation`
+//     charge test. A bare `flowRuns` row is seeded inline since the
+//     mutation reads/patches it directly (`fallbackTimeoutId` check +
+//     final `status: "handed_off"` patch) regardless of how the run
+//     got there.
+// ============================================================
+
+async function seedFlowRun(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; flowId: Id<"flows">; conversationId?: Id<"conversations">; currentNodeKey?: string },
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("flowRuns", {
+      accountId: opts.accountId,
+      flowId: opts.flowId,
+      conversationId: opts.conversationId,
+      status: "active",
+      currentNodeKey: opts.currentNodeKey ?? "escalate",
+      repromptCount: 0,
+    }),
+  );
+}
+
+test("executeHandoffMutation charges the assigned agent when a lead value is set", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const agentUserId = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "Agent Smith", email: "agent@example.com" });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: "agent",
+      fullName: "Agent Smith",
+      email: "agent@example.com",
+    });
+    return userId;
+  });
+  const { conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["help"] },
+    entryNodeId: "start",
+  });
+  const flowRunId = await seedFlowRun(t, { accountId, flowId, conversationId });
+
+  await t.mutation(internal.flowsEngine.executeHandoffMutation, {
+    accountId,
+    flowRunId,
+    conversationId,
+    assignToUserId: agentUserId,
+    note: "needs a human",
+    nodeKey: "escalate",
+  });
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.assignedToUserId).toBe(agentUserId);
+
+  const charges = await t.run((ctx) =>
+    ctx.db
+      .query("leadCharges")
+      .withIndex("by_user_conversation", (q) =>
+        q.eq("userId", agentUserId).eq("conversationId", conversationId),
+      )
+      .collect(),
+  );
+  expect(charges).toHaveLength(1);
+  expect(charges[0]).toMatchObject({ accountId, value: 5, currency: "USD" });
+});
+
+test("executeHandoffMutation writes no charge when assignToUserId isn't a member of this account", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const outsiderUserId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Outsider", email: "outsider@example.com" }),
+  );
+  const { conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["help"] },
+    entryNodeId: "start",
+  });
+  const flowRunId = await seedFlowRun(t, { accountId, flowId, conversationId });
+
+  await t.mutation(internal.flowsEngine.executeHandoffMutation, {
+    accountId,
+    flowRunId,
+    conversationId,
+    assignToUserId: outsiderUserId,
+    note: "needs a human",
+    nodeKey: "escalate",
+  });
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.assignedToUserId).toBeUndefined();
+  expect(await t.run((ctx) => ctx.db.query("leadCharges").collect())).toHaveLength(0);
+});
+
+// ============================================================
 // 5. Fallback timeout via the scheduler (no flows cron).
 // ============================================================
 

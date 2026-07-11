@@ -364,6 +364,79 @@ test("a handoff-signalled reply assigns the conversation to the configured hando
 });
 
 // ============================================================
+// markHandoff — direct `internalMutation` coverage of the lead-charge
+// wiring (lead-value fix wave — final review, Fix 1). The two handoff
+// tests above already prove `dispatchInbound` reaches `markHandoff` and
+// that it assigns `handoffAgentId`; these call `markHandoff` itself
+// directly (skipping the whole config/generation pipeline) to focus
+// narrowly on the charge side, mirroring `automationsEngine.test.ts`'s
+// own focused `assign_conversation` charge test.
+// ============================================================
+
+test("markHandoff charges the handoff agent when a lead value is set", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const handoffAgentId = await seedTeammate(t, {
+    accountId,
+    name: "Hank (handoff agent)",
+    email: "hank@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "I need a human",
+  });
+
+  await t.mutation(internal.aiReply.markHandoff, {
+    accountId,
+    conversationId,
+    handoffAgentId,
+    summary: "test handoff",
+  });
+
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
+
+  const charges = await t.run((ctx) =>
+    ctx.db
+      .query("leadCharges")
+      .withIndex("by_user_conversation", (q) =>
+        q.eq("userId", handoffAgentId).eq("conversationId", conversationId),
+      )
+      .collect(),
+  );
+  expect(charges).toHaveLength(1);
+  expect(charges[0]).toMatchObject({ accountId, value: 5, currency: "USD" });
+});
+
+test("markHandoff writes no charge when no handoff agent is configured (unassigned queue)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "I need a human",
+  });
+
+  await t.mutation(internal.aiReply.markHandoff, {
+    accountId,
+    conversationId,
+    summary: "test handoff",
+  });
+
+  expect((await getConversation(t, conversationId))!.assignedToUserId).toBeUndefined();
+  expect(await t.run((ctx) => ctx.db.query("leadCharges").collect())).toHaveLength(0);
+});
+
+// ============================================================
 // Account isolation
 // ============================================================
 

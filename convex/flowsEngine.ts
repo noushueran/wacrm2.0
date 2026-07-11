@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import type { ActionCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { decideFallback, resolveFallbackPolicy } from "./lib/flows/fallback";
+import { chargeLeadIfAgent } from "./lib/leadCharge";
 import type {
   CollectInputNodeConfig,
   ConditionNodeConfig,
@@ -1423,6 +1424,17 @@ export const executeHandoffMutation = internalMutation({
           if (membership) patch.assignedToUserId = args.assignToUserId as Id<"users">;
         }
         await ctx.db.patch(args.conversationId, patch);
+        // Same charge-on-assignment guarantee as `conversations.assign`,
+        // `conversations.setAutoreplyPaused`, and `automationsEngine.ts`'s
+        // `assign_conversation` step — feature-off/agents-only/idempotent,
+        // so safe to call unconditionally right after the patch. Reads
+        // `patch.assignedToUserId` (not the raw `args.assignToUserId`) so
+        // this only fires when the membership check above actually
+        // confirmed the target belongs to this account (lead-value fix
+        // wave — final review).
+        if (patch.assignedToUserId) {
+          await chargeLeadIfAgent(ctx, args.accountId, patch.assignedToUserId, args.conversationId);
+        }
       }
     }
     await ctx.db.insert("flowRunEvents", {
