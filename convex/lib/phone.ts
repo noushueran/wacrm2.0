@@ -28,3 +28,12 @@ export function normalizePhone(phone: string): string {
 export function isValidE164(phone: string): boolean {
   return /^\+?[1-9]\d{6,14}$/.test(phone);
 }
+
+/** Mask all but the last two digits of a phone number, for callers not
+ *  permitted to see it. Drops country code + formatting; keeps 2 digits
+ *  so two leads stay distinguishable. Never returns the real number. */
+export function maskPhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length <= 2) return "••";
+  return "•".repeat(digits.length - 2) + digits.slice(-2);
+}
