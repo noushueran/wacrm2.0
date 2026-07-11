@@ -105,6 +105,7 @@ export const me = query({
         id: account._id,
         name: account.name,
         defaultCurrency: account.defaultCurrency,
+        leadValue: account.leadValue ?? 0,
       },
     };
   },
@@ -230,6 +231,37 @@ export const setDefaultCurrency = mutation({
     await ctx.db.patch(membership.accountId, {
       defaultCurrency: args.currency,
     });
+    return membership.accountId;
+  },
+});
+
+/**
+ * Sets the account-wide flat lead value (Phase 2). Admin+ only — a
+ * stricter floor than setDefaultCurrency's supervisor+, per the Phase 2
+ * decision that only admins configure money charged to agents. Same
+ * inline identity derivation as setDefaultCurrency. `value` is the
+ * per-lead charge in the account's defaultCurrency; 0 disables charging.
+ */
+export const setLeadValue = mutation({
+  args: { value: v.number() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(membership.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
+    }
+    if (!Number.isFinite(args.value) || args.value < 0) {
+      throw new ConvexError({
+        code: "INVALID_INPUT",
+        message: "lead value must be a number >= 0",
+      });
+    }
+    await ctx.db.patch(membership.accountId, { leadValue: args.value });
     return membership.accountId;
   },
 });

@@ -437,3 +437,48 @@ test("accountContextForUser returns null for a user with no membership yet", asy
 
   expect(result).toBeNull();
 });
+
+// ============================================================
+// setLeadValue — admin+ action; sets the account-wide flat per-lead
+// charge (Phase 2, Task 1). Stricter floor than setDefaultCurrency
+// ("admin", not "supervisor") — only admins configure money charged to
+// agents. Same identity-inline / shared-row-patch shape as
+// setDefaultCurrency above, but the input guard is "value >= 0" rather
+// than a currency whitelist.
+// ============================================================
+
+test("setLeadValue: admin sets the account lead value", async () => {
+  const t = convexTest(schema, modules);
+  const adminId = await insertUser(t, { name: "Ad", email: "ad@x.com" });
+  const asAdmin = t.withIdentity({ subject: `${adminId}|s` });
+  await asAdmin.mutation(api.accounts.bootstrapAccount, {}); // creates account + owner membership
+  // bootstrap makes them owner; owner is admin+ so setLeadValue is allowed
+  const accountId = await asAdmin.mutation(api.accounts.setLeadValue, { value: 5 });
+  const acct = await t.run((ctx) => ctx.db.get(accountId));
+  expect(acct?.leadValue).toBe(5);
+});
+
+test("setLeadValue: rejects a value below zero", async () => {
+  const t = convexTest(schema, modules);
+  const adminId = await insertUser(t, { name: "Ad", email: "ad@x.com" });
+  const asAdmin = t.withIdentity({ subject: `${adminId}|s` });
+  await asAdmin.mutation(api.accounts.bootstrapAccount, {});
+  await expect(
+    asAdmin.mutation(api.accounts.setLeadValue, { value: -1 }),
+  ).rejects.toMatchObject({ data: { code: "INVALID_INPUT" } });
+});
+
+test("setLeadValue: FORBIDDEN below admin", async () => {
+  const t = convexTest(schema, modules);
+  const ownerId = await insertUser(t, { name: "O", email: "o@x.com" });
+  const asOwner = t.withIdentity({ subject: `${ownerId}|s` });
+  await asOwner.mutation(api.accounts.bootstrapAccount, {});
+  const { userId: supId } = await insertTeammate(t, {
+    accountId: (await t.run((ctx) => ctx.db.query("accounts").first()))!._id,
+    name: "Su", email: "su@x.com", role: "supervisor",
+  });
+  const asSup = t.withIdentity({ subject: `${supId}|s` });
+  await expect(
+    asSup.mutation(api.accounts.setLeadValue, { value: 5 }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});

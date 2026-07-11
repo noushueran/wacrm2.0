@@ -11,7 +11,24 @@ export default defineSchema({
     name: v.string(),
     defaultCurrency: v.string(), // ISO-4217, default "USD"
     ownerUserId: v.id("users"),
+    leadValue: v.optional(v.number()), // flat per-lead charge; unset/<=0 = feature OFF
   }).index("by_owner", ["ownerUserId"]),
+
+  // Append-only spend ledger — one row = one agent charged once for one
+  // conversation. Never updated/deleted in normal operation. `value`/
+  // `currency` are snapshots of the account rate at charge time so later
+  // rate changes don't rewrite history. `by_user_conversation` backs the
+  // once-per-(agent,conversation) idempotency check.
+  leadCharges: defineTable({
+    accountId: v.id("accounts"),
+    userId: v.id("users"),
+    conversationId: v.id("conversations"),
+    value: v.number(),
+    currency: v.string(),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_user_account", ["userId", "accountId"])
+    .index("by_user_conversation", ["userId", "conversationId"]),
 
   // Join table between `users` and `accounts`. A user's role within a
   // given account. `fullName`/`email`/`avatarUrl` are a denormalized
