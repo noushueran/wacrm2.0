@@ -2,6 +2,7 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
+import { requireConversationAccess } from "./lib/conversationAccess";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -151,7 +152,7 @@ export const listByConversation = accountQuery({
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
-    await requireOwnConversation(ctx, ctx.accountId, args.conversationId);
+    await requireConversationAccess(ctx, args.conversationId, "view");
 
     // `by_conversation` binds its only field via `.eq` below, so the
     // sole remaining sort key is the implicit `_creationTime` —
@@ -195,10 +196,10 @@ export const append = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    const conversation = await requireOwnConversation(
+    const conversation = await requireConversationAccess(
       ctx,
-      ctx.accountId,
       args.conversationId,
+      "own",
     );
     return await insertMessageAndUpdateConversation(
       ctx,

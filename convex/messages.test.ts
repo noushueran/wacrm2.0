@@ -72,7 +72,99 @@ async function seedConversation(
   );
 }
 
-const onePage = { numItems: 50, cursor: null };
+/**
+ * Seeds a teammate onto an existing account with a chosen role and
+ * returns an authenticated client for them — unlike `seedAccountMember`
+ * above, which always mints a fresh account. Used by the role-scoped
+ * access tests (Task 7) below, which need several differently-roled
+ * teammates on the SAME account. Copied from
+ * `convex/conversations.test.ts`'s identical helper (Task 4).
+ */
+async function seedUserInAccount(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: { name: string; email: string; role: AccountRole },
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: opts.name, email: opts.email }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    }),
+  );
+  return { userId, asUser: t.withIdentity({ subject: `${userId}|s-${opts.name}` }) };
+}
+
+/**
+ * Seeds a contact + its conversation in one call, optionally
+ * pre-assigned — unlike `seedConversation` above, which takes an
+ * already-created `contactId` and has no `assignedToUserId` knob. Used
+ * by the role-scoped access tests (Task 7) to seed "mine" / "pool" /
+ * "a teammate's" conversations. Copied from
+ * `convex/conversations.test.ts`'s identical helper (Task 4).
+ */
+async function seedConv(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: { phone: string; name: string; assignedToUserId?: Id<"users"> },
+) {
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: opts.phone,
+      phoneNormalized: opts.phone.replace(/\D/g, ""),
+      name: opts.name,
+    }),
+  );
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+      ...(opts.assignedToUserId
+        ? { assignedToUserId: opts.assignedToUserId }
+        : {}),
+    }),
+  );
+  return { contactId, conversationId };
+}
+
+/**
+ * Seeds a bare account + its owner membership with no `asUser` client
+ * of its own — the role-scoped access tests (Task 7) build their own
+ * differently-roled teammates via `seedUserInAccount` and never need to
+ * act as the owner directly. Copied from `convex/conversations.test.ts`'s
+ * identical helper (Task 4).
+ */
+async function seedAccountWithOwner(t: ReturnType<typeof convexTest>) {
+  const ownerId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Owner", email: "owner@x.com" }),
+  );
+  const accountId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", {
+      name: "Acme",
+      defaultCurrency: "USD",
+      ownerUserId: ownerId,
+    });
+    await ctx.db.insert("memberships", { userId: ownerId, accountId: id, role: "owner" });
+    return id;
+  });
+  return { ownerId, accountId };
+}
+
+// Task 4's `onePage` shape (`{ paginationOpts: {...} }`, spread at each
+// call site via `...onePage`) rather than this file's earlier bare
+// `{ numItems, cursor }` value — unified so the Task 7 tests below
+// (copied verbatim from the task brief, which spreads `...onePage`)
+// and this file's pre-existing call sites (updated to `...onePage`
+// alongside this change) share one constant.
+const onePage = { paginationOpts: { numItems: 50, cursor: null } };
 
 // ============================================================
 // append — insert + conversation denorm update
@@ -80,10 +172,13 @@ const onePage = { numItems: 50, cursor: null };
 
 test("append inserts a message, updates the conversation's preview fields, and bumps unreadCount only for customer-authored messages", async () => {
   const t = convexTest(schema, modules);
+  // supervisor, not agent: this conversation is seeded unassigned
+  // (pool) and this test is about denormalized-write behavior, not
+  // RBAC — Task 7's own access rules are covered separately below.
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
@@ -138,10 +233,11 @@ test("append inserts a message, updates the conversation's preview fields, and b
 
 test("append falls back to a bracketed content-type preview when contentText is omitted", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
@@ -165,10 +261,11 @@ test("append falls back to a bracketed content-type preview when contentText is 
 
 test("listByConversation returns messages newest-first", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
@@ -196,7 +293,7 @@ test("listByConversation returns messages newest-first", async () => {
 
   const result = await asUser.query(api.messages.listByConversation, {
     conversationId,
-    paginationOpts: onePage,
+    ...onePage,
   });
 
   expect(result.page.map((m) => m._id)).toEqual([third, second, first]);
@@ -209,11 +306,12 @@ test("listByConversation returns messages newest-first", async () => {
 
 test("listByConversation throws NOT_FOUND for a conversation belonging to a different account", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
@@ -238,7 +336,7 @@ test("listByConversation throws NOT_FOUND for a conversation belonging to a diff
   await expect(
     asBob.query(api.messages.listByConversation, {
       conversationId,
-      paginationOpts: onePage,
+      ...onePage,
     }),
   ).rejects.toMatchObject({
     data: { code: "NOT_FOUND", entity: "conversation" },
@@ -248,7 +346,7 @@ test("listByConversation throws NOT_FOUND for a conversation belonging to a diff
   // about cross-account isolation, not a broken query in general.
   const hers = await asAlice.query(api.messages.listByConversation, {
     conversationId,
-    paginationOpts: onePage,
+    ...onePage,
   });
   expect(hers.page).toHaveLength(1);
 });
@@ -312,10 +410,11 @@ test("append throws NOT_FOUND for a conversation belonging to a different accoun
 
 test("getForAccount returns the message when it belongs to accountId", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "111",
@@ -341,11 +440,12 @@ test("getForAccount returns the message when it belongs to accountId", async () 
 
 test("getForAccount throws NOT_FOUND for a message belonging to a different account", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser: asAlice, accountId: aliceAccountId } =
     await seedAccountMember(t, {
       name: "Alice",
       email: "alice@example.com",
-      role: "agent",
+      role: "supervisor",
     });
   const { accountId: bobAccountId } = await seedAccountMember(t, {
     name: "Bob",
@@ -381,10 +481,11 @@ test("getForAccount throws NOT_FOUND for a message belonging to a different acco
 
 test("updateDeliveryStatusByWamid patches the status of the message matching the wamid", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversation, not about RBAC (see Task 7 tests below).
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, { phone: "111" });
   const conversationId = await seedConversation(t, { accountId, contactId });
@@ -425,15 +526,16 @@ test("updateDeliveryStatusByWamid is a safe no-op when no message matches the wa
 
 test("updateDeliveryStatusByWamid is cross-account safe: when two accounts' messages coincidentally share a wamid, only the caller's own accountId's row is patched", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversations, not about RBAC (see Task 7 tests below).
   const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactId = await asAlice.mutation(api.contacts.create, { phone: "111" });
   const aliceConversationId = await seedConversation(t, {
@@ -475,15 +577,16 @@ test("updateDeliveryStatusByWamid is cross-account safe: when two accounts' mess
 
 test("updateDeliveryStatusByWamid without accountId updates every matching row (mirrors the source's own account-agnostic sweep)", async () => {
   const t = convexTest(schema, modules);
+  // supervisor: pool conversations, not about RBAC (see Task 7 tests below).
   const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactId = await asAlice.mutation(api.contacts.create, { phone: "111" });
   const aliceConversationId = await seedConversation(t, {
@@ -518,4 +621,56 @@ test("updateDeliveryStatusByWamid without accountId updates every matching row (
 
   expect((await t.run((ctx) => ctx.db.get(aliceMessageId)))!.status).toBe("failed");
   expect((await t.run((ctx) => ctx.db.get(bobMessageId)))!.status).toBe("failed");
+});
+
+// ============================================================
+// role-scoped read/send access (Task 7) — `requireConversationAccess`
+// (`convex/lib/conversationAccess.ts`) now gates `listByConversation`
+// ("view") and `append` ("own"): an agent may READ their own+pool
+// conversations but only SEND in one actually assigned to them.
+// Mirrors `conversations.test.ts`'s Task 4 tests for the
+// conversation-level equivalents. `appendInternal` is untouched (no
+// session/role to gate on) and isn't exercised here.
+// ============================================================
+
+test("agent can send only in a conversation assigned to them", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const mine = await seedConv(t, accountId, { phone: "111", name: "Mine", assignedToUserId: a.userId });
+  const pool = await seedConv(t, accountId, { phone: "222", name: "Pool" });
+
+  await a.asUser.mutation(api.messages.append, {
+    conversationId: mine.conversationId,
+    senderType: "agent",
+    contentType: "text",
+    contentText: "hi",
+  });
+  expect(await t.run((ctx) => ctx.db.query("messages").collect())).toHaveLength(1);
+
+  await expect(
+    a.asUser.mutation(api.messages.append, {
+      conversationId: pool.conversationId,
+      senderType: "agent",
+      contentType: "text",
+      contentText: "nope",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("agent cannot read messages of another agent's conversation; viewer can read the pool", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const v = await seedUserInAccount(t, accountId, { name: "Vic", email: "v@x.com", role: "viewer" });
+  const theirs = await seedConv(t, accountId, { phone: "111", name: "Bees", assignedToUserId: b.userId });
+  const pool = await seedConv(t, accountId, { phone: "222", name: "Pool" });
+
+  await expect(
+    a.asUser.query(api.messages.listByConversation, { conversationId: theirs.conversationId, ...onePage }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+
+  const poolMsgs = await v.asUser.query(api.messages.listByConversation, { conversationId: pool.conversationId, ...onePage });
+  expect(poolMsgs.page).toEqual([]);
 });
