@@ -1,20 +1,15 @@
 {
-  "name": "wacrm-mcp",
+  "name": "holidayys-wa-crm-mcp",
   "version": "0.1.1",
-  "mcpName": "io.github.ArnasDon/wacrm-mcp",
-  "description": "Model Context Protocol (MCP) server for wacrm — drive your self-hosted WhatsApp CRM from Claude, Cursor, and other MCP clients.",
-  "license": "MIT",
-  "author": "Arnas Donauskas",
-  "homepage": "https://github.com/ArnasDon/wacrm",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ArnasDon/wacrm.git",
-    "directory": "mcp-server"
-  },
+  "mcpName": "co.holidayys.wa-crm-mcp",
+  "description": "Model Context Protocol (MCP) server for Holidayys WA CRM — drive the internal WhatsApp CRM of Holidays Tours LLC from Claude, Cursor, and other MCP clients.",
+  "license": "UNLICENSED",
+  "author": "Holidays Tours LLC",
+  "homepage": "https://wa.holidayys.co",
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "wacrm",
+    "holidayys",
     "whatsapp",
     "crm",
     "claude",
@@ -25,7 +20,7 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "wacrm-mcp": "./dist/index.js"
+    "holidayys-wa-crm-mcp": "./dist/index.js"
   },
   "files": [
     "dist",

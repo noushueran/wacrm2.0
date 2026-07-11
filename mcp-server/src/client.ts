@@ -1,5 +1,5 @@
 // ============================================================
-// wacrm public API client.
+// Holidayys WA CRM public API client.
 //
 // A thin wrapper over the `/api/v1` REST surface. It attaches the
 // bearer key, unwraps the `{ data }` / `{ error }` envelope, and
@@ -9,7 +9,7 @@
 
 import type { Config } from './config.js';
 
-/** A structured error from the wacrm API envelope (`{ error: { code, message } }`). */
+/** A structured error from the Holidayys WA CRM API envelope (`{ error: { code, message } }`). */
 export class WacrmApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -69,7 +69,7 @@ export class WacrmClient {
       throw new WacrmApiError(
         0,
         'network_error',
-        `Could not reach wacrm at ${this.baseUrl}: ${(err as Error).message}`,
+        `Could not reach Holidayys WA CRM at ${this.baseUrl}: ${(err as Error).message}`,
       );
     }
 

@@ -5,7 +5,7 @@ import type { Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================
-// Webhook endpoints — admin-managed HTTPS targets wacrm POSTs account
+// Webhook endpoints — admin-managed HTTPS targets Holidayys WA CRM POSTs account
 // events to (`convex/schema.ts`'s `webhookEndpoints`, Convex
 // counterpart to migration 028's `webhook_endpoints` table). This is
 // the dashboard-facing management surface only (mirrors `apiKeys.ts`'s
@@ -41,7 +41,7 @@ async function requireOwnWebhookEndpoint(
  * result — the same "shown once, at creation only" contract
  * `src/lib/webhooks/endpoints.ts`'s `WEBHOOK_PUBLIC_COLUMNS` enforces
  * at the REST-API layer (unlike `apiKeys.keyHash`, this `secret` is a
- * value wacrm itself needs back at delivery time, so it really is
+ * value Holidayys WA CRM itself needs back at delivery time, so it really is
  * stored — which makes it more important, not less, to keep it out of
  * a roster a browser session can read). Explicit field selection, not
  * a destructure-and-omit, mirrors `apiKeys.list`'s own convention.

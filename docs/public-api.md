@@ -1,6 +1,6 @@
 # Public API (`/api/v1`)
 
-The public API lets you drive your wacrm instance from your own
+The public API lets you drive your Holidayys WA CRM instance from your own
 scripts and automations — send messages, manage contacts, launch
 broadcasts — without going through the dashboard UI.
 
@@ -33,8 +33,8 @@ In the dashboard: **Settings → API keys → New API key**. Only
 
 1. Give the key a name (after the integration that will use it).
 2. Grant the **scopes** it needs — nothing more (see below).
-3. Copy the key. **The full key is shown exactly once.** wacrm
-   stores only a SHA-256 hash, so it can never be shown again. If you
+3. Copy the key. **The full key is shown exactly once.** Holidayys WA
+   CRM stores only a SHA-256 hash, so it can never be shown again. If you
    lose it, revoke it and create a new one.
 
 ### Revoking a key
@@ -93,7 +93,7 @@ Requests are limited **per key**: **120 requests per minute**. On a
 - `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
 
 > The limiter is in-memory and **per process**. A single-instance
-> deploy (the common case for a self-hosted fork) is fine as-is. If
+> deploy (the common case for our single-instance setup) is fine as-is. If
 > you scale to multiple instances, swap the limiter for a shared
 > store (Redis/Upstash) — see the note at the top of
 > `src/lib/rate-limit.ts`. The limit is otherwise unenforced across
@@ -108,7 +108,7 @@ Requires only a valid key (no scope). Use it to verify a key works
 and to discover its scopes.
 
 ```bash
-curl https://your-crm.example.com/api/v1/me \
+curl https://wa.holidayys.co/api/v1/me \
   -H "Authorization: Bearer wacrm_live_xxx"
 ```
 
@@ -128,7 +128,7 @@ pass an **E.164 number**, not an internal id — the endpoint
 finds-or-creates the contact + conversation, then sends.
 
 ```bash
-curl -X POST https://your-crm.example.com/api/v1/messages \
+curl -X POST https://wa.holidayys.co/api/v1/messages \
   -H "Authorization: Bearer wacrm_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{ "to": "+14155550123", "type": "text", "text": "Hi 👋" }'
@@ -235,7 +235,7 @@ immediately and the sends fan out in the background, so the call
 returns fast — poll `GET /api/v1/broadcasts/{id}` for progress.
 
 ```bash
-curl -X POST https://your-crm.example.com/api/v1/broadcasts \
+curl -X POST https://wa.holidayys.co/api/v1/broadcasts \
   -H "Authorization: Bearer wacrm_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -291,8 +291,8 @@ last page.
 
 ## Webhooks
 
-Rather than polling, register an endpoint and wacrm will POST to it when
-things happen in your account.
+Rather than polling, register an endpoint and Holidayys WA CRM will POST to it
+when things happen in your account.
 
 ### Events
 
@@ -306,14 +306,14 @@ things happen in your account.
 
 All under scope `webhooks:manage`.
 
-- `POST /api/v1/webhooks` — register `{ "url": "https://…", "events": ["message.received"] }`. `url` must be `https://`. **The response includes `secret` exactly once** — store it to verify signatures; wacrm keeps only an encrypted copy.
+- `POST /api/v1/webhooks` — register `{ "url": "https://…", "events": ["message.received"] }`. `url` must be `https://`. **The response includes `secret` exactly once** — store it to verify signatures; Holidayys WA CRM keeps only an encrypted copy.
 - `GET /api/v1/webhooks` — list your endpoints (never returns the secret).
 - `GET /api/v1/webhooks/{id}` — read one.
 - `PATCH /api/v1/webhooks/{id}` — update `url`, `events`, or `is_active` (re-enabling clears the failure counter).
 - `DELETE /api/v1/webhooks/{id}` — remove one.
 
 ```bash
-curl -X POST https://your-crm.example.com/api/v1/webhooks \
+curl -X POST https://wa.holidayys.co/api/v1/webhooks \
   -H "Authorization: Bearer wacrm_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{ "url": "https://example.com/hooks/wacrm", "events": ["message.received"] }'
@@ -366,7 +366,7 @@ const ok = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v1));
 
 Delivery is **best-effort**: a single attempt per event with a short
 timeout, and **redirects are not followed**. `message.status_updated`
-covers messages wacrm stores (inbox + API sends), not broadcast-only
+covers messages Holidayys WA CRM stores (inbox + API sends), not broadcast-only
 sends, and — because providers re-send and re-order status callbacks —
 the same status may arrive more than once or out of order; **dedupe on
 `id` and don't assume ordering**. Each consecutive failure increments
@@ -384,7 +384,6 @@ internal targets are refused at delivery time.
 ## Roadmap
 
 The public API now covers messaging, contacts, conversations,
-broadcasts, and outbound webhooks — the full scope of
-[#245](https://github.com/ArnasDon/wacrm/issues/245). Future ideas
-(deals/pipelines, templates, flows, a delivery queue for webhooks) are
-not yet scheduled.
+broadcasts, and outbound webhooks — the full scope originally planned.
+Future ideas (deals/pipelines, templates, flows, a delivery queue for
+webhooks) are not yet scheduled.

@@ -516,7 +516,7 @@ export default defineSchema({
     .index("by_account", ["accountId"])
     .index("by_key_hash", ["keyHash"]),
 
-  // An account-registered HTTPS endpoint wacrm POSTs events to. Unlike
+  // An account-registered HTTPS endpoint Holidayys WA CRM POSTs events to. Unlike
   // `apiKeys.keyHash` (a bearer credential the *client* presents, so we
   // only need a hash), `secret` is the HMAC key *we* sign outgoing
   // payloads with, so the plaintext is needed at delivery time — it's

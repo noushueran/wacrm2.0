@@ -2,7 +2,7 @@
 
 > **Nature:** Unlike Phases 0–7 (autonomous, unit-testable backend), the cutover flips the REAL app from Supabase to Convex. It's verified by **running the app**, is **higher-touch/interactive**, and has a **point of no return** (once auth swaps, the app runs on Convex — the `/convex-demo` proof was safe; this is the real thing). Execute on the branch; only merge to `main` when the whole app runs on Convex and Supabase is gone.
 
-**Goal:** Make `wacrm` run entirely on the Convex backend (Phases 0–7), delete Supabase, and update deployment/docs.
+**Goal:** Make `Holidayys WA CRM` run entirely on the Convex backend (Phases 0–7), delete Supabase, and update deployment/docs.
 
 ## Surface area (measured)
 - **102** files import a Supabase client · **66** client components query via `createClient()` · **39** files use the Supabase `useAuth` · **23** `/api` routes call Supabase · **2** `use-realtime` consumers (→ reactive `useQuery`, then delete `use-realtime.ts`).

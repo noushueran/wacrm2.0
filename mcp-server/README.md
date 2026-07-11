@@ -1,49 +1,50 @@
-# wacrm MCP server
+# Holidayys WA CRM — MCP server
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for
-**[wacrm](https://github.com/ArnasDon/wacrm)** — the self-hostable
-WhatsApp CRM. It lets MCP clients (Claude Desktop, Claude Code, Cursor,
-and others) drive your CRM in natural language:
+**Holidayys WA CRM** — the internal WhatsApp CRM of Holidays Tours LLC. It lets
+MCP clients (Claude Desktop, Claude Code, Cursor, and others) drive the CRM in
+natural language:
 
 > "How many conversations are still open?"
 > "Find the contact for +1 415 555 0123 and show the last few messages."
 > "Draft and send an order-update template to Jane."
 
-It's a thin wrapper over wacrm's public [`/api/v1`](../docs/public-api.md)
-REST API. All auth, scoping, and rate limiting are enforced by your
-wacrm instance — this server just exposes the API as MCP tools.
+It's a thin wrapper over the CRM's public [`/api/v1`](../docs/public-api.md)
+REST API. All auth, scoping, and rate limiting are enforced by the CRM — this
+server just exposes the API as MCP tools.
 
 ## Prerequisites
 
-1. A running wacrm instance (your own self-hosted deploy).
-2. An API key: in the dashboard go to **Settings → API keys → New API
-   key** and grant only the scopes you need. The key is shown once.
+1. A running Holidayys WA CRM instance (e.g. `https://wa.holidayys.co`).
+2. An API key: in the dashboard go to **Settings → API keys → New API key** and
+   grant only the scopes you need. The key is shown once.
 
 ## Install & configure
 
-The server reads two required environment variables and two optional
-write guards:
+Build it first (`npm install && npm run build`), then point your MCP client at
+`dist/index.js`. The server reads two required environment variables and two
+optional write guards:
 
 | Variable                  | Required | Purpose                                                        |
 | ------------------------- | -------- | -------------------------------------------------------------- |
-| `WACRM_BASE_URL`          | yes      | Your instance URL, e.g. `https://crm.example.com`              |
+| `WACRM_BASE_URL`          | yes      | The CRM URL, e.g. `https://wa.holidayys.co`                     |
 | `WACRM_API_KEY`           | yes      | An API key from the dashboard                                  |
 | `WACRM_ENABLE_WRITES`     | no       | `true` to expose contact writes + message sending             |
 | `WACRM_ENABLE_BROADCASTS` | no       | `true` to expose mass broadcasts (needs `WACRM_ENABLE_WRITES`) |
 
 ### Claude Desktop / Claude Code / Cursor
 
-Add to your MCP client config (e.g. `claude_desktop_config.json`, or
-`.mcp.json` for Claude Code):
+Add to your MCP client config (e.g. `claude_desktop_config.json`, or `.mcp.json`
+for Claude Code), pointing at the built entry point:
 
 ```jsonc
 {
   "mcpServers": {
-    "wacrm": {
-      "command": "npx",
-      "args": ["-y", "wacrm-mcp"],
+    "holidayys-wa-crm": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-server/dist/index.js"],
       "env": {
-        "WACRM_BASE_URL": "https://crm.example.com",
+        "WACRM_BASE_URL": "https://wa.holidayys.co",
         "WACRM_API_KEY": "wacrm_live_xxxxxxxxxxxxxxxxxxxxxxxx"
       }
     }
@@ -51,12 +52,12 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`, or
 }
 ```
 
-That configuration is **read-only** — the safe default. To let the
-assistant change data or send messages, add the write guards:
+That configuration is **read-only** — the safe default. To let the assistant
+change data or send messages, add the write guards:
 
 ```jsonc
 "env": {
-  "WACRM_BASE_URL": "https://crm.example.com",
+  "WACRM_BASE_URL": "https://wa.holidayys.co",
   "WACRM_API_KEY": "wacrm_live_xxxxxxxxxxxxxxxxxxxxxxxx",
   "WACRM_ENABLE_WRITES": "true",
   "WACRM_ENABLE_BROADCASTS": "true"
@@ -65,8 +66,8 @@ assistant change data or send messages, add the write guards:
 
 ## Tools
 
-Read tools are always available. Write and broadcast tools appear only
-when their guard is set.
+Read tools are always available. Write and broadcast tools appear only when
+their guard is set.
 
 | Tool                 | Group     | Scope needed         | What it does                                    |
 | -------------------- | --------- | -------------------- | ----------------------------------------------- |
@@ -84,19 +85,18 @@ when their guard is set.
 
 ## Safety model
 
-Sending WhatsApp messages through an LLM is a real-world side effect, so
-the server layers three guards:
+Sending WhatsApp messages through an LLM is a real-world side effect, so the
+server layers three guards:
 
-1. **Read-only by default.** Write and broadcast tools are not even
-   registered — the model can't see them — unless you opt in via
-   `WACRM_ENABLE_WRITES` / `WACRM_ENABLE_BROADCASTS`.
-2. **API-key scopes.** Whatever the guards allow, your wacrm instance
-   still enforces the key's scopes. A call without the right scope
-   returns a clean `forbidden` error. Issue a read-only key for a
-   read-only assistant.
-3. **Explicit broadcast confirmation.** `send_broadcast` refuses to run
-   unless called with `confirm: true`, and is marked `destructive` so
-   compliant clients prompt the user first.
+1. **Read-only by default.** Write and broadcast tools are not even registered
+   — the model can't see them — unless you opt in via `WACRM_ENABLE_WRITES` /
+   `WACRM_ENABLE_BROADCASTS`.
+2. **API-key scopes.** Whatever the guards allow, the CRM still enforces the
+   key's scopes. A call without the right scope returns a clean `forbidden`
+   error. Issue a read-only key for a read-only assistant.
+3. **Explicit broadcast confirmation.** `send_broadcast` refuses to run unless
+   called with `confirm: true`, and is marked `destructive` so compliant
+   clients prompt the user first.
 
 ## Development
 
@@ -111,4 +111,4 @@ Logs go to **stderr** — stdout is reserved for the MCP protocol.
 
 ## License
 
-MIT — same as wacrm.
+Proprietary and confidential. © 2026 Holidays Tours LLC. Internal use only.

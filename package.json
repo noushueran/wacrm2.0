@@ -1,18 +1,11 @@
 {
-  "name": "wacrm",
+  "name": "holidayys-wa-crm",
   "version": "0.8.0",
   "private": true,
-  "description": "Self-hostable CRM template for WhatsApp built on Next.js and Convex — shared inbox, contacts, sales pipelines, broadcasts, and no-code automations.",
-  "license": "MIT",
-  "author": "Arnas Donauskas",
-  "homepage": "https://github.com/ArnasDon/wacrm",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ArnasDon/wacrm.git"
-  },
-  "bugs": {
-    "url": "https://github.com/ArnasDon/wacrm/issues"
-  },
+  "description": "Holidayys WA CRM — internal WhatsApp CRM for Holidays Tours LLC: shared inbox, contacts, sales pipelines, broadcasts, and no-code automations.",
+  "license": "UNLICENSED",
+  "author": "Holidays Tours LLC",
+  "homepage": "https://wa.holidayys.co",
   "keywords": [
     "crm",
     "whatsapp",
@@ -21,8 +14,7 @@
     "convex",
     "automation",
     "broadcast",
-    "self-hosted",
-    "template"
+    "holidayys"
   ],
   "engines": {
     "node": ">=20.0.0"

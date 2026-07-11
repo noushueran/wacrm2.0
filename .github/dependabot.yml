@@ -8,8 +8,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    reviewers:
-      - ArnasDon
     labels:
       - dependencies
     groups:
@@ -46,8 +44,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
-    reviewers:
-      - ArnasDon
     labels:
       - dependencies
       - github-actions

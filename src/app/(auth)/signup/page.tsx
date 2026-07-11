@@ -124,7 +124,7 @@ function SignupPageInner() {
           <CardDescription className="text-muted-foreground">
             {displayInvite
               ? "Create your account, then accept the invitation to join your team."
-              : "Get started with CRM Template for WhatsApp"}
+              : "Get started with Holidayys WA CRM"}
           </CardDescription>
         </CardHeader>
         <CardContent>

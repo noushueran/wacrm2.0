@@ -38,6 +38,23 @@ import type { Id } from "./_generated/dataModel";
 // ============================================================
 
 /**
+ * Plain-English rejection used by both `upsert` and `connectAndSave`
+ * when a caller supplies a `wabaId` identical to the `phoneNumberId`.
+ * A WhatsApp Business Account ID and a Phone Number ID are two separate
+ * Meta objects — the same value in both is a copy-paste mistake that
+ * otherwise surfaces downstream only as Meta's opaque "#100" (a
+ * WABA-scoped call like `subscribeWabaToApp` hitting a phone-number
+ * ID). `connectAndSave` (an action) returns this as its `{ error }`
+ * string, which the settings form toasts verbatim; `upsert` (a raw
+ * mutation) throws a `WABA_EQUALS_PHONE_NUMBER` ConvexError instead.
+ */
+const WABA_EQUALS_PHONE_NUMBER_MESSAGE =
+  "The WhatsApp Business Account ID and Phone Number ID must be different " +
+  "values. They are two separate IDs from Meta WhatsApp Manager — you've " +
+  "entered the same value for both. Copy the WhatsApp Business Account ID " +
+  "(WABA ID) from your WhatsApp account overview and try again.";
+
+/**
  * The caller's own account's single WhatsApp config, or `null` if
  * never configured. `by_account` is the same "one row per account"
  * index `upsert` below relies on for its find-or-insert check — there
@@ -82,7 +99,7 @@ export const get = accountQuery({
  *
  * `phoneNumberId` is checked against `by_phone_number_id` FIRST: if a
  * row with that number already exists for a DIFFERENT account, this
- * throws `PHONE_NUMBER_CLAIMED` before touching anything. wacrm is
+ * throws `PHONE_NUMBER_CLAIMED` before touching anything. Holidayys WA CRM is
  * single-tenant-per-WhatsApp-number (see `src/app/api/whatsapp/config/
  * route.ts`'s own comment on issue #136) — letting two accounts bind
  * the same number would make inbound-webhook routing ambiguous. A row
@@ -106,6 +123,15 @@ export const upsert = accountMutation({
     ctx.requireRole("admin");
 
     const { accessToken, ...rest } = args;
+
+    // A WABA ID equal to the Phone Number ID is always a mistake (see
+    // `WABA_EQUALS_PHONE_NUMBER_MESSAGE`) — reject before writing the
+    // row, alongside the `PHONE_NUMBER_CLAIMED` guard below.
+    // `connectAndSave` makes the same check and returns the plain-English
+    // message; here (a raw mutation) it surfaces as a ConvexError code.
+    if (args.wabaId && args.wabaId === args.phoneNumberId) {
+      throw new ConvexError({ code: "WABA_EQUALS_PHONE_NUMBER" });
+    }
 
     const claimed = await ctx.db
       .query("whatsappConfig")
@@ -322,7 +348,7 @@ export const getForAccount = internalQuery({
  * the owning account/config before calling `ingest.processInbound` (or
  * the status/template handlers). Mirrors `getForAccount`'s exact "never
  * throws, `null` for not-configured" contract, just keyed by
- * `by_phone_number_id` instead of `by_account` — `wacrm` is
+ * `by_phone_number_id` instead of `by_account` — Holidayys WA CRM is
  * single-tenant-per-WhatsApp-number (see `upsert`'s own comment on this),
  * so at most one row can ever match.
  *
@@ -486,6 +512,18 @@ export const connectAndSave = action({
       !/^\d{6}$/.test(args.pin)
     ) {
       return { error: "PIN must be exactly 6 digits." };
+    }
+
+    // Reject the copy-paste mistake where the WhatsApp Business Account
+    // ID and the Phone Number ID are the same value. They are two
+    // DIFFERENT Meta objects; pasting the Phone Number ID in as the
+    // WABA ID is what made `subscribeWabaToApp` (POST /{waba-id}/
+    // subscribed_apps) fail against Meta with the opaque "#100". Caught
+    // here, before any Meta call, so the user sees an actionable message
+    // instead. Only meaningful when a wabaId was actually supplied
+    // (it's optional — an empty string is falsy and skips this).
+    if (args.wabaId && args.wabaId === args.phoneNumberId) {
+      return { error: WABA_EQUALS_PHONE_NUMBER_MESSAGE };
     }
 
     const existing = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
@@ -693,7 +731,7 @@ export const connectionStatus = action({
         reason: "token_corrupted",
         needs_reset: true,
         message:
-          'The stored access token cannot be decrypted with the current ENCRYPTION_KEY. This usually means the key changed, or it differs between environments (local vs Hostinger vs Vercel). Click "Reset Configuration" below, then re-save.',
+          'The stored access token cannot be decrypted with the current ENCRYPTION_KEY. This usually means the key changed, or it differs between environments (local vs production, or between deployments). Click "Reset Configuration" below, then re-save.',
       };
     }
 
