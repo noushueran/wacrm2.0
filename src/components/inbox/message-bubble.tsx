@@ -119,7 +119,7 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
   );
 }
 
-function MessageContent({ message, t }: { message: Message, t: ReturnType<typeof useTranslations> }) {
+function MessageContent({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
   switch (message.content_type) {
     case "text":
       return (
@@ -196,7 +196,19 @@ function MessageContent({ message, t }: { message: Message, t: ReturnType<typeof
     case "template":
       return (
         <div>
-          <span className="mb-1 inline-flex items-center gap-1 rounded bg-primary/20 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+          <span
+            className={cn(
+              "mb-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
+              // Outbound bubbles are filled with `bg-primary`, so the old
+              // `bg-primary/20 text-primary` badge was purple-on-purple and
+              // invisible — the reason a body-less template message rendered
+              // as a fully blank bubble. Theme the pill to its bubble so it
+              // always reads (and a template message is never blank).
+              isAgent
+                ? "bg-primary-foreground/20 text-primary-foreground"
+                : "bg-primary/20 text-primary",
+            )}
+          >
             <LayoutTemplate className="h-3 w-3" />
             {t("template")}
           </span>
@@ -294,7 +306,7 @@ export function MessageBubble({
             onPrimary={isAgent}
           />
         )}
-        <MessageContent message={message} t={t} />
+        <MessageContent message={message} t={t} isAgent={isAgent} />
         <div
           className={cn(
             "mt-1 flex items-center gap-1",

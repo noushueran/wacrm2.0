@@ -129,6 +129,11 @@ export const send = action({
           templateName: args.templateName,
           language: args.templateLanguage,
           params: args.templateParams,
+          // Client-side rendered body (`message-thread.tsx` substitutes the
+          // params into the template text) — persisted for the chat bubble
+          // and conversation-list preview; Meta still receives the
+          // structured name+params payload, not this string.
+          contentText: args.contentText,
           contextMessageId,
           // Dashboard sends are agent-initiated, not automation/flow bot
           // sends — see `metaSend.ts`'s own doc comment on the default.
