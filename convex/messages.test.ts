@@ -519,3 +519,44 @@ test("updateDeliveryStatusByWamid without accountId updates every matching row (
   expect((await t.run((ctx) => ctx.db.get(aliceMessageId)))!.status).toBe("failed");
   expect((await t.run((ctx) => ctx.db.get(bobMessageId)))!.status).toBe("failed");
 });
+
+// ============================================================
+// setMediaUrl — attaches a resolved media URL to an already-persisted
+// message. Second half of inbound-media resolution: ingest persists an
+// inbound media message with no URL (the webhook carries only Meta's raw
+// mediaId), then convex/ingest.ts's processInbound downloads the bytes
+// via whatsappConfig.resolveInboundMedia and calls this to attach the
+// resulting Convex-storage URL.
+// ============================================================
+
+test("setMediaUrl attaches a mediaUrl to a message that had none", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "111" });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  // An inbound audio message as ingest first persists it: no mediaUrl.
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "audio",
+      status: "delivered",
+    }),
+  );
+  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaUrl).toBeUndefined();
+
+  await t.mutation(internal.messages.setMediaUrl, {
+    messageId,
+    mediaUrl: "https://convex.test/api/storage/voice-1",
+  });
+
+  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaUrl).toBe(
+    "https://convex.test/api/storage/voice-1",
+  );
+});

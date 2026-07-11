@@ -487,6 +487,32 @@ export const processInbound = internalAction({
       return { duplicate: true, flowConsumed: false };
     }
 
+    // ---- Inbound media resolution ----
+    // A media message (voice note / image / video / document) arrives as
+    // a bare Meta `mediaId`: `flattenInboundMessage` can't resolve it (a
+    // signed Graph fetch is real network I/O), and neither can the
+    // `ingestInbound` mutation, so the row was just persisted with no
+    // `mediaUrl` — which the inbox renders as an "unavailable" bubble.
+    // Now — AFTER the dedup check, so a Meta retry can't re-download and
+    // orphan a second copy in storage — pull the bytes into Convex
+    // storage and attach the durable URL to the already-persisted
+    // message. Best-effort: `resolveInboundMedia` returns null on any
+    // failure, leaving the "unavailable" bubble rather than derailing the
+    // fan-out below (a media that won't fetch must not cost the customer
+    // their flow/automation/AI reply).
+    if (message.mediaId && !message.mediaUrl) {
+      const resolved = await ctx.runAction(
+        internal.whatsappConfig.resolveInboundMedia,
+        { accountId, mediaId: message.mediaId },
+      );
+      if (resolved) {
+        await ctx.runMutation(internal.messages.setMediaUrl, {
+          messageId: res.messageId,
+          mediaUrl: resolved.url,
+        });
+      }
+    }
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.

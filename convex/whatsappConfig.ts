@@ -1,5 +1,10 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { action, internalMutation, internalQuery } from "./_generated/server";
+import {
+  action,
+  internalAction,
+  internalMutation,
+  internalQuery,
+} from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
@@ -994,5 +999,61 @@ export const fetchMedia = action({
       data: buffer,
       contentType: contentType || mediaInfo.mimeType,
     };
+  },
+});
+
+// ============================================================
+// resolveInboundMedia — the INBOUND half of the media flow, and the
+// "future inbound-ingestion path" that `convex/files.ts`'s `storeFromUrl`
+// and `convex/lib/whatsapp/webhookParse.ts` both flag as a follow-up.
+// `fetchMedia` above serves the outbound-proxy read for a signed-in
+// agent; this serves inbound ingestion, which has NO user session — the
+// `accountId` is resolved upstream from the webhook's phone_number_id
+// (`accountByPhoneNumberId`) and handed straight in.
+//
+// The decrypted access token never leaves this action (same one-way-door
+// design `fetchMedia` documents): it decrypts, resolves the Meta media
+// id to its short-lived CDN URL (`getMediaUrl`), then hands that URL plus
+// a `Bearer` header to `files.storeFromUrl`, which downloads the bytes
+// into Convex storage. Only the resulting DURABLE storage URL comes back
+// out — so the inbox `<audio>`/`<video>`/`<img>` can fetch it directly,
+// forever, exactly like agent-sent (outbound) media, with no auth proxy
+// and no dependence on Meta's media-retention window.
+//
+// Best-effort by contract: returns `null` (never throws) for a missing
+// config, an undecryptable token, or any failing Meta/storage step, so
+// one media that can't be fetched degrades to an "unavailable" bubble
+// rather than derailing `ingest.processInbound`'s whole fan-out. The
+// caller reads `null` as "leave this message without a mediaUrl".
+// ============================================================
+
+export const resolveInboundMedia = internalAction({
+  args: { accountId: v.id("accounts"), mediaId: v.string() },
+  handler: async (ctx, args): Promise<{ url: string } | null> => {
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId: args.accountId,
+    });
+    if (!config) return null;
+
+    try {
+      const accessToken = await decrypt(config.accessToken);
+      const mediaInfo = await getMediaUrl({
+        mediaId: args.mediaId,
+        accessToken,
+      });
+      const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+        url: mediaInfo.url,
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const url = await ctx.storage.getUrl(storageId);
+      return url ? { url } : null;
+    } catch (err) {
+      console.error(
+        "[resolveInboundMedia] failed to resolve media",
+        args.mediaId,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    }
   },
 });
