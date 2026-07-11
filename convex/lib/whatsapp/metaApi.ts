@@ -86,18 +86,44 @@ interface MetaErrorResponse {
   error?: { message?: string; code?: number; type?: string };
 }
 
+/**
+ * Meta's error #100 ("Invalid parameter" / unsupported operation) is
+ * notoriously opaque: it fires when an object ID doesn't exist, is the
+ * WRONG TYPE for the endpoint (e.g. a Phone Number ID passed where a
+ * WhatsApp Business Account ID is expected — the exact copy-paste
+ * mistake behind the connect-flow #100 this humanizer was added for),
+ * or the access token lacks permission for it. Rewrite it into one
+ * actionable sentence, keeping Meta's own text in parentheses so
+ * nothing is lost for debugging. Every other code passes through
+ * unchanged, so error strings the UI/tests already rely on (bad OAuth
+ * token, PIN messages, etc.) are untouched.
+ */
+function humanizeMetaError(message: string, code: number | undefined): string {
+  if (code === 100) {
+    return (
+      "WhatsApp couldn't find or access that ID (Meta error #100). " +
+      "Check that the Phone Number ID and WhatsApp Business Account ID " +
+      "are correct and that your access token has permission for them. " +
+      `(Meta: ${message})`
+    );
+  }
+  return message;
+}
+
 async function throwMetaError(
   response: Response,
   fallback: string,
 ): Promise<never> {
   let message = fallback;
+  let code: number | undefined;
   try {
     const data = (await response.json()) as MetaErrorResponse;
     if (data.error?.message) message = data.error.message;
+    code = data.error?.code;
   } catch {
     // response body wasn't JSON — keep the fallback
   }
-  throw new Error(message);
+  throw new Error(humanizeMetaError(message, code));
 }
 
 // ============================================================

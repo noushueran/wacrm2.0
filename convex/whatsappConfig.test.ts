@@ -1402,6 +1402,120 @@ test("connectAndSave rejects a malformed PIN before ever calling Meta", async ()
   vi.unstubAllGlobals();
 });
 
+// ============================================================
+// WABA-ID-equals-Phone-Number-ID guard + Meta "#100" humanization.
+// A WhatsApp Business Account ID and a Phone Number ID are two DIFFERENT
+// Meta objects; pasting the same value into both is the copy-paste
+// mistake that used to surface only as Meta's opaque "#100" once a
+// WABA-scoped call ran. Reject it up front (before any Meta call), on
+// BOTH the store-only `upsert` path and the `connectAndSave` action,
+// and translate a genuine Meta #100 into plain English.
+// ============================================================
+
+test("connectAndSave rejects a wabaId equal to the phoneNumberId before ever calling Meta", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("Meta should never be called when WABA == phone number");
+    }),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    wabaId: "1000000000",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  expect(result).toHaveProperty("error");
+  expect((result as { error: string }).error).toMatch(
+    /WhatsApp Business Account ID and Phone Number ID must be different/i,
+  );
+
+  // Nothing persisted — the guard runs before verify/register/persist.
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+
+  vi.unstubAllGlobals();
+});
+
+test("upsert rejects a wabaId equal to the phoneNumberId with WABA_EQUALS_PHONE_NUMBER", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  await expect(
+    asUser.mutation(api.whatsappConfig.upsert, {
+      phoneNumberId: "1000000000",
+      wabaId: "1000000000",
+      accessToken: "alice-token",
+      status: "connected",
+    }),
+  ).rejects.toMatchObject({ data: { code: "WABA_EQUALS_PHONE_NUMBER" } });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+});
+
+test("connectAndSave surfaces a plain-English message when Meta returns error #100", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const metaRaw =
+    "Unsupported get request. Object with ID '1000000000' does not exist, " +
+    "cannot be loaded due to missing permissions, or does not support this operation.";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: metaRaw, code: 100 } }),
+          { status: 400 },
+        ),
+    ),
+  );
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const result = await asUser.action(api.whatsappConfig.connectAndSave, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    pin: "123456",
+  });
+
+  expect(result).toHaveProperty("error");
+  const message = (result as { error: string }).error;
+  // Friendly, actionable text — not just Meta's opaque string.
+  expect(message).toMatch(/#100/);
+  expect(message).toMatch(/access token/i);
+  // Meta's own text is preserved in-line for debugging.
+  expect(message).toContain(metaRaw);
+
+  vi.unstubAllGlobals();
+});
+
 test("connectAndSave still succeeds when WABA subscription fails (non-fatal)", async () => {
   delete process.env.CONVEX_META_DRY_RUN;
   vi.stubGlobal("fetch", mockConnectFetch({ subscribeOk: false }));
