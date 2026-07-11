@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatPhoneIntl,
   isRecipientNotAllowedError,
   isValidE164,
   normalizePhone,
@@ -160,5 +161,21 @@ describe("isRecipientNotAllowedError", () => {
       false,
     );
     expect(isRecipientNotAllowedError("")).toBe(false);
+  });
+});
+
+describe("formatPhoneIntl", () => {
+  it("prefixes a digits-only international number with +", () => {
+    expect(formatPhoneIntl("971501234567")).toBe("+971501234567");
+  });
+  it("strips separators but keeps the leading +", () => {
+    expect(formatPhoneIntl("+971 50 123 4567")).toBe("+971501234567");
+  });
+  it("rewrites a 00 international prefix to +", () => {
+    expect(formatPhoneIntl("00971501234567")).toBe("+971501234567");
+  });
+  it("returns an empty string for blank input", () => {
+    expect(formatPhoneIntl("")).toBe("");
+    expect(formatPhoneIntl("   ")).toBe("");
   });
 });

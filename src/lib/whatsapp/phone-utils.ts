@@ -41,6 +41,23 @@ export function isValidE164(phone: string): boolean {
 }
 
 /**
+ * Format a phone number for display in international `+E.164` form:
+ * strip every non-digit, rewrite a leading `00` international prefix to
+ * `+`, and prefix the result with `+`. Never returns bare digits or a
+ * `00` prefix. Blank input returns "".
+ *
+ * Doubles as the normalizer for a user-entered number on save: prefill
+ * the input with the default country code (e.g. "971") so a plain local
+ * entry becomes "+971…".
+ */
+export function formatPhoneIntl(phone: string): string {
+  if (!phone || !phone.trim()) return ''
+  let digits = phone.replace(/\D/g, '')
+  if (digits.startsWith('00')) digits = digits.slice(2)
+  return digits ? `+${digits}` : ''
+}
+
+/**
  * Generate plausible phone number variants for retry when Meta's
  * sandbox rejects a number with error #131030 ("not in allowed list").
  *
