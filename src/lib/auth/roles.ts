@@ -158,6 +158,15 @@ export function canAccessNav(role: AccountRole, href: string): boolean {
   return false;
 }
 
+/** Route-level access (for the client route guard). Same as `canAccessNav`
+ *  except `/settings` is always reachable — the personal Profile/Appearance
+ *  sections are universal, and the settings page gates its own tabs. */
+export function canAccessRoute(role: AccountRole, path: string): boolean {
+  const base = "/" + (path.split("?")[0].split("/")[1] ?? "");
+  if (base === "/settings") return true;
+  return canAccessNav(role, base);
+}
+
 /** Settings section ids (mirror of settings-sections.ts). */
 export type SettingsSectionKey =
   | "overview"

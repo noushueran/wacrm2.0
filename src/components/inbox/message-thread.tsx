@@ -36,12 +36,14 @@ import {
   Check,
   Clock,
   ArrowLeft,
+  Loader2,
   PanelRightOpen,
   PanelRightClose,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -57,6 +59,7 @@ import { TemplatePicker } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
+import { canAssignToOthers } from "@/lib/auth/roles";
 
 interface ReplyDraft {
   id: string;
@@ -145,12 +148,15 @@ export function MessageThread({
   const tTimer = useTranslations("Inbox.sessionTimer");
   const tQuote = useTranslations("Inbox.replyQuote");
 
-  const { user } = useAuth();
+  const { user, accountRole } = useAuth();
   const convex = useConvex();
   const { getPresence, getRow, now } = usePresence();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
+  // Busy flag for the "Claim to reply" CTA only (Task 11) — the assign
+  // dropdown's own items don't need one, they close on click.
+  const [claiming, setClaiming] = useState(false);
 
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
@@ -248,7 +254,6 @@ export function MessageThread({
   // Clear any in-progress reply draft when the active conversation changes —
   // a quote pulled from conversation A shouldn't bleed into conversation B.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot reset on conversation switch, not a per-render derivation
     setReplyTo(null);
   }, [conversationId]);
 
@@ -536,6 +541,21 @@ export function MessageThread({
     [conversation, assignMutation, unassignMutation],
   );
 
+  // Agent claim-to-reply (Task 11): an agent can't send in a conversation
+  // they don't own — the server now rejects it — so a pool (unassigned)
+  // conversation must be claimed first. Wraps `handleAssignChange` (which
+  // already owns the try/catch + toast) with a local busy flag so the
+  // "Claim to reply" CTA can show a spinner and guard against double-clicks.
+  const handleClaim = useCallback(async () => {
+    if (!user?.id) return;
+    setClaiming(true);
+    try {
+      await handleAssignChange(user.id);
+    } finally {
+      setClaiming(false);
+    }
+  }, [user, handleAssignChange]);
+
   // Empty state — same WhatsApp-style doodle background as the active
   // thread below, so swapping between empty/selected doesn't change the
   // pattern under the user's eye.
@@ -565,6 +585,11 @@ export function MessageThread({
   const assignLabel = assignedAgentId
     ? (currentAssignee?.full_name ?? t("assigned"))
     : t("assign");
+  // Claim-to-reply (Task 11): whether this conversation is the caller's
+  // own vs. still sitting in the shared pool. Drives both the header
+  // assign-dropdown's agent-limited actions and the composer swap below.
+  const mine = assignedAgentId === user?.id;
+  const isPool = !assignedAgentId;
 
   return (
     // `min-w-0` is load-bearing: the page already puts min-w-0 on the
@@ -666,70 +691,99 @@ export function MessageThread({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* Assign dropdown */}
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              className={cn(
-                "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
-                assignedAgentId ? "text-primary" : "text-muted-foreground"
-              )}
-            >
-              <UserPlus className="h-3 w-3" />
-              <span className="hidden sm:inline">{assignLabel}</span>
-              <ChevronDown className="h-3 w-3" />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              className="border-border bg-popover"
-            >
-              {profiles.length === 0 ? (
-                <DropdownMenuItem disabled className="text-sm text-muted-foreground">
-                  {t("noTeammates")}
-                </DropdownMenuItem>
-              ) : (
-                profiles.map((p) => {
-                  const isSelected = p.user_id === assignedAgentId;
-                  const presence = getPresence(p.user_id);
-                  return (
-                    <DropdownMenuItem
-                      key={p.id}
-                      onClick={() => handleAssignChange(p.user_id)}
-                      className={cn(
-                        "text-sm",
-                        isSelected ? "text-primary" : "text-popover-foreground"
-                      )}
-                    >
-                      <PresenceDot
-                        status={presence}
-                        label={presenceLabel(
-                          presence,
-                          getRow(p.user_id)?.last_seen_at ?? null,
-                          now
-                        )}
-                        className="mr-2"
-                      />
-                      <span className="flex-1">
-                        {p.full_name}
-                        {p.user_id === user?.id ? t("me") : ""}
-                      </span>
-                      {isSelected && <Check className="ml-2 h-3 w-3" />}
-                    </DropdownMenuItem>
-                  );
-                })
-              )}
-              {assignedAgentId && (
-                <>
-                  <DropdownMenuSeparator className="bg-border" />
+          {/* Assign dropdown — supervisor+ keeps the full teammate picker.
+              An agent gets self-serve Claim/Release only: the server now
+              rejects an agent assigning to anyone but themselves (Task 11).
+              A viewer gets no assign control at all — view-only, can't
+              assign/claim/release. */}
+          {accountRole !== "viewer" && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  assignedAgentId ? "text-primary" : "text-muted-foreground"
+                )}
+              >
+                <UserPlus className="h-3 w-3" />
+                <span className="hidden sm:inline">{assignLabel}</span>
+                <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="border-border bg-popover"
+              >
+                {accountRole && canAssignToOthers(accountRole) ? (
+                  <>
+                    {profiles.length === 0 ? (
+                      <DropdownMenuItem disabled className="text-sm text-muted-foreground">
+                        {t("noTeammates")}
+                      </DropdownMenuItem>
+                    ) : (
+                      profiles.map((p) => {
+                        const isSelected = p.user_id === assignedAgentId;
+                        const presence = getPresence(p.user_id);
+                        return (
+                          <DropdownMenuItem
+                            key={p.id}
+                            onClick={() => handleAssignChange(p.user_id)}
+                            className={cn(
+                              "text-sm",
+                              isSelected ? "text-primary" : "text-popover-foreground"
+                            )}
+                          >
+                            <PresenceDot
+                              status={presence}
+                              label={presenceLabel(
+                                presence,
+                                getRow(p.user_id)?.last_seen_at ?? null,
+                                now
+                              )}
+                              className="mr-2"
+                            />
+                            <span className="flex-1">
+                              {p.full_name}
+                              {p.user_id === user?.id ? t("me") : ""}
+                            </span>
+                            {isSelected && <Check className="ml-2 h-3 w-3" />}
+                          </DropdownMenuItem>
+                        );
+                      })
+                    )}
+                    {assignedAgentId && (
+                      <>
+                        <DropdownMenuSeparator className="bg-border" />
+                        <DropdownMenuItem
+                          onClick={() => handleAssignChange(null)}
+                          className="text-sm text-muted-foreground"
+                        >
+                          {t("unassign")}
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </>
+                ) : mine ? (
+                  // Agent, theirs: release back to the pool.
                   <DropdownMenuItem
                     onClick={() => handleAssignChange(null)}
-                    className="text-sm text-muted-foreground"
+                    className="text-sm text-popover-foreground"
                   >
-                    {t("unassign")}
+                    {t("release")}
                   </DropdownMenuItem>
-                </>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
+                ) : (
+                  // Agent, unassigned (a colleague's conversation is never
+                  // reachable here — the inbox scope already hides it):
+                  // self-claim only.
+                  <DropdownMenuItem
+                    disabled={!isPool || !user?.id}
+                    onClick={() => user?.id && handleAssignChange(user.id)}
+                    className="text-sm text-popover-foreground"
+                  >
+                    {t("claim")}
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
       </div>
 
@@ -829,37 +883,113 @@ export function MessageThread({
 
       {/* AI auto-reply banner — take over an active bot, or resume it
           after a handoff. Renders nothing unless the account has
-          auto-reply configured. */}
-      <AiThreadBanner
-        conversationId={conversation.id}
-        disabled={conversation.ai_autoreply_disabled ?? false}
-        handoffSummary={conversation.ai_handoff_summary}
-        assignedAgentId={assignedAgentId}
-        currentUserId={user?.id}
-        onChange={(patch) => {
-          if ("assigned_agent_id" in patch) {
-            void handleAssignChange(patch.assigned_agent_id ?? null);
-          }
-        }}
-      />
+          auto-reply configured. Hidden entirely for viewers: both
+          "Take over" and "Resume AI" are assign-class writes, and a
+          viewer may not assign/claim/release (Task 11). */}
+      {accountRole !== "viewer" && (
+        <AiThreadBanner
+          conversationId={conversation.id}
+          disabled={conversation.ai_autoreply_disabled ?? false}
+          handoffSummary={conversation.ai_handoff_summary}
+          assignedAgentId={assignedAgentId}
+          currentUserId={user?.id}
+          onChange={(patch) => {
+            if ("assigned_agent_id" in patch) {
+              void handleAssignChange(patch.assigned_agent_id ?? null);
+            }
+          }}
+        />
+      )}
 
-      {/* Composer */}
-      <MessageComposer
-        conversationId={conversation.id}
-        sessionExpired={sessionInfo.expired}
-        onSend={handleSend}
-        onSendMedia={handleSendMedia}
-        onSendInteractive={handleSendInteractive}
-        onOpenTemplates={handleOpenTemplates}
-        replyTo={replyTo}
-        onClearReply={() => setReplyTo(null)}
-      />
+      {/* Composer / claim-to-reply / read-only notice — role-gated
+          (Task 11). An agent viewing a pool conversation that isn't
+          theirs yet can't send (the server now rejects it) — they get a
+          Claim CTA instead, and the real composer returns reactively
+          once they own it. A viewer never gets a composer at all.
+          Supervisor/admin/owner and an agent on their own conversation
+          get the normal composer, whose own `canSend` gate (unchanged)
+          covers everything else. */}
+      {accountRole === "viewer" ? (
+        <ViewerComposerNotice t={t} />
+      ) : accountRole === "agent" && !mine ? (
+        <ClaimToReplyBar
+          disabled={!isPool || !user?.id}
+          claiming={claiming}
+          onClaim={handleClaim}
+          t={t}
+        />
+      ) : (
+        <MessageComposer
+          conversationId={conversation.id}
+          sessionExpired={sessionInfo.expired}
+          onSend={handleSend}
+          onSendMedia={handleSendMedia}
+          onSendInteractive={handleSendInteractive}
+          onOpenTemplates={handleOpenTemplates}
+          replyTo={replyTo}
+          onClearReply={() => setReplyTo(null)}
+        />
+      )}
 
       <TemplatePicker
         open={templateModalOpen}
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
       />
+    </div>
+  );
+}
+
+/**
+ * Replaces the composer for an agent viewing a pool conversation that
+ * isn't theirs yet (Task 11 claim-to-reply) — the server rejects a send
+ * until they own it. Claiming re-renders this away reactively once
+ * `conversation.assigned_agent_id` flips to the caller's id. Declared at
+ * module scope (not nested in `MessageThread`) so it doesn't remount on
+ * every parent re-render, matching `message-composer.tsx`'s
+ * `MediaDraftPreview` pattern.
+ */
+function ClaimToReplyBar({
+  disabled,
+  claiming,
+  onClaim,
+  t,
+}: {
+  disabled: boolean;
+  claiming: boolean;
+  onClaim: () => void;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-t border-border bg-card p-3">
+      <p className="text-sm text-muted-foreground">{t("claimHint")}</p>
+      <Button
+        type="button"
+        size="sm"
+        disabled={disabled || claiming}
+        onClick={onClaim}
+        className="shrink-0"
+      >
+        {claiming ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <UserPlus className="h-3.5 w-3.5" />
+        )}
+        {t("claimToReply")}
+      </Button>
+    </div>
+  );
+}
+
+/** Replaces the composer for a viewer — read-only, never sends. */
+function ViewerComposerNotice({
+  t,
+}: {
+  t: ReturnType<typeof useTranslations>;
+}) {
+  return (
+    <div className="border-t border-border bg-card p-3">
+      <p className="text-sm text-muted-foreground">{t("viewerNotice")}</p>
     </div>
   );
 }

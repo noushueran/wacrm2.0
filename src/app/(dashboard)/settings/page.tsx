@@ -1,11 +1,12 @@
 'use client';
 
-import { useMemo, type ReactNode } from 'react';
+import { useEffect, useMemo, type ReactNode } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
+import { canAccessSettingsSection } from '@/lib/auth/roles';
 import { SettingsRail } from '@/components/settings/settings-rail';
 import { SettingsOverview } from '@/components/settings/settings-overview';
 import { ProfileForm } from '@/components/settings/profile-form';
@@ -25,7 +26,7 @@ import {
 export default function SettingsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { defaultCurrency } = useAuth();
+  const { defaultCurrency, accountRole } = useAuth();
   const { mode } = useTheme();
   const t = useTranslations('Settings');
 
@@ -34,6 +35,20 @@ export default function SettingsPage() {
   // app sidebar/header working. Legacy tab values (tags, custom-fields)
   // resolve onto their new home; unknown/empty → the Overview landing.
   const section = resolveSection(searchParams.get('tab'));
+
+  // Route-level enforcement is server-side (every settings mutation/query
+  // already rejects); this just keeps a member from being stranded on a
+  // section their role can't use if they deep-link or the URL is stale
+  // (e.g. a supervisor demoted while `?tab=whatsapp` is still open).
+  // `accountRole` is null while the profile is still loading, so this
+  // stays false (not blocked) until we actually know the role.
+  const blocked = !!accountRole && !canAccessSettingsSection(accountRole, section);
+
+  useEffect(() => {
+    if (blocked) {
+      router.replace('/settings?tab=profile');
+    }
+  }, [blocked, router]);
 
   const go = (next: SettingsSection) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -78,7 +93,10 @@ export default function SettingsPage() {
 
       <div className="mt-6 grid gap-6 lg:grid-cols-[236px_minmax(0,1fr)] lg:items-start">
         <SettingsRail active={section} onSelect={go} hints={hints} />
-        <div className="min-w-0">{panel[section]}</div>
+        {/* Blocked section: render Profile while the redirect effect
+            above swaps the URL to `?tab=profile`, instead of flashing
+            a panel this role can't use. */}
+        <div className="min-w-0">{blocked ? panel.profile : panel[section]}</div>
       </div>
     </div>
   );

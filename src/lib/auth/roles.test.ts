@@ -3,6 +3,7 @@ import {
   ACCOUNT_ROLES,
   type AccountRole,
   canAccessNav,
+  canAccessRoute,
   canAccessSettingsSection,
   canDeleteAccount,
   canEditCriticalSettings,
@@ -179,5 +180,14 @@ describe("capability predicates", () => {
     expect(defaultLandingPath("viewer")).toBe("/inbox");
     expect(defaultLandingPath("supervisor")).toBe("/dashboard");
     expect(defaultLandingPath("admin")).toBe("/dashboard");
+  });
+
+  it("canAccessRoute always allows /settings (personal) but gates feature routes", () => {
+    expect(canAccessRoute("agent", "/settings")).toBe(true);
+    expect(canAccessRoute("agent", "/settings?tab=whatsapp")).toBe(true); // page gates the tab
+    expect(canAccessRoute("agent", "/contacts")).toBe(false);
+    expect(canAccessRoute("agent", "/inbox")).toBe(true);
+    expect(canAccessRoute("viewer", "/notifications")).toBe(false);
+    expect(canAccessRoute("supervisor", "/broadcasts")).toBe(true);
   });
 });
