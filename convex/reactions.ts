@@ -3,7 +3,8 @@ import { action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
-import { hasMinRole } from "./lib/roles";
+import { canAccessConversation, hasMinRole } from "./lib/roles";
+import { requireConversationAccess } from "./lib/conversationAccess";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
@@ -13,7 +14,12 @@ import type { QueryCtx } from "./_generated/server";
 // here is built on `accountQuery`/`accountMutation` (never the raw
 // `query`/`mutation`), mirroring `messages.ts`: a reaction can never be
 // read or written without first proving its parent message belongs to
-// the caller's own account — see `requireOwnMessage`.
+// the caller's own account — see `requireOwnMessage`. `set`/`remove`/
+// `reactToMeta` additionally require "own" access to that message's
+// PARENT CONVERSATION (RBAC final review, I1) — the same
+// `canAccessConversation` policy `messages.append`/`send.ts`'s `send`
+// enforce: supervisor+ any conversation, an agent only one actually
+// assigned to them, never a colleague's.
 // ============================================================
 
 /**
@@ -97,6 +103,10 @@ export const set = accountMutation({
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
     const message = await requireOwnMessage(ctx, args.messageId);
+    // "own" access to the message's PARENT CONVERSATION (I1) — not
+    // just account tenancy: an agent may react in a conversation
+    // assigned to them, never a colleague's.
+    await requireConversationAccess(ctx, message.conversationId, "own");
 
     const existing = await findReaction(ctx, args);
     if (existing) {
@@ -131,7 +141,10 @@ export const remove = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnMessage(ctx, args.messageId);
+    const message = await requireOwnMessage(ctx, args.messageId);
+    // "own" access to the message's PARENT CONVERSATION (I1) — same
+    // reasoning as `set` above.
+    await requireConversationAccess(ctx, message.conversationId, "own");
 
     const existing = await findReaction(ctx, args);
     if (existing) await ctx.db.delete(existing._id);
@@ -176,14 +189,20 @@ export const forConversation = accountQuery({
  * enforce the same "agent" floor `set`/`remove` above already require,
  * then `internal.messages.getForAccount` to verify the target message
  * belongs to this account and read its Meta wamid + conversation off
- * it, before dispatching to `internal.metaSend.sendReaction`.
+ * it. Also enforces "own" access to that message's parent conversation
+ * (RBAC final review, I1) — the same role+userId pattern `send.ts`'s
+ * `send` uses (C1): `internal.conversations.getForAccountInternal` to
+ * load the conversation (no `ctx.db` here either), then
+ * `canAccessConversation(..., "own")` against its `assignedToUserId` —
+ * before dispatching to `internal.metaSend.sendReaction`.
  *
  * Does NOT touch `messageReactions` itself — the DB row is already
- * written by the UI's own call to `set`/`remove` above; this action's
- * entire job is the Meta leg those two mutations can't do (they're
- * plain mutations, no outbound `fetch`). `emoji: ""` removes an
- * existing reaction on Meta's side, mirroring `sendReaction`'s own
- * pass-through of that convention.
+ * written by the UI's own call to `set`/`remove` above (which now
+ * enforce this same "own" check themselves); this action's entire job
+ * is the Meta leg those two mutations can't do (they're plain
+ * mutations, no outbound `fetch`). `emoji: ""` removes an existing
+ * reaction on Meta's side, mirroring `sendReaction`'s own pass-through
+ * of that convention.
  */
 export const reactToMeta = action({
   args: { messageId: v.id("messages"), emoji: v.string() },
@@ -205,6 +224,26 @@ export const reactToMeta = action({
       accountId,
       messageId: args.messageId,
     });
+
+    // "own" access to the message's PARENT CONVERSATION (I1) — checked
+    // before the wamid check below so a caller without access can't
+    // learn anything about the message's send state either.
+    const conversation = await ctx.runQuery(
+      internal.conversations.getForAccountInternal,
+      { accountId, conversationId: message.conversationId },
+    );
+    const allowedToReact = canAccessConversation(
+      context.role,
+      {
+        isMine: conversation.assignedToUserId === userId,
+        isUnassigned: conversation.assignedToUserId === undefined,
+      },
+      "own",
+    );
+    if (!allowedToReact) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+
     if (!message.messageId) {
       throw new Error(
         "Cannot react to a message that has not been sent to WhatsApp",

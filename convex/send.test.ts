@@ -48,6 +48,36 @@ async function seedAccountMember(
 }
 
 /**
+ * Adds a second membership row to an *existing* account — unlike
+ * `seedAccountMember`, which always mints a brand-new account. The
+ * per-conversation "own" access tests (RBAC final review, C1) need a
+ * real teammate `userId` on the *same* account as the conversation
+ * under test, which `seedAccountMember` alone can't produce. Mirrors
+ * `convex/conversations.test.ts`'s own `seedTeammate` byte-for-byte —
+ * duplicated per this suite's own established per-file-helper
+ * convention (see `seedAccountMember`'s own comment above).
+ */
+async function seedTeammate(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; name: string; email: string; role: AccountRole },
+) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: opts.name,
+      email: opts.email,
+    });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId: opts.accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return userId;
+  });
+}
+
+/**
  * Inserts a `conversations` row directly via `t.run` — same shape
  * `convex/metaSend.test.ts`'s own `seedConversation` uses.
  */
@@ -207,7 +237,7 @@ test("send rejects a contactId belonging to a different account", async () => {
 test("send with a conversationId sends text and persists the outbound message (DRY-RUN)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -215,7 +245,13 @@ test("send with a conversationId sends text and persists the outbound message (D
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  // Assigned to the caller — `send` now requires "own" access (RBAC
+  // final review, C1), same as `messages.append` already did.
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
 
   const result = await asUser.action(api.send.send, {
     conversationId,
@@ -247,7 +283,7 @@ test("send with a conversationId sends text and persists the outbound message (D
 test("send throws a plain validation error when messageType=text has no contentText", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -255,7 +291,14 @@ test("send throws a plain validation error when messageType=text has no contentT
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  // Assigned to the caller — see the DRY-RUN text-send test above for
+  // why (this test needs to reach the messageType validation, not the
+  // new "own" access check).
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
 
   await expect(
     asUser.action(api.send.send, { conversationId, messageType: "text" }),
@@ -271,10 +314,17 @@ test("send throws a plain validation error when messageType=text has no contentT
 test("send with a contactId find-or-creates the conversation, then sends", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
+  // supervisor: a brand-new contact has no existing conversation yet,
+  // so this exercises the CREATE branch of find-or-create — which
+  // (RBAC final review, C1) only supervisor+ may do via `send`, since
+  // the freshly-created conversation is always unassigned and an
+  // agent's "own" access can never reach an unassigned conversation.
+  // See "agent cannot send.send to a brand-new contact" below for the
+  // sub-supervisor denial case.
   const { asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-    role: "agent",
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
   });
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
@@ -341,7 +391,7 @@ test("send with a contactId find-or-creates the conversation, then sends", async
 test("send routes messageType=template to metaSend.sendTemplate", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -349,7 +399,11 @@ test("send routes messageType=template to metaSend.sendTemplate", async () => {
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
 
   const result = await asUser.action(api.send.send, {
     conversationId,
@@ -383,7 +437,7 @@ test("send routes messageType=template to metaSend.sendTemplate", async () => {
 test("send routes messageType=interactive to metaSend.sendInteractive", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -391,7 +445,11 @@ test("send routes messageType=interactive to metaSend.sendInteractive", async ()
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
 
   const payload = {
     kind: "buttons" as const,
@@ -422,7 +480,7 @@ test("send routes messageType=interactive to metaSend.sendInteractive", async ()
 test("send routes a media messageType (image) to metaSend.sendMedia", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",
@@ -430,7 +488,11 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
 
   const result = await asUser.action(api.send.send, {
     conversationId,
@@ -469,7 +531,15 @@ test("send rejects a replyToMessageId that belongs to a different conversation",
   const contactId = await asUser.mutation(api.contacts.create, {
     phone: "15551234567",
   });
-  const conversationId = await seedConversation(t, { accountId, contactId });
+  // Assigned to the caller — the PRIMARY send target must pass the new
+  // "own" access check (RBAC final review, C1) so this test actually
+  // reaches its real target: the `replyToMessageId` cross-conversation
+  // rejection, not an access denial.
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
   const otherContactId = await asUser.mutation(api.contacts.create, {
     phone: "15559998888",
   });
@@ -496,6 +566,168 @@ test("send rejects a replyToMessageId that belongs to a different conversation",
   ).rejects.toMatchObject({
     data: { code: "NOT_FOUND", entity: "replyToMessage" },
   });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
+// send — per-conversation "own" access (RBAC final review, C1): an
+// agent may only send.send into a conversation actually assigned to
+// them; supervisor+ may send into any conversation in the account,
+// including creating one for a brand-new contact.
+// ============================================================
+
+test("agent cannot send.send into a conversation assigned to another agent", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const bobUserId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "15551112222",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: bobUserId,
+  });
+
+  await expect(
+    asAlice.action(api.send.send, {
+      conversationId,
+      messageType: "text",
+      contentText: "should never land",
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("agent CAN send.send into their own assigned conversation", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551112223",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  const result = await asUser.action(api.send.send, {
+    conversationId,
+    messageType: "text",
+    contentText: "hi from my own thread",
+  });
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("supervisor can send.send into any conversation, including one assigned to someone else", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asSupervisor, accountId } = await seedAccountMember(t, {
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  const bobUserId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const contactId = await asSupervisor.mutation(api.contacts.create, {
+    phone: "15551112224",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: bobUserId,
+  });
+
+  const result = await asSupervisor.action(api.send.send, {
+    conversationId,
+    messageType: "text",
+    contentText: "supervisor override",
+  });
+  expect(result.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("agent cannot send.send to a brand-new contact (would create an unassigned conversation), and no orphan conversation is left behind", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551112225",
+  });
+
+  await expect(
+    asUser.action(api.send.send, {
+      contactId,
+      messageType: "text",
+      contentText: "cold outreach",
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  // The whole point of checking BEFORE create (C1's edge case): a
+  // denied agent must not leave a dead, empty conversation behind.
+  const conversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .first(),
+  );
+  expect(conversation).toBeNull();
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

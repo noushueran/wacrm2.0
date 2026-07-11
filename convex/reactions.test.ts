@@ -51,6 +51,36 @@ async function seedAccountMember(
 }
 
 /**
+ * Adds a second membership row to an *existing* account — unlike
+ * `seedAccountMember`, which always mints a brand-new account. The
+ * per-conversation "own" access tests (RBAC final review, I1) need a
+ * real teammate `userId` on the *same* account as the conversation
+ * under test, which `seedAccountMember` alone can't produce. Mirrors
+ * `convex/conversations.test.ts`'s own `seedTeammate` byte-for-byte —
+ * duplicated per this suite's own established per-file-helper
+ * convention (see `seedAccountMember`'s own comment above).
+ */
+async function seedTeammate(
+  t: ReturnType<typeof convexTest>,
+  opts: { accountId: Id<"accounts">; name: string; email: string; role: AccountRole },
+) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: opts.name,
+      email: opts.email,
+    });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId: opts.accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return userId;
+  });
+}
+
+/**
  * Inserts a `conversations` row directly via `t.run`, exactly like
  * `convex/messages.test.ts`'s own `seedConversation` — this suite's
  * messages need a parent conversation, but exercising
@@ -248,6 +278,74 @@ test("different actors reacting to the same message each get their own row", asy
 
   const rows = await asUser.query(api.reactions.forMessage, { messageId });
   expect(rows).toHaveLength(2);
+});
+
+// ============================================================
+// per-conversation "own" access (RBAC final review, I1) — set/remove/
+// reactToMeta require "own" access to the message's PARENT
+// CONVERSATION, not just account tenancy: an agent may react in a
+// conversation assigned to them, never a colleague's.
+// ============================================================
+
+test("agent cannot react in a colleague's conversation", async () => {
+  const t = convexTest(schema, modules);
+  const {
+    asUser: asAlice,
+    accountId,
+    userId: aliceUserId,
+  } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const bobUserId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: bobUserId,
+  });
+  // Inserted directly (not via `api.messages.append`, which itself now
+  // requires "own" access) — Alice isn't assigned to this conversation
+  // either, so she couldn't have appended this message herself; mirrors
+  // this file's own "reactToMeta throws FORBIDDEN for a viewer" test's
+  // same raw-insert workaround for a caller who can't call `append`.
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "Hi",
+      status: "sent",
+    }),
+  );
+
+  await expect(
+    asAlice.mutation(api.reactions.set, {
+      messageId,
+      emoji: "👍",
+      actorType: "agent",
+      actorId: aliceUserId,
+    }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "conversation" },
+  });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("messageReactions")
+      .withIndex("by_message", (q) => q.eq("messageId", messageId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
 });
 
 // ============================================================

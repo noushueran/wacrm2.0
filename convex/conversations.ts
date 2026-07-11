@@ -265,9 +265,38 @@ export const findOrCreateForContact = accountMutation({
  * `by_contact` + an `accountId` filter (see `findOrCreateForContact`'s
  * own comment for why that filter is defense-in-depth, not
  * load-bearing), insert if none exists.
+ *
+ * `role` is OPTIONAL and, when supplied, gates the CREATE branch only
+ * (RBAC final review, C1): a brand-new conversation is always
+ * unassigned, and `canAccessConversation`'s "own" mode can never grant
+ * an agent access to an unassigned conversation (see that function's
+ * own doc comment) — so a caller below `supervisor` who has no
+ * existing conversation for this contact is denied BEFORE the row is
+ * inserted, rather than being allowed to create it and only THEN
+ * denied when `send.ts` checks "own" access on the result, which would
+ * leave a dead, empty, never-messaged conversation behind. The
+ * EXISTING-conversation branch is deliberately NOT re-checked here
+ * (no side effect to prevent there — it already existed); `send.ts`'s
+ * own uniform post-resolution access check covers that case instead.
+ * Every other caller (`apiV1.sendMessage`'s API-key-authenticated REST
+ * send, `broadcasts.ts`'s account-level bulk send) omits `role`
+ * entirely and keeps its exact prior, unrestricted-creation behavior —
+ * neither is scoped to an individual user's role at all.
  */
 export const findOrCreateForContactInternal = internalMutation({
-  args: { accountId: v.id("accounts"), contactId: v.id("contacts") },
+  args: {
+    accountId: v.id("accounts"),
+    contactId: v.id("contacts"),
+    role: v.optional(
+      v.union(
+        v.literal("owner"),
+        v.literal("admin"),
+        v.literal("supervisor"),
+        v.literal("agent"),
+        v.literal("viewer"),
+      ),
+    ),
+  },
   handler: async (ctx, args) => {
     const contact = await ctx.db.get(args.contactId);
     if (!contact || contact.accountId !== args.accountId) {
@@ -281,12 +310,50 @@ export const findOrCreateForContactInternal = internalMutation({
       .first();
     if (existing) return existing._id;
 
+    if (
+      args.role !== undefined &&
+      !canAccessConversation(
+        args.role,
+        { isMine: false, isUnassigned: true },
+        "own",
+      )
+    ) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+
     return await ctx.db.insert("conversations", {
       accountId: args.accountId,
       contactId: args.contactId,
       status: "open",
       unreadCount: 0,
     });
+  },
+});
+
+/**
+ * Server-only conversation lookup by id+accountId — the action-callable
+ * ownership check `send.ts`'s `send` (C1) and `reactions.ts`'s
+ * `reactToMeta` (I1) both need before they can apply
+ * `canAccessConversation(..., "own")` against a resolved conversation's
+ * `assignedToUserId`: neither is a query/mutation with its own `ctx.db`
+ * (only `ctx.runQuery`/`ctx.runMutation`/`ctx.runAction`), and each
+ * already derived the caller's role/userId itself
+ * (`accounts.accountContextForUser` + `getAuthUserId`) — this is just
+ * the one remaining piece only `ctx.db` can supply. Same NOT_FOUND
+ * collapse as every other ownership check in this file: "doesn't
+ * exist" and "belongs to a different account" are indistinguishable to
+ * the caller. Mirrors `messages.ts`'s `getForAccount` one-to-one (same
+ * name pattern, same shape), just for `conversations` instead of
+ * `messages`.
+ */
+export const getForAccountInternal = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+    return conversation;
   },
 });
 

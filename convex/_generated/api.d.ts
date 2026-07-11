@@ -46,6 +46,7 @@ import type * as lib_apiKey from "../lib/apiKey.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_automations_stepsTree from "../lib/automations/stepsTree.js";
 import type * as lib_automations_validate from "../lib/automations/validate.js";
+import type * as lib_conversationAccess from "../lib/conversationAccess.js";
 import type * as lib_dashboardDate from "../lib/dashboardDate.js";
 import type * as lib_flows_edges from "../lib/flows/edges.js";
 import type * as lib_flows_fallback from "../lib/flows/fallback.js";
@@ -122,6 +123,7 @@ declare const fullApi: ApiFromModules<{
   "lib/auth": typeof lib_auth;
   "lib/automations/stepsTree": typeof lib_automations_stepsTree;
   "lib/automations/validate": typeof lib_automations_validate;
+  "lib/conversationAccess": typeof lib_conversationAccess;
   "lib/dashboardDate": typeof lib_dashboardDate;
   "lib/flows/edges": typeof lib_flows_edges;
   "lib/flows/fallback": typeof lib_flows_fallback;

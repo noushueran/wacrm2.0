@@ -2,26 +2,31 @@ import { action } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
-import { hasMinRole } from "./lib/roles";
+import { canAccessConversation, hasMinRole } from "./lib/roles";
 import type { Id } from "./_generated/dataModel";
 
 // ============================================================
 // `send` — the authed, PUBLIC entrypoint the Inbox + contact-detail
 // "send message" UI will call (Phase 8, Task 4; the UI rewire itself is
 // a later task). Wraps the already-tested `convex/metaSend.ts` internal
-// actions (Meta POST + persist) with the three things a plain `action`
+// actions (Meta POST + persist) with the four things a plain `action`
 // — unlike `accountQuery`/`accountMutation` — doesn't get for free:
 //
 //   1. deriving the caller's account + role from their session
 //      (`getAuthUserId` + `internal.accounts.accountContextForUser`,
 //      since an action has no `ctx.db` to run `lib/auth.ts`'s own
 //      membership lookup inline);
-//   2. resolving WHICH conversation to send into — an explicit,
-//      ownership-checked `conversationId`, or a `contactId` that
-//      find-or-creates one (`internal.conversations
-//      .findOrCreateForContactInternal`) — and the Meta recipient phone
-//      that goes with it (`internal.conversations.resolveSendTarget`);
-//   3. picking which `metaSend` action matches `messageType` and
+//   2. resolving WHICH conversation to send into — an explicit
+//      `conversationId`, or a `contactId` that find-or-creates one
+//      (`internal.conversations.findOrCreateForContactInternal`);
+//   3. enforcing that the caller has "own" access to that resolved
+//      conversation (`canAccessConversation`, `convex/lib/roles.ts` —
+//      RBAC final review, C1): supervisor+ may send into any
+//      conversation; an agent only into one actually assigned to
+//      them, never an unclaimed pool conversation or a colleague's —
+//      then resolving the Meta recipient phone + optional reply
+//      context (`internal.conversations.resolveSendTarget`);
+//   4. picking which `metaSend` action matches `messageType` and
 //      shaping its args.
 //
 // Deliberately does NOT reimplement any Meta wire logic or persistence
@@ -73,15 +78,49 @@ export const send = action({
     if (args.conversationId) {
       conversationId = args.conversationId;
     } else if (args.contactId) {
+      // `role` gates the CREATE branch inside this mutation (a
+      // brand-new conversation is always unassigned, so a sub-
+      // supervisor caller who has no existing conversation for this
+      // contact is denied here, BEFORE any row is inserted — see that
+      // function's own doc comment for why this can't just be left to
+      // the "own" check below).
       conversationId = await ctx.runMutation(
         internal.conversations.findOrCreateForContactInternal,
-        { accountId, contactId: args.contactId },
+        { accountId, contactId: args.contactId, role: context.role },
       );
     } else {
       throw new Error("send requires a conversationId or a contactId");
     }
 
-    // Ownership-checks `conversationId` (covers the caller-supplied
+    // ---- (2b) per-conversation "own" access check (RBAC final
+    // review, C1) — an agent may only send into a conversation
+    // actually assigned to them; supervisor+ passes unconditionally.
+    // Same NOT_FOUND shape `requireConversationAccess` uses elsewhere
+    // (`convex/lib/conversationAccess.ts`) so a denied agent can't
+    // distinguish "not yours" from "doesn't exist". Runs AFTER
+    // conversation resolution so it uniformly covers BOTH the
+    // caller-supplied `conversationId` path and the just-resolved
+    // `contactId` path — the latter's "must create" half is already
+    // denied above (without creating anything); this is what also
+    // catches an agent's `contactId` routing to an EXISTING
+    // conversation that's a colleague's, not theirs.
+    const conversation = await ctx.runQuery(
+      internal.conversations.getForAccountInternal,
+      { accountId, conversationId },
+    );
+    const allowedToSend = canAccessConversation(
+      context.role,
+      {
+        isMine: conversation.assignedToUserId === userId,
+        isUnassigned: conversation.assignedToUserId === undefined,
+      },
+      "own",
+    );
+    if (!allowedToSend) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+
+    // Ownership-checks `conversationId` again (covers the caller-supplied
     // branch above; the find-or-create branch is already
     // account-scoped, so this is a defense-in-depth re-check, not
     // load-bearing there) and resolves the Meta recipient phone +

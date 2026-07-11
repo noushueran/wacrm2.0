@@ -542,10 +542,12 @@ export function MessageThread({
   );
 
   // Agent claim-to-reply (Task 11): an agent can't send in a conversation
-  // they don't own — the server now rejects it — so a pool (unassigned)
-  // conversation must be claimed first. Wraps `handleAssignChange` (which
-  // already owns the try/catch + toast) with a local busy flag so the
-  // "Claim to reply" CTA can show a spinner and guard against double-clicks.
+  // they don't own — `send.send` enforces this server-side (per-
+  // conversation "own" access via `canAccessConversation`, RBAC final
+  // review) — so a pool (unassigned) conversation must be claimed
+  // first. Wraps `handleAssignChange` (which already owns the
+  // try/catch + toast) with a local busy flag so the "Claim to reply"
+  // CTA can show a spinner and guard against double-clicks.
   const handleClaim = useCallback(async () => {
     if (!user?.id) return;
     setClaiming(true);
@@ -898,7 +900,8 @@ export function MessageThread({
 
       {/* Composer / claim-to-reply / read-only notice — role-gated
           (Task 11). An agent viewing a pool conversation that isn't
-          theirs yet can't send (the server now rejects it) — they get a
+          theirs yet can't send — `send.send` rejects it server-side
+          (per-conversation "own" access, RBAC final review) — they get a
           Claim CTA instead, and the real composer returns reactively
           once they own it. A viewer never gets a composer at all.
           Supervisor/admin/owner and an agent on their own conversation

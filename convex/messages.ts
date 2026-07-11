@@ -16,9 +16,13 @@ import type { MutationCtx, QueryCtx } from "./_generated/server";
 // `query`/`mutation`), mirroring `conversations.ts`/`contacts.ts`:
 // `ctx.accountId` always comes from the caller's own `memberships`
 // row, never a client-supplied argument (there is no `accountId`
-// field in either public args validator below). A message can never
-// be read or written without first proving its parent conversation
-// belongs to the target account — see `requireOwnConversation`.
+// field in either public args validator below). The PUBLIC read/write
+// paths (`listByConversation`/`append`) gate on the role-aware
+// `requireConversationAccess` (`convex/lib/conversationAccess.ts`) —
+// "view" to read, "own" to write — not on `requireOwnConversation`
+// below, which is a plainer account-tenancy-only check now used only
+// by the internal (no-user-session) paths; see that function's own
+// doc comment.
 // ============================================================
 
 /**
@@ -26,18 +30,25 @@ import type { MutationCtx, QueryCtx } from "./_generated/server";
  * `accountId` — the same error for "doesn't exist" and "exists but
  * isn't yours" on purpose (mirrors `contacts.ts`'s `requireOwnContact`
  * and `conversations.ts`'s `get`), so a cross-account probe can't
- * distinguish the two. Shared by `listByConversation`, `append`, and
- * `appendInternal` below, since every message read/write starts by
- * proving ownership of its parent conversation.
+ * distinguish the two. Account-tenancy only — unlike
+ * `requireConversationAccess`, it has no role/mode awareness at all.
+ *
+ * Guards only the INTERNAL paths below that have no user session to
+ * derive a role from — `appendInternal` and
+ * `latestForConversationInternal` — since the PUBLIC
+ * `listByConversation`/`append` moved onto the role-aware
+ * `requireConversationAccess` ("view"/"own") once per-conversation
+ * access shipped. Kept (rather than deleted) because those two
+ * internal callers still only need the plain "same account" check —
+ * neither has a caller role to apply "view" vs "own" against.
  *
  * Takes `accountId` as an explicit parameter (not read off `ctx`) so
- * the SAME check serves both callers: `append` passes its
- * `accountMutation` ctx's own `ctx.accountId` (the caller's own
- * account, proven via their `memberships` row), while `appendInternal`
- * passes its caller-supplied `args.accountId` (there is no user
- * session — and therefore no `ctx.accountId` — inside an
- * `internalMutation`). Typed to accept any ctx with a `db` (only
- * `db.get` is used), same treatment as `contacts.ts`'s
+ * the SAME check serves both remaining callers: `appendInternal`
+ * passes its caller-supplied `args.accountId`, and
+ * `latestForConversationInternal` does the same — neither has a user
+ * session, and therefore no `ctx.accountId`, being an
+ * `internalMutation`/`internalQuery`. Typed to accept any ctx with a
+ * `db` (only `db.get` is used), same treatment as `contacts.ts`'s
  * `requireOwnContact`.
  */
 async function requireOwnConversation(

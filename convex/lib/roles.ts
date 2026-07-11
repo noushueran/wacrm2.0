@@ -1,12 +1,21 @@
 // ============================================================
 // Account role helpers — pure, unit-testable, no I/O.
 //
-// Mirrors the `account_role_enum` Postgres type from migration
-// 017_account_sharing.sql. The hierarchy is intentionally a flat
-// ordinal (owner=4 … viewer=1) — it matches the same CASE
-// expression the `is_account_member(account_id, min_role)` SQL
-// helper uses, so server-side TypeScript guards and database-side
-// RLS speak the same language.
+// `roleRank`/`hasMinRole` give the linear ladder (owner=5 > admin=4 >
+// supervisor=3 > agent=2 > viewer=1) most guards in this codebase need
+// — a plain "does the caller outrank this floor" check. The Postgres
+// `account_role_enum`/`is_account_member` CASE expression this once
+// mirrored is gone (this codebase is fully on Convex now); nothing
+// here speaks to a database layer anymore.
+//
+// Below the ladder, this file also holds the NON-linear policy
+// functions the per-conversation access model needs —
+// `canAccessConversation`, `canSeeContactPhone`, `canAssignToOthers`,
+// and the settings split. These don't reduce to a single rank
+// comparison: an agent's access depends on WHICH conversation
+// (assigned to them vs. the unassigned pool vs. a colleague's), not
+// just their rank, so each takes the caller's role AND the relevant
+// row's ownership shape as separate inputs.
 // ============================================================
 
 export type AccountRole =

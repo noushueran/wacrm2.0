@@ -206,8 +206,17 @@ export const filterByTags = accountQuery({
 
     const total = matched.length;
     const page = matched.slice(offset, offset + limit);
+    // Same server-side phone masking `list`/`get` already apply (Task
+    // 5) — this query materializes full contact docs in memory (see
+    // this function's own header comment), so it's just as directly
+    // callable as those two and needs the same defense-in-depth.
     const items = await Promise.all(
-      page.map((contact) => embedTags(ctx, contact)),
+      page.map(async (contact) => {
+        const withTags = await embedTags(ctx, contact);
+        return hasMinRole(ctx.role, "supervisor")
+          ? withTags
+          : maskContactPhone(withTags);
+      }),
     );
 
     return { items, total };
@@ -278,10 +287,17 @@ export const byCustomFieldValue = accountQuery({
     // contact having been deleted after its value row was written
     // (matches `filterByTags`'s own null-drop).
     const fetched = await Promise.all(contactIds.map((id) => ctx.db.get(id)));
-    return fetched.filter(
+    const contacts = fetched.filter(
       (contact): contact is Doc<"contacts"> =>
         contact !== null && contact.accountId === ctx.accountId,
     );
+
+    // Same server-side phone masking `list`/`get`/`filterByTags` apply
+    // (Task 5) — this is a directly-callable query too, regardless of
+    // what the broadcast composer's UI exposes.
+    return hasMinRole(ctx.role, "supervisor")
+      ? contacts
+      : contacts.map((contact) => maskContactPhone(contact));
   },
 });
 

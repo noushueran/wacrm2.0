@@ -1140,6 +1140,79 @@ test("contacts.get masks the phone for agent and viewer", async () => {
   expect(got.phoneNormalized).toBe("");
 });
 
+test("filterByTags masks phone for agent/viewer", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  const { contactId, tagId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15551230148",
+      phoneNormalized: "15551230148",
+      name: "X",
+    });
+    const tagId = await ctx.db.insert("tags", {
+      accountId,
+      name: "VIP",
+      color: "#f00",
+    });
+    await ctx.db.insert("contactTags", { accountId, contactId, tagId });
+    return { contactId, tagId };
+  });
+
+  const result = await asUser.query(api.contacts.filterByTags, {
+    tagIds: [tagId],
+    limit: 10,
+    offset: 0,
+  });
+
+  expect(result.items).toHaveLength(1);
+  expect(result.items[0]!.phone).toMatch(/^•+48$/);
+  expect(result.items[0]!.phoneNormalized).toBe("");
+});
+
+test("byCustomFieldValue masks phone for agent/viewer", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  const { fieldId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15551230148",
+      phoneNormalized: "15551230148",
+      name: "X",
+    });
+    const fieldId = await ctx.db.insert("customFields", {
+      accountId,
+      fieldName: "Plan",
+      fieldType: "text",
+    });
+    await ctx.db.insert("contactCustomValues", {
+      accountId,
+      contactId,
+      customFieldId: fieldId,
+      value: "Pro",
+    });
+    return { contactId, fieldId };
+  });
+
+  const result = await asUser.query(api.contacts.byCustomFieldValue, {
+    customFieldId: fieldId,
+    operator: "is",
+    value: "Pro",
+  });
+
+  expect(result).toHaveLength(1);
+  expect(result[0]!.phone).toMatch(/^•+48$/);
+  expect(result[0]!.phoneNormalized).toBe("");
+});
+
 test("filterByTags returns nothing for an empty tagIds list", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
