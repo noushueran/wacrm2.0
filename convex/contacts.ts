@@ -269,6 +269,13 @@ export const update = accountMutation({
     email: v.optional(v.string()),
     company: v.optional(v.string()),
     phone: v.optional(v.string()),
+    altPhone: v.optional(v.string()),
+    address: v.optional(v.string()),
+    city: v.optional(v.string()),
+    country: v.optional(v.string()),
+    nationality: v.optional(v.string()),
+    preferredDestination: v.optional(v.string()),
+    notes: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
@@ -281,6 +288,13 @@ export const update = accountMutation({
       company: string;
       phone: string;
       phoneNormalized: string;
+      altPhone: string;
+      address: string;
+      city: string;
+      country: string;
+      nationality: string;
+      preferredDestination: string;
+      notes: string;
     }> = { ...rest };
 
     if (phone !== undefined) {
