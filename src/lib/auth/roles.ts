@@ -15,25 +15,29 @@
 // changes a one-file diff.
 // ============================================================
 
-export type AccountRole = "owner" | "admin" | "agent" | "viewer";
+export type AccountRole =
+  | "owner"
+  | "admin"
+  | "supervisor"
+  | "agent"
+  | "viewer";
 
-/** Ordered list of every valid role, lowest privilege first. */
+/** Ordered list, lowest privilege first. */
 export const ACCOUNT_ROLES: readonly AccountRole[] = [
   "viewer",
   "agent",
+  "supervisor",
   "admin",
   "owner",
 ] as const;
 
-/**
- * Numeric rank of a role. Higher = more privileged. Mirrors the
- * CASE expression in `is_account_member` so JS/SQL stay aligned.
- */
 export function roleRank(role: AccountRole): number {
   switch (role) {
     case "owner":
-      return 4;
+      return 5;
     case "admin":
+      return 4;
+    case "supervisor":
       return 3;
     case "agent":
       return 2;
@@ -71,13 +75,18 @@ export function canManageMembers(role: AccountRole): boolean {
   return hasMinRole(role, "admin");
 }
 
-/**
- * Owner / admin: edit account-wide settings (WhatsApp config,
- * message templates, pipelines, tags, custom fields, account
- * name). Excludes per-user settings like avatar or own password.
- */
+/** @deprecated Prefer `canEditCriticalSettings` / `canEditOperationalSettings`.
+ *  Retained (admin+) so existing critical-settings call sites are unchanged. */
 export function canEditSettings(role: AccountRole): boolean {
+  return canEditCriticalSettings(role);
+}
+
+export function canEditCriticalSettings(role: AccountRole): boolean {
   return hasMinRole(role, "admin");
+}
+
+export function canEditOperationalSettings(role: AccountRole): boolean {
+  return hasMinRole(role, "supervisor");
 }
 
 /**
@@ -106,4 +115,75 @@ export function canDeleteAccount(role: AccountRole): boolean {
 /** Owner only: hand the account to another member. */
 export function canTransferOwnership(role: AccountRole): boolean {
   return role === "owner";
+}
+
+export type ConversationScope = "all" | "own_and_pool" | "unassigned";
+export function conversationScope(role: AccountRole): ConversationScope {
+  switch (role) {
+    case "owner":
+    case "admin":
+    case "supervisor":
+      return "all";
+    case "agent":
+      return "own_and_pool";
+    case "viewer":
+      return "unassigned";
+  }
+}
+
+export function canSeeContactPhone(
+  role: AccountRole,
+  isAssignedToCaller: boolean,
+): boolean {
+  if (hasMinRole(role, "supervisor")) return true;
+  if (role === "agent") return isAssignedToCaller;
+  return false;
+}
+
+export function canAssignToOthers(role: AccountRole): boolean {
+  return hasMinRole(role, "supervisor");
+}
+
+// ── Section access (nav + settings rail) ────────────────────────────
+/** Top-level nav hrefs. */
+export const AGENT_NAV = ["/inbox", "/notifications"] as const;
+export const VIEWER_NAV = ["/inbox"] as const;
+
+export function canAccessNav(role: AccountRole, href: string): boolean {
+  // Match the concrete href or a nested route under it.
+  const base = "/" + (href.split("/")[1] ?? "");
+  if (hasMinRole(role, "supervisor")) return true; // supervisor/admin/owner: all
+  if (role === "agent") return (AGENT_NAV as readonly string[]).includes(base);
+  if (role === "viewer") return (VIEWER_NAV as readonly string[]).includes(base);
+  return false;
+}
+
+/** Settings section ids (mirror of settings-sections.ts). */
+export type SettingsSectionKey =
+  | "overview"
+  | "profile"
+  | "appearance"
+  | "whatsapp"
+  | "templates"
+  | "quick-replies"
+  | "fields"
+  | "deals"
+  | "members"
+  | "api";
+
+const PERSONAL_SECTIONS: SettingsSectionKey[] = ["overview", "profile", "appearance"];
+const CRITICAL_SECTIONS: SettingsSectionKey[] = ["whatsapp", "api", "members"];
+
+export function canAccessSettingsSection(
+  role: AccountRole,
+  section: SettingsSectionKey,
+): boolean {
+  if (PERSONAL_SECTIONS.includes(section)) return true; // everyone
+  if (hasMinRole(role, "admin")) return true; // admin/owner: all
+  if (role === "supervisor") return !CRITICAL_SECTIONS.includes(section);
+  return false; // agent/viewer: personal only
+}
+
+export function defaultLandingPath(role: AccountRole): string {
+  return hasMinRole(role, "supervisor") ? "/dashboard" : "/inbox";
 }

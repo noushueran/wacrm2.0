@@ -2,12 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   ACCOUNT_ROLES,
   type AccountRole,
+  canAccessNav,
+  canAccessSettingsSection,
   canDeleteAccount,
+  canEditCriticalSettings,
+  canEditOperationalSettings,
   canEditSettings,
   canManageMembers,
   canSendMessages,
   canTransferOwnership,
   canViewOnly,
+  defaultLandingPath,
   hasMinRole,
   isAccountRole,
   roleRank,
@@ -21,12 +26,9 @@ describe("roleRank", () => {
   });
 
   it("matches the account-role model's numeric mapping", () => {
-    // Keep these in lockstep with the role ladder in
-    // `convex/lib/roles.ts` (`roleRank`) and the `memberships.role`
-    // union in `convex/schema.ts` — any change here means those need
-    // the same change.
-    expect(roleRank("owner")).toBe(4);
-    expect(roleRank("admin")).toBe(3);
+    expect(roleRank("owner")).toBe(5);
+    expect(roleRank("admin")).toBe(4);
+    expect(roleRank("supervisor")).toBe(3);
     expect(roleRank("agent")).toBe(2);
     expect(roleRank("viewer")).toBe(1);
   });
@@ -50,18 +52,27 @@ describe("hasMinRole", () => {
   it.each<[AccountRole, AccountRole, boolean]>([
     ["owner", "owner", true],
     ["owner", "admin", true],
+    ["owner", "supervisor", true],
     ["owner", "agent", true],
     ["owner", "viewer", true],
     ["admin", "owner", false],
     ["admin", "admin", true],
+    ["admin", "supervisor", true],
     ["admin", "agent", true],
     ["admin", "viewer", true],
+    ["supervisor", "owner", false],
+    ["supervisor", "admin", false],
+    ["supervisor", "supervisor", true],
+    ["supervisor", "agent", true],
+    ["supervisor", "viewer", true],
     ["agent", "owner", false],
     ["agent", "admin", false],
+    ["agent", "supervisor", false],
     ["agent", "agent", true],
     ["agent", "viewer", true],
     ["viewer", "owner", false],
     ["viewer", "admin", false],
+    ["viewer", "supervisor", false],
     ["viewer", "agent", false],
     ["viewer", "viewer", true],
   ])("%s vs min %s → %s", (role, min, expected) => {
@@ -127,5 +138,46 @@ describe("capability predicates", () => {
     expect(canTransferOwnership("admin")).toBe(false);
     expect(canTransferOwnership("agent")).toBe(false);
     expect(canTransferOwnership("viewer")).toBe(false);
+  });
+
+  it("canEditOperationalSettings: supervisor+", () => {
+    expect(canEditOperationalSettings("owner")).toBe(true);
+    expect(canEditOperationalSettings("admin")).toBe(true);
+    expect(canEditOperationalSettings("supervisor")).toBe(true);
+    expect(canEditOperationalSettings("agent")).toBe(false);
+    expect(canEditOperationalSettings("viewer")).toBe(false);
+  });
+
+  it("canEditCriticalSettings: admin+ (supervisor excluded)", () => {
+    expect(canEditCriticalSettings("admin")).toBe(true);
+    expect(canEditCriticalSettings("supervisor")).toBe(false);
+  });
+
+  it("canAccessNav gates agent/viewer to inbox + notifications", () => {
+    expect(canAccessNav("agent", "/inbox")).toBe(true);
+    expect(canAccessNav("agent", "/notifications")).toBe(true);
+    expect(canAccessNav("agent", "/contacts")).toBe(false);
+    expect(canAccessNav("agent", "/settings")).toBe(false);
+    expect(canAccessNav("viewer", "/inbox")).toBe(true);
+    expect(canAccessNav("viewer", "/notifications")).toBe(false);
+    expect(canAccessNav("supervisor", "/broadcasts")).toBe(true);
+    expect(canAccessNav("supervisor", "/settings")).toBe(true);
+  });
+
+  it("canAccessSettingsSection: agent/viewer personal-only; supervisor no critical", () => {
+    expect(canAccessSettingsSection("agent", "profile")).toBe(true);
+    expect(canAccessSettingsSection("agent", "appearance")).toBe(true);
+    expect(canAccessSettingsSection("agent", "templates")).toBe(false);
+    expect(canAccessSettingsSection("supervisor", "templates")).toBe(true);
+    expect(canAccessSettingsSection("supervisor", "whatsapp")).toBe(false);
+    expect(canAccessSettingsSection("supervisor", "members")).toBe(false);
+    expect(canAccessSettingsSection("admin", "whatsapp")).toBe(true);
+  });
+
+  it("defaultLandingPath: agent/viewer → /inbox, others → /dashboard", () => {
+    expect(defaultLandingPath("agent")).toBe("/inbox");
+    expect(defaultLandingPath("viewer")).toBe("/inbox");
+    expect(defaultLandingPath("supervisor")).toBe("/dashboard");
+    expect(defaultLandingPath("admin")).toBe("/dashboard");
   });
 });
