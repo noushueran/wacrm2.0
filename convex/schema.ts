@@ -22,6 +22,7 @@ export default defineSchema({
     role: v.union(
       v.literal("owner"),
       v.literal("admin"),
+      v.literal("supervisor"),
       v.literal("agent"),
       v.literal("viewer"),
     ),
@@ -487,7 +488,7 @@ export default defineSchema({
   accountInvitations: defineTable({
     accountId: v.id("accounts"),
     tokenHash: v.string(),
-    role: v.union(v.literal("admin"), v.literal("agent"), v.literal("viewer")),
+    role: v.union(v.literal("admin"), v.literal("supervisor"), v.literal("agent"), v.literal("viewer")),
     createdByUserId: v.optional(v.id("users")),
     label: v.optional(v.string()),
     expiresAt: v.number(),
