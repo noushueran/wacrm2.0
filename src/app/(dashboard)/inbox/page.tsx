@@ -11,13 +11,9 @@ import { toUiConversation } from "@/lib/convex/adapters";
 import type { Conversation } from "@/types";
 import { ConversationList } from "@/components/inbox/conversation-list";
 import { MessageThread } from "@/components/inbox/message-thread";
-import { ContactSidebar } from "@/components/inbox/contact-sidebar";
+import { ContactPanelDrawer } from "@/components/inbox/contact-panel-drawer";
 import { WifiOff } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-// Remembers the agent's show/hide choice for the desktop contact panel
-// across reloads and sessions (device-scoped, like the theme prefs).
-const CONTACT_PANEL_STORAGE_KEY = "wacrm:inbox:contact-panel-open";
 
 export default function InboxPage() {
   const t = useTranslations("Inbox.page");
@@ -35,35 +31,23 @@ export default function InboxPage() {
   >(null);
 
   /**
-   * Whether the desktop contact sidebar (tags / deals / notes) is shown.
-   * Defaults to `true` (the historical behaviour) and is restored from
-   * localStorage after mount. We deliberately do NOT read localStorage in
-   * the initializer: the server renders with `true`, so reading a stored
-   * `false` synchronously would produce a hydration mismatch. The effect
-   * below reconciles to the stored value right after mount instead.
+   * Whether the contact-details slide-over is open. On-demand, not
+   * sticky: it defaults closed and is opened by clicking the thread
+   * header name/number. A dedicated effect collapses it again whenever
+   * the active conversation changes, so it never lingers across chats.
    */
-  const [contactPanelOpen, setContactPanelOpen] = useState(true);
-  useEffect(() => {
-    try {
-      const stored = localStorage.getItem(CONTACT_PANEL_STORAGE_KEY);
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot sync from localStorage on mount, not a per-render derivation
-      if (stored !== null) setContactPanelOpen(stored === "true");
-    } catch {
-      // localStorage can throw in private-browsing / sandboxed contexts.
-    }
-  }, []);
+  const [contactPanelOpen, setContactPanelOpen] = useState(false);
 
   const handleToggleContactPanel = useCallback(() => {
-    setContactPanelOpen((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem(CONTACT_PANEL_STORAGE_KEY, String(next));
-      } catch {
-        // Persistence is best-effort; ignore storage failures.
-      }
-      return next;
-    });
+    setContactPanelOpen((prev) => !prev);
   }, []);
+
+  // Collapse the panel whenever the agent opens or switches
+  // conversations, so it only appears when they click the header.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset tied to conversation change, not a per-render derivation
+    setContactPanelOpen(false);
+  }, [activeConversationId]);
 
   // Fire the deep-link auto-select exactly once per URL — subsequent
   // list refreshes (a reactive push from Convex, a later click
@@ -207,9 +191,12 @@ export default function InboxPage() {
             long URL in a message body) forces the flex child past
             its share and pushes the contact-sidebar panel off-screen
             on the right. Issue #165. */}
+        {/* `relative` anchors the contact-details slide-over, which
+            overlays the thread's right edge instead of taking its own
+            column. */}
         <div
           className={cn(
-            "flex h-full min-w-0 flex-1 lg:flex",
+            "relative flex h-full min-w-0 flex-1 lg:flex",
             hasActiveConv ? "flex" : "hidden lg:flex",
           )}
         >
@@ -220,17 +207,12 @@ export default function InboxPage() {
             contactPanelOpen={contactPanelOpen}
             onToggleContactPanel={handleToggleContactPanel}
           />
+          <ContactPanelDrawer
+            open={contactPanelOpen}
+            onClose={handleToggleContactPanel}
+            contact={activeContact}
+          />
         </div>
-
-        {/* Right panel: Contact sidebar — desktop only, and only when the
-            agent hasn't collapsed it via the thread-header toggle (#258).
-            On mobile it's always hidden (the `lg:block` below), so the
-            toggle — which is itself desktop-only — never affects it. */}
-        {contactPanelOpen && (
-          <div className="hidden lg:block">
-            <ContactSidebar contact={activeContact} />
-          </div>
-        )}
       </div>
     </div>
   );

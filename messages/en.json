@@ -150,6 +150,7 @@
       "backToConversations": "Back to conversations",
       "hideContactPanel": "Hide contact panel",
       "showContactPanel": "Show contact panel",
+      "viewContactDetails": "View contact details",
       "hideContact": "Hide contact",
       "showContact": "Show contact",
       "refresh": "Refresh",
@@ -258,6 +259,7 @@
     },
     "sidebar": {
       "contactInfo": "Contact info",
+      "close": "Close",
       "tags": "Tags",
       "notes": "Notes",
       "deals": "Deals",
