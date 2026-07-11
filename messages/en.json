@@ -1631,7 +1631,13 @@
       "save": "Save",
       "saving": "Saving...",
       "saveFailed": "Failed to save default currency",
-      "saveSuccess": "Default currency updated"
+      "saveSuccess": "Default currency updated",
+      "leadValueTitle": "Lead value",
+      "leadValueDesc": "Amount charged to an agent each time a lead is assigned to them.",
+      "leadValueLabel": "Value per lead",
+      "leadValueHint": "Set to 0 to disable lead-spend tracking.",
+      "leadValueSaveSuccess": "Lead value updated",
+      "leadValueSaveFailed": "Failed to save lead value"
     },
     "aiConfig": {
       "title": "Agent setup",

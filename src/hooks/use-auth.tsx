@@ -56,6 +56,11 @@ interface AccountSummary {
   /** Default deal currency (ISO-4217). NOT NULL DEFAULT 'USD' on the
    *  Convex `accounts` table; narrowed to DEFAULT_CURRENCY when absent. */
   default_currency: string;
+  /** Flat amount charged to an agent each time a lead is assigned to
+   *  them, in `default_currency`. `v.optional(v.number())` on the
+   *  Convex `accounts` table; narrowed to 0 when absent (0/unset means
+   *  the lead-spend feature is off). */
+  leadValue: number;
 }
 
 interface AuthContextValue {
@@ -102,6 +107,11 @@ interface AuthContextValue {
    *  while loading or when no account is resolved, so callers can use
    *  it unconditionally. */
   defaultCurrency: string;
+  /** Flat amount charged to an agent each time a lead is assigned to
+   *  them, in `defaultCurrency`. Falls back to 0 (feature off) while
+   *  loading or when no account is resolved, so callers can use it
+   *  unconditionally. */
+  leadValue: number;
   /** True if `accountRole === 'owner'`. */
   isOwner: boolean;
   /** True if `accountRole === 'admin'` (does NOT include owner — use canManageMembers for "admin or above"). */
@@ -197,6 +207,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         id: me.account.id,
         name: me.account.name,
         default_currency: me.account.defaultCurrency,
+        leadValue: me.account.leadValue ?? 0,
       }
     : null;
 
@@ -246,6 +257,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         refreshProfile,
         account,
         defaultCurrency: account?.default_currency ?? DEFAULT_CURRENCY,
+        leadValue: account?.leadValue ?? 0,
         ...derived,
       }}
     >
@@ -276,6 +288,7 @@ export function useAuth(): AuthContextValue {
       refreshProfile: async () => {},
       account: null,
       defaultCurrency: DEFAULT_CURRENCY,
+      leadValue: 0,
       accountId: null,
       accountRole: null,
       isOwner: false,
