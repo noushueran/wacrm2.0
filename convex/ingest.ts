@@ -6,6 +6,7 @@ import {
   insertMessageAndUpdateConversation,
   type AppendMessageArgs,
 } from "./messages";
+import { extractRefCode, extractCtwaClid } from "./attribution";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -63,6 +64,17 @@ import type { Doc, Id } from "./_generated/dataModel";
 // than declared inline in `ingestInbound`'s own args) so `processInbound`
 // below can share the identical validator instead of a second,
 // drift-prone copy.
+//
+// `ctwaClid` (Task B4/B2): Meta's ad-referral click id, threaded onto the
+// flattened message by `webhookParse.ts`'s `flattenInboundMessage` when
+// the inbound carries a `referral.ctwa_clid`. Declared here (not just on
+// `processInbound`'s own args) so the SAME validator both functions
+// share actually accepts it end-to-end from the httpAction — otherwise
+// Convex would reject the field as unexpected before it ever reached
+// `processInbound`'s attribution step below. `ingestInbound` itself
+// still ignores it: the message row has no column for it, and only
+// `processInbound`'s new attribution step (via `extractCtwaClid`)
+// reads it.
 const inboundMessageValidator = v.object({
   type: v.union(
     v.literal("text"),
@@ -78,6 +90,7 @@ const inboundMessageValidator = v.object({
   mediaUrl: v.optional(v.string()),
   wamid: v.string(),
   interactiveReplyId: v.optional(v.string()),
+  ctwaClid: v.optional(v.string()),
 });
 
 export const ingestInbound = internalMutation({
@@ -602,6 +615,31 @@ export const processInbound = internalAction({
         }),
       }),
     );
+
+    // ---- Attribution signal (verified-WhatsApp conversion) — OUTSIDE every
+    // guard above, best-effort like webhookDelivery. Detect our HY- code (in
+    // the message text) or Meta's ctwa_clid (ad referral), record an
+    // account-scoped signal once per (accountId, identifier), and enqueue the
+    // POST to Platform A. A failure here never blocks the pipeline.
+    await runBestEffort("attribution.signal", async () => {
+      const code = extractRefCode(message.text);
+      const identifier = code ?? extractCtwaClid(message);
+      if (!identifier) return;
+      const lane: "code" | "ctwa" = code ? "code" : "ctwa";
+      const signalId = await ctx.runMutation(internal.attribution.recordSignal, {
+        accountId,
+        identifier,
+        lane,
+        phone: normalizePhone(from),
+        waMessageId: message.wamid,
+        contactId: res.contactId,
+        conversationId: res.conversationId,
+        firstMessageAt: Date.now(),
+      });
+      if (signalId) {
+        await ctx.scheduler.runAfter(0, internal.attribution.sendSignal, { signalId });
+      }
+    });
 
     return { duplicate: false, flowConsumed };
   },
