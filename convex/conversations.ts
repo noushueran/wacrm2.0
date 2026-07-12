@@ -92,10 +92,13 @@ export const list = accountQuery({
     status: v.optional(
       v.union(v.literal("open"), v.literal("pending"), v.literal("closed")),
     ),
+    assignment: v.optional(
+      v.union(v.literal("mine"), v.literal("unassigned")),
+    ),
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
-    const { status, paginationOpts } = args;
+    const { status, assignment, paginationOpts } = args;
     const scope = conversationScope(ctx.role);
 
     const base = ctx.db
@@ -105,11 +108,13 @@ export const list = accountQuery({
       )
       .order("desc");
 
-    // Compose the optional status filter with the role visibility scope.
-    // `own_and_pool` = assigned to me OR unassigned; `unassigned` = the
-    // pool only; `all` = no extra predicate.
+    // Compose the optional status filter with the role visibility scope,
+    // plus the optional assignment tab. `own_and_pool` = assigned to me OR
+    // unassigned; `unassigned` = the pool only; `all` = no scope predicate.
+    // The assignment tab (`mine`/`unassigned`) narrows *within* that scope
+    // and is AND-composed, so it can never widen a role's visibility.
     const query =
-      status || scope !== "all"
+      status || assignment || scope !== "all"
         ? base.filter((q) => {
             const parts = [];
             if (status) parts.push(q.eq(q.field("status"), status));
@@ -121,6 +126,11 @@ export const list = accountQuery({
                 ),
               );
             } else if (scope === "unassigned") {
+              parts.push(q.eq(q.field("assignedToUserId"), undefined));
+            }
+            if (assignment === "mine") {
+              parts.push(q.eq(q.field("assignedToUserId"), ctx.userId));
+            } else if (assignment === "unassigned") {
               parts.push(q.eq(q.field("assignedToUserId"), undefined));
             }
             return parts.reduce((a, b) => q.and(a, b));

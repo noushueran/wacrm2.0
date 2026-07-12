@@ -1558,6 +1558,38 @@ test("list scopes conversations by role", async () => {
   expect(asS.page).toHaveLength(3);
 });
 
+test("list filters by the assignment tab within the role scope", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+
+  await seedConv(t, accountId, { phone: "111", name: "Mine", assignedToUserId: a.userId });
+  await seedConv(t, accountId, { phone: "222", name: "Pool" });
+  await seedConv(t, accountId, { phone: "333", name: "Bees", assignedToUserId: b.userId });
+
+  // Agent "Mine" → only their own assigned chat.
+  const aMine = await a.asUser.query(api.conversations.list, { assignment: "mine", ...onePage });
+  expect(aMine.page.map((c) => c.contact?.name)).toEqual(["Mine"]);
+
+  // Agent "Unassigned" → the pool only.
+  const aPool = await a.asUser.query(api.conversations.list, { assignment: "unassigned", ...onePage });
+  expect(aPool.page.map((c) => c.contact?.name)).toEqual(["Pool"]);
+
+  // Supervisor "Mine" → owns none.
+  const sMine = await s.asUser.query(api.conversations.list, { assignment: "mine", ...onePage });
+  expect(sMine.page).toHaveLength(0);
+
+  // Supervisor "Unassigned" → the pool only (not Bees, not Mine).
+  const sPool = await s.asUser.query(api.conversations.list, { assignment: "unassigned", ...onePage });
+  expect(sPool.page.map((c) => c.contact?.name)).toEqual(["Pool"]);
+
+  // Supervisor, no assignment arg → unchanged: sees all three.
+  const sAll = await s.asUser.query(api.conversations.list, onePage);
+  expect(sAll.page).toHaveLength(3);
+});
+
 test("get denies an out-of-scope conversation with NOT_FOUND", async () => {
   const t = convexTest(schema, modules);
   const { accountId } = await seedAccountWithOwner(t);
