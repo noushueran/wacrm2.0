@@ -1030,4 +1030,40 @@ export default defineSchema({
   })
     .index("by_storage", ["storageId"])
     .index("by_account", ["accountId"]),
+
+  // ============================================================
+  // WA conversion attribution (Task B3). One row per detected
+  // attribution identifier (an `HY-XXXXXX` ref code or a Meta
+  // `ctwa_clid`) seen on an inbound WhatsApp message — written by
+  // `attribution.recordSignal` and later updated by the outbound
+  // partner-signal action as it lands. `by_account_identifier` backs
+  // `recordSignal`'s own idempotent first-occurrence-only insert (one
+  // row per account+identifier, ever); `by_account_result` supports a
+  // future dashboard filtering by landing outcome.
+  // ============================================================
+  attributionSignals: defineTable({
+    accountId: v.id("accounts"),
+    identifier: v.string(), // the HY-code (uppercased) OR the ctwa_clid
+    lane: v.union(v.literal("code"), v.literal("ctwa")),
+    phone: v.string(), // sender phone as supplied by the caller (E.164 in prod; stored verbatim)
+    waMessageId: v.string(),
+    contactId: v.id("contacts"),
+    conversationId: v.id("conversations"),
+    firstMessageAt: v.number(),
+    landingResult: v.union(
+      v.literal("pending"),
+      v.literal("matched"),
+      v.literal("unmatched"),
+      v.literal("error"),
+    ),
+    offerSlug: v.optional(v.string()),
+    firedAt: v.optional(v.number()),
+    attempts: v.number(),
+  })
+    .index("by_account_identifier", ["accountId", "identifier"])
+    // Reserved wamid lookup/dedup/debug index — not queried by the
+    // B-tasks yet (mirrors the existing `broadcastRecipients.by_wamid`
+    // precedent above).
+    .index("by_wamid", ["waMessageId"])
+    .index("by_account_result", ["accountId", "landingResult"]),
 });
