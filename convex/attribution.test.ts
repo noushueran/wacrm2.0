@@ -1,8 +1,9 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { convexTest } from "convex-test";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
+import type { AccountRole } from "./lib/roles";
 import { extractRefCode, extractCtwaClid } from "./attribution";
 
 test("extractRefCode finds our code anywhere, uppercased", () => {
@@ -955,4 +956,268 @@ test("retryPending re-schedules sendSignal for every error/pending row; draining
   // sendSignal's own already-matched check.
   expect(rowMatched!.landingResult).toBe("matched");
   expect(rowMatched!.attempts).toBe(0);
+});
+
+// ============================================================
+// listConversions (Task B7a) — admin-gated, account-scoped read side
+// for the attribution "conversions" admin view (Task B7b's UI). Unlike
+// every other function tested above, `listConversions` is a PUBLIC
+// `accountQuery` — it needs an AUTHENTICATED caller with a real
+// `memberships` row, which `seedAccount` above deliberately does NOT
+// set up (see that helper's own header comment: every other function
+// in this file is a session-less `internalMutation`/`internalQuery`/
+// `internalAction`, so it only ever needed the bare `accounts.
+// ownerUserId` FK). `seedAccountMember` below is the standard
+// authenticated-caller helper used throughout this codebase for
+// `accountQuery`/`accountMutation` suites (identical copy in e.g.
+// `convex/aiKnowledge.test.ts`) — duplicated here rather than
+// imported, per this file's own established per-suite-owns-its-own-
+// helpers convention.
+// ============================================================
+
+/**
+ * Seeds a `users` row + a fresh `accounts`/`memberships` row and
+ * returns a convex-test client already authenticated as that user —
+ * same shape as every other suite's `seedAccountMember` (see
+ * `convex/aiKnowledge.test.ts`).
+ */
+async function seedAccountMember(
+  t: ReturnType<typeof convexTest>,
+  opts: { name: string; email: string; role: AccountRole },
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: opts.name, email: opts.email }),
+  );
+  const accountId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", {
+      name: `${opts.name}'s account`,
+      defaultCurrency: "USD",
+      ownerUserId: userId,
+    });
+    await ctx.db.insert("memberships", {
+      userId,
+      accountId: id,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return id;
+  });
+  const asUser = t.withIdentity({
+    subject: `${userId}|session-${opts.name}`,
+  });
+  return { userId, accountId, asUser };
+}
+
+/**
+ * Direct `attributionSignals` insert with full control over every
+ * field `listConversions` reads or returns. Unlike `insertSignalRow`
+ * above (Task B6's helper, which fixes `phone`/`lane` and derives
+ * `waMessageId` from `identifier` alone), these tests need a distinct
+ * phone/identifier/lane/offerSlug/firedAt per row so the assertions
+ * below prove the handler's field mapping and its firedAt-desc sort
+ * are real, not coincidentally correct from insertion order.
+ */
+async function seedFullSignal(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    conversationId: Id<"conversations">;
+    identifier: string;
+    lane: "code" | "ctwa";
+    phone: string;
+    landingResult: "pending" | "matched" | "unmatched" | "error";
+    offerSlug?: string;
+    firedAt?: number;
+    firstMessageAt?: number;
+  },
+): Promise<Id<"attributionSignals">> {
+  return await t.run((ctx) =>
+    ctx.db.insert("attributionSignals", {
+      accountId: opts.accountId,
+      identifier: opts.identifier,
+      lane: opts.lane,
+      phone: opts.phone,
+      waMessageId: `wamid.${opts.identifier}`,
+      contactId: opts.contactId,
+      conversationId: opts.conversationId,
+      firstMessageAt: opts.firstMessageAt ?? Date.now(),
+      landingResult: opts.landingResult,
+      offerSlug: opts.offerSlug,
+      firedAt: opts.firedAt,
+      attempts: 0,
+    }),
+  );
+}
+
+test("listConversions returns only matched conversions with phone, sorted by firedAt desc, and counts reflect the full mix", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+
+  // The OLDEST-firedAt matched row is inserted FIRST (earliest
+  // `_creationTime`) and the NEWEST-firedAt matched row SECOND — the
+  // opposite of the expected output order. A handler that merely
+  // returned the `by_account_result` scan's natural order instead of
+  // actually sorting by `firedAt` would yield [old, new] here, not the
+  // expected [new, old] below — so this genuinely exercises the sort.
+  const matchedOldId = await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-OLD001",
+    lane: "code",
+    phone: "15550000001",
+    landingResult: "matched",
+    offerSlug: "spring",
+    firedAt: 1_700_000_000_000,
+    firstMessageAt: 1_600_000_000_000,
+  });
+  const matchedNewId = await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "clid-new002",
+    lane: "ctwa",
+    phone: "15550000002",
+    landingResult: "matched",
+    offerSlug: "summer",
+    firedAt: 1_800_000_000_000,
+    firstMessageAt: 1_650_000_000_000,
+  });
+  await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-PEND01",
+    lane: "code",
+    phone: "15550000003",
+    landingResult: "pending",
+  });
+  await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-UNMT01",
+    lane: "code",
+    phone: "15550000004",
+    landingResult: "unmatched",
+  });
+  await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ERR001",
+    lane: "code",
+    phone: "15550000005",
+    landingResult: "error",
+  });
+
+  const result = await asAlice.query(api.attribution.listConversions, {});
+
+  expect(result.counts).toEqual({
+    total: 5,
+    matched: 2,
+    pending: 1,
+    unmatched: 1,
+    error: 1,
+  });
+  expect(result.conversions).toHaveLength(2);
+  expect(result.conversions[0]).toEqual({
+    id: matchedNewId,
+    phone: "15550000002",
+    identifier: "clid-new002",
+    lane: "ctwa",
+    offerSlug: "summer",
+    firedAt: 1_800_000_000_000,
+    firstMessageAt: 1_650_000_000_000,
+  });
+  expect(result.conversions[1]).toEqual({
+    id: matchedOldId,
+    phone: "15550000001",
+    identifier: "HY-OLD001",
+    lane: "code",
+    offerSlug: "spring",
+    firedAt: 1_700_000_000_000,
+    firstMessageAt: 1_600_000_000_000,
+  });
+});
+
+test("listConversions is account-scoped: never returns another account's conversions (mandatory cross-account isolation)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId: accountA } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const contactA = await seedContact(t, accountA);
+  const conversationA = await seedConversation(t, accountA, contactA);
+  await seedFullSignal(t, {
+    accountId: accountA,
+    contactId: contactA,
+    conversationId: conversationA,
+    identifier: "HY-A-MATCH",
+    lane: "code",
+    phone: "15551110000",
+    landingResult: "matched",
+    offerSlug: "a-offer",
+    firedAt: 1_700_000_000_000,
+  });
+
+  const { asUser: asBob, accountId: accountB } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  const contactB = await seedContact(t, accountB);
+  const conversationB = await seedConversation(t, accountB, contactB);
+  await seedFullSignal(t, {
+    accountId: accountB,
+    contactId: contactB,
+    conversationId: conversationB,
+    identifier: "HY-B-MATCH",
+    lane: "code",
+    phone: "15552220000",
+    landingResult: "matched",
+    offerSlug: "b-offer",
+    firedAt: 1_700_000_000_000,
+  });
+
+  const resultA = await asAlice.query(api.attribution.listConversions, {});
+  expect(resultA.conversions).toHaveLength(1);
+  expect(resultA.conversions[0].identifier).toBe("HY-A-MATCH");
+  expect(resultA.conversions[0].phone).toBe("15551110000");
+  expect(resultA.counts.total).toBe(1);
+  expect(resultA.conversions.some((c) => c.identifier === "HY-B-MATCH")).toBe(
+    false,
+  );
+  expect(resultA.conversions.some((c) => c.phone === "15552220000")).toBe(
+    false,
+  );
+
+  // Symmetric check on B's side — proves the scoping isn't an artifact
+  // of insertion order (e.g. "only ever returns the first account").
+  const resultB = await asBob.query(api.attribution.listConversions, {});
+  expect(resultB.conversions).toHaveLength(1);
+  expect(resultB.conversions[0].identifier).toBe("HY-B-MATCH");
+  expect(resultB.conversions[0].phone).toBe("15552220000");
+});
+
+test("listConversions throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAgent } = await seedAccountMember(t, {
+    name: "Alex",
+    email: "alex@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asAgent.query(api.attribution.listConversions, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });

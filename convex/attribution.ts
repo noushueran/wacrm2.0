@@ -1,5 +1,6 @@
 import { internalAction, internalMutation, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { accountQuery } from "./lib/auth";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 
@@ -323,5 +324,79 @@ export const retryPending = internalAction({
         signalId: row._id,
       });
     }
+  },
+});
+
+// ============================================================
+// listConversions (Task B7a) — the read side for the attribution
+// "conversions" admin view (Task B7b's UI calls this directly as
+// `api.attribution.listConversions`). Unlike every function above,
+// this is a PUBLIC `accountQuery` (`./lib/auth`), not an
+// `internalQuery`/`internalMutation`/`internalAction` — it's driven by
+// an admin's own browser session, not a webhook/cron/engine caller, so
+// it needs `accountQuery`'s real caller identity: `ctx.accountId`
+// derived from the caller's own `memberships` row (never a
+// client-supplied arg) and `ctx.requireRole` for the gate below.
+// ============================================================
+
+/**
+ * Admin+ only (`ctx.requireRole("admin")`) — this view exposes lead
+ * phone numbers (`row.phone`) unmasked, the same "only a trusted-enough
+ * role sees a raw phone" principle `canSeeContactPhone`
+ * (`convex/lib/roles.ts`) applies elsewhere in the app.
+ *
+ * Reads THIS account's entire signal history in one shot via the
+ * `by_account_result` index bound only on `accountId` (leaving
+ * `landingResult` unbound) — an account-scoped full scan. Acceptable
+ * at current scale, the same trade-off `dashboard.ts`'s own several
+ * UNBOUNDED account-scoped scans make (see that file's header
+ * comment): there's no time-bounded index this view could narrow by
+ * instead, and per-account attribution-signal volume is low today.
+ *
+ * `counts` tallies every row's `landingResult` across that full set.
+ * `conversions` narrows to `matched` rows only, newest-`firedAt`-first
+ * (a row missing `firedAt` sorts as if it were `0`, i.e. last — should
+ * only ever happen for a hand-inserted/edge-case row, since a real
+ * `matched` transition always comes from `patchResult` with `firedAt`
+ * supplied), capped to the 200 most recent — this is an admin
+ * dashboard list, not a paginated export.
+ */
+export const listConversions = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    ctx.requireRole("admin");
+
+    const rows = await ctx.db
+      .query("attributionSignals")
+      .withIndex("by_account_result", (q) => q.eq("accountId", ctx.accountId))
+      .collect();
+
+    const counts = {
+      total: 0,
+      matched: 0,
+      pending: 0,
+      unmatched: 0,
+      error: 0,
+    };
+    for (const row of rows) {
+      counts.total += 1;
+      counts[row.landingResult] += 1;
+    }
+
+    const conversions = rows
+      .filter((row) => row.landingResult === "matched")
+      .sort((a, b) => (b.firedAt ?? 0) - (a.firedAt ?? 0))
+      .slice(0, 200)
+      .map((row) => ({
+        id: row._id,
+        phone: row.phone,
+        identifier: row.identifier,
+        lane: row.lane,
+        offerSlug: row.offerSlug,
+        firedAt: row.firedAt,
+        firstMessageAt: row.firstMessageAt,
+      }));
+
+    return { conversions, counts };
   },
 });
