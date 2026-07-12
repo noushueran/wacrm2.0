@@ -291,6 +291,38 @@ test("flattenInboundMessage: an unrecognized type still surfaces as a visible te
   });
 });
 
+test("flattenInboundMessage: system (customer changed number) surfaces the human-readable body, not an '[Unsupported message type]' placeholder", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "system",
+        id: "wamid.SYS",
+        system: {
+          body: "This person changed their phone number to a new one.",
+          wa_id: "971500000000",
+          type: "user_changed_number",
+        },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "This person changed their phone number to a new one.",
+    wamid: "wamid.SYS",
+  });
+});
+
+test("flattenInboundMessage: system with no body falls back to a generic label (never a blank bubble)", () => {
+  expect(
+    flattenInboundMessage(
+      msg({ type: "system", system: { type: "customer_identity_changed" } }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "[System message]",
+    wamid: "wamid.DEFAULT",
+  });
+});
+
 test("flattenInboundMessage: a malformed media message (missing the nested id) still returns a bare message rather than throwing", () => {
   expect(flattenInboundMessage(msg({ type: "image" }))).toEqual({
     type: "image",

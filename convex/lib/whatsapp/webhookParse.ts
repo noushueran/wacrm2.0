@@ -59,6 +59,19 @@ export interface MetaWebhookMessage {
     address?: string;
   };
   reaction?: { message_id: string; emoji?: string };
+  // Present when Meta sends a `type: "system"` event — a customer changed
+  // their phone number (`user_changed_number` / `customer_changed_number`)
+  // or re-registered on a new device (`customer_identity_changed`). NOT a
+  // message the customer typed; `body` is Meta's human-readable notice
+  // (e.g. "‪+1 (555) 000‬ changed their phone number").
+  system?: {
+    body?: string;
+    identity?: string;
+    wa_id?: string;
+    new_wa_id?: string;
+    type?: string;
+    customer?: string;
+  };
   interactive?: {
     type?: "button_reply" | "list_reply";
     button_reply?: { id: string; title?: string };
@@ -327,6 +340,18 @@ function flattenByType(
         };
       }
       return { type: "interactive", text: "[Interactive reply]", wamid };
+    }
+
+    case "system": {
+      // A WhatsApp system notice (customer changed number / identity), not
+      // a message the customer typed. Surface Meta's human-readable `body`
+      // so the thread shows e.g. "‪+971…‬ changed their phone number"
+      // instead of a raw "[Unsupported message type: system]" placeholder.
+      // `ingestInbound` has no distinct system content_type, so it rides in
+      // as `"text"`; the `body || …` fallback guards against a blank bubble
+      // if Meta ever omits the body.
+      const body = message.system?.body?.trim();
+      return { type: "text", text: body || "[System message]", wamid };
     }
 
     case "reaction":
