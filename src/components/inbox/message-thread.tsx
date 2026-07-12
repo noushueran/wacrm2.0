@@ -1,13 +1,13 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import {
-  useAction,
-  useConvex,
-  useMutation,
-  useQuery,
-  usePaginatedQuery,
-} from "convex/react";
+import { useAction, useConvex, useMutation } from "convex/react";
+// Cached variants — keep each per-conversation subscription
+// (messages.listByConversation, reactions.forConversation) warm for a few
+// minutes after the thread switches away, so re-opening a recently-viewed
+// chat paints instantly instead of paying another cold round-trip to the
+// self-hosted Convex backend. Mutations/actions stay on `convex/react`.
+import { useQuery, usePaginatedQuery } from "@/lib/convex/cached";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
 import {
@@ -20,6 +20,11 @@ import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
 import { presenceLabel } from "@/lib/presence";
 import { cn } from "@/lib/utils";
+import { Skeleton } from "@/components/dashboard/skeleton";
+import {
+  INITIAL_MESSAGE_PAGE_SIZE,
+  messageAreaState,
+} from "@/lib/inbox/view";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import type {
   Conversation,
@@ -180,7 +185,7 @@ export function MessageThread({
     conversationId
       ? { conversationId: conversationId as Id<"conversations"> }
       : "skip",
-    { initialNumItems: 30 },
+    { initialNumItems: INITIAL_MESSAGE_PAGE_SIZE },
   );
   const convexMessages = useMemo(
     () => msg.results.map(toUiMessage).reverse(),
@@ -579,6 +584,11 @@ export function MessageThread({
 
   const displayName = contact.name || contact.phone;
   const messageGroups = groupMessagesByDate(messages);
+  // Cold first-page load → skeleton (not a blank spinner); loaded-but-empty
+  // → empty state; otherwise the message list. A re-visited conversation is
+  // served from the query cache, so `area` is "list" immediately and the
+  // skeleton never flashes. See `messageAreaState` for the exact rules.
+  const area = messageAreaState(msg.status, messages.length);
   const currentStatus = STATUS_OPTIONS.find(
     (s) => s.value === conversation.status
   );
@@ -786,11 +796,9 @@ export function MessageThread({
 
       {/* Messages Area */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
-        {msg.status === "LoadingFirstPage" ? (
-          <div className="flex items-center justify-center py-12">
-            <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-          </div>
-        ) : messages.length === 0 ? (
+        {area === "loading" ? (
+          <ThreadSkeleton />
+        ) : area === "empty" ? (
           <div className="flex flex-col items-center justify-center py-12">
             <p className="text-sm text-muted-foreground">{t("noMessagesYet")}</p>
             <p className="text-xs text-muted-foreground">
@@ -934,6 +942,38 @@ export function MessageThread({
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
       />
+    </div>
+  );
+}
+
+/**
+ * Placeholder shown while a conversation's first page of messages is
+ * still loading (cold, uncached open). A few message-shaped bars —
+ * alternating incoming/outgoing — read as "messages arriving" rather than
+ * a blank pane with a lone spinner, and roughly match the real bubble
+ * layout so the swap to content doesn't jump. Declared at module scope so
+ * it doesn't remount on every parent re-render. Purely decorative, hence
+ * `aria-hidden`.
+ */
+function ThreadSkeleton() {
+  const rows: { out: boolean; w: string }[] = [
+    { out: false, w: "w-40" },
+    { out: false, w: "w-56" },
+    { out: true, w: "w-48" },
+    { out: false, w: "w-32" },
+    { out: true, w: "w-60" },
+    { out: true, w: "w-36" },
+  ];
+  return (
+    <div className="space-y-3" aria-hidden="true">
+      {rows.map((r, i) => (
+        <div
+          key={i}
+          className={cn("flex", r.out ? "justify-end" : "justify-start")}
+        >
+          <Skeleton className={cn("h-10 max-w-[75%] rounded-2xl", r.w)} />
+        </div>
+      ))}
     </div>
   );
 }
