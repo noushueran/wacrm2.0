@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { convexTest } from "convex-test";
 import { internal } from "./_generated/api";
 import schema from "./schema";
@@ -208,4 +208,570 @@ test("recordSignal dedupe is per-account: the same identifier under a different 
   expect(idA).not.toBeNull();
   expect(idB).not.toBeNull();
   expect(idA).not.toBe(idB);
+});
+
+// ============================================================
+// getSignal / patchResult / sendSignal (Task B5) — the outbound side:
+// POST the signal to Platform A's `/whatsapp-conversion` endpoint and
+// record the result. `getSignal`/`patchResult` are the plain
+// query/mutation primitives `sendSignal` (an `internalAction`, which
+// has no `ctx.db` of its own) goes through to read/write the row —
+// same shape as `webhookEndpoints.ts`'s `listActiveForEvent`/
+// `recordDeliverySuccess`/`recordDeliveryFailure` backing
+// `webhookDelivery.ts`'s `dispatch`.
+//
+// FETCH-MOCKING NOTE: this task's brief said to copy
+// `webhookDelivery.test.ts`'s fetch-mocking approach — but that file
+// turns out not to mock `fetch` at all. Every one of its tests sets
+// `CONVEX_META_DRY_RUN=1`, which makes `webhookDelivery.ts`'s
+// `deliverOne` skip the real `fetch` call entirely, so that suite never
+// exercises a real response body. That short-circuit can't produce the
+// specific matched/unmatched/401/throw JSON responses these tests need,
+// so this suite instead follows the pattern actually used everywhere
+// else in this codebase for asserting on real fetch responses under
+// convex-test: `vi.stubGlobal("fetch", ...)` + `vi.unstubAllGlobals()`
+// after (see `metaTemplates.test.ts`'s `submitToMeta` tests,
+// `ingest.test.ts`'s media-resolution test, `automationsEngine.test.ts`'s
+// `send_webhook` test, `whatsappConfig.test.ts`, `templates.test.ts`,
+// `aiConfig.test.ts`, `files.test.ts`, `lib/ai/generate.test.ts` — all
+// of the same shape). `metaTemplates.test.ts`'s `submitToMeta` tests are
+// the closest sibling: a Bearer-token POST whose JSON response is
+// parsed and branched on, same as `sendSignal` here.
+// ============================================================
+
+afterEach(() => {
+  // Belt-and-suspenders, matching every other fetch-mocking suite's own
+  // afterEach (`ingest.test.ts`'s comment on this exact pattern): a
+  // thrown assertion inside a fetch mock could otherwise skip a test's
+  // own cleanup and leak into the next test.
+  delete process.env.LANDING_CONVERSION_URL;
+  delete process.env.WA_CONVERSION_SHARED_SECRET;
+  vi.unstubAllGlobals();
+});
+
+/** Seeds a signal row via `recordSignal` (Task B3) and returns its id. */
+async function seedSignal(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    conversationId: Id<"conversations">;
+    identifier: string;
+    lane: "code" | "ctwa";
+    phone: string;
+    waMessageId: string;
+    firstMessageAt: number;
+  },
+): Promise<Id<"attributionSignals">> {
+  const id = await t.mutation(internal.attribution.recordSignal, opts);
+  return id as Id<"attributionSignals">;
+}
+
+// ------------------------------------------------------------
+// getSignal
+// ------------------------------------------------------------
+
+test("getSignal returns the row for an existing signalId", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  const row = await t.query(internal.attribution.getSignal, { signalId });
+  expect(row).not.toBeNull();
+  expect(row!._id).toBe(signalId);
+  expect(row!.identifier).toBe("HY-ABCDEF");
+});
+
+test("getSignal returns null for a signalId that does not exist", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+  await t.run((ctx) => ctx.db.delete(signalId));
+
+  const row = await t.query(internal.attribution.getSignal, { signalId });
+  expect(row).toBeNull();
+});
+
+// ------------------------------------------------------------
+// patchResult
+// ------------------------------------------------------------
+
+test("patchResult sets landingResult and the provided optional fields, leaving attempts unchanged when bumpAttempts is omitted", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "matched",
+    offerSlug: "summer",
+    firedAt: 1720000000000,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("matched");
+  expect(row!.offerSlug).toBe("summer");
+  expect(row!.firedAt).toBe(1720000000000);
+  expect(row!.attempts).toBe(0); // bumpAttempts not passed
+});
+
+test("patchResult bumps attempts by exactly one per call when bumpAttempts is true", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "error",
+    bumpAttempts: true,
+  });
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "error",
+    bumpAttempts: true,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(2);
+});
+
+test("patchResult is a no-op when the signalId does not exist", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+  await t.run((ctx) => ctx.db.delete(signalId));
+
+  // Undefined handler return serializes as `null` over the wire (same
+  // reason `webhookDelivery.ts`'s own `recordSuccess`/`recordFailure`
+  // need an explicit `await` — see that file's comment).
+  await expect(
+    t.mutation(internal.attribution.patchResult, {
+      signalId,
+      landingResult: "matched",
+    }),
+  ).resolves.toBeNull();
+});
+
+// ------------------------------------------------------------
+// sendSignal — dormant when env is not configured (the CURRENT prod
+// state: `LANDING_CONVERSION_URL`/`WA_CONVERSION_SHARED_SECRET` are not
+// set on the deployment yet).
+// ------------------------------------------------------------
+
+test("sendSignal records an error without calling fetch when LANDING_CONVERSION_URL is not configured", async () => {
+  delete process.env.LANDING_CONVERSION_URL;
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).not.toHaveBeenCalled();
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(1);
+});
+
+test("sendSignal records an error without calling fetch when WA_CONVERSION_SHARED_SECRET is not configured", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  delete process.env.WA_CONVERSION_SHARED_SECRET;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).not.toHaveBeenCalled();
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(1);
+});
+
+// ------------------------------------------------------------
+// sendSignal — real POST (fetch mocked)
+// ------------------------------------------------------------
+
+test("sendSignal (matched): POSTs the code-lane identifier + phone/waMessageId/firstMessageAt and records matched + firedAt + offerSlug", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const firstMessageAt = Date.now();
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt,
+  });
+
+  // CAPTURE-then-assert-after (NOT `expect` inside the mock): `sendSignal`
+  // wraps `fetch` in a try/catch that never rethrows, so an assertion
+  // thrown from inside the mock would be swallowed — the request would
+  // look like a network failure and land as `landingResult:"error"`,
+  // while `fetchMock` was still "called once". Capturing the request and
+  // asserting on it AFTER the action resolves makes a wrong URL/header/
+  // body fail the test DIRECTLY.
+  let capturedUrl: string | undefined;
+  let capturedInit: RequestInit | undefined;
+  const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+    capturedUrl = String(url);
+    capturedInit = init;
+    return new Response(
+      JSON.stringify({
+        matched: true,
+        alreadyFired: false,
+        firedAt: 1720000000000,
+        offerSlug: "summer",
+      }),
+      { status: 200 },
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(capturedUrl).toBe(
+    "https://platform-a.example.com/whatsapp-conversion",
+  );
+  expect(capturedInit!.method).toBe("POST");
+  const headers = capturedInit!.headers as Record<string, string>;
+  expect(headers.Authorization).toBe("Bearer shh-secret");
+  expect(headers["Content-Type"]).toBe("application/json");
+  expect(JSON.parse(capturedInit!.body as string)).toEqual({
+    code: "HY-ABCDEF",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("matched");
+  expect(row!.firedAt).toBe(1720000000000);
+  expect(row!.offerSlug).toBe("summer");
+});
+
+test("sendSignal (unmatched): a 200 response with matched:false records unmatched and leaves firedAt unset", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            matched: false,
+            alreadyFired: false,
+            reason: "code_not_found",
+          }),
+          { status: 200 },
+        ),
+    ),
+  );
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("unmatched");
+  expect(row!.firedAt).toBeUndefined();
+  expect(row!.attempts).toBe(0);
+});
+
+test("sendSignal (non-200): a 401 response records error and bumps attempts 0 -> 1", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ reason: "unauthorized" }), {
+          status: 401,
+        }),
+    ),
+  );
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(1);
+});
+
+test("sendSignal (throw): a rejected fetch records error and bumps attempts", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("network down");
+    }),
+  );
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(1);
+});
+
+test("sendSignal (non-JSON 200 body): res.json() throwing inside the try lands as error + attempts bump", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+
+  // 200 but not JSON — `res.json()` rejects. Because that parse is INSIDE
+  // `sendSignal`'s try, the rejection is caught the same as a network
+  // error: the row lands `"error"` and `attempts` is bumped (rather than,
+  // say, an unhandled rejection escaping the action).
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response("not json", { status: 200 })),
+  );
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(1);
+});
+
+test("sendSignal (already matched): never re-POSTs a signal whose landingResult is already matched", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABCDEF",
+    lane: "code",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt: Date.now(),
+  });
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "matched",
+    firedAt: 1710000000000,
+    offerSlug: "spring",
+  });
+
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).not.toHaveBeenCalled();
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("matched");
+  expect(row!.firedAt).toBe(1710000000000);
+  expect(row!.offerSlug).toBe("spring");
+});
+
+test("sendSignal (ctwa lane): POSTs the identifier under a ctwaClid key, not code", async () => {
+  process.env.LANDING_CONVERSION_URL =
+    "https://platform-a.example.com/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "shh-secret";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  const firstMessageAt = Date.now();
+  const signalId = await seedSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "clid-abc123",
+    lane: "ctwa",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt,
+  });
+
+  // CAPTURE-then-assert-after — see the matched test's comment. This is
+  // the ONLY coverage of the "identifier key chosen by lane" contract
+  // for the ctwa branch, so the body assertion MUST bite: asserting
+  // inside the mock would let a wrong branch (e.g. always `{ code }`)
+  // pass, because `sendSignal`'s catch would absorb the thrown assertion
+  // and `fetchMock` would still read as called-once.
+  let capturedBody: string | undefined;
+  const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = init!.body as string;
+    return new Response(JSON.stringify({ matched: false }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(JSON.parse(capturedBody!)).toEqual({
+    ctwaClid: "clid-abc123",
+    phone: "15551234567",
+    waMessageId: "wamid.SIGNAL1",
+    firstMessageAt,
+  });
+  // The lane's key is `ctwaClid`, never `code` — assert the wrong key is
+  // absent so a regression to `{ code }` fails here, not silently.
+  expect(JSON.parse(capturedBody!)).not.toHaveProperty("code");
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("unmatched");
 });
