@@ -18,6 +18,19 @@ export function extractCtwaClid(msg: { ctwaClid?: string }): string | null {
   return msg.ctwaClid ?? null;
 }
 
+/**
+ * How many times a signal may attempt to reach Platform A before it is
+ * retired to the terminal `"abandoned"` state. `patchResult` flips an
+ * `"error"` row to `"abandoned"` on the failed bump that makes `attempts`
+ * reach this value, so the `"error"`/`"pending"` rows `getPendingToRetry`
+ * scans are always still live (`attempts < MAX_ATTEMPTS`) — a permanently
+ * dead row no longer sits at the front of the `by_result` "error"
+ * partition for every 15-min cron sweep to read past. `getPendingToRetry`
+ * additionally keeps an `attempts < MAX_ATTEMPTS` filter as a cheap
+ * backstop for that same invariant.
+ */
+export const MAX_ATTEMPTS = 5;
+
 // ============================================================
 // recordSignal (Task B3) — idempotent, account-scoped write side of
 // `attributionSignals` (`convex/schema.ts`). Plain `internalMutation`
@@ -117,6 +130,13 @@ export const getSignal = internalQuery({
  * field"). `attempts` only increments when `bumpAttempts === true`
  * (strict check, not just truthy) — `sendSignal`'s "landed OK" branches
  * (matched/unmatched) never pass it, only its error branches do.
+ *
+ * When an `"error"` bump is the one that makes `attempts` reach
+ * `MAX_ATTEMPTS`, the row is written `"abandoned"` (the terminal
+ * give-up state) instead of `"error"` — the single point where a signal
+ * is permanently retired. That keeps `"error"`/`"pending"` (the retry
+ * cron's partitions) free of dead rows. Callers still only ever pass the
+ * four live outcomes; `"abandoned"` is derived here, never a caller arg.
  */
 export const patchResult = internalMutation({
   args: {
@@ -135,15 +155,30 @@ export const patchResult = internalMutation({
     const row = await ctx.db.get(args.signalId);
     if (!row) return;
 
+    const bumping = args.bumpAttempts === true;
+    const nextAttempts = row.attempts + 1;
+
+    // A failed attempt (`"error"` + a bump) that reaches `MAX_ATTEMPTS`
+    // is retired to the terminal `"abandoned"` state instead of being
+    // left as another retryable `"error"`. This is the single place
+    // give-up is decided, so a maxed-out row leaves the `"error"`
+    // partition `getPendingToRetry` scans rather than accumulating at its
+    // front forever. Gated on `landingResult === "error"` (the only
+    // outcome its callers ever pair with `bumpAttempts`) so a
+    // matched/unmatched result is never overridden.
+    const landingResult =
+      bumping && args.landingResult === "error" && nextAttempts >= MAX_ATTEMPTS
+        ? ("abandoned" as const)
+        : args.landingResult;
+
     const maybeOfferSlug =
       args.offerSlug !== undefined ? { offerSlug: args.offerSlug } : {};
     const maybeFiredAt =
       args.firedAt !== undefined ? { firedAt: args.firedAt } : {};
-    const maybeAttempts =
-      args.bumpAttempts === true ? { attempts: row.attempts + 1 } : {};
+    const maybeAttempts = bumping ? { attempts: nextAttempts } : {};
 
     await ctx.db.patch(args.signalId, {
-      landingResult: args.landingResult,
+      landingResult,
       ...maybeOfferSlug,
       ...maybeFiredAt,
       ...maybeAttempts,
@@ -172,7 +207,9 @@ export const patchResult = internalMutation({
  * `WA_CONVERSION_SHARED_SECRET` are configured on the deployment
  * (intentionally deferred past this task) — every row instead records
  * `"error"` + an attempts bump, which Task B6's retry cron will keep
- * nudging (up to its own attempts bound) until the env is set.
+ * nudging until the env is set or `attempts` hits `MAX_ATTEMPTS`, at
+ * which point `patchResult` retires the row to `"abandoned"` and the
+ * cron stops picking it up.
  */
 export const sendSignal = internalAction({
   args: { signalId: v.id("attributionSignals") },
@@ -274,9 +311,15 @@ export const sendSignal = internalAction({
 // ============================================================
 
 /**
- * Retry candidates: `landingResult` is `"error"` OR `"pending"`, AND
- * `attempts < 5` (a maxed-out row is left alone — permanently stuck,
- * not this cron's problem), capped at 100 rows total.
+ * Retry candidates: `landingResult` is `"error"` OR `"pending"`, capped
+ * at 100 rows total. A row that exhausts its retries is retired to
+ * `"abandoned"` by `patchResult` (see `MAX_ATTEMPTS`), so it leaves these
+ * two partitions entirely — the point being that this global, every-15-
+ * minute sweep never has to read past an ever-growing wall of
+ * permanently-dead rows (they sort oldest-first, at the front) to reach
+ * the live ones. The `attempts < MAX_ATTEMPTS` filter below is a cheap
+ * backstop for that same invariant — a still-`"error"`/`"pending"` row
+ * should never have reached the cap — not the primary mechanism.
  *
  * Queries the two statuses separately through the `by_result` index —
  * never a full scan — each independently bounded to `.take(100)`
@@ -289,12 +332,12 @@ export const getPendingToRetry = internalQuery({
     const errorRows = await ctx.db
       .query("attributionSignals")
       .withIndex("by_result", (q) => q.eq("landingResult", "error"))
-      .filter((q) => q.lt(q.field("attempts"), 5))
+      .filter((q) => q.lt(q.field("attempts"), MAX_ATTEMPTS))
       .take(100);
     const pendingRows = await ctx.db
       .query("attributionSignals")
       .withIndex("by_result", (q) => q.eq("landingResult", "pending"))
-      .filter((q) => q.lt(q.field("attempts"), 5))
+      .filter((q) => q.lt(q.field("attempts"), MAX_ATTEMPTS))
       .take(100);
 
     return [...errorRows, ...pendingRows].slice(0, 100);
@@ -377,6 +420,7 @@ export const listConversions = accountQuery({
       pending: 0,
       unmatched: 0,
       error: 0,
+      abandoned: 0,
     };
     for (const row of rows) {
       counts.total += 1;

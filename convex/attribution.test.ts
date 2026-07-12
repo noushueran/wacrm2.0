@@ -414,6 +414,47 @@ test("patchResult is a no-op when the signalId does not exist", async () => {
   ).resolves.toBeNull();
 });
 
+test("patchResult retires a row to abandoned once an error bump reaches the attempts cap (5), but not before", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  // One short of the cap-minus-one: the SECOND error bump below is the
+  // 5th (cap-reaching) attempt.
+  const signalId = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABAND1",
+    landingResult: "error",
+    attempts: 3,
+  });
+
+  // 4th attempt: 3 -> 4 stays under the cap, so it remains a retryable
+  // "error" — the transition fires AT the cap, never before.
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "error",
+    bumpAttempts: true,
+  });
+  let row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("error");
+  expect(row!.attempts).toBe(4);
+
+  // 5th attempt: 4 -> 5 reaches the cap, so the row is retired to the
+  // terminal "abandoned" state instead of another retryable "error" —
+  // this is what keeps it out of the "error" partition getPendingToRetry
+  // scans.
+  await t.mutation(internal.attribution.patchResult, {
+    signalId,
+    landingResult: "error",
+    bumpAttempts: true,
+  });
+  row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("abandoned");
+  expect(row!.attempts).toBe(5);
+});
+
 // ------------------------------------------------------------
 // sendSignal — dormant when env is not configured (the CURRENT prod
 // state: `LANDING_CONVERSION_URL`/`WA_CONVERSION_SHARED_SECRET` are not
@@ -477,6 +518,37 @@ test("sendSignal records an error without calling fetch when WA_CONVERSION_SHARE
   const row = await t.run((ctx) => ctx.db.get(signalId));
   expect(row!.landingResult).toBe("error");
   expect(row!.attempts).toBe(1);
+});
+
+test("sendSignal retires a row to abandoned when its final (cap-reaching) attempt fails", async () => {
+  // Dormant env → sendSignal takes its error path with no network call,
+  // the same give-up path a persistent Platform A outage would hit on
+  // the 5th attempt.
+  delete process.env.LANDING_CONVERSION_URL;
+  delete process.env.WA_CONVERSION_SHARED_SECRET;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+  // Already 4 failed attempts — this one is the 5th and reaches the cap.
+  const signalId = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABAND2",
+    landingResult: "error",
+    attempts: 4,
+  });
+
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.attribution.sendSignal, { signalId });
+
+  expect(fetchMock).not.toHaveBeenCalled();
+  const row = await t.run((ctx) => ctx.db.get(signalId));
+  expect(row!.landingResult).toBe("abandoned");
+  expect(row!.attempts).toBe(5);
 });
 
 // ------------------------------------------------------------
@@ -805,7 +877,7 @@ async function insertSignalRow(
     contactId: Id<"contacts">;
     conversationId: Id<"conversations">;
     identifier: string;
-    landingResult: "pending" | "matched" | "unmatched" | "error";
+    landingResult: "pending" | "matched" | "unmatched" | "error" | "abandoned";
     attempts: number;
   },
 ): Promise<Id<"attributionSignals">> {
@@ -886,6 +958,41 @@ test("getPendingToRetry returns error/pending rows with attempts < 5, excluding 
   expect(ids.has(excludedMaxedOutError)).toBe(false);
   expect(ids.has(excludedMatched)).toBe(false);
   expect(ids.has(excludedUnmatched)).toBe(false);
+});
+
+test("getPendingToRetry excludes abandoned (terminal) rows — they have left the error partition entirely", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+
+  // A live, still-retryable error row alongside one that maxed out and
+  // was retired to "abandoned" (attempts == the cap). Because an
+  // abandoned row is in neither the "error" nor "pending" partition of
+  // `by_result`, `getPendingToRetry`'s two indexed reads never surface it
+  // at all — the point of the terminal state. Only the live row returns.
+  const liveError = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-LIVE01",
+    landingResult: "error",
+    attempts: 2,
+  });
+  const abandoned = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-DEAD05",
+    landingResult: "abandoned",
+    attempts: 5,
+  });
+
+  const rows = await t.query(internal.attribution.getPendingToRetry, {});
+
+  const ids = new Set(rows.map((row) => row._id));
+  expect(ids.has(liveError)).toBe(true);
+  expect(ids.has(abandoned)).toBe(false);
 });
 
 // ------------------------------------------------------------
@@ -1027,7 +1134,7 @@ async function seedFullSignal(
     identifier: string;
     lane: "code" | "ctwa";
     phone: string;
-    landingResult: "pending" | "matched" | "unmatched" | "error";
+    landingResult: "pending" | "matched" | "unmatched" | "error" | "abandoned";
     offerSlug?: string;
     firedAt?: number;
     firstMessageAt?: number;
@@ -1118,15 +1225,27 @@ test("listConversions returns only matched conversions with phone, sorted by fir
     phone: "15550000005",
     landingResult: "error",
   });
+  // A retired (terminal) signal — counted in its own `abandoned` bucket
+  // and in `total`, but never surfaced as a matched conversion.
+  await seedFullSignal(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ABND01",
+    lane: "code",
+    phone: "15550000006",
+    landingResult: "abandoned",
+  });
 
   const result = await asAlice.query(api.attribution.listConversions, {});
 
   expect(result.counts).toEqual({
-    total: 5,
+    total: 6,
     matched: 2,
     pending: 1,
     unmatched: 1,
     error: 1,
+    abandoned: 1,
   });
   expect(result.conversions).toHaveLength(2);
   expect(result.conversions[0]).toEqual({

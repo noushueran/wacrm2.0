@@ -58,6 +58,10 @@ const EMPTY_COUNTS = {
   pending: 0,
   unmatched: 0,
   error: 0,
+  // Kept in shape-parity with `listConversions`'s server-side `counts`
+  // (which tallies retired signals) so the `?? EMPTY_COUNTS` fallback
+  // type matches. Not surfaced as its own funnel tile today.
+  abandoned: 0,
 };
 
 function fmtDateTime(ms: number): string {

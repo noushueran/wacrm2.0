@@ -1059,6 +1059,11 @@ export default defineSchema({
       v.literal("matched"),
       v.literal("unmatched"),
       v.literal("error"),
+      // Terminal give-up state: a row whose retries hit `attempts` ==
+      // `MAX_ATTEMPTS` is retired here (by `attribution.patchResult`) so
+      // it leaves the `"error"` partition the retry cron's
+      // `getPendingToRetry` scans — see that function's own comment.
+      v.literal("abandoned"),
     ),
     offerSlug: v.optional(v.string()),
     firedAt: v.optional(v.number()),

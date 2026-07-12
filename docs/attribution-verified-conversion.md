@@ -33,8 +33,8 @@ The full B1–B7 pipeline, all on `feat/wa-conversion-attribution`:
 | Store | `convex/schema.ts` (`attributionSignals` table) + `convex/attribution.ts` — `recordSignal` | One row per `(accountId, identifier)`, idempotent (first occurrence only, via the `by_account_identifier` index). Starts `landingResult: "pending"`, `attempts: 0`. |
 | Hook | `convex/ingest.ts` — `processInbound`'s last `runBestEffort` step (~line 619) | On every inbound message, detects the identifier (an HY- code wins over a ctwa_clid if both are present), records the signal, and — only on a fresh insert — schedules `sendSignal`. Best-effort: a failure here never blocks message ingestion, flows, automations, or the AI reply. |
 | Send | `convex/attribution.ts` — `sendSignal` | POSTs `{ code? \| ctwaClid?, phone, waMessageId, firstMessageAt }` to Platform A and records `matched` / `unmatched` / `error`. |
-| Retry | `convex/crons.ts` (`retry-attribution-signals`) + `convex/attribution.ts` — `getPendingToRetry` / `retryPending` | Every 15 minutes, re-sends any row still `"pending"` or `"error"` with `attempts < 5` (capped at 100 rows/sweep). Rows that landed `"unmatched"` are **not** retried — only `"pending"`/`"error"` ones are. |
-| View | `convex/attribution.ts` — `listConversions` + `src/components/settings/conversions-tab.tsx` | Settings → Conversions: matched leads (phone, identifier, lane, offer, timestamps), newest first, plus a funnel count (`total` / `matched` / `pending` / `unmatched` / `error`). Admin+ only. |
+| Retry | `convex/crons.ts` (`retry-attribution-signals`) + `convex/attribution.ts` — `getPendingToRetry` / `retryPending` | Every 15 minutes, re-sends any row still `"pending"` or `"error"` (capped at 100 rows/sweep). A row that exhausts `MAX_ATTEMPTS` (5) retries is retired to a terminal `"abandoned"` state, leaving the retried partitions so the global sweep never reads past permanently-dead rows. Rows that landed `"unmatched"` are **not** retried — only `"pending"`/`"error"` ones are. |
+| View | `convex/attribution.ts` — `listConversions` + `src/components/settings/conversions-tab.tsx` | Settings → Conversions: matched leads (phone, identifier, lane, offer, timestamps), newest first, plus a funnel count (`total` / `matched` / `pending` / `unmatched` / `error` / `abandoned`). Admin+ only. |
 
 **It is DORMANT in prod today.** `sendSignal` checks `process.env
 .LANDING_CONVERSION_URL` / `process.env.WA_CONVERSION_SHARED_SECRET` on the
@@ -276,7 +276,8 @@ Response:
 
 A non-2xx response, a network failure, or a missing env var all land the row
 on `landingResult: "error"` with `attempts` incremented — the retry cron
-keeps nudging it (up to 5 attempts total) until it succeeds or maxes out.
+keeps nudging it until it succeeds or, once `attempts` reaches `MAX_ATTEMPTS`
+(5), is retired to the terminal `"abandoned"` state and no longer retried.
 
 ---
 
