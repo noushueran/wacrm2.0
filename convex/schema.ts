@@ -1039,7 +1039,11 @@ export default defineSchema({
   // partner-signal action as it lands. `by_account_identifier` backs
   // `recordSignal`'s own idempotent first-occurrence-only insert (one
   // row per account+identifier, ever); `by_account_result` supports a
-  // future dashboard filtering by landing outcome.
+  // future dashboard filtering by landing outcome; `by_result` (Task
+  // B6) is the GLOBAL (non-account-scoped) counterpart that backs the
+  // retry cron's `getPendingToRetry` — it has no account context, so it
+  // needs a `landingResult`-only index to find retry candidates across
+  // every account without a full table scan.
   // ============================================================
   attributionSignals: defineTable({
     accountId: v.id("accounts"),
@@ -1065,5 +1069,6 @@ export default defineSchema({
     // B-tasks yet (mirrors the existing `broadcastRecipients.by_wamid`
     // precedent above).
     .index("by_wamid", ["waMessageId"])
-    .index("by_account_result", ["accountId", "landingResult"]),
+    .index("by_account_result", ["accountId", "landingResult"])
+    .index("by_result", ["landingResult"]),
 });

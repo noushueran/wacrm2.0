@@ -255,3 +255,73 @@ export const sendSignal = internalAction({
     }
   },
 });
+
+// ============================================================
+// getPendingToRetry / retryPending (Task B6) — the retry safety net.
+// A `sendSignal` attempt can leave a row `"error"` (non-2xx, network
+// failure, or a missing env var — see that function's own comment),
+// or a row can be stuck `"pending"` if its originally-scheduled
+// `sendSignal` never ran at all. `convex/crons.ts` runs `retryPending`
+// on an interval to sweep both cases back through `sendSignal`, which
+// is safe to call again for either status — see `sendSignal`'s own
+// "already matched" early-out.
+//
+// `getPendingToRetry` is global (no `accountId` arg): the cron has no
+// account context to scope by, so it reads the `by_result` index
+// (`landingResult` only) rather than `by_account_result` — finding
+// candidates across every account without a full table scan.
+// ============================================================
+
+/**
+ * Retry candidates: `landingResult` is `"error"` OR `"pending"`, AND
+ * `attempts < 5` (a maxed-out row is left alone — permanently stuck,
+ * not this cron's problem), capped at 100 rows total.
+ *
+ * Queries the two statuses separately through the `by_result` index —
+ * never a full scan — each independently bounded to `.take(100)`
+ * before combining and re-capping at 100, so a large backlog in one
+ * status can never crowd the other out of consideration entirely.
+ */
+export const getPendingToRetry = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Doc<"attributionSignals">[]> => {
+    const errorRows = await ctx.db
+      .query("attributionSignals")
+      .withIndex("by_result", (q) => q.eq("landingResult", "error"))
+      .filter((q) => q.lt(q.field("attempts"), 5))
+      .take(100);
+    const pendingRows = await ctx.db
+      .query("attributionSignals")
+      .withIndex("by_result", (q) => q.eq("landingResult", "pending"))
+      .filter((q) => q.lt(q.field("attempts"), 5))
+      .take(100);
+
+    return [...errorRows, ...pendingRows].slice(0, 100);
+  },
+});
+
+/**
+ * Cron-facing entry point (`convex/crons.ts`, every 15 minutes): pulls
+ * this batch of retry candidates and re-schedules `sendSignal` for
+ * each — the same "action does `runQuery` then fans out via the
+ * scheduler" shape as `broadcasts.ts`'s `send`. An `internalAction`
+ * rather than a mutation specifically because it needs `ctx.runQuery`
+ * to call the sibling `getPendingToRetry` query — only actions have
+ * `ctx.runQuery`/`ctx.runMutation`. Kept deliberately tiny: all the
+ * actual retry logic (idempotency, error handling) already lives in
+ * `sendSignal` itself.
+ */
+export const retryPending = internalAction({
+  args: {},
+  handler: async (ctx): Promise<void> => {
+    const rows = await ctx.runQuery(
+      internal.attribution.getPendingToRetry,
+      {},
+    );
+    for (const row of rows) {
+      await ctx.scheduler.runAfter(0, internal.attribution.sendSignal, {
+        signalId: row._id,
+      });
+    }
+  },
+});

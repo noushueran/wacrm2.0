@@ -243,9 +243,14 @@ afterEach(() => {
   // Belt-and-suspenders, matching every other fetch-mocking suite's own
   // afterEach (`ingest.test.ts`'s comment on this exact pattern): a
   // thrown assertion inside a fetch mock could otherwise skip a test's
-  // own cleanup and leak into the next test.
+  // own cleanup and leak into the next test. `vi.useRealTimers()` is
+  // for the `retryPending` test further below, which opts into
+  // `vi.useFakeTimers()` to drain its scheduled `sendSignal` calls
+  // (mirrors `ingest.test.ts`'s own identical addition for the same
+  // reason on its `processInbound` scheduling test).
   delete process.env.LANDING_CONVERSION_URL;
   delete process.env.WA_CONVERSION_SHARED_SECRET;
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -774,4 +779,180 @@ test("sendSignal (ctwa lane): POSTs the identifier under a ctwaClid key, not cod
   expect(JSON.parse(capturedBody!)).not.toHaveProperty("code");
   const row = await t.run((ctx) => ctx.db.get(signalId));
   expect(row!.landingResult).toBe("unmatched");
+});
+
+// ============================================================
+// getPendingToRetry / retryPending (Task B6) — the retry safety net:
+// finds `attributionSignals` rows stuck `"error"` or `"pending"`
+// (attempts < 5) and re-schedules `sendSignal` for each so a transient
+// Platform A outage (or a scheduled `sendSignal` that never ran) isn't
+// permanent. `getPendingToRetry` is global (no `accountId`) — the cron
+// (`convex/crons.ts`) has no account context — and reads the new
+// `by_result` index rather than scanning every account's rows.
+// ============================================================
+
+/** Direct `attributionSignals` insert with caller-controlled
+ *  `landingResult`/`attempts`. Unlike `seedSignal` above (which always
+ *  produces a fresh `"pending"`/`0` row via the real `recordSignal`
+ *  mutation), these tests need arbitrary combinations — `"error"` with
+ *  a specific attempts count, `"matched"`, etc. — so this goes
+ *  straight through `ctx.db.insert`, per this task's own brief. */
+async function insertSignalRow(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    conversationId: Id<"conversations">;
+    identifier: string;
+    landingResult: "pending" | "matched" | "unmatched" | "error";
+    attempts: number;
+  },
+): Promise<Id<"attributionSignals">> {
+  return await t.run((ctx) =>
+    ctx.db.insert("attributionSignals", {
+      accountId: opts.accountId,
+      identifier: opts.identifier,
+      lane: "code",
+      phone: "15551234567",
+      waMessageId: `wamid.${opts.identifier}`,
+      contactId: opts.contactId,
+      conversationId: opts.conversationId,
+      firstMessageAt: Date.now(),
+      landingResult: opts.landingResult,
+      attempts: opts.attempts,
+    }),
+  );
+}
+
+// ------------------------------------------------------------
+// getPendingToRetry
+// ------------------------------------------------------------
+
+test("getPendingToRetry returns error/pending rows with attempts < 5, excluding matched, unmatched, and attempts >= 5", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+
+  const includedError = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ERR001",
+    landingResult: "error",
+    attempts: 0,
+  });
+  const excludedMaxedOutError = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ERR005",
+    landingResult: "error",
+    attempts: 5,
+  });
+  const includedPending = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-PEND02",
+    landingResult: "pending",
+    attempts: 2,
+  });
+  const excludedMatched = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-MATCHD",
+    landingResult: "matched",
+    attempts: 0,
+  });
+  const excludedUnmatched = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-UNMTCH",
+    landingResult: "unmatched",
+    attempts: 0,
+  });
+
+  const rows = await t.query(internal.attribution.getPendingToRetry, {});
+
+  // Exactly the two included rows — not a subset/superset.
+  expect(rows).toHaveLength(2);
+  const ids = new Set(rows.map((row) => row._id));
+  expect(ids.has(includedError)).toBe(true);
+  expect(ids.has(includedPending)).toBe(true);
+  expect(ids.has(excludedMaxedOutError)).toBe(false);
+  expect(ids.has(excludedMatched)).toBe(false);
+  expect(ids.has(excludedUnmatched)).toBe(false);
+});
+
+// ------------------------------------------------------------
+// retryPending
+// ------------------------------------------------------------
+
+test("retryPending re-schedules sendSignal for every error/pending row; draining the scheduler bumps their attempts and leaves a matched row untouched", async () => {
+  // Dormant sendSignal branch (env unset) — deterministic, no fetch
+  // mock needed: every scheduled sendSignal call lands "error" + bumps
+  // attempts by exactly 1, so this test can assert the *count* of
+  // signals retryPending actually scheduled.
+  delete process.env.LANDING_CONVERSION_URL;
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const contactId = await seedContact(t, accountId);
+  const conversationId = await seedConversation(t, accountId, contactId);
+
+  const error1 = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ERR001",
+    landingResult: "error",
+    attempts: 0,
+  });
+  const error2 = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-ERR002",
+    landingResult: "error",
+    attempts: 1,
+  });
+  const matched = await insertSignalRow(t, {
+    accountId,
+    contactId,
+    conversationId,
+    identifier: "HY-MATCHD",
+    landingResult: "matched",
+    attempts: 0,
+  });
+
+  await t.action(internal.attribution.retryPending, {});
+
+  // Not yet run — convex-test does not auto-run scheduled functions
+  // (mirrors `ingest.test.ts`'s identical comment on its own
+  // sendSignal-scheduling test), so both error rows are still exactly
+  // as seeded until the scheduler queue is drained below.
+  let row1 = await t.run((ctx) => ctx.db.get(error1));
+  expect(row1!.attempts).toBe(0);
+
+  // Proves the schedule happened: draining the scheduler queue is the
+  // only way these rows could change at all.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  row1 = await t.run((ctx) => ctx.db.get(error1));
+  const row2 = await t.run((ctx) => ctx.db.get(error2));
+  const rowMatched = await t.run((ctx) => ctx.db.get(matched));
+
+  expect(row1!.landingResult).toBe("error");
+  expect(row1!.attempts).toBe(1);
+  expect(row2!.landingResult).toBe("error");
+  expect(row2!.attempts).toBe(2);
+
+  // retryPending never selects the matched row in the first place
+  // (getPendingToRetry excludes it) — untouched, not merely guarded by
+  // sendSignal's own already-matched check.
+  expect(rowMatched!.landingResult).toBe("matched");
+  expect(rowMatched!.attempts).toBe(0);
 });
