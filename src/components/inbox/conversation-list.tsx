@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useQuery } from "convex/react";
 import type { PaginationStatus } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import { matchesContactFilters } from "@/lib/inbox/conversations";
+import { PrefetchThread } from "@/components/inbox/prefetch-thread";
 import { toUiTag } from "@/lib/convex/adapters";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag } from "@/types";
@@ -152,6 +153,35 @@ export function ConversationList({
       onSelect(conv);
     },
     [onSelect]
+  );
+
+  // Hover-prefetch (perf): warm a conversation's thread queries while the
+  // pointer rests on its row, so the eventual click paints from the query
+  // cache instead of a cold round-trip. Debounced so sweeping the cursor
+  // down the list doesn't open a subscription for every row it crosses —
+  // only a row the pointer settles on (~120ms) gets prefetched. One slot:
+  // `prefetchId` follows the hover; the cache keeps prior warmed threads
+  // alive on its own (5-min TTL), so there's nothing to tear down here.
+  const [prefetchId, setPrefetchId] = useState<string | null>(null);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleHover = useCallback((id: string) => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = setTimeout(() => setPrefetchId(id), 120);
+  }, []);
+
+  const handleHoverEnd = useCallback(() => {
+    if (hoverTimer.current) {
+      clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    },
+    [],
   );
 
   const activeFilter = FILTER_OPTIONS.find((o) => o.value === filter);
@@ -355,6 +385,8 @@ export function ConversationList({
                 conversation={conv}
                 isActive={conv.id === activeConversationId}
                 onSelect={handleSelect}
+                onHover={handleHover}
+                onHoverEnd={handleHoverEnd}
                 t={t}
               />
             ))}
@@ -383,6 +415,10 @@ export function ConversationList({
           </div>
         )}
       </ScrollArea>
+
+      {/* Invisible hover-prefetcher for the row the pointer rests on —
+          renders nothing, just warms that thread's cache. */}
+      {prefetchId && <PrefetchThread conversationId={prefetchId} />}
     </div>
   );
 }
@@ -391,6 +427,10 @@ interface ConversationItemProps {
   conversation: Conversation;
   isActive: boolean;
   onSelect: (conversation: Conversation) => void;
+  /** Pointer entered this row — parent debounces then prefetches it. */
+  onHover: (conversationId: string) => void;
+  /** Pointer left this row before the debounce fired — cancel it. */
+  onHoverEnd: () => void;
   t: ReturnType<typeof useTranslations>;
 }
 
@@ -398,6 +438,8 @@ function ConversationItem({
   conversation,
   isActive,
   onSelect,
+  onHover,
+  onHoverEnd,
   t,
 }: ConversationItemProps) {
   const contact = conversation.contact;
@@ -408,6 +450,10 @@ function ConversationItem({
     onSelect(conversation);
   }, [onSelect, conversation]);
 
+  const handleMouseEnter = useCallback(() => {
+    onHover(conversation.id);
+  }, [onHover, conversation.id]);
+
   const timeAgo = conversation.last_message_at
     ? formatDistanceToNow(new Date(conversation.last_message_at), {
         addSuffix: false,
@@ -417,6 +463,8 @@ function ConversationItem({
   return (
     <button
       onClick={handleClick}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={onHoverEnd}
       className={cn(
         "flex w-full items-start gap-3 px-3 py-3 text-left transition-colors hover:bg-muted/50",
         isActive && "border-l-2 border-primary bg-muted/70"
