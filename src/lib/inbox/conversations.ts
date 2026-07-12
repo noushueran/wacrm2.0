@@ -69,3 +69,36 @@ export function matchesContactFilters(
 
   return true;
 }
+
+/** How a conversation's assignee should render as a row chip in the Inbox. */
+export type AssigneeDisplay =
+  | { kind: "unassigned" }
+  | { kind: "you" }
+  | { kind: "other"; name: string; avatarUrl?: string };
+
+/**
+ * Resolves how a conversation's assignee should appear in the list row.
+ * `profilesById` is keyed by `user_id` (from `api.members.list` mapped
+ * through `toUiMemberProfile`). Returns `you` when the chat is assigned to
+ * the current user, `unassigned` when it sits in the pool, and otherwise the
+ * teammate's name/avatar — falling back to the label "Assigned" when that
+ * teammate has no name or is not in the roster.
+ */
+export function resolveAssignee(
+  conversation: Pick<Conversation, "assigned_agent_id">,
+  currentUserId: string | null | undefined,
+  profilesById: Map<
+    string,
+    { full_name: string | null; avatar_url?: string | null }
+  >,
+): AssigneeDisplay {
+  const id = conversation.assigned_agent_id;
+  if (!id) return { kind: "unassigned" };
+  if (currentUserId && id === currentUserId) return { kind: "you" };
+  const p = profilesById.get(id);
+  return {
+    kind: "other",
+    name: p?.full_name ?? "Assigned",
+    avatarUrl: p?.avatar_url ?? undefined,
+  };
+}

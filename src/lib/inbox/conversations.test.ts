@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   matchesContactFilters,
   normalizeConversation,
+  resolveAssignee,
 } from "./conversations";
 import type { Conversation } from "@/types";
 
@@ -141,5 +142,42 @@ describe("normalizeConversation", () => {
     };
     // A contactless row passes through untouched (consumers use `?.`).
     expect(normalizeConversation(raw).contact).toBeNull();
+  });
+});
+
+describe("resolveAssignee", () => {
+  const profiles = new Map<
+    string,
+    { full_name: string | null; avatar_url?: string | null }
+  >([
+    ["u-b", { full_name: "Bob", avatar_url: "http://x/bob.png" }],
+    ["u-c", { full_name: null, avatar_url: null }],
+  ]);
+
+  it("returns unassigned when there is no assignee", () => {
+    expect(
+      resolveAssignee({ assigned_agent_id: undefined }, "u-a", profiles),
+    ).toEqual({ kind: "unassigned" });
+  });
+
+  it("returns 'you' when assigned to the current user", () => {
+    expect(resolveAssignee({ assigned_agent_id: "u-a" }, "u-a", profiles)).toEqual(
+      { kind: "you" },
+    );
+  });
+
+  it("returns the teammate's name + avatar when assigned to someone else", () => {
+    expect(resolveAssignee({ assigned_agent_id: "u-b" }, "u-a", profiles)).toEqual(
+      { kind: "other", name: "Bob", avatarUrl: "http://x/bob.png" },
+    );
+  });
+
+  it("falls back to 'Assigned' when the teammate has no name or is not in the roster", () => {
+    expect(resolveAssignee({ assigned_agent_id: "u-c" }, "u-a", profiles)).toEqual(
+      { kind: "other", name: "Assigned", avatarUrl: undefined },
+    );
+    expect(resolveAssignee({ assigned_agent_id: "u-z" }, "u-a", profiles)).toEqual(
+      { kind: "other", name: "Assigned", avatarUrl: undefined },
+    );
   });
 });
