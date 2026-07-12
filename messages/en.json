@@ -158,7 +158,13 @@
       "clearAll": "Clear all",
       "noConversations": "No conversations found",
       "noMessagesYet": "No messages yet",
-      "unknown": "Unknown"
+      "unknown": "Unknown",
+      "tabAll": "All",
+      "tabMine": "Mine",
+      "tabUnassigned": "Unassigned",
+      "assignedToYou": "You",
+      "emptyMine": "No chats assigned to you yet",
+      "emptyUnassigned": "No unassigned chats"
     },
     "messageThread": {
       "backToConversations": "Back to conversations",
