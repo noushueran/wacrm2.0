@@ -11,6 +11,10 @@ import {
   shouldDispatchAiReply,
 } from "./ingest";
 import { encrypt } from "./lib/whatsappEncryption";
+import {
+  flattenInboundMessage,
+  type MetaWebhookMessage,
+} from "./lib/whatsapp/webhookParse";
 import type { Id } from "./_generated/dataModel";
 
 // Convex function modules for convex-test to resolve `internal.*`
@@ -1325,4 +1329,138 @@ test("processInbound schedules attribution.sendSignal on a fresh signal; drainin
   expect(signals).toHaveLength(1);
   expect(signals[0]!.landingResult).toBe("error");
   expect(signals[0]!.attempts).toBe(1);
+});
+
+// ============================================================
+// Task B8 — offline integration test for the SEAM no existing test
+// covers. webhookParse.test.ts proves `flattenInboundMessage` extracts
+// `ctwaClid` from a raw `referral` in isolation; the attribution tests
+// just above prove `processInbound` consumes an ALREADY-flattened
+// `message.ctwaClid`/HY- text and records a signal — but nothing
+// proves the two compose end-to-end: a RAW `MetaWebhookMessage`,
+// flattened by the SAME `flattenInboundMessage` convex/http.ts's
+// `processChange` calls, fed into `processInbound` exactly as
+// `processChange` does it (`{ accountId, from: rawMessage.from, name,
+// message: flattened }`), actually produces an `attributionSignals`
+// row.
+//
+// httpActions themselves can't be invoked under convex-test (see
+// webhookParse.ts's own header comment), so the literal HTTP POST to
+// `/whatsapp/ingest` is the deferred live E2E (see
+// docs/attribution-verified-conversion.md) — this offline test is the
+// stand-in, replicating exactly what `processChange` does between the
+// HTTP layer and the engine. Reuses this file's own
+// `seedAccount`/`seedAiConfig`/`seedWebhookEndpoint`/
+// `attributionSignalsFor` scaffolding and DRY-RUN env, same as every
+// processInbound test above. Each test asserts immediately after
+// `processInbound` returns — before any scheduled fn runs — so every
+// row here is still `"pending"` (mirrors the "schedules
+// attribution.sendSignal" test's own comment just above).
+// ============================================================
+
+test("integration seam: a RAW Meta message with referral.ctwa_clid flattens via flattenInboundMessage and ingests via processInbound into a ctwa-lane signal", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  // A RAW Meta webhook message — the exact shape Meta POSTs (an `id` +
+  // `referral`), not a hand-built FlattenedInboundMessage.
+  const raw: MetaWebhookMessage = {
+    id: "wamid.INT-CTWA1",
+    from: "15551230001",
+    timestamp: "1700000000",
+    type: "text",
+    text: { body: "Hi, interested in your offer" },
+    referral: { ctwa_clid: "clid-int-1", source_id: "AD1" },
+  };
+
+  const flattened = flattenInboundMessage(raw);
+  if (!flattened) throw new Error("expected a flattened message, got null");
+  // Proves this is genuinely the parser's output, not a hand-rolled
+  // stand-in: `wamid` only exists on `flattened` because
+  // flattenInboundMessage copied it over from raw.id (a differently
+  // named field on the raw shape), and `ctwaClid` only exists because
+  // it lifted raw.referral.ctwa_clid.
+  expect(flattened.wamid).toBe(raw.id);
+  expect(flattened.ctwaClid).toBe("clid-int-1");
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: raw.from,
+    message: flattened,
+  });
+
+  const signals = await attributionSignalsFor(t, accountId);
+  expect(signals).toHaveLength(1);
+  expect(signals[0]!.lane).toBe("ctwa");
+  expect(signals[0]!.identifier).toBe("clid-int-1");
+  expect(signals[0]!.landingResult).toBe("pending");
+});
+
+test("integration seam: a RAW Meta message with an HY- code in the text flattens via flattenInboundMessage and ingests via processInbound into a code-lane signal", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const raw: MetaWebhookMessage = {
+    id: "wamid.INT-CODE1",
+    from: "15551230002",
+    timestamp: "1700000001",
+    type: "text",
+    text: { body: "hi, my ref HY-ABCDEF please" },
+  };
+
+  const flattened = flattenInboundMessage(raw);
+  if (!flattened) throw new Error("expected a flattened message, got null");
+  expect(flattened.wamid).toBe(raw.id);
+  expect(flattened.text).toBe("hi, my ref HY-ABCDEF please");
+  expect(flattened.ctwaClid).toBeUndefined();
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: raw.from,
+    message: flattened,
+  });
+
+  const signals = await attributionSignalsFor(t, accountId);
+  expect(signals).toHaveLength(1);
+  expect(signals[0]!.lane).toBe("code");
+  expect(signals[0]!.identifier).toBe("HY-ABCDEF");
+  expect(signals[0]!.landingResult).toBe("pending");
+});
+
+test("integration seam: a RAW Meta message with neither a code nor a referral flattens via flattenInboundMessage and ingests via processInbound with NO attribution signal", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  const raw: MetaWebhookMessage = {
+    id: "wamid.INT-NONE1",
+    from: "15551230003",
+    timestamp: "1700000002",
+    type: "text",
+    text: { body: "just saying hello" },
+  };
+
+  const flattened = flattenInboundMessage(raw);
+  if (!flattened) throw new Error("expected a flattened message, got null");
+  expect(flattened.wamid).toBe(raw.id);
+  expect(flattened.ctwaClid).toBeUndefined();
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: raw.from,
+    message: flattened,
+  });
+
+  expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
 });
