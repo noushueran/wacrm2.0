@@ -297,3 +297,62 @@ test("flattenInboundMessage: a malformed media message (missing the nested id) s
     wamid: "wamid.DEFAULT",
   });
 });
+
+// ------------------------------------------------------------
+// flattenInboundMessage: ctwa_clid (click-to-WhatsApp ad referral)
+// ------------------------------------------------------------
+
+test("flattenInboundMessage: text with a referral surfaces ctwaClid alongside the existing fields", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "text",
+        text: { body: "Hi there" },
+        id: "wamid.1",
+        referral: { ctwa_clid: "abc", source_id: "AD1" },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "Hi there",
+    wamid: "wamid.1",
+    ctwaClid: "abc",
+  });
+});
+
+test("flattenInboundMessage: text with no referral has no ctwaClid", () => {
+  const result = flattenInboundMessage(
+    msg({ type: "text", text: { body: "Hi there" } }),
+  );
+  expect(result?.ctwaClid).toBeUndefined();
+});
+
+test("flattenInboundMessage: image with a referral surfaces ctwaClid alongside mediaId", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "image",
+        image: { id: "media-1", caption: "Look!" },
+        referral: { ctwa_clid: "xyz" },
+      }),
+    ),
+  ).toEqual({
+    type: "image",
+    text: "Look!",
+    mediaId: "media-1",
+    wamid: "wamid.DEFAULT",
+    ctwaClid: "xyz",
+  });
+});
+
+test("flattenInboundMessage: reaction with a referral still returns null (a referral must not resurrect a skipped type)", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "reaction",
+        reaction: { message_id: "wamid.X", emoji: "👍" },
+        referral: { ctwa_clid: "abc" },
+      }),
+    ),
+  ).toBeNull();
+});

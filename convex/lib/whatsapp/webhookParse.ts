@@ -65,6 +65,10 @@ export interface MetaWebhookMessage {
     list_reply?: { id: string; title?: string; description?: string };
   };
   context?: { id: string };
+  // Present when the message originated from a click-to-WhatsApp ad.
+  // `source_id` mirrors Meta's payload for fidelity even though only
+  // `ctwa_clid` is surfaced downstream (see `FlattenedInboundMessage`).
+  referral?: { ctwa_clid?: string; source_id?: string };
 }
 
 export interface MetaWebhookStatus {
@@ -236,9 +240,26 @@ export interface FlattenedInboundMessage {
   mediaId?: string;
   wamid: string;
   interactiveReplyId?: string;
+  ctwaClid?: string;
 }
 
+/**
+ * Public entry point: flattens by type, then merges the click-to-WhatsApp
+ * ad click id (if any) onto the result. Kept separate from `flattenByType`
+ * so the referral merge lives in exactly one place instead of being
+ * appended to every `case` below — a `reaction` (or other `null` result)
+ * stays `null`; a referral does not resurrect a skipped message.
+ */
 export function flattenInboundMessage(
+  message: MetaWebhookMessage,
+): FlattenedInboundMessage | null {
+  const base = flattenByType(message);
+  if (!base) return null;
+  const ctwaClid = message.referral?.ctwa_clid || undefined;
+  return ctwaClid ? { ...base, ctwaClid } : base;
+}
+
+function flattenByType(
   message: MetaWebhookMessage,
 ): FlattenedInboundMessage | null {
   const wamid = message.id;
