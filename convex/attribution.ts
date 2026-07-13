@@ -6,12 +6,44 @@ import type { Doc, Id } from "./_generated/dataModel";
 
 export const CODE_REGEX = /HY-[0-9A-HJKMNP-TV-Z]{6}/i;
 
+// Invisible zero-width code — a shared wire format with the landing site
+// (go-holidayys `src/lib/tracking/hidden-code.ts`, which keeps an IDENTICAL encoder).
+// The HY-code is hidden as ZWSP (U+200B) = bit 0 / ZWNJ (U+200C) = bit 1, 8 bits per
+// char (MSB first), so the visitor sees a normal message with nothing to delete.
+// End-to-end survival through WhatsApp → Meta Cloud API → this CRM verified live
+// 2026-07-13. Only ZWSP/ZWNJ are used (the two most universally preserved).
+const ZW_ZERO = "​"; // ZWSP
+const ZW_ONE = "‌"; // ZWNJ
+
+/** Decode the invisible zero-width run out of a message body back into a string.
+ *  Only ZWSP/ZWNJ are read; every visible/other character is ignored. */
+export function decodeHidden(text: string): string {
+  const bits = Array.from(text)
+    .filter((c) => c === ZW_ZERO || c === ZW_ONE)
+    .map((c) => (c === ZW_ZERO ? "0" : "1"))
+    .join("");
+  let out = "";
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    out += String.fromCharCode(parseInt(bits.slice(i, i + 8), 2));
+  }
+  return out;
+}
+
+/**
+ * The HY-code carried by an inbound message. PRIMARY path is the invisible
+ * zero-width code (invisible-only rollout); a visible HY-code is still accepted as a
+ * belt-and-suspenders fallback (legacy links / manually-typed codes). Uppercased.
+ */
 export function extractRefCode(text: string | undefined | null): string | null {
   if (!text) {
     return null;
   }
-  const match = text.match(CODE_REGEX);
-  return match ? match[0].toUpperCase() : null;
+  const hidden = decodeHidden(text).match(CODE_REGEX);
+  if (hidden) {
+    return hidden[0].toUpperCase();
+  }
+  const visible = text.match(CODE_REGEX);
+  return visible ? visible[0].toUpperCase() : null;
 }
 
 export function extractCtwaClid(msg: { ctwaClid?: string }): string | null {

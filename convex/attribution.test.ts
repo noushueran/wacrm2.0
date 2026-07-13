@@ -4,7 +4,18 @@ import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
-import { extractRefCode, extractCtwaClid } from "./attribution";
+import { extractRefCode, extractCtwaClid, decodeHidden } from "./attribution";
+
+// Mirror the landing-side encoder (go-holidayys src/lib/tracking/hidden-code.ts) so
+// these tests also prove the two sides agree on the exact wire format.
+function encodeHidden(code: string): string {
+  let out = "";
+  for (const ch of code) {
+    const bits = ch.charCodeAt(0).toString(2).padStart(8, "0");
+    for (const b of bits) out += b === "0" ? "​" : "‌";
+  }
+  return out;
+}
 
 test("extractRefCode finds our code anywhere, uppercased", () => {
   expect(extractRefCode("Hi… my enquiry ref: hy-3f9k2q")).toBe("HY-3F9K2Q");
@@ -30,6 +41,22 @@ test("extractRefCode charset boundary", () => {
 test("extractRefCode null input", () => {
   expect(extractRefCode(null)).toBeNull();
   expect(extractRefCode("")).toBeNull(); // empty string
+});
+
+test("extractRefCode decodes an INVISIBLE zero-width code (primary path)", () => {
+  const body = "Hi," + encodeHidden("HY-3F9K2Q") + " I need a UAE visa.";
+  // The code is invisible: stripping the zero-width chars leaves a plain message.
+  expect(body.replace(/[​‌]/g, "")).toBe("Hi, I need a UAE visa.");
+  expect(extractRefCode(body)).toBe("HY-3F9K2Q");
+});
+
+test("extractRefCode reads an invisible code with no visible text at all", () => {
+  expect(extractRefCode(encodeHidden("HY-ABCDEF"))).toBe("HY-ABCDEF");
+});
+
+test("decodeHidden yields nothing for a normal message (no false positives)", () => {
+  expect(decodeHidden("just a normal message")).toBe("");
+  expect(extractRefCode("just a normal message")).toBeNull();
 });
 
 // ============================================================
