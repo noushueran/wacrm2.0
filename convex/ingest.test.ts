@@ -17,6 +17,18 @@ import {
 } from "./lib/whatsapp/webhookParse";
 import type { Id } from "./_generated/dataModel";
 
+// Encode a 6-char base32 code as its 30 invisible zero-width chars — mirrors the
+// landing-side + attribution.ts codec, so these ingest tests feed the SAME wire form.
+const ZW_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTVWXYZ".replace(/[ILOU]/g, "");
+function hidden(code: string): string {
+  let out = "";
+  for (const ch of code) {
+    const bits = ZW_ALPHABET.indexOf(ch).toString(2).padStart(5, "0");
+    for (const b of bits) out += b === "0" ? "​" : "‌";
+  }
+  return out;
+}
+
 // Convex function modules for convex-test to resolve `internal.*`
 // references against. Absolute, from-project-root pattern (matches
 // every other `convex/*.test.ts` suite — see `convex/lib/auth.test.ts`'s
@@ -1170,7 +1182,7 @@ test("processInbound records a code-lane attribution signal when the inbound tex
     from: "15551234567",
     message: {
       type: "text",
-      text: "hi, my ref HY-ABCDEF please",
+      text: "hi," + hidden("ABCDEF") + " please",
       wamid: "wamid.CODE1",
     },
   });
@@ -1184,7 +1196,7 @@ test("processInbound records a code-lane attribution signal when the inbound tex
 
   const signals = await attributionSignalsFor(t, accountId);
   expect(signals).toHaveLength(1);
-  expect(signals[0]!.identifier).toBe("HY-ABCDEF");
+  expect(signals[0]!.identifier).toBe("ABCDEF");
   expect(signals[0]!.lane).toBe("code");
   expect(signals[0]!.phone).toBe("15551234567");
   expect(signals[0]!.landingResult).toBe("pending");
@@ -1231,7 +1243,7 @@ test("processInbound: an HY- code in the text wins over a ctwaClid also present 
     from: "15551234567",
     message: {
       type: "text",
-      text: "hi, my ref HY-ABCDEF please",
+      text: "hi," + hidden("ABCDEF") + " please",
       wamid: "wamid.BOTH1",
       ctwaClid: "clid-should-lose",
     },
@@ -1240,7 +1252,7 @@ test("processInbound: an HY- code in the text wins over a ctwaClid also present 
   const signals = await attributionSignalsFor(t, accountId);
   expect(signals).toHaveLength(1);
   expect(signals[0]!.lane).toBe("code");
-  expect(signals[0]!.identifier).toBe("HY-ABCDEF");
+  expect(signals[0]!.identifier).toBe("ABCDEF");
 });
 
 test("processInbound creates no attribution signal when the message carries neither an HY- code nor a ctwaClid", async () => {
@@ -1270,7 +1282,7 @@ test("processInbound does not create a second attribution signal when the SAME c
 
   const message = {
     type: "text" as const,
-    text: "hi, my ref HY-ABCDEF please",
+    text: "hi," + hidden("ABCDEF") + " please",
     wamid: "wamid.DUPCODE",
   };
 
@@ -1310,7 +1322,7 @@ test("processInbound schedules attribution.sendSignal on a fresh signal; drainin
     from: "15551234567",
     message: {
       type: "text",
-      text: "hi, my ref HY-ABCDEF please",
+      text: "hi," + hidden("ABCDEF") + " please",
       wamid: "wamid.SCHED1",
     },
   });
@@ -1413,13 +1425,13 @@ test("integration seam: a RAW Meta message with an HY- code in the text flattens
     from: "15551230002",
     timestamp: "1700000001",
     type: "text",
-    text: { body: "hi, my ref HY-ABCDEF please" },
+    text: { body: "hi," + hidden("ABCDEF") + " please" },
   };
 
   const flattened = flattenInboundMessage(raw);
   if (!flattened) throw new Error("expected a flattened message, got null");
   expect(flattened.wamid).toBe(raw.id);
-  expect(flattened.text).toBe("hi, my ref HY-ABCDEF please");
+  expect(flattened.text).toBe("hi," + hidden("ABCDEF") + " please");
   expect(flattened.ctwaClid).toBeUndefined();
 
   await t.action(internal.ingest.processInbound, {
@@ -1431,7 +1443,7 @@ test("integration seam: a RAW Meta message with an HY- code in the text flattens
   const signals = await attributionSignalsFor(t, accountId);
   expect(signals).toHaveLength(1);
   expect(signals[0]!.lane).toBe("code");
-  expect(signals[0]!.identifier).toBe("HY-ABCDEF");
+  expect(signals[0]!.identifier).toBe("ABCDEF");
   expect(signals[0]!.landingResult).toBe("pending");
 });
 

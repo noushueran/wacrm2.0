@@ -4,46 +4,48 @@ import { accountQuery } from "./lib/auth";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 
-export const CODE_REGEX = /HY-[0-9A-HJKMNP-TV-Z]{6}/i;
+// Compact invisible reference code — a shared wire format with the landing site
+// (go-holidayys `src/lib/tracking/hidden-code.ts`, which keeps an IDENTICAL codec).
+// The code is 6 Crockford base32 chars, encoded DIRECTLY as 30 bits — 5 bits per
+// char, MSB first — into ZWSP (U+200B) = 0 / ZWNJ (U+200C) = 1, anchored right after
+// the first word of the message. 30 hidden chars carry the whole code (down from 72
+// for the old "HY-XXXXXX" ASCII form), so there's far less to lose on an edit.
+// Survival through WhatsApp → Meta Cloud API → this CRM verified live 2026-07-13.
+// Only ZWSP/ZWNJ are used (the two most universally preserved).
+const ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTVWXYZ".replace(/[ILOU]/g, "");
+const CODE_LEN = 6;
+const BITS = CODE_LEN * 5; // 30
+const ZW_ZERO = "​"; // ZWSP → 0
+const ZW_ONE = "‌"; // ZWNJ → 1
 
-// Invisible zero-width code — a shared wire format with the landing site
-// (go-holidayys `src/lib/tracking/hidden-code.ts`, which keeps an IDENTICAL encoder).
-// The HY-code is hidden as ZWSP (U+200B) = bit 0 / ZWNJ (U+200C) = bit 1, 8 bits per
-// char (MSB first), so the visitor sees a normal message with nothing to delete.
-// End-to-end survival through WhatsApp → Meta Cloud API → this CRM verified live
-// 2026-07-13. Only ZWSP/ZWNJ are used (the two most universally preserved).
-const ZW_ZERO = "​"; // ZWSP
-const ZW_ONE = "‌"; // ZWNJ
-
-/** Decode the invisible zero-width run out of a message body back into a string.
- *  Only ZWSP/ZWNJ are read; every visible/other character is ignored. */
-export function decodeHidden(text: string): string {
+/** Decode the invisible reference code out of a message body: read the FIRST 30
+ *  zero-width bits (5 bits/char) into the 6-char base32 code. Null when fewer than a
+ *  full code of hidden bits are present. Only ZWSP/ZWNJ are read. */
+export function decodeHidden(text: string): string | null {
   const bits = Array.from(text)
     .filter((c) => c === ZW_ZERO || c === ZW_ONE)
     .map((c) => (c === ZW_ZERO ? "0" : "1"))
     .join("");
-  let out = "";
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    out += String.fromCharCode(parseInt(bits.slice(i, i + 8), 2));
+  if (bits.length < BITS) {
+    return null;
   }
-  return out;
+  let code = "";
+  for (let i = 0; i < BITS; i += 5) {
+    code += ALPHABET[parseInt(bits.slice(i, i + 5), 2)];
+  }
+  return code;
 }
 
 /**
- * The HY-code carried by an inbound message. PRIMARY path is the invisible
- * zero-width code (invisible-only rollout); a visible HY-code is still accepted as a
- * belt-and-suspenders fallback (legacy links / manually-typed codes). Uppercased.
+ * The reference code carried by an inbound message — decoded from the invisible
+ * zero-width block ONLY (invisible-only; no visible fallback). Null when no full
+ * hidden code is present.
  */
 export function extractRefCode(text: string | undefined | null): string | null {
   if (!text) {
     return null;
   }
-  const hidden = decodeHidden(text).match(CODE_REGEX);
-  if (hidden) {
-    return hidden[0].toUpperCase();
-  }
-  const visible = text.match(CODE_REGEX);
-  return visible ? visible[0].toUpperCase() : null;
+  return decodeHidden(text);
 }
 
 export function extractCtwaClid(msg: { ctwaClid?: string }): string | null {
