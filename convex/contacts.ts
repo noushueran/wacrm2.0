@@ -104,6 +104,59 @@ export async function allocateContactCode(
   return formatContactCode(1);
 }
 
+/**
+ * One-shot migration: assign `HC-…` codes to every contact that lacks one,
+ * per account, in `_creationTime` order, and seed each account's
+ * `("contacts")` counter to the highest number in use. Idempotent — coded
+ * contacts are skipped and the counter never moves backwards, so it is safe
+ * to re-run. Run once after deploying the schema change.
+ */
+export const backfillContactCodes = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const accounts = await ctx.db.query("accounts").collect();
+    for (const account of accounts) {
+      const contacts = await ctx.db
+        .query("contacts")
+        .withIndex("by_account", (q) => q.eq("accountId", account._id))
+        .collect();
+      contacts.sort((a, b) => a._creationTime - b._creationTime);
+
+      // Start from whichever is higher: the existing counter, or the max
+      // numeric code already assigned (covers a counter that lags reality).
+      const counter = await ctx.db
+        .query("counters")
+        .withIndex("by_account_name", (q) =>
+          q.eq("accountId", account._id).eq("name", "contacts"),
+        )
+        .first();
+      let next = counter?.value ?? 0;
+      for (const c of contacts) {
+        if (c.contactCode) {
+          const n = Number(c.contactCode.replace(/\D/g, ""));
+          if (Number.isFinite(n) && n > next) next = n;
+        }
+      }
+
+      for (const c of contacts) {
+        if (c.contactCode) continue;
+        next += 1;
+        await ctx.db.patch(c._id, { contactCode: formatContactCode(next) });
+      }
+
+      if (counter) {
+        if (next !== counter.value) await ctx.db.patch(counter._id, { value: next });
+      } else if (next > 0) {
+        await ctx.db.insert("counters", {
+          accountId: account._id,
+          name: "contacts",
+          value: next,
+        });
+      }
+    }
+  },
+});
+
 export const create = accountMutation({
   args: {
     phone: v.string(),

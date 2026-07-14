@@ -1367,3 +1367,53 @@ test("findOrCreateByPhoneInternal assigns a contact code on create, none extra o
   );
   expect(counter!.value).toBe(1);
 });
+
+// ============================================================
+// backfillContactCodes (Contact Section Enhancements, Task 3) — the
+// one-shot migration that codes contacts created before this feature
+// existed.
+// ============================================================
+
+test("backfillContactCodes assigns codes in creation order, is idempotent, and seeds the counter", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  // Insert three code-less contacts directly (simulating pre-migration rows).
+  const ids: Id<"contacts">[] = [];
+  for (const phone of ["111", "222", "333"]) {
+    const id = await t.run((ctx) =>
+      ctx.db.insert("contacts", { accountId, phone, phoneNormalized: phone }),
+    );
+    ids.push(id);
+  }
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  const codes = await Promise.all(
+    ids.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  expect(codes).toEqual(["HC-000001", "HC-000002", "HC-000003"]);
+
+  // Idempotent: re-running changes nothing.
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+  const codesAgain = await Promise.all(
+    ids.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  expect(codesAgain).toEqual(["HC-000001", "HC-000002", "HC-000003"]);
+
+  // Counter is seeded to the highest number used, so the next create
+  // continues at HC-000004 rather than colliding at HC-000001.
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(3);
+});
