@@ -403,3 +403,28 @@ export const setMediaUrl = internalMutation({
     await ctx.db.patch(args.messageId, { mediaUrl: args.mediaUrl });
   },
 });
+
+/** Attach the durable Convex-storage URL of a downloaded ad image to both
+ *  the message's `referral` and the conversation's `adReferral` denorm.
+ *  Best-effort partner to `ingest.processInbound`'s ad-image step. */
+export const setAdReferralImage = internalMutation({
+  args: {
+    messageId: v.id("messages"),
+    conversationId: v.id("conversations"),
+    storedImageUrl: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (message?.referral) {
+      await ctx.db.patch(args.messageId, {
+        referral: { ...message.referral, storedImageUrl: args.storedImageUrl },
+      });
+    }
+    const conversation = await ctx.db.get(args.conversationId);
+    if (conversation?.adReferral) {
+      await ctx.db.patch(args.conversationId, {
+        adReferral: { ...conversation.adReferral, storedImageUrl: args.storedImageUrl },
+      });
+    }
+  },
+});

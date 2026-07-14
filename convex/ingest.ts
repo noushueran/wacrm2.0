@@ -570,6 +570,29 @@ export const processInbound = internalAction({
       }
     }
 
+    // ---- Ad-referral image → storage ----
+    // The referral gives a DIRECT public CDN url (not a Meta mediaId), so a
+    // plain `storeFromUrl` (no auth headers) re-hosts it into Convex storage
+    // — same durability the inbound-media block gives voice notes/photos,
+    // so the ad card never breaks when Meta's CDN url expires. After the
+    // dedup guard above, so a Meta retry can't orphan a second copy.
+    const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
+    if (adImageSrc) {
+      await runBestEffort("ingest.storeAdReferralImage", async () => {
+        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+          url: adImageSrc,
+        });
+        const url = await ctx.storage.getUrl(storageId);
+        if (url) {
+          await ctx.runMutation(internal.messages.setAdReferralImage, {
+            messageId: res.messageId,
+            conversationId: res.conversationId,
+            storedImageUrl: url,
+          });
+        }
+      });
+    }
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.

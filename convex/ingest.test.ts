@@ -1569,3 +1569,36 @@ test("processInbound sets no ad fields for a plain (non-ad) inbound message", as
   const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
   expect(contact!.acquisitionSource).toBeUndefined();
 });
+
+test("processInbound downloads the ad image into storage and attaches storedImageUrl to the message + conversation", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  const imgBytes = new TextEncoder().encode("jpeg-ad-banner-bytes");
+  const fetchMock = vi.fn(async () =>
+    ({ ok: true, status: 200, blob: async () => new Blob([imgBytes], { type: "image/jpeg" }) }) as unknown as Response,
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551230000",
+    message: {
+      type: "text",
+      text: "info?",
+      wamid: "wamid.ADIMG1",
+      referral: { sourceType: "ad", headline: "Pkg", imageUrl: "https://scontent.example/ad.jpg" },
+    },
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADIMG1")).first(),
+  );
+  expect(message!.referral?.storedImageUrl).toBeTruthy();
+  const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
+  expect(conversation!.adReferral?.storedImageUrl).toBeTruthy();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
