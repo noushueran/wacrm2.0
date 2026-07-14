@@ -406,7 +406,16 @@ export const setMediaUrl = internalMutation({
 
 /** Attach the durable Convex-storage URL of a downloaded ad image to both
  *  the message's `referral` and the conversation's `adReferral` denorm.
- *  Best-effort partner to `ingest.processInbound`'s ad-image step. */
+ *  Best-effort partner to `ingest.processInbound`'s ad-image step.
+ *
+ *  The MESSAGE patch is unconditional — every ad message records its OWN
+ *  stored image. The CONVERSATION patch is set-once (only when
+ *  `storedImageUrl` is still empty), mirroring `ingestInbound`'s "first ad
+ *  wins" for the whole `adReferral` denorm: a returning contact who clicks
+ *  a DIFFERENT ad reuses the same conversation, whose `adReferral` still
+ *  pins Ad A's headline/imageUrl — so its `storedImageUrl` must stay Ad A's
+ *  too, never flipping to the later ad's image (which would desync the card:
+ *  Ad A's headline over Ad B's picture). */
 export const setAdReferralImage = internalMutation({
   args: {
     messageId: v.id("messages"),
@@ -421,7 +430,7 @@ export const setAdReferralImage = internalMutation({
       });
     }
     const conversation = await ctx.db.get(args.conversationId);
-    if (conversation?.adReferral) {
+    if (conversation?.adReferral && !conversation.adReferral.storedImageUrl) {
       await ctx.db.patch(args.conversationId, {
         adReferral: { ...conversation.adReferral, storedImageUrl: args.storedImageUrl },
       });

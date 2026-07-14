@@ -1602,3 +1602,68 @@ test("processInbound downloads the ad image into storage and attaches storedImag
   expect(conversation!.adReferral?.storedImageUrl).toBeTruthy();
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
+
+test("processInbound pins the conversation adReferral image to the FIRST ad — a later DIFFERENT ad updates only its own message, not the conversation denorm", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  // Distinct bytes per ad creative (adA vs adB) — convex-test's
+  // `ctx.storage.store` is content-addressed, so identical bytes would
+  // collapse to the same storage id (hence the same getUrl) and mask a
+  // conversation-level overwrite. Different bytes → different stored URLs,
+  // so an overwrite of the conversation denorm is observable as a URL flip.
+  const fetchMock = vi.fn(async (url: string | URL) => {
+    const bytes = new TextEncoder().encode(
+      String(url).includes("adB") ? "jpeg-ad-B-bytes" : "jpeg-ad-A-bytes",
+    );
+    return {
+      ok: true,
+      status: 200,
+      blob: async () => new Blob([bytes], { type: "image/jpeg" }),
+    } as unknown as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const sendAd = (wamid: string, headline: string, imageUrl: string) =>
+    t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551230000",
+      message: {
+        type: "text",
+        text: "info?",
+        wamid,
+        referral: { sourceType: "ad", headline, imageUrl },
+      },
+    });
+
+  // ---- Ad A: the FIRST ad on this (new) conversation ----
+  await sendAd("wamid.ADA", "Ad A", "https://scontent.example/adA.jpg");
+  const msgA = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADA")).first(),
+  );
+  const convAfterA = await t.run((ctx) => ctx.db.get(msgA!.conversationId));
+  // The conversation denorm is filled from the first ad's own stored image.
+  expect(convAfterA!.adReferral?.storedImageUrl).toBeTruthy();
+  expect(convAfterA!.adReferral?.storedImageUrl).toBe(msgA!.referral?.storedImageUrl);
+  const pinnedUrl = convAfterA!.adReferral!.storedImageUrl;
+
+  // ---- Ad B: a returning contact clicks a DIFFERENT ad; the SAME
+  // conversation is reused (by_contact lookup), and its `adReferral` is
+  // set-once so it still holds Ad A's headline/imageUrl. ----
+  await sendAd("wamid.ADB", "Ad B", "https://scontent.example/adB.jpg");
+  const msgB = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADB")).first(),
+  );
+  const convAfterB = await t.run((ctx) => ctx.db.get(msgB!.conversationId));
+
+  // Msg B recorded its OWN stored image (message-scoped — always correct)...
+  expect(msgB!.referral?.storedImageUrl).toBeTruthy();
+  expect(msgB!.referral?.storedImageUrl).not.toBe(pinnedUrl);
+  // ...but the conversation denorm stays PINNED to Ad A's image (set-once),
+  // so it never desyncs from the Ad A headline/imageUrl it holds. Without
+  // the guard, this flips to Ad B's URL and the assertion fails.
+  expect(convAfterB!.adReferral?.storedImageUrl).toBe(pinnedUrl);
+});
