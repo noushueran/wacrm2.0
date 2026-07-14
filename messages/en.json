@@ -317,7 +317,10 @@
       "nationality": "Nationality",
       "preferredDestination": "Preferred destination",
       "aboutPlaceholder": "Add notes about this contact…",
-      "notFilled": "—"
+      "notFilled": "—",
+      "sectionAcquisition": "Acquisition",
+      "acquiredViaAd": "Acquired via a Click-to-WhatsApp ad",
+      "viewAd": "View ad"
     },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",

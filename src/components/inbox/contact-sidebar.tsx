@@ -21,6 +21,8 @@ import {
   MapPin,
   Plane,
   Info,
+  Megaphone,
+  ExternalLink,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -297,6 +299,32 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
               notFilled={tSidebar("notFilled")}
             />
           </Section>
+
+          {contact.acquisition_source === "ad" && (
+            <Section icon={Megaphone} label={tSidebar("sectionAcquisition")}>
+              <div className="px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  {tSidebar("acquiredViaAd")}
+                </p>
+                {contact.acquisition_ad?.headline && (
+                  <p className="mt-0.5 text-sm text-foreground">
+                    {contact.acquisition_ad.headline}
+                  </p>
+                )}
+                {contact.acquisition_ad?.source_url && (
+                  <a
+                    href={contact.acquisition_ad.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-0.5 inline-flex items-center gap-0.5 text-xs text-primary hover:underline"
+                  >
+                    {tSidebar("viewAd")}
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
+              </div>
+            </Section>
+          )}
 
           {/* Section: Location */}
           <Section icon={MapPin} label={tSidebar("sectionLocation")}>
