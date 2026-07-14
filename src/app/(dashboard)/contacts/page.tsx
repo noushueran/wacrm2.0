@@ -141,9 +141,8 @@ export default function ContactsPage() {
   );
 
   // Tag-filtered list — offset-paginated (`filterByTags` supports
-  // limit/offset). Both this and `contacts.list` above now support
-  // full name/phone/email/ID search, not just name; see
-  // convex/contacts.ts.
+  // limit/offset). filterByTags searches name/phone/email only; contacts.list
+  // above additionally supports ID search.
   const filtered = useQuery(
     api.contacts.filterByTags,
     usingTagFilter
