@@ -4,11 +4,16 @@ import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { useQuery } from "convex/react";
 import type { PaginationStatus } from "convex/react";
 import { api } from "../../../convex/_generated/api";
-import { matchesContactFilters } from "@/lib/inbox/conversations";
+import {
+  matchesContactFilters,
+  resolveAssignee,
+  type AssigneeDisplay,
+} from "@/lib/inbox/conversations";
 import { PrefetchThread } from "@/components/inbox/prefetch-thread";
-import { toUiTag } from "@/lib/convex/adapters";
+import { toUiTag, toUiMemberProfile } from "@/lib/convex/adapters";
+import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
-import type { Conversation, ConversationStatus, Tag } from "@/types";
+import type { Conversation, ConversationStatus, Tag, Profile } from "@/types";
 import { Search, ChevronDown, X } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -23,6 +28,10 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { OwnSpendLine } from "@/components/inbox/own-spend-line";
 
+/** Which assignment bucket the list shows. `all` omits the server-side
+ *  `assignment` filter entirely (today's default view). */
+export type AssignmentTab = "all" | "mine" | "unassigned";
+
 interface ConversationListProps {
   activeConversationId: string | null;
   onSelect: (conversation: Conversation) => void;
@@ -34,6 +43,10 @@ interface ConversationListProps {
   /** Pagination status from the page's `usePaginatedQuery` — drives the
    *  initial spinner and the "Load more" button's visibility. */
   status: PaginationStatus;
+  /** Active assignment tab + setter — owned by the page, which owns the
+   *  paginated query this tab feeds into. */
+  assignment: AssignmentTab;
+  onAssignmentChange: (tab: AssignmentTab) => void;
 }
 
 const STATUS_COLORS: Record<ConversationStatus, string> = {
@@ -52,6 +65,8 @@ export function ConversationList({
   conversations,
   loadMore,
   status,
+  assignment,
+  onAssignmentChange,
 }: ConversationListProps) {
   const t = useTranslations("Inbox.conversationList");
 
@@ -62,6 +77,15 @@ export function ConversationList({
     { label: t("filterPending"), value: "pending" },
     { label: t("filterClosed"), value: "closed" },
   ], [t]);
+
+  const ASSIGNMENT_TABS: { label: string; value: AssignmentTab }[] = useMemo(
+    () => [
+      { label: t("tabAll"), value: "all" },
+      { label: t("tabMine"), value: "mine" },
+      { label: t("tabUnassigned"), value: "unassigned" },
+    ],
+    [t],
+  );
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<InboxFilter>("all");
@@ -77,6 +101,21 @@ export function ConversationList({
   // use by a loaded conversation).
   const tagDocs = useQuery(api.tags.list);
   const tags = (tagDocs ?? []).map(toUiTag);
+
+  // Current user + account roster — resolve each row's assignee chip
+  // (a teammate's name/initial, or "You"). `api.members.list` is already
+  // loaded by the thread's assign dropdown, so this reuses a cached
+  // subscription rather than adding a new round-trip.
+  const { user } = useAuth();
+  const memberDocs = useQuery(api.members.list);
+  const profilesById = useMemo(() => {
+    const m = new Map<string, Profile>();
+    for (const doc of memberDocs ?? []) {
+      const p = toUiMemberProfile(doc);
+      m.set(p.user_id, p);
+    }
+    return m;
+  }, [memberDocs]);
 
   // Company options are derived from the loaded conversations — there's no
   // separate companies table, and only companies with a live conversation
@@ -195,6 +234,28 @@ export function ConversationList({
           supervisors/admins (who have the Dashboard card instead) and
           when lead-value tracking is off. */}
       <OwnSpendLine />
+
+      {/* Assignment tabs — which bucket of chats to show. A separate axis
+          from the status/tags filters below: this one is server-filtered
+          via the page's `assignment` query arg, so each tab paginates its
+          own complete set. `All` is the default (today's view unchanged). */}
+      <div className="flex items-center gap-1 border-b border-border p-2">
+        {ASSIGNMENT_TABS.map((tab) => (
+          <button
+            key={tab.value}
+            type="button"
+            onClick={() => onAssignmentChange(tab.value)}
+            className={cn(
+              "flex-1 rounded-md px-2 py-1 text-xs font-medium transition-colors",
+              assignment === tab.value
+                ? "bg-muted text-primary"
+                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+            )}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
       {/* Search + Filter */}
       <div className="space-y-2 border-b border-border p-3">
@@ -375,7 +436,13 @@ export function ConversationList({
           </div>
         ) : filtered.length === 0 ? (
           <div className="px-4 py-12 text-center">
-            <p className="text-sm text-muted-foreground">{t("noConversations")}</p>
+            <p className="text-sm text-muted-foreground">
+              {assignment === "mine"
+                ? t("emptyMine")
+                : assignment === "unassigned"
+                  ? t("emptyUnassigned")
+                  : t("noConversations")}
+            </p>
           </div>
         ) : (
           <div className="flex flex-col">
@@ -385,6 +452,7 @@ export function ConversationList({
                 conversation={conv}
                 isActive={conv.id === activeConversationId}
                 onSelect={handleSelect}
+                assignee={resolveAssignee(conv, user?.id, profilesById)}
                 onHover={handleHover}
                 onHoverEnd={handleHoverEnd}
                 t={t}
@@ -427,6 +495,7 @@ interface ConversationItemProps {
   conversation: Conversation;
   isActive: boolean;
   onSelect: (conversation: Conversation) => void;
+  assignee: AssigneeDisplay;
   /** Pointer entered this row — parent debounces then prefetches it. */
   onHover: (conversationId: string) => void;
   /** Pointer left this row before the debounce fired — cancel it. */
@@ -438,6 +507,7 @@ function ConversationItem({
   conversation,
   isActive,
   onSelect,
+  assignee,
   onHover,
   onHoverEnd,
   t,
@@ -496,6 +566,23 @@ function ConversationItem({
             {conversation.last_message_text || t("noMessagesYet")}
           </p>
           <div className="flex shrink-0 items-center gap-1.5">
+            {assignee.kind !== "unassigned" && (
+              <span
+                title={
+                  assignee.kind === "you" ? t("assignedToYou") : assignee.name
+                }
+                className={cn(
+                  "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium",
+                  assignee.kind === "you"
+                    ? "bg-primary/15 text-primary"
+                    : "bg-muted text-muted-foreground"
+                )}
+              >
+                {assignee.kind === "you"
+                  ? t("assignedToYou")
+                  : assignee.name.charAt(0).toUpperCase()}
+              </span>
+            )}
             {conversation.unread_count > 0 && (
               <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
                 {conversation.unread_count}

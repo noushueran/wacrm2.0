@@ -10,7 +10,10 @@ import type { Id } from "../../../../convex/_generated/dataModel";
 import { toUiConversation } from "@/lib/convex/adapters";
 import { inboxUrl } from "@/lib/inbox/view";
 import type { Conversation } from "@/types";
-import { ConversationList } from "@/components/inbox/conversation-list";
+import {
+  ConversationList,
+  type AssignmentTab,
+} from "@/components/inbox/conversation-list";
 import { MessageThread } from "@/components/inbox/message-thread";
 import { ContactPanelDrawer } from "@/components/inbox/contact-panel-drawer";
 import { WifiOff } from "lucide-react";
@@ -29,6 +32,11 @@ export default function InboxPage() {
   const [activeConversationId, setActiveConversationId] = useState<
     string | null
   >(null);
+
+  // Which assignment "bucket" the list shows: everything, only chats
+  // assigned to me, or only the unassigned pool. Server-filtered via the
+  // `assignment` arg below so each tab paginates its own complete set.
+  const [assignment, setAssignment] = useState<AssignmentTab>("all");
 
   /**
    * Whether the contact-details slide-over is open. On-demand, not
@@ -62,7 +70,7 @@ export default function InboxPage() {
   // whole coordinator this page used to own is gone.
   const conv = usePaginatedQuery(
     api.conversations.list,
-    {},
+    { assignment: assignment === "all" ? undefined : assignment },
     { initialNumItems: 30 },
   );
   const conversations = useMemo(
@@ -184,6 +192,8 @@ export default function InboxPage() {
             conversations={conversations}
             loadMore={conv.loadMore}
             status={conv.status}
+            assignment={assignment}
+            onAssignmentChange={setAssignment}
           />
         </div>
 
