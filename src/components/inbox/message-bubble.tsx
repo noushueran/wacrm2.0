@@ -28,6 +28,10 @@ interface MessageBubbleProps {
   reactions?: MessageReaction[];
   currentUserId?: string;
   onToggleReaction?: (emoji: string) => void;
+  /** When false (viewer role), reaction pills render read-only (still
+   *  shown, not clickable) — passed through to <MessageReactions>.
+   *  Defaults to true. */
+  canReact?: boolean;
 }
 
 function StatusIcon({ status }: { status: Message["status"] }) {
@@ -276,6 +280,7 @@ export function MessageBubble({
   reactions,
   currentUserId,
   onToggleReaction,
+  canReact = true,
 }: MessageBubbleProps) {
   const t = useTranslations("Inbox.bubble");
 
@@ -346,6 +351,7 @@ export function MessageBubble({
           reactions={reactions}
           currentUserId={currentUserId}
           onToggle={onToggleReaction}
+          canReact={canReact}
         />
       )}
     </div>

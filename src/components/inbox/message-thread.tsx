@@ -602,6 +602,13 @@ export function MessageThread({
   // assign-dropdown's agent-limited actions and the composer swap below.
   const mine = assignedAgentId === user?.id;
   const isPool = !assignedAgentId;
+  // Viewers are read-only in the thread (Task 11 parity with the status /
+  // assign controls above): they can see reactions but not add or toggle
+  // them — reactions.set/remove require requireRole("agent"). Threaded into
+  // the message toolbar (hides the add-reaction button) and the pills
+  // (rendered non-interactive) so a viewer never gets a control that would
+  // only fail server-side.
+  const canReact = accountRole !== "viewer";
 
   return (
     // `min-w-0` is load-bearing: the page already puts min-w-0 on the
@@ -864,6 +871,7 @@ export function MessageThread({
                       <MessageActions
                         key={msg.id}
                         message={msg}
+                        canReact={canReact}
                         onReply={() => handleStartReply(msg)}
                         onReact={(emoji) => {
                           if (emoji) void postReaction(msg.id, emoji);
@@ -875,6 +883,7 @@ export function MessageThread({
                           reactions={msgReactions}
                           currentUserId={user?.id}
                           onToggleReaction={handlePillToggle}
+                          canReact={canReact}
                         />
                       </MessageActions>
                     );
