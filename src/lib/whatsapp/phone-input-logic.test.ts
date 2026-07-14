@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_COUNTRY,
   composeE164,
+  formatAsYouType,
   isValidNationalNumber,
   listCountryOptions,
   splitE164,
@@ -36,5 +37,13 @@ describe("phone-input-logic", () => {
       national: "501234567",
     });
     expect(splitE164("")).toBeNull();
+  });
+
+  it("live-formats an AE number as the user types it (AsYouType), inserting spaces", () => {
+    // libphonenumber-js's AsYouType only recognizes the domestic trunk-0
+    // form as it's typed, so "0501234567" (not "501234567") is the input
+    // that actually exercises its progressive space-insertion — confirmed
+    // against the installed libphonenumber-js@^1.13.8 AsYouType directly.
+    expect(formatAsYouType("AE", "0501234567")).toBe("050 123 4567");
   });
 });

@@ -36,6 +36,7 @@ export function PhoneInput({ value, onChange, id, placeholder }: PhoneInputProps
       setNational(parts.national);
     } else if (!value) {
       setNational('');
+      setCountry(DEFAULT_COUNTRY);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-seed only on external value change
   }, [value]);
