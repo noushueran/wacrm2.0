@@ -1058,6 +1058,47 @@ test("filterByTags applies name/phone/email search on top of the tag match", asy
   expect(result.items[0]!._id).toBe(c1);
 });
 
+test("filterByTags matches by contact ID under an active tag filter", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+
+  const tagA = await asUser.mutation(api.tags.create, {
+    name: "A",
+    color: "#000",
+  });
+  // Phones deliberately contain no "1", so the ID-search terms below match
+  // ONLY via `contactCode`, not incidentally via the phone number.
+  const c1 = await asUser.mutation(api.contacts.create, {
+    phone: "555",
+    name: "Jonas",
+  }); // HC-000001
+  const c2 = await asUser.mutation(api.contacts.create, {
+    phone: "777",
+    name: "Marija",
+  }); // HC-000002
+  // Both carry the tag, so a match must come from the ID, not the tag set.
+  await asUser.mutation(api.contacts.assignTag, { contactId: c1, tagId: tagA });
+  await asUser.mutation(api.contacts.assignTag, { contactId: c2, tagId: tagA });
+
+  // Previously ID search silently returned nothing while a tag filter was
+  // active (filterByTags matched name/phone/email only). Full code, bare
+  // number, and zero-padded number now all resolve to c1 (not c2).
+  for (const search of ["HC-000001", "1", "000001"]) {
+    const result = await asUser.query(api.contacts.filterByTags, {
+      tagIds: [tagA],
+      search,
+      limit: 10,
+      offset: 0,
+    });
+    expect(result.total).toBe(1);
+    expect(result.items[0]!._id).toBe(c1);
+  }
+});
+
 test("filterByTags paginates with offset/limit while total reflects every match", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {

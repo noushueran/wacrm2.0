@@ -296,14 +296,12 @@ export const filterByTags = accountQuery({
         contact !== null && contact.accountId === ctx.accountId,
     );
 
-    const term = search?.trim().toLowerCase();
+    // Same matcher as `list`'s search branch — name/phoneNormalized/email/
+    // contactCode with lenient ID matching — so contact-ID (and digit-based
+    // phone) search works identically whether or not a tag filter is active.
+    const term = search?.trim();
     const matched = term
-      ? contacts.filter(
-          (contact) =>
-            contact.name?.toLowerCase().includes(term) ||
-            contact.phone.toLowerCase().includes(term) ||
-            contact.email?.toLowerCase().includes(term),
-        )
+      ? contacts.filter((contact) => matchesContactSearch(contact, term))
       : contacts;
 
     matched.sort((a, b) => b._creationTime - a._creationTime);
