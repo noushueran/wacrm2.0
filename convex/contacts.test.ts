@@ -1382,9 +1382,15 @@ test("backfillContactCodes assigns codes in creation order, is idempotent, and s
     role: "agent",
   });
 
-  // Insert three code-less contacts directly (simulating pre-migration rows).
+  // Insert three code-less contacts directly (simulating pre-migration
+  // rows), in the REVERSE of their expected code order — phone "333" is
+  // created first, "111" last. If codes were assigned by anything other
+  // than true `_creationTime` order (e.g. phone value, or whatever
+  // incidental order `.collect()` happened to return), this would
+  // produce a different, easily-distinguishable result; ascending
+  // insertion order couldn't have told the two apart.
   const ids: Id<"contacts">[] = [];
-  for (const phone of ["111", "222", "333"]) {
+  for (const phone of ["333", "222", "111"]) {
     const id = await t.run((ctx) =>
       ctx.db.insert("contacts", { accountId, phone, phoneNormalized: phone }),
     );
@@ -1396,6 +1402,8 @@ test("backfillContactCodes assigns codes in creation order, is idempotent, and s
   const codes = await Promise.all(
     ids.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
   );
+  // ids[0] ("333") was created FIRST, so it gets the LOWEST code — even
+  // though "333" is numerically/lexically the largest phone value.
   expect(codes).toEqual(["HC-000001", "HC-000002", "HC-000003"]);
 
   // Idempotent: re-running changes nothing.
@@ -1416,4 +1424,143 @@ test("backfillContactCodes assigns codes in creation order, is idempotent, and s
       .first(),
   );
   expect(counter!.value).toBe(3);
+});
+
+test("backfillContactCodes seeds past a counter that lags an already-assigned code's numeric suffix", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  // An already-coded contact whose numeric suffix (50) is HIGHER than the
+  // counter row below (3) — simulates a counter that drifted behind
+  // reality (e.g. codes assigned by some path other than
+  // `allocateContactCode`). Without the "bump past the max assigned code"
+  // logic (convex/contacts.ts:134-139), the backfill below would trust the
+  // stale counter, hand the code-less contact HC-000004, and leave the
+  // counter at 4 — a future `create` would eventually count up to 50 and
+  // collide with this contact's existing HC-000050.
+  await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "111",
+      phoneNormalized: "111",
+      contactCode: "HC-000050",
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("counters", { accountId, name: "contacts", value: 3 }),
+  );
+
+  // A code-less contact that still needs backfilling.
+  const codelessId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "222",
+      phoneNormalized: "222",
+    }),
+  );
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  // Continues from the true max (50), not the stale counter (3): lands on
+  // HC-000051, never colliding with the existing HC-000050.
+  const codeless = await t.run((ctx) => ctx.db.get(codelessId));
+  expect(codeless!.contactCode).toBe("HC-000051");
+
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(51);
+});
+
+test("backfillContactCodes scopes numbering and counters independently per account", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: aliceId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { accountId: bobId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const { accountId: carolId } = await seedAccountMember(t, {
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+
+  // Alice gets two code-less contacts, Bob gets one, Carol gets none at
+  // all — she should come out of a global backfill run completely
+  // untouched.
+  const aliceIds: Id<"contacts">[] = [];
+  for (const phone of ["a1", "a2"]) {
+    const id = await t.run((ctx) =>
+      ctx.db.insert("contacts", {
+        accountId: aliceId,
+        phone,
+        phoneNormalized: phone,
+      }),
+    );
+    aliceIds.push(id);
+  }
+  const bobContactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId: bobId,
+      phone: "b1",
+      phoneNormalized: "b1",
+    }),
+  );
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  const aliceCodes = await Promise.all(
+    aliceIds.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  expect(aliceCodes).toEqual(["HC-000001", "HC-000002"]);
+
+  // Bob's own sequence starts at HC-000001 too, not HC-000003 — proving
+  // his numbering doesn't continue on from Alice's.
+  const bobContact = await t.run((ctx) => ctx.db.get(bobContactId));
+  expect(bobContact!.contactCode).toBe("HC-000001");
+
+  const aliceCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", aliceId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  const bobCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", bobId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  const carolCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", carolId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(aliceCounter!.value).toBe(2);
+  expect(bobCounter!.value).toBe(1);
+  // Carol had zero contacts, so the backfill never touches her: no counter
+  // row is conjured out of nowhere (`next` stays 0, and the mutation only
+  // inserts a counter when `next > 0`).
+  expect(carolCounter).toBeNull();
 });
