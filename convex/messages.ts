@@ -5,6 +5,7 @@ import { paginationOptsValidator } from "convex/server";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
+import type { AdReferral } from "./lib/whatsapp/webhookParse";
 
 // ============================================================
 // Messages — the Inbox thread view (`listByConversation`) plus the
@@ -97,6 +98,9 @@ export interface AppendMessageArgs {
   // can't drift" comment on `insertMessageAndUpdateConversation`.
   interactiveReplyId?: string;
   aiGenerated?: boolean;
+  /** Click-to-WhatsApp ad referral (inbound-only), stored verbatim on the
+   *  message row. `storedImageUrl` is filled later (Task 3). */
+  referral?: AdReferral;
 }
 
 export async function insertMessageAndUpdateConversation(
@@ -116,6 +120,7 @@ export async function insertMessageAndUpdateConversation(
     interactivePayload,
     interactiveReplyId,
     aiGenerated,
+    referral,
   } = args;
 
   const newMessageId = await ctx.db.insert("messages", {
@@ -130,6 +135,7 @@ export async function insertMessageAndUpdateConversation(
     interactivePayload,
     interactiveReplyId,
     aiGenerated,
+    referral,
     status: "sent",
   });
 

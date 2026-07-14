@@ -73,6 +73,17 @@ export default defineSchema({
     nationality: v.optional(v.string()),
     preferredDestination: v.optional(v.string()),
     notes: v.optional(v.string()),
+    // Lead-acquisition provenance. Set ONCE, the first time a contact
+    // arrives via a Click-to-WhatsApp ad referral; never overwritten.
+    acquisitionSource: v.optional(v.literal("ad")),
+    acquisitionAd: v.optional(
+      v.object({
+        headline: v.optional(v.string()),
+        sourceId: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        firstSeenAt: v.number(),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_account_phone", ["accountId", "phoneNormalized"])
@@ -136,6 +147,21 @@ export default defineSchema({
     // uniform trigger parity across every such table (P1 review) — the
     // dashboard's inbox sort and the v1 API contract both expose it.
     updatedAt: v.optional(v.number()),
+    // Denormalized Click-to-WhatsApp ad summary — presence flags this
+    // conversation as an "ad lead" for the inbox badge without scanning
+    // messages. `startedAt` anchors the 72h free-entry-point indicator
+    // (set once, on the first ad message).
+    adReferral: v.optional(
+      v.object({
+        headline: v.optional(v.string()),
+        body: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+        imageUrl: v.optional(v.string()),
+        storedImageUrl: v.optional(v.string()),
+        startedAt: v.number(),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"])
@@ -199,6 +225,23 @@ export default defineSchema({
     // default). Already surfaced optional in `src/types/index.ts`
     // (`Message.ai_generated?: boolean`).
     aiGenerated: v.optional(v.boolean()),
+    // The full Click-to-WhatsApp ad referral, on the FIRST inbound message
+    // that carried it. `storedImageUrl` is the durable Convex-storage copy
+    // of the ad image (Task 3), patched in after ingest.
+    referral: v.optional(
+      v.object({
+        sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+        sourceId: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        headline: v.optional(v.string()),
+        body: v.optional(v.string()),
+        mediaType: v.optional(v.union(v.literal("image"), v.literal("video"))),
+        imageUrl: v.optional(v.string()),
+        videoUrl: v.optional(v.string()),
+        thumbnailUrl: v.optional(v.string()),
+        storedImageUrl: v.optional(v.string()),
+      }),
+    ),
   })
     .index("by_conversation", ["conversationId"])
     .index("by_message_id", ["messageId"])

@@ -1476,3 +1476,96 @@ test("integration seam: a RAW Meta message with neither a code nor a referral fl
 
   expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
 });
+
+test("processInbound persists the ad referral on the message, denorms it onto the conversation, and marks the contact acquired via ad", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551230000",
+    message: {
+      type: "text",
+      text: "Hello, how can I get more info?",
+      wamid: "wamid.ADLEAD1",
+      ctwaClid: "clid-1",
+      referral: {
+        sourceType: "ad",
+        sourceId: "120210000",
+        sourceUrl: "https://fb.me/ad123",
+        headline: "Dubai 5N/6D Package",
+        body: "Starting AED 1,499",
+        mediaType: "image",
+        imageUrl: "https://scontent.example/ad.jpg",
+      },
+    },
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADLEAD1"))
+      .first(),
+  );
+  expect(message!.referral?.headline).toBe("Dubai 5N/6D Package");
+  expect(message!.referral?.sourceType).toBe("ad");
+
+  const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
+  expect(conversation!.adReferral?.headline).toBe("Dubai 5N/6D Package");
+  expect(typeof conversation!.adReferral?.startedAt).toBe("number");
+
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionSource).toBe("ad");
+  expect(contact!.acquisitionAd?.sourceId).toBe("120210000");
+});
+
+test("processInbound does NOT overwrite an existing conversation adReferral or contact acquisition on a later ad message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  const send = (wamid: string, headline: string) =>
+    t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551230000",
+      message: {
+        type: "text",
+        text: "hi",
+        wamid,
+        referral: { sourceType: "ad", sourceId: "AD-" + headline, headline },
+      },
+    });
+  await send("wamid.FIRST", "First Ad");
+  await send("wamid.SECOND", "Second Ad");
+
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  expect(conversation!.adReferral?.headline).toBe("First Ad");
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionAd?.sourceId).toBe("AD-First Ad");
+});
+
+test("processInbound sets no ad fields for a plain (non-ad) inbound message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551239999",
+    message: { type: "text", text: "just browsing", wamid: "wamid.PLAIN1" },
+  });
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  expect(conversation!.adReferral).toBeUndefined();
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionSource).toBeUndefined();
+});

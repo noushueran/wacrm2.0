@@ -91,6 +91,19 @@ const inboundMessageValidator = v.object({
   wamid: v.string(),
   interactiveReplyId: v.optional(v.string()),
   ctwaClid: v.optional(v.string()),
+  referral: v.optional(
+    v.object({
+      sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+      sourceId: v.optional(v.string()),
+      sourceUrl: v.optional(v.string()),
+      headline: v.optional(v.string()),
+      body: v.optional(v.string()),
+      mediaType: v.optional(v.union(v.literal("image"), v.literal("video"))),
+      imageUrl: v.optional(v.string()),
+      videoUrl: v.optional(v.string()),
+      thumbnailUrl: v.optional(v.string()),
+    }),
+  ),
 });
 
 export const ingestInbound = internalMutation({
@@ -237,12 +250,43 @@ export const ingestInbound = internalMutation({
       mediaUrl: message.mediaUrl,
       messageId: message.wamid,
       interactiveReplyId: message.interactiveReplyId,
+      referral: message.referral,
     };
     const messageId = await insertMessageAndUpdateConversation(
       ctx,
       appendArgs,
       conversation,
     );
+
+    // ---- (4b) ad-lead denorm + contact acquisition (set once) ----
+    // `conversation` is the pre-patch doc, so `.adReferral` reflects state
+    // BEFORE this message — the correct "already an ad lead?" check.
+    if (message.referral) {
+      if (!conversation.adReferral) {
+        await ctx.db.patch(conversationId, {
+          adReferral: {
+            headline: message.referral.headline,
+            body: message.referral.body,
+            sourceUrl: message.referral.sourceUrl,
+            sourceType: message.referral.sourceType,
+            imageUrl: message.referral.imageUrl ?? message.referral.thumbnailUrl,
+            startedAt: Date.now(),
+          },
+        });
+      }
+      const contactForAcq = existingContact ?? (await ctx.db.get(contactId));
+      if (contactForAcq && !contactForAcq.acquisitionSource) {
+        await ctx.db.patch(contactId, {
+          acquisitionSource: "ad",
+          acquisitionAd: {
+            headline: message.referral.headline,
+            sourceId: message.referral.sourceId,
+            sourceUrl: message.referral.sourceUrl,
+            firstSeenAt: Date.now(),
+          },
+        });
+      }
+    }
 
     return {
       contactId,
