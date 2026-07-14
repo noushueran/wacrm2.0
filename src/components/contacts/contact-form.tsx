@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { PhoneInput } from '@/components/ui/phone-input';
 import { Label } from '@/components/ui/label';
 import { Loader2, AlertTriangle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
@@ -220,15 +221,14 @@ export function ContactForm({
             <Label htmlFor="cf-phone" className="text-muted-foreground">
               {t('phoneLabel')} <span className="text-red-400">*</span>
             </Label>
-            <Input
+            <PhoneInput
               id="cf-phone"
               value={phone}
-              onChange={(e) => {
-                setPhone(e.target.value);
+              onChange={(next) => {
+                setPhone(next);
                 if (dupContactId) setDupContactId(null);
               }}
               placeholder={t('phonePlaceholder')}
-              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
             />
             {dupContact ? (
               <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-2 text-xs text-red-300">
