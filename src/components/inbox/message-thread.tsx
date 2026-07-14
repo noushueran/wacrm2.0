@@ -44,6 +44,7 @@ import {
   ArrowLeft,
   Loader2,
   ChevronRight,
+  Megaphone,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -662,6 +663,15 @@ export function MessageThread({
             <Clock className="h-3 w-3" />
             {sessionInfo.remaining}
           </Badge>
+          {conversation.ad_referral && (
+            <Badge
+              variant="outline"
+              className="ml-1 hidden gap-1 border-primary/40 text-[10px] text-primary sm:inline-flex sm:ml-2"
+            >
+              <Megaphone className="h-3 w-3" />
+              {t("adLeadBadge")}
+            </Badge>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
