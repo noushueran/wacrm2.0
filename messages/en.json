@@ -244,7 +244,9 @@
       "interactiveReply": "[Interactive reply]",
       "unsupported": "[Unsupported message type]",
       "aiBadge": "AI",
-      "aiBadgeTitle": "Sent automatically by the AI assistant"
+      "aiBadgeTitle": "Sent automatically by the AI assistant",
+      "fromAd": "From an ad",
+      "viewAd": "View ad"
     },
     "actions": {
       "reply": "Reply",
