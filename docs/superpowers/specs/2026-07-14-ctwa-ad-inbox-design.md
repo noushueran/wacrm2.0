@@ -57,18 +57,23 @@ This is the critical, non-obvious rule and it shapes the whole window design:
   came from an ad and the business replied within 24h, all messages within 72h —
   including templates sent in hours 24–72 — are **free of charge**.
 
-> "if the 24h Customer Service Window closes and you're beyond 24h from the user's
-> last message, you can only send template messages — though they are still free
-> within the 72h FEP window."
-> — [DoubleTick: 72-hour free window](https://learn.doubletick.io/click-to-whatsapp-ctwa/understanding-the-72-hour-free-messaging-window-for-ctwa-leads)
+Meta's **primary** documentation states the FEP conversation "lasts 72 hours" and
+that within it you may send any message type free — **but** "you can only send
+non-template messages if there is an open customer service window between you and
+the customer," and "the customer service window is independent of the FEP window."
+Meta's own worked example: reply at 10pm and free-form is allowed only until ~10am
+the next day (24h from the customer's message); after that, templates only — still
+free for the remainder of the 72h.
 
 So the real benefit of an ad lead is **free template re-engagement for 72h**, not
 free-form for 72h. Extending the composer's free-form gate to 72h would produce
-Meta API rejections in hours 24–72 — we deliberately do **not** do that.
+Meta API rejections in hours 24–72 — we deliberately do **not** do that. (This was
+double-checked against Meta's primary docs after the number was challenged; the 72h
+FEP window is also **unchanged** by the Oct 2026 service-message pricing update.)
 
-Sources also: [SleekFlow](https://help.sleekflow.io/en_US/whatsapp/understanding-click-to-whatsapp-ads-ctwa-and-the-72-hour-free-window),
-[Helpscout / Mastermind KB](https://mastermind.helpscoutdocs.com/article/1222-managing-whatsapp-conversations-a-guide-to-categories-duration-and-free-entry-point-conversations),
-[Meta pricing](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing).
+Primary sources: [Meta — Conversation-based pricing (defines FEP)](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing/conversation-based-pricing),
+[Meta — Pricing](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing),
+[Meta — Pricing updates](https://developers.facebook.com/docs/whatsapp/pricing/updates-to-pricing/).
 
 ## 3. Decisions (locked with the user)
 
