@@ -573,10 +573,12 @@ export async function findOrCreateContactByPhone(
     .first();
   if (existing) return { contactId: existing._id, created: false };
 
+  const contactCode = await allocateContactCode(ctx.db, accountId);
   const contactId = await ctx.db.insert("contacts", {
     accountId,
     phone: input.phone,
     phoneNormalized,
+    contactCode,
     name: input.name ?? input.phone,
     email: input.email,
     company: input.company,

@@ -2,7 +2,7 @@
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { ConvexError } from "convex/values";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -1324,4 +1324,46 @@ test("contact codes are numbered independently per account", async () => {
   const bob = await t.run((ctx) => ctx.db.get(bobId));
   expect(alice!.contactCode).toBe("HC-000001");
   expect(bob!.contactCode).toBe("HC-000001");
+});
+
+// ============================================================
+// contactCode via findOrCreateByPhoneInternal (Contact Section
+// Enhancements, Task 2) — the account-explicit find-or-create the
+// public API uses must allocate a code on the CREATE branch only; a
+// FIND must never burn a number.
+// ============================================================
+
+test("findOrCreateByPhoneInternal assigns a contact code on create, none extra on find", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const created = await t.mutation(
+    internal.contacts.findOrCreateByPhoneInternal,
+    { accountId, phone: "+971501234567", name: "Guest" },
+  );
+  expect(created.created).toBe(true);
+  const row = await t.run((ctx) => ctx.db.get(created.contactId));
+  expect(row!.contactCode).toBe("HC-000001");
+
+  const found = await t.mutation(
+    internal.contacts.findOrCreateByPhoneInternal,
+    { accountId, phone: "+971501234567" },
+  );
+  expect(found.created).toBe(false);
+  expect(found.contactId).toBe(created.contactId);
+
+  // No wasted number: the counter only advanced once.
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(1);
 });
