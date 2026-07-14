@@ -4,6 +4,7 @@ import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { normalizePhone, maskPhone } from "./lib/phone";
 import { hasMinRole } from "./lib/roles";
+import { matchesContactSearch } from "./lib/contactSearch";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -197,33 +198,43 @@ export const list = accountQuery({
   },
   handler: async (ctx, args) => {
     const { search, paginationOpts } = args;
+    const term = search?.trim();
 
-    // `search_name` only covers `name` (see convex/schema.ts) — phone/
-    // email search for the paginated list view is left as a documented
-    // gap (see the schema's "Search note"); `filterByTags` below is
-    // where full name/phone/email search is actually needed and
-    // implemented, since it already materializes full docs in memory.
-    const result = search
-      ? await ctx.db
-          .query("contacts")
-          .withSearchIndex("search_name", (q) =>
-            q.search("name", search).eq("accountId", ctx.accountId),
-          )
-          .paginate(paginationOpts)
-      : await ctx.db
-          .query("contacts")
-          .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-          .order("desc")
-          .paginate(paginationOpts);
+    const embedAndMask = async (contact: Doc<"contacts">) => {
+      const withTags = await embedTags(ctx, contact);
+      return hasMinRole(ctx.role, "supervisor")
+        ? withTags
+        : maskContactPhone(withTags);
+    };
 
-    const page = await Promise.all(
-      result.page.map(async (contact) => {
-        const withTags = await embedTags(ctx, contact);
-        return hasMinRole(ctx.role, "supervisor")
-          ? withTags
-          : maskContactPhone(withTags);
-      }),
-    );
+    if (term) {
+      // Full name/phone/email/ID search: scan the account's contacts in
+      // memory (same approach as `filterByTags`), newest-first, and page
+      // manually with the cursor as a stringified offset. Bounded by the
+      // account's own contact count; search does not use the name index
+      // (`search_name`, see convex/schema.ts) — that index only covers
+      // `name`, so matching phone/email/`HC-…` id requires scanning full
+      // docs via `matchesContactSearch` instead.
+      const all = await ctx.db
+        .query("contacts")
+        .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+        .order("desc")
+        .collect();
+      const matched = all.filter((c) => matchesContactSearch(c, term));
+      const offset = paginationOpts.cursor
+        ? Number(paginationOpts.cursor)
+        : 0;
+      const end = offset + paginationOpts.numItems;
+      const page = await Promise.all(matched.slice(offset, end).map(embedAndMask));
+      return { page, isDone: end >= matched.length, continueCursor: String(end) };
+    }
+
+    const result = await ctx.db
+      .query("contacts")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .order("desc")
+      .paginate(paginationOpts);
+    const page = await Promise.all(result.page.map(embedAndMask));
     return { ...result, page };
   },
 });

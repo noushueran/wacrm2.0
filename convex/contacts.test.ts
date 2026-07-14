@@ -620,6 +620,40 @@ test("list search_name matches by name prefix and stays scoped to the caller's a
   expect(result.page[0]!.name).toBe("Jonas Petraitis");
 });
 
+test("list search matches by phone digits, email, and contact ID (not just name)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor", // supervisor+ so the phone isn't masked in the result
+  });
+
+  await asUser.mutation(api.contacts.create, {
+    phone: "+971501234567",
+    name: "Jonas",
+    email: "jonas@travel.com",
+  }); // HC-000001
+  await asUser.mutation(api.contacts.create, { phone: "222", name: "Marija" });
+
+  const byPhone = await asUser.query(api.contacts.list, {
+    search: "50123",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byPhone.page.map((c) => c.name)).toEqual(["Jonas"]);
+
+  const byEmail = await asUser.query(api.contacts.list, {
+    search: "travel.com",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byEmail.page.map((c) => c.name)).toEqual(["Jonas"]);
+
+  const byId = await asUser.query(api.contacts.list, {
+    search: "HC-000001",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byId.page.map((c) => c.name)).toEqual(["Jonas"]);
+});
+
 test("assignTag is idempotent — assigning the same tag twice does not duplicate the link", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
