@@ -1,13 +1,14 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useMutation } from "convex/react";
 import { usePaginatedQuery, useQuery } from "@/lib/convex/cached";
 import { api } from "../../../../convex/_generated/api";
 import type { Id } from "../../../../convex/_generated/dataModel";
 import { toUiConversation } from "@/lib/convex/adapters";
+import { inboxUrl } from "@/lib/inbox/view";
 import type { Conversation } from "@/types";
 import {
   ConversationList,
@@ -20,7 +21,6 @@ import { cn } from "@/lib/utils";
 
 export default function InboxPage() {
   const t = useTranslations("Inbox.page");
-  const router = useRouter();
   const searchParams = useSearchParams();
   /**
    * `?c=<id>` deep-link support. Used when landing here from the
@@ -122,21 +122,27 @@ export default function InboxPage() {
       if (activeConversationId === conversation.id) return;
       setActiveConversationId(conversation.id);
       // Record the selection on the deep-link ref BEFORE we change the
-      // URL. The router.replace below flips `deepLinkConvId`, which
-      // could otherwise cause the auto-select effect above to think a
-      // *different* deep-link should be applied.
+      // URL. The history update below still flips `deepLinkConvId` (Next
+      // 16 syncs native history into `useSearchParams`), which could
+      // otherwise make the auto-select effect above apply a *different*
+      // deep-link.
       autoSelectedForDeepLinkRef.current = conversation.id;
-      // Reflect the selection in the URL so a refresh lands the user
-      // back in the same thread, and so copy-paste links work. Use
-      // replace() to avoid polluting browser history with every click.
-      router.replace(`/inbox?c=${conversation.id}`, { scroll: false });
+      // Reflect the selection in the URL so a refresh lands the user back
+      // in the same thread and copy-paste links work — but via the native
+      // history API, NOT `router.replace`. router.replace runs a soft
+      // navigation to `/inbox`, which re-runs the auth middleware and
+      // refetches the route's RSC payload on EVERY click, even though the
+      // visible thread is already driven by React state. replaceState
+      // updates the URL with none of that work, and (unlike pushState)
+      // keeps rapid chat-switching out of the back/forward stack.
+      window.history.replaceState(null, "", inboxUrl(conversation.id));
       markRead({
         conversationId: conversation.id as Id<"conversations">,
       }).catch((err) => {
         console.error("Failed to mark conversation read:", err);
       });
     },
-    [activeConversationId, router, markRead],
+    [activeConversationId, markRead],
   );
 
   // Mobile "back" — deselect the conversation so the list pane comes
@@ -147,8 +153,8 @@ export default function InboxPage() {
     // Clearing the ref lets the deep-link auto-selector fire again if
     // the user later visits /inbox?c=<same-id> — desirable UX.
     autoSelectedForDeepLinkRef.current = null;
-    router.replace("/inbox", { scroll: false });
-  }, [router]);
+    window.history.replaceState(null, "", inboxUrl(null));
+  }, []);
 
   // On mobile (<lg) we show a SINGLE pane — either the list or the
   // thread — rather than cramming both side-by-side. Selecting a

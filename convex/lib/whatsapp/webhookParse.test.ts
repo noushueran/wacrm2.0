@@ -291,9 +291,100 @@ test("flattenInboundMessage: an unrecognized type still surfaces as a visible te
   });
 });
 
+test("flattenInboundMessage: system (customer changed number) surfaces the human-readable body, not an '[Unsupported message type]' placeholder", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "system",
+        id: "wamid.SYS",
+        system: {
+          body: "This person changed their phone number to a new one.",
+          wa_id: "971500000000",
+          type: "user_changed_number",
+        },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "This person changed their phone number to a new one.",
+    wamid: "wamid.SYS",
+  });
+});
+
+test("flattenInboundMessage: system with no body falls back to a generic label (never a blank bubble)", () => {
+  expect(
+    flattenInboundMessage(
+      msg({ type: "system", system: { type: "customer_identity_changed" } }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "[System message]",
+    wamid: "wamid.DEFAULT",
+  });
+});
+
 test("flattenInboundMessage: a malformed media message (missing the nested id) still returns a bare message rather than throwing", () => {
   expect(flattenInboundMessage(msg({ type: "image" }))).toEqual({
     type: "image",
     wamid: "wamid.DEFAULT",
   });
+});
+
+// ------------------------------------------------------------
+// flattenInboundMessage: ctwa_clid (click-to-WhatsApp ad referral)
+// ------------------------------------------------------------
+
+test("flattenInboundMessage: text with a referral surfaces ctwaClid alongside the existing fields", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "text",
+        text: { body: "Hi there" },
+        id: "wamid.1",
+        referral: { ctwa_clid: "abc", source_id: "AD1" },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "Hi there",
+    wamid: "wamid.1",
+    ctwaClid: "abc",
+  });
+});
+
+test("flattenInboundMessage: text with no referral has no ctwaClid", () => {
+  const result = flattenInboundMessage(
+    msg({ type: "text", text: { body: "Hi there" } }),
+  );
+  expect(result?.ctwaClid).toBeUndefined();
+});
+
+test("flattenInboundMessage: image with a referral surfaces ctwaClid alongside mediaId", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "image",
+        image: { id: "media-1", caption: "Look!" },
+        referral: { ctwa_clid: "xyz" },
+      }),
+    ),
+  ).toEqual({
+    type: "image",
+    text: "Look!",
+    mediaId: "media-1",
+    wamid: "wamid.DEFAULT",
+    ctwaClid: "xyz",
+  });
+});
+
+test("flattenInboundMessage: reaction with a referral still returns null (a referral must not resurrect a skipped type)", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "reaction",
+        reaction: { message_id: "wamid.X", emoji: "👍" },
+        referral: { ctwa_clid: "abc" },
+      }),
+    ),
+  ).toBeNull();
 });

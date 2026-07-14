@@ -1562,7 +1562,8 @@
       "fields": "Fields & tags",
       "deals": "Deals & currency",
       "members": "Team members",
-      "api": "API keys"
+      "api": "API keys",
+      "conversions": "Conversions"
     },
     "groups": {
       "account": "Account",
@@ -1639,6 +1640,31 @@
       "newKeyDesc": "Name it after the integration that will use it, and grant only the scopes it needs.",
       "done": "Done",
       "networkError": "Could not reach the server"
+    },
+    "conversions": {
+      "title": "Conversions",
+      "description": "Leads that arrived through an attributed WhatsApp signal and were matched to a booking on Platform A.",
+      "empty": "No matched conversions yet.",
+      "funnel": {
+        "sent": "Signals sent",
+        "matched": "Matched",
+        "matchRate": "Match rate",
+        "pending": "Pending",
+        "unmatched": "Unmatched",
+        "error": "Error"
+      },
+      "columns": {
+        "phone": "Mobile number",
+        "identifier": "Identifier",
+        "lane": "Lane",
+        "offer": "Offer",
+        "time": "Time",
+        "fired": "Fired"
+      },
+      "lane": {
+        "code": "Code",
+        "ctwa": "CTWA"
+      }
     },
     "deals": {
       "title": "Deals & currency",

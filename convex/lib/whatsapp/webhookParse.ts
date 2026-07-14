@@ -59,12 +59,29 @@ export interface MetaWebhookMessage {
     address?: string;
   };
   reaction?: { message_id: string; emoji?: string };
+  // Present when Meta sends a `type: "system"` event — a customer changed
+  // their phone number (`user_changed_number` / `customer_changed_number`)
+  // or re-registered on a new device (`customer_identity_changed`). NOT a
+  // message the customer typed; `body` is Meta's human-readable notice
+  // (e.g. "‪+1 (555) 000‬ changed their phone number").
+  system?: {
+    body?: string;
+    identity?: string;
+    wa_id?: string;
+    new_wa_id?: string;
+    type?: string;
+    customer?: string;
+  };
   interactive?: {
     type?: "button_reply" | "list_reply";
     button_reply?: { id: string; title?: string };
     list_reply?: { id: string; title?: string; description?: string };
   };
   context?: { id: string };
+  // Present when the message originated from a click-to-WhatsApp ad.
+  // `source_id` mirrors Meta's payload for fidelity even though only
+  // `ctwa_clid` is surfaced downstream (see `FlattenedInboundMessage`).
+  referral?: { ctwa_clid?: string; source_id?: string };
 }
 
 export interface MetaWebhookStatus {
@@ -236,9 +253,26 @@ export interface FlattenedInboundMessage {
   mediaId?: string;
   wamid: string;
   interactiveReplyId?: string;
+  ctwaClid?: string;
 }
 
+/**
+ * Public entry point: flattens by type, then merges the click-to-WhatsApp
+ * ad click id (if any) onto the result. Kept separate from `flattenByType`
+ * so the referral merge lives in exactly one place instead of being
+ * appended to every `case` below — a `reaction` (or other `null` result)
+ * stays `null`; a referral does not resurrect a skipped message.
+ */
 export function flattenInboundMessage(
+  message: MetaWebhookMessage,
+): FlattenedInboundMessage | null {
+  const base = flattenByType(message);
+  if (!base) return null;
+  const ctwaClid = message.referral?.ctwa_clid || undefined;
+  return ctwaClid ? { ...base, ctwaClid } : base;
+}
+
+function flattenByType(
   message: MetaWebhookMessage,
 ): FlattenedInboundMessage | null {
   const wamid = message.id;
@@ -306,6 +340,18 @@ export function flattenInboundMessage(
         };
       }
       return { type: "interactive", text: "[Interactive reply]", wamid };
+    }
+
+    case "system": {
+      // A WhatsApp system notice (customer changed number / identity), not
+      // a message the customer typed. Surface Meta's human-readable `body`
+      // so the thread shows e.g. "‪+971…‬ changed their phone number"
+      // instead of a raw "[Unsupported message type: system]" placeholder.
+      // `ingestInbound` has no distinct system content_type, so it rides in
+      // as `"text"`; the `body || …` fallback guards against a blank bubble
+      // if Meta ever omits the body.
+      const body = message.system?.body?.trim();
+      return { type: "text", text: body || "[System message]", wamid };
     }
 
     case "reaction":
