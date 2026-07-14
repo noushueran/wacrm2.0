@@ -105,6 +105,15 @@ export function toUiContact(
     created_at: createdAt,
     updated_at: createdAt,
     tags: doc.tags ? doc.tags.map(toUiTag) : undefined,
+    acquisition_source: doc.acquisitionSource,
+    acquisition_ad: doc.acquisitionAd
+      ? {
+          headline: doc.acquisitionAd.headline,
+          source_id: doc.acquisitionAd.sourceId,
+          source_url: doc.acquisitionAd.sourceUrl,
+          first_seen_at: new Date(doc.acquisitionAd.firstSeenAt).toISOString(),
+        }
+      : undefined,
   };
 }
 
@@ -281,6 +290,17 @@ export function toUiConversation(
     ai_autoreply_disabled: doc.aiAutoreplyDisabled,
     ai_reply_count: doc.aiReplyCount,
     ai_handoff_summary: doc.aiHandoffSummary,
+    ad_referral: doc.adReferral
+      ? {
+          headline: doc.adReferral.headline,
+          body: doc.adReferral.body,
+          source_url: doc.adReferral.sourceUrl,
+          source_type: doc.adReferral.sourceType,
+          image_url: doc.adReferral.imageUrl,
+          stored_image_url: doc.adReferral.storedImageUrl,
+          started_at: new Date(doc.adReferral.startedAt).toISOString(),
+        }
+      : undefined,
   };
 }
 
@@ -309,6 +329,20 @@ export function toUiMessage(doc: Doc<"messages">): Message {
       | InteractiveMessagePayload
       | undefined,
     ai_generated: doc.aiGenerated,
+    referral: doc.referral
+      ? {
+          source_type: doc.referral.sourceType,
+          source_id: doc.referral.sourceId,
+          source_url: doc.referral.sourceUrl,
+          headline: doc.referral.headline,
+          body: doc.referral.body,
+          media_type: doc.referral.mediaType,
+          image_url: doc.referral.imageUrl,
+          video_url: doc.referral.videoUrl,
+          thumbnail_url: doc.referral.thumbnailUrl,
+          stored_image_url: doc.referral.storedImageUrl,
+        }
+      : undefined,
   };
 }
 

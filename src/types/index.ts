@@ -115,6 +115,14 @@ export interface Contact {
   nationality?: string;
   preferred_destination?: string;
   notes?: string;
+  /** Lead-acquisition provenance (set once). */
+  acquisition_source?: 'ad';
+  acquisition_ad?: {
+    headline?: string;
+    source_id?: string;
+    source_url?: string;
+    first_seen_at: string;
+  };
   avatar_url?: string;
   created_at: string;
   updated_at: string;
@@ -189,6 +197,8 @@ export interface Conversation {
   ai_autoreply_disabled?: boolean;
   ai_reply_count?: number;
   ai_handoff_summary?: string | null;
+  /** Present when this conversation began from a Click-to-WhatsApp ad. */
+  ad_referral?: ConversationAdReferral;
 }
 
 // ============================================================
@@ -226,6 +236,31 @@ export type ContentType =
   | 'interactive';
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
+export interface MessageAdReferral {
+  source_type?: 'ad' | 'post';
+  source_id?: string;
+  source_url?: string;
+  headline?: string;
+  body?: string;
+  media_type?: 'image' | 'video';
+  image_url?: string;
+  video_url?: string;
+  thumbnail_url?: string;
+  /** Durable Convex-storage copy of the ad image (preferred over image_url). */
+  stored_image_url?: string;
+}
+
+export interface ConversationAdReferral {
+  headline?: string;
+  body?: string;
+  source_url?: string;
+  source_type?: 'ad' | 'post';
+  image_url?: string;
+  stored_image_url?: string;
+  /** ISO timestamp the ad conversation started — anchors the 72h free window. */
+  started_at: string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
@@ -260,6 +295,9 @@ export interface Message {
    * badge in the inbox. Migration 033.
    */
   ai_generated?: boolean;
+  /** Click-to-WhatsApp ad referral, on the first inbound message. Drives
+   *  the ad-preview card in the bubble. */
+  referral?: MessageAdReferral;
 }
 
 export type ReactionActor = 'customer' | 'agent';
