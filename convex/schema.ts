@@ -64,6 +64,10 @@ export default defineSchema({
     email: v.optional(v.string()),
     company: v.optional(v.string()),
     avatarUrl: v.optional(v.string()),
+    // Human-readable per-account identifier, e.g. "HC-000123". Optional in
+    // the schema so pre-backfill rows validate, but written on every new
+    // insert via `allocateContactCode`.
+    contactCode: v.optional(v.string()),
     // Extended CRM detail — all optional, edited from the inbox contact
     // panel. Additive/backward-compatible; no migration.
     altPhone: v.optional(v.string()),
@@ -76,6 +80,7 @@ export default defineSchema({
   })
     .index("by_account", ["accountId"])
     .index("by_account_phone", ["accountId", "phoneNormalized"])
+    .index("by_account_code", ["accountId", "contactCode"])
     .searchIndex("search_name", {
       searchField: "name",
       filterFields: ["accountId"],
@@ -97,6 +102,15 @@ export default defineSchema({
     .index("by_contact", ["contactId"])
     .index("by_tag", ["tagId"])
     .index("by_contact_tag", ["contactId", "tagId"]),
+
+  // Per-account monotonic counters for human-readable sequential codes
+  // (e.g. `("contacts")` backs the HC-000123 contact code). One row per
+  // (accountId, name); `value` is the last number allocated (0 = none yet).
+  counters: defineTable({
+    accountId: v.id("accounts"),
+    name: v.string(),
+    value: v.number(),
+  }).index("by_account_name", ["accountId", "name"]),
 
   // ============================================================
   // Inbox + CRM (Phase 1, Task 1). Source: supabase/migrations

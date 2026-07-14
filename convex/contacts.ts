@@ -71,6 +71,39 @@ async function requireOwnContact(
   return contact;
 }
 
+/** Formats a running number as the human-readable contact code, e.g.
+ *  1 -> "HC-000001". Pad is a 6-digit MINIMUM (natural width beyond). */
+export function formatContactCode(n: number): string {
+  return `HC-${String(n).padStart(6, "0")}`;
+}
+
+/**
+ * Atomically allocates the next `HC-…` code for `accountId` by
+ * incrementing the account's `("contacts")` counter row (creating it at 1
+ * the first time). Convex mutations are transactional with optimistic-
+ * concurrency retry, so two concurrent creates can't collide on a number.
+ * Takes a bare `db` so it works from `accountMutation`, the plain-`{db}`
+ * `findOrCreateContactByPhone`, and the `internalMutation` inbound path.
+ */
+export async function allocateContactCode(
+  db: MutationCtx["db"],
+  accountId: Id<"accounts">,
+): Promise<string> {
+  const existing = await db
+    .query("counters")
+    .withIndex("by_account_name", (q) =>
+      q.eq("accountId", accountId).eq("name", "contacts"),
+    )
+    .first();
+  if (existing) {
+    const next = existing.value + 1;
+    await db.patch(existing._id, { value: next });
+    return formatContactCode(next);
+  }
+  await db.insert("counters", { accountId, name: "contacts", value: 1 });
+  return formatContactCode(1);
+}
+
 export const create = accountMutation({
   args: {
     phone: v.string(),
@@ -90,11 +123,13 @@ export const create = accountMutation({
     if (dup) {
       throw new ConvexError({ code: "DUPLICATE_PHONE", contactId: dup._id });
     }
+    const contactCode = await allocateContactCode(ctx.db, ctx.accountId);
     return await ctx.db.insert("contacts", {
       accountId: ctx.accountId,
       createdByUserId: ctx.userId,
       phone: args.phone,
       phoneNormalized,
+      contactCode,
       name: args.name,
       email: args.email,
       company: args.company,

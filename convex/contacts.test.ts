@@ -1281,3 +1281,47 @@ test("update persists the extended contact fields", async () => {
   expect(doc?.preferredDestination).toBe("Maldives");
   expect(doc?.notes).toBe("VIP — prefers window seat");
 });
+
+// ============================================================
+// contactCode — sequential HC-000001-style per-account identifier
+// (Contact Section Enhancements, Task 1).
+// ============================================================
+
+test("create assigns sequential HC- contact codes per account, starting at HC-000001", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const firstId = await asUser.mutation(api.contacts.create, { phone: "111" });
+  const secondId = await asUser.mutation(api.contacts.create, { phone: "222" });
+
+  const first = await t.run((ctx) => ctx.db.get(firstId));
+  const second = await t.run((ctx) => ctx.db.get(secondId));
+  expect(first!.contactCode).toBe("HC-000001");
+  expect(second!.contactCode).toBe("HC-000002");
+});
+
+test("contact codes are numbered independently per account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+
+  const aliceId = await asAlice.mutation(api.contacts.create, { phone: "111" });
+  const bobId = await asBob.mutation(api.contacts.create, { phone: "111" });
+
+  const alice = await t.run((ctx) => ctx.db.get(aliceId));
+  const bob = await t.run((ctx) => ctx.db.get(bobId));
+  expect(alice!.contactCode).toBe("HC-000001");
+  expect(bob!.contactCode).toBe("HC-000001");
+});
