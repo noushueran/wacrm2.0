@@ -107,6 +107,8 @@ export interface Contact {
   name?: string;
   email?: string;
   company?: string;
+  /** Human-readable per-account identifier, e.g. "HC-000123". */
+  contact_code?: string;
   /** Extended CRM detail, edited from the inbox contact panel. */
   alt_phone?: string;
   address?: string;
