@@ -49,6 +49,14 @@ export function isValidNationalNumber(
   return isValidPhoneNumber(national, country)
 }
 
+/** True only for a complete, valid `+E.164` number. `composeE164` falls
+ *  back to `+<dialCode><digits>` for incomplete input (e.g. a dial-code-
+ *  only or too-short value), so this is what save handlers must check
+ *  before persisting `PhoneInput`'s emitted value. */
+export function isCompletePhoneNumber(value: string): boolean {
+  return isValidPhoneNumber(value)
+}
+
 /** Parse a stored `+E.164` value back into the picker's parts. */
 export function splitE164(
   value: string,

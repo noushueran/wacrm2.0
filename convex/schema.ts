@@ -80,7 +80,6 @@ export default defineSchema({
   })
     .index("by_account", ["accountId"])
     .index("by_account_phone", ["accountId", "phoneNormalized"])
-    .index("by_account_code", ["accountId", "contactCode"])
     .searchIndex("search_name", {
       searchField: "name",
       filterFields: ["accountId"],

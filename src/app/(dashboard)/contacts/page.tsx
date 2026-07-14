@@ -615,17 +615,21 @@ export default function ContactsPage() {
                         align="end"
                         className="bg-popover border-border"
                       >
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void openChat(contact.id);
-                          }}
-                          className="text-popover-foreground focus:bg-muted focus:text-foreground"
-                        >
-                          <MessageSquare className="size-4" />
-                          {t('openChatAction')}
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator className="bg-border" />
+                        {canEdit && (
+                          <>
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void openChat(contact.id);
+                              }}
+                              className="text-popover-foreground focus:bg-muted focus:text-foreground"
+                            >
+                              <MessageSquare className="size-4" />
+                              {t('openChatAction')}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="bg-border" />
+                          </>
+                        )}
                         <DropdownMenuItem
                           onClick={(e) => {
                             e.stopPropagation();

@@ -3,6 +3,7 @@ import {
   DEFAULT_COUNTRY,
   composeE164,
   formatAsYouType,
+  isCompletePhoneNumber,
   isValidNationalNumber,
   listCountryOptions,
   splitE164,
@@ -29,6 +30,19 @@ describe("phone-input-logic", () => {
   it("validates a national number for its country", () => {
     expect(isValidNationalNumber("AE", "50 123 4567")).toBe(true);
     expect(isValidNationalNumber("AE", "123")).toBe(false);
+  });
+
+  it("only treats a complete, valid +E.164 number as complete (gates save on composeE164's incomplete-input fallback)", () => {
+    // Confirmed directly against the installed libphonenumber-js@^1.13.8's
+    // isValidPhoneNumber before asserting, same as this file's other tests:
+    //   isValidPhoneNumber("+971501234567") -> true  (full valid AE number)
+    //   isValidPhoneNumber("+971")          -> false (dial code only)
+    //   isValidPhoneNumber("")              -> false (empty)
+    //   isValidPhoneNumber("+9715")         -> false (too short)
+    expect(isCompletePhoneNumber("+971501234567")).toBe(true);
+    expect(isCompletePhoneNumber("+971")).toBe(false);
+    expect(isCompletePhoneNumber("")).toBe(false);
+    expect(isCompletePhoneNumber("+9715")).toBe(false);
   });
 
   it("splits an E.164 value back into country + national number", () => {

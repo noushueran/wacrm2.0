@@ -11,6 +11,7 @@ import {
   toUiContact,
   toUiTag,
 } from '@/lib/convex/adapters';
+import { isCompletePhoneNumber } from '@/lib/whatsapp/phone-input-logic';
 import {
   Dialog,
   DialogContent,
@@ -81,6 +82,14 @@ export function ContactForm({
   );
   const dupContact = dupContactDoc ? toUiContact(dupContactDoc) : null;
 
+  // Live validity of the composed `+E.164` value — `PhoneInput`'s
+  // `composeE164` falls back to `+<dialCode><digits>` for incomplete
+  // input (e.g. dial-code-only or a too-short number), so a non-empty
+  // `phone` isn't necessarily a saveable one. Computed from `phone`
+  // directly (no "touched"/"submitted" flag) so the message appears as
+  // the user types, same as `phoneHint`/`dupContact` below.
+  const phoneInvalid = phone.trim().length > 0 && !isCompletePhoneNumber(phone);
+
   const tagsResult = useQuery(api.tags.list);
   const tags = useMemo(
     () => (tagsResult ?? []).map(toUiTag),
@@ -118,6 +127,11 @@ export function ContactForm({
 
     if (!phone.trim()) {
       toast.error(t('phoneRequired'));
+      return;
+    }
+
+    if (!isCompletePhoneNumber(phone)) {
+      toast.error(t('phoneInvalid'));
       return;
     }
 
@@ -246,6 +260,8 @@ export function ContactForm({
                   )}
                 </div>
               </div>
+            ) : phoneInvalid ? (
+              <p className="text-xs text-red-400">{t('phoneInvalid')}</p>
             ) : (
               <p className="text-xs text-muted-foreground">
                 {t('phoneHint')}

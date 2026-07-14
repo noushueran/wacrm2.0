@@ -380,8 +380,8 @@
       "nameLabel": "Name",
       "namePlaceholder": "Jane Doe",
       "phoneLabel": "Phone Number",
-      "phonePlaceholder": "+1234567890",
-      "phoneHint": "Include country code, e.g. +1 for US",
+      "phonePlaceholder": "50 123 4567",
+      "phoneHint": "Pick the country, then enter the local number.",
       "emailLabel": "Email",
       "emailPlaceholder": "jane@example.com",
       "companyLabel": "Company",
@@ -403,7 +403,8 @@
       "dupSimilar": "A contact with a very similar number already exists.",
       "loadingTags": "Loading tags...",
       "noTagsAvailable": "No tags available. Create tags in Settings.",
-      "phoneRequired": "Phone number is required"
+      "phoneRequired": "Phone number is required",
+      "phoneInvalid": "Enter a valid phone number for the selected country."
     },
     "detailView": {
       "tabs": {
@@ -457,6 +458,7 @@
       "saveChangesBtn": "Save Changes",
       "saveCustomFieldsBtn": "Save Custom Fields",
       "toastPhoneRequired": "Phone number is required",
+      "phoneInvalid": "Enter a valid phone number for the selected country.",
       "toastUpdateFailed": "Failed to update contact",
       "toastUpdated": "Contact updated",
       "toastNotAuthenticated": "Not authenticated",

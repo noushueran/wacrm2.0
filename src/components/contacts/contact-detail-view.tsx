@@ -3,9 +3,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useAction, useMutation, useQuery } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
+import { useCan } from '@/hooks/use-can';
 import { useOpenContactChat } from '@/hooks/use-open-contact-chat';
 import { formatCurrency } from '@/lib/currency';
 import { formatPhoneDisplay } from '@/lib/whatsapp/phone-utils';
+import { isCompletePhoneNumber } from '@/lib/whatsapp/phone-input-logic';
 import { toast } from 'sonner';
 import type { MessageTemplate } from '@/types';
 import {
@@ -70,6 +72,7 @@ export function ContactDetailView({
 }: ContactDetailViewProps) {
   const t = useTranslations('Contacts.detailView');
   const { defaultCurrency } = useAuth();
+  const canEdit = useCan('send-messages');
 
   const [copiedPhone, setCopiedPhone] = useState(false);
   const openChat = useOpenContactChat();
@@ -87,6 +90,13 @@ export function ContactDetailView({
   const [editEmail, setEditEmail] = useState('');
   const [editCompany, setEditCompany] = useState('');
   const [savingDetails, setSavingDetails] = useState(false);
+  // Live validity of the composed `+E.164` value — same reasoning as
+  // `contact-form.tsx`'s `phoneInvalid`: `PhoneInput`'s `composeE164`
+  // falls back to `+<dialCode><digits>` for incomplete input, so this is
+  // computed straight from `editPhone` (no "touched" flag) so the inline
+  // error appears as the user types.
+  const editPhoneInvalid =
+    editPhone.trim().length > 0 && !isCompletePhoneNumber(editPhone);
 
   // Tags tab
   const [savingTags, setSavingTags] = useState(false);
@@ -183,6 +193,11 @@ export function ContactDetailView({
   async function saveDetails() {
     if (!contactId || !editPhone.trim()) {
       toast.error(t('toastPhoneRequired'));
+      return;
+    }
+
+    if (!isCompletePhoneNumber(editPhone)) {
+      toast.error(t('phoneInvalid'));
       return;
     }
 
@@ -356,6 +371,7 @@ export function ContactDetailView({
                     </button>
                     {contact.contact_code && (
                       <button
+                        type="button"
                         onClick={async () => {
                           await navigator.clipboard.writeText(contact.contact_code!);
                           setCopiedId(true);
@@ -385,15 +401,17 @@ export function ContactDetailView({
                 </div>
               </div>
               <div className="mt-3 flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void openChat(contact.id)}
-                  className="border-border text-muted-foreground hover:bg-muted"
-                >
-                  <MessageSquare className="size-4" />
-                  {t('openChatBtn')}
-                </Button>
+                {canEdit && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void openChat(contact.id)}
+                    className="border-border text-muted-foreground hover:bg-muted"
+                  >
+                    <MessageSquare className="size-4" />
+                    {t('openChatBtn')}
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   onClick={() => setTemplatePickerOpen(true)}
@@ -464,6 +482,9 @@ export function ContactDetailView({
                       value={editPhone}
                       onChange={setEditPhone}
                     />
+                    {editPhoneInvalid && (
+                      <p className="text-xs text-red-400">{t('phoneInvalid')}</p>
+                    )}
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-muted-foreground text-xs">{t('email')}</Label>
