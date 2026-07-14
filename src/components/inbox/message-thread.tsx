@@ -25,6 +25,7 @@ import {
   INITIAL_MESSAGE_PAGE_SIZE,
   messageAreaState,
 } from "@/lib/inbox/view";
+import { adFreeWindowRemainingMs } from "@/lib/inbox/adWindow";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import type {
   Conversation,
@@ -237,6 +238,25 @@ export function MessageThread({
 
     return { expired, remaining };
   }, [messages, tTimer]);
+
+  // Ad-lead free-entry-point window (72h, cost-only). Shown in the composer
+  // once the 24h free-form window has closed, so agents know template
+  // re-engagement is free. `null` when not an ad lead or the 72h has run out.
+  const adFreeWindowLabel = useMemo(() => {
+    // `conversation` is nullable here (this memo runs before the
+    // `!conversation` render guard below), so chain past it too.
+    const startedIso = conversation?.ad_referral?.started_at;
+    if (!startedIso) return null;
+    const remainingMs = adFreeWindowRemainingMs(
+      new Date(startedIso).getTime(),
+      Date.now(),
+    );
+    if (remainingMs <= 0) return null;
+    const hoursLeft = remainingMs / (60 * 60 * 1000);
+    return hoursLeft >= 1
+      ? tTimer("adFreeXhRemaining", { hours: Math.floor(hoursLeft) })
+      : tTimer("adFreeXmRemaining", { minutes: Math.floor(hoursLeft * 60) });
+  }, [conversation?.ad_referral?.started_at, tTimer]);
 
   // Reset the server-side unread_count to 0 whenever an unread count
   // surfaces on the active conversation — covers both (a) opening a
@@ -944,6 +964,7 @@ export function MessageThread({
           onOpenTemplates={handleOpenTemplates}
           replyTo={replyTo}
           onClearReply={() => setReplyTo(null)}
+          adFreeWindowLabel={sessionInfo.expired ? adFreeWindowLabel : null}
         />
       )}
 

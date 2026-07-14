@@ -119,6 +119,9 @@ interface MessageComposerProps {
   onOpenTemplates: () => void;
   replyTo?: ReplyDraft | null;
   onClearReply?: () => void;
+  /** When set (and the session is expired), the expired banner switches to
+   *  a "templates are free for {label}" hint for Click-to-WhatsApp ad leads. */
+  adFreeWindowLabel?: string | null;
 }
 
 function formatDuration(seconds: number): string {
@@ -141,6 +144,7 @@ export function MessageComposer({
   onOpenTemplates,
   replyTo,
   onClearReply,
+  adFreeWindowLabel,
 }: MessageComposerProps) {
   const t = useTranslations("Inbox.composer");
 
@@ -555,7 +559,9 @@ export function MessageComposer({
       {sessionExpired && (
         <div className="mb-2 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2">
           <p className="text-xs text-amber-400">
-            {t("sessionExpiredHint")}
+            {adFreeWindowLabel
+              ? t("adFreeWindowHint", { remaining: adFreeWindowLabel })
+              : t("sessionExpiredHint")}
           </p>
           <Button
             variant="ghost"
