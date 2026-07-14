@@ -285,10 +285,11 @@ export interface FlattenedInboundMessage {
 
 /**
  * Public entry point: flattens by type, then merges the click-to-WhatsApp
- * ad click id (if any) onto the result. Kept separate from `flattenByType`
- * so the referral merge lives in exactly one place instead of being
- * appended to every `case` below — a `reaction` (or other `null` result)
- * stays `null`; a referral does not resurrect a skipped message.
+ * ad click id (if any) AND the full ad referral creative (`AdReferral`,
+ * when previewable content is present) onto the result. Kept separate from
+ * `flattenByType` so the referral merge lives in exactly one place instead
+ * of being appended to every `case` below — a `reaction` (or other `null`
+ * result) stays `null`; a referral does not resurrect a skipped message.
  */
 export function flattenInboundMessage(
   message: MetaWebhookMessage,

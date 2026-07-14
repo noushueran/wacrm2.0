@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import type { MessageAdReferral } from "@/types";
 import { Megaphone, ExternalLink } from "lucide-react";
 import { useTranslations } from "next-intl";
@@ -9,6 +10,7 @@ import { useTranslations } from "next-intl";
  *  and text-only ads (no media block). */
 export function AdReferralCard({ referral }: { referral: MessageAdReferral }) {
   const t = useTranslations("Inbox.bubble");
+  const [imgError, setImgError] = useState(false);
   const img =
     referral.stored_image_url ?? referral.image_url ?? referral.thumbnail_url;
 
@@ -19,12 +21,13 @@ export function AdReferralCard({ referral }: { referral: MessageAdReferral }) {
         {t("fromAd")}
       </div>
       <div className="flex gap-2 p-2">
-        {img && (
+        {img && !imgError && (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={img}
             alt=""
             loading="lazy"
+            onError={() => setImgError(true)}
             className="h-14 w-14 shrink-0 rounded object-cover"
           />
         )}

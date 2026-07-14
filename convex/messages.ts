@@ -430,6 +430,14 @@ export const setAdReferralImage = internalMutation({
       });
     }
     const conversation = await ctx.db.get(args.conversationId);
+    // "First-image-only" pin: this guard only checks whether storedImageUrl
+    // is still empty, not whether THIS message is the first ad's — so if
+    // the first ad's image download failed (leaving it empty), a LATER,
+    // DIFFERENT ad's image can fill it in here while the denorm's
+    // headline/imageUrl stay pinned to the first ad. Currently harmless
+    // (nothing renders `conversation.adReferral`'s image), but a future
+    // task that does render it should tighten this to "is this the first
+    // ad's message" instead.
     if (conversation?.adReferral && !conversation.adReferral.storedImageUrl) {
       await ctx.db.patch(args.conversationId, {
         adReferral: { ...conversation.adReferral, storedImageUrl: args.storedImageUrl },
