@@ -9,6 +9,7 @@
  */
 
 import type * as accounts from "../accounts.js";
+import type * as adReferrals from "../adReferrals.js";
 import type * as aiConfig from "../aiConfig.js";
 import type * as aiKnowledge from "../aiKnowledge.js";
 import type * as aiReply from "../aiReply.js";
@@ -90,6 +91,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
+  adReferrals: typeof adReferrals;
   aiConfig: typeof aiConfig;
   aiKnowledge: typeof aiKnowledge;
   aiReply: typeof aiReply;
