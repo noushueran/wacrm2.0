@@ -2,8 +2,6 @@ import { accountQuery } from "./lib/auth";
 import { FUNNEL_STAGE_KEYS } from "./lib/funnel";
 import type { Id } from "./_generated/dataModel";
 
-const STATUSES = ["sent", "pending", "unmatched", "error", "abandoned"] as const;
-
 /**
  * Funnel performance overview for the admin dashboard. Admin+ only (exposes
  * account-wide conversion/revenue aggregates — same gate as
