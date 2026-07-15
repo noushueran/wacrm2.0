@@ -715,7 +715,7 @@ export const processInbound = internalAction({
     // funnel's ad lane reads later. Separate from the `conversation.adReferral`
     // display denorm written in `ingestInbound`. Never blocks the pipeline.
     if (message.referral || message.ctwaClid) {
-      await runBestEffort("campaigns.recordAdReferral", () =>
+      await runBestEffort("adReferrals.recordAdReferral", () =>
         ctx.runMutation(internal.adReferrals.recordAdReferral, {
           accountId,
           contactId: res.contactId,
