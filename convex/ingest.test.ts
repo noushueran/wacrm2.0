@@ -1230,6 +1230,38 @@ test("processInbound records a ctwa-lane attribution signal from a Meta ad-refer
   expect(signals[0]!.lane).toBe("ctwa");
 });
 
+test("processInbound captures an adReferrals row from an inbound ad referral", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.AD1",
+      ctwaClid: "clid-xyz789",
+      referral: { sourceType: "ad", sourceId: "AD1", headline: "Maldives" },
+    },
+  });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("adReferrals")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0].ctwaClid).toBe("clid-xyz789");
+  expect(rows[0].adId).toBe("AD1");
+  expect(rows[0].isFirstTouch).toBe(true);
+});
+
 test("processInbound: an HY- code in the text wins over a ctwaClid also present on the same message", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";

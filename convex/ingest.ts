@@ -708,6 +708,25 @@ export const processInbound = internalAction({
       }
     });
 
+    // ---- CTWA ad-referral capture (adReferrals + campaignAds) — OUTSIDE
+    // every guard above, best-effort like the attribution signal. Records
+    // the raw referral + first-touch and seeds ad->campaign resolution. The
+    // `ctwa_clid` it persists is the durable per-conversation source the
+    // funnel's ad lane reads later. Separate from the `conversation.adReferral`
+    // display denorm written in `ingestInbound`. Never blocks the pipeline.
+    if (message.referral || message.ctwaClid) {
+      await runBestEffort("campaigns.recordAdReferral", () =>
+        ctx.runMutation(internal.adReferrals.recordAdReferral, {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          waMessageId: message.wamid,
+          ctwaClid: message.ctwaClid,
+          referral: message.referral ?? {},
+        }),
+      );
+    }
+
     return { duplicate: false, flowConsumed };
   },
 });
