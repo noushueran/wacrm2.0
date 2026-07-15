@@ -197,7 +197,7 @@ export function MessageThread({
         });
       } catch (err) {
         console.error("Failed to update stage:", err);
-        toast.error(tFunnel("label"));
+        toast.error(tFunnel("updateError"));
       }
     },
     [conversation, setStageMutation, tFunnel],

@@ -340,6 +340,7 @@
       "saleAmountTitle": "Record the sale",
       "saleAmountLabel": "Sale amount",
       "saleAmountConfirm": "Mark purchased",
+      "updateError": "Couldn't update the stage.",
       "stage": {
         "new_lead": "New lead",
         "qualified": "Qualified lead",
