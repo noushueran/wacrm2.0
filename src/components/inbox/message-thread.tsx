@@ -58,6 +58,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { MessageBubble } from "./message-bubble";
 import { MessageActions } from "./message-actions";
 import { MessageComposer, type SendMediaPayload } from "./message-composer";
@@ -67,6 +75,7 @@ import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
 import { canAssignToOthers } from "@/lib/auth/roles";
+import { UI_FUNNEL_STAGES } from "@/lib/inbox/funnel";
 
 interface ReplyDraft {
   id: string;
@@ -167,6 +176,45 @@ export function MessageThread({
 
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
+
+  const tFunnel = useTranslations("Inbox.funnel");
+  const funnelState = useQuery(
+    api.funnel.getState,
+    conversationId ? { conversationId: conversationId as Id<"conversations"> } : "skip",
+  );
+  const setStageMutation = useMutation(api.funnel.setStage);
+  const [purchaseOpen, setPurchaseOpen] = useState(false);
+  const [purchaseAmount, setPurchaseAmount] = useState("");
+
+  const applyStage = useCallback(
+    async (stage: string, saleValue?: number) => {
+      if (!conversation) return;
+      try {
+        await setStageMutation({
+          conversationId: conversation.id as Id<"conversations">,
+          stage: stage as never,
+          ...(saleValue !== undefined ? { saleValue } : {}),
+        });
+      } catch (err) {
+        console.error("Failed to update stage:", err);
+        toast.error(tFunnel("label"));
+      }
+    },
+    [conversation, setStageMutation, tFunnel],
+  );
+
+  const handleStageSelect = useCallback(
+    (stage: string) => {
+      const def = UI_FUNNEL_STAGES.find((s) => s.key === stage);
+      if (def?.needsValue) {
+        setPurchaseAmount("");
+        setPurchaseOpen(true);
+        return;
+      }
+      void applyStage(stage);
+    },
+    [applyStage],
+  );
 
   // The assign dropdown's teammate list — every member of the account,
   // via reactive `api.members.list` (the Convex counterpart to the old
@@ -695,6 +743,33 @@ export function MessageThread({
         </div>
 
         <div className="flex items-center gap-2">
+          {accountRole !== "viewer" && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  funnelState?.currentStage ? "text-primary" : "text-muted-foreground",
+                )}
+              >
+                {funnelState?.currentStage
+                  ? tFunnel(`stage.${funnelState.currentStage}`)
+                  : tFunnel("label")}
+                <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="border-border bg-popover">
+                {UI_FUNNEL_STAGES.map((s) => (
+                  <DropdownMenuItem
+                    key={s.key}
+                    onClick={() => handleStageSelect(s.key)}
+                    className="text-sm"
+                  >
+                    {tFunnel(`stage.${s.key}`)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
           {/* Status dropdown — hidden for viewers, same as the assign
               dropdown and AiThreadBanner below. Changing a
               conversation's status is an agent-class write
@@ -973,6 +1048,38 @@ export function MessageThread({
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
       />
+
+      <Dialog open={purchaseOpen} onOpenChange={setPurchaseOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{tFunnel("saleAmountTitle")}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <label className="text-xs text-muted-foreground">{tFunnel("saleAmountLabel")}</label>
+            <Input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              value={purchaseAmount}
+              onChange={(e) => setPurchaseAmount(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={() => {
+                const v = Number(purchaseAmount);
+                if (!Number.isFinite(v) || v <= 0) return;
+                setPurchaseOpen(false);
+                void applyStage("purchased", v);
+              }}
+              disabled={!(Number(purchaseAmount) > 0)}
+            >
+              {tFunnel("saleAmountConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
