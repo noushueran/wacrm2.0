@@ -1220,7 +1220,9 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     .index("by_event_id", ["eventId"])
     .index("by_status", ["status"])
-    .index("by_account_stage", ["accountId", "stage"]),
+    // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
+    // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
+    .index("by_account", ["accountId"]),
 
   // Append-only funnel progress log (funnel Phase 2). One row per stage
   // ENTERED, for every conversation (incl. organic and the internal
@@ -1247,7 +1249,9 @@ export default defineSchema({
     conversionEventId: v.optional(v.id("conversionEvents")),
   })
     .index("by_conversation", ["conversationId"])
-    .index("by_account_stage", ["accountId", "stage"]),
+    // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
+    // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
+    .index("by_account", ["accountId"]),
 
   // ============================================================
   // CTWA ad-capture (funnel Phase 0). Raw event log: one row per

@@ -24,6 +24,9 @@ export default function CampaignsPage() {
       <div>
         <h1 className="text-xl font-semibold text-foreground">{t('title')}</h1>
         <p className="text-sm text-muted-foreground">{t('subtitle')}</p>
+        {data && (
+          <p className="mt-1 text-xs text-muted-foreground">{t('window', { days: data.windowDays })}</p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -34,7 +37,7 @@ export default function CampaignsPage() {
             <MetricCard title={t('newLeads')} value={(byStage.new_lead ?? 0).toLocaleString()} icon={Users} />
             <MetricCard title={t('qualified')} value={(byStage.qualified ?? 0).toLocaleString()} icon={Users} />
             <MetricCard title={t('purchases')} value={data.purchase.count.toLocaleString()} icon={ShoppingCart} />
-            <MetricCard title={t('purchaseValue')} value={formatCurrency(data.purchase.reportedValue, data.purchase.currency)} icon={DollarSign} subtitle={t('reportedToMeta')} />
+            <MetricCard title={t('purchaseValue')} value={formatCurrency(data.purchase.totalValue, data.purchase.currency)} icon={DollarSign} />
           </>
         )}
       </div>
