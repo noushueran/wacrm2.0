@@ -93,10 +93,28 @@ export default defineSchema({
     }),
 
   // A label defined per-account and attached to contacts via `contactTags`.
+  // Optionally belongs to a `tagGroups` dimension (Product, Destination, …);
+  // ungrouped tags (groupId unset) remain valid — pre-grouping tags stay usable.
   tags: defineTable({
     accountId: v.id("accounts"),
     name: v.string(),
     color: v.string(),
+    groupId: v.optional(v.id("tagGroups")),
+    position: v.optional(v.number()),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_group", ["groupId"]),
+
+  // A dimension that tags are organised under. `selectionMode: "single"`
+  // means a contact holds at most one tag from this group (e.g. Priority);
+  // "multi" allows several (e.g. Destination). `position` orders groups
+  // in the UI.
+  tagGroups: defineTable({
+    accountId: v.id("accounts"),
+    name: v.string(),
+    color: v.optional(v.string()),
+    selectionMode: v.union(v.literal("single"), v.literal("multi")),
+    position: v.number(),
   }).index("by_account", ["accountId"]),
 
   // Join table between `contacts` and `tags`.

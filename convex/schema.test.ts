@@ -479,3 +479,27 @@ test("Task 4 — an out-of-union value is rejected by the schema validator", asy
     ),
   ).rejects.toThrow();
 });
+
+test("tagGroups table accepts a group and a tag can reference it", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, groupId } = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "S", email: "s@x.com" });
+    const accountId = await ctx.db.insert("accounts", {
+      name: "A", defaultCurrency: "USD", ownerUserId: userId,
+    });
+    const groupId = await ctx.db.insert("tagGroups", {
+      accountId, name: "Product", selectionMode: "single", position: 0,
+    });
+    await ctx.db.insert("tags", {
+      accountId, name: "UAE Visa", color: "#3b82f6", groupId, position: 0,
+    });
+    return { accountId, groupId };
+  });
+  const group = await t.run((ctx) => ctx.db.get(groupId));
+  expect(group!.selectionMode).toBe("single");
+  const tags = await t.run((ctx) =>
+    ctx.db.query("tags").withIndex("by_group", (q) => q.eq("groupId", groupId)).collect(),
+  );
+  expect(tags).toHaveLength(1);
+  expect(tags[0].accountId).toBe(accountId);
+});
