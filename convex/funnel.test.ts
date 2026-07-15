@@ -190,3 +190,20 @@ test("setStage is forbidden for a viewer", async () => {
     asViewer.mutation(api.funnel.setStage, { conversationId, stage: "qualified" }),
   ).rejects.toThrow();
 });
+
+test("setStage is forbidden for an agent who is not the assignee (own-mode, not view)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, { name: "Own", email: "own@example.com", role: "owner" });
+  // A second agent on the SAME account, NOT assigned the conversation.
+  const otherAgentId = await t.run((ctx) => ctx.db.insert("users", { name: "Ari", email: "ari@example.com" }));
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", { userId: otherAgentId, accountId, role: "agent", fullName: "Ari", email: "ari@example.com" }),
+  );
+  const asOtherAgent = t.withIdentity({ subject: `${otherAgentId}|session-Ari` });
+  // Attributed but UNASSIGNED conversation (no assignedToUserId).
+  const { conversationId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-own" });
+
+  await expect(
+    asOtherAgent.mutation(api.funnel.setStage, { conversationId, stage: "qualified" }),
+  ).rejects.toThrow();
+});
