@@ -207,3 +207,31 @@ test("setStage is forbidden for an agent who is not the assignee (own-mode, not 
     asOtherAgent.mutation(api.funnel.setStage, { conversationId, stage: "qualified" }),
   ).rejects.toThrow();
 });
+
+test("getState composes current stage, reached-at, and per-stage Meta status", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Gia", email: "gia@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-1", assignedToUserId: userId });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "price_quoted" });
+
+  const state = await asUser.query(api.funnel.getState, { conversationId });
+  expect(state.attributed).toBe(true);
+  expect(state.lane).toBe("ctwa");
+  expect(state.currentStage).toBe("price_quoted");
+  expect(state.reachedAt.price_quoted).toBeGreaterThan(0);
+  expect(state.metaStatus.price_quoted).toBe("pending"); // dormant → pending
+});
+
+test("getState for an organic conversation reports attributed:false", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Hal", email: "hal@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { assignedToUserId: userId }); // organic
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "qualified" });
+
+  const state = await asUser.query(api.funnel.getState, { conversationId });
+  expect(state.attributed).toBe(false);
+  expect(state.lane).toBeNull();
+  expect(state.currentStage).toBe("qualified");
+  expect(Object.keys(state.metaStatus)).toHaveLength(0);
+});

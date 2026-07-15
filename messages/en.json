@@ -331,6 +331,24 @@
       "resumed": "AI resumed.",
       "updateError": "Couldn’t update the AI assistant.",
       "networkError": "Couldn’t reach the server."
+    },
+    "funnel": {
+      "label": "Stage",
+      "crmOnly": "CRM only — not from an ad or tracked link, so not reported to Meta.",
+      "reportedToMeta": "Reported to Meta",
+      "notReportedYet": "Not reported yet",
+      "saleAmountTitle": "Record the sale",
+      "saleAmountLabel": "Sale amount",
+      "saleAmountConfirm": "Mark purchased",
+      "stage": {
+        "new_lead": "New lead",
+        "qualified": "Qualified lead",
+        "price_quoted": "Price quoted",
+        "itinerary_created": "Itinerary created",
+        "itinerary_sent": "Itinerary sent",
+        "invoice_sent": "Invoice sent",
+        "purchased": "Purchased"
+      }
     }
   },
   "Contacts": {

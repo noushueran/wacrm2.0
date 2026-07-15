@@ -1,4 +1,4 @@
-import { accountMutation } from "./lib/auth";
+import { accountMutation, accountQuery } from "./lib/auth";
 import { internal } from "./_generated/api";
 import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
@@ -133,5 +133,51 @@ export const setStage = accountMutation({
     });
 
     return args.conversationId;
+  },
+});
+
+export const getState = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "view",
+    );
+
+    const transitions = await ctx.db
+      .query("funnelTransitions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .collect();
+    const reachedAt: Record<string, number> = {};
+    for (const tr of transitions) {
+      const at = tr._creationTime;
+      if (reachedAt[tr.stage] === undefined || at < reachedAt[tr.stage]) {
+        reachedAt[tr.stage] = at;
+      }
+    }
+
+    const events = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .collect();
+    const metaStatus: Record<string, string> = {};
+    for (const ev of events) {
+      metaStatus[ev.stage] = ev.status;
+    }
+
+    return {
+      attributed: conversation.attribution !== undefined,
+      lane: conversation.attribution?.lane ?? null,
+      currentStage: conversation.funnel?.stage ?? null,
+      saleValue: conversation.funnel?.saleValue,
+      saleCurrency: conversation.funnel?.saleCurrency,
+      reachedAt,
+      metaStatus,
+    };
   },
 });
