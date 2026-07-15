@@ -5,6 +5,7 @@ import { useMutation, useQuery } from 'convex/react';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { toUiCustomField } from '@/lib/convex/adapters';
+import { pruneValueForField } from '@/lib/inbox/customFieldValues';
 import { Input } from '@/components/ui/input';
 import type { CustomField } from '@/types';
 import { api } from '../../../convex/_generated/api';
@@ -42,12 +43,19 @@ export function ContactCustomFields({ contactId }: { contactId: string }) {
     try {
       await setForContact({
         contactId: contactId as Id<'contacts'>,
-        values: Object.entries(next)
-          .filter(([, val]) => val.trim() !== '' && val !== '[]')
-          .map(([customFieldId, value]) => ({
-            customFieldId: customFieldId as Id<'customFields'>,
-            value,
-          })),
+        // Prune each value against its field's *current* type/options before
+        // sending — otherwise a stale select/multiselect value (from an
+        // option a supervisor since removed) trips the server's strict
+        // validator and fails the whole batch, including this edit's real
+        // change. See src/lib/inbox/customFieldValues.ts.
+        values: Object.entries(next).flatMap(([customFieldId, rawValue]) => {
+          const value = pruneValueForField(
+            fields.find((f) => f.id === customFieldId),
+            rawValue,
+          );
+          if (value === null || value.trim() === '' || value === '[]') return [];
+          return [{ customFieldId: customFieldId as Id<'customFields'>, value }];
+        }),
       });
     } catch {
       toast.error(t('failed'));

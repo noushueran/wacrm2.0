@@ -25,6 +25,18 @@ interface CustomFieldsManagerProps {
   onOpenChange: (open: boolean) => void;
 }
 
+/** Maps a field's raw `field_type` (the machine value stored in Convex,
+ *  e.g. "select") to its `Contacts.customFields` translation key — the same
+ *  keys the create-field dropdown already uses — so the type badge in
+ *  `FieldRow` doesn't leak an untranslated raw value. */
+const TYPE_LABEL_KEY: Record<string, string> = {
+  text: 'typeText',
+  select: 'typeSelect',
+  multiselect: 'typeMultiselect',
+  date: 'typeDate',
+  number: 'typeNumber',
+};
+
 /**
  * Dialog wrapper around {@link CustomFieldsPanel}, used on the Contacts page.
  * The same panel is rendered inline under Settings → Custom Fields, so the
@@ -309,7 +321,7 @@ function FieldRow({
         <OptionsEditor field={field} onSave={onSaveOptions} />
       )}
       <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
-        {field.field_type}
+        {t(TYPE_LABEL_KEY[field.field_type] ?? 'typeText')}
       </span>
       <Button
         variant="ghost"
