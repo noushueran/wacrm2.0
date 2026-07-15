@@ -21,6 +21,7 @@ import type * as auth from "../auth.js";
 import type * as automations from "../automations.js";
 import type * as automationsEngine from "../automationsEngine.js";
 import type * as broadcasts from "../broadcasts.js";
+import type * as campaigns from "../campaigns.js";
 import type * as campaignAds from "../campaignAds.js";
 import type * as contactNotes from "../contactNotes.js";
 import type * as contacts from "../contacts.js";
@@ -107,6 +108,7 @@ declare const fullApi: ApiFromModules<{
   automations: typeof automations;
   automationsEngine: typeof automationsEngine;
   broadcasts: typeof broadcasts;
+  campaigns: typeof campaigns;
   campaignAds: typeof campaignAds;
   contactNotes: typeof contactNotes;
   contacts: typeof contacts;
