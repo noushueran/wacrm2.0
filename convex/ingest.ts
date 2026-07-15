@@ -683,37 +683,46 @@ export const processInbound = internalAction({
       }),
     );
 
-    // ---- Attribution signal (verified-WhatsApp conversion) — OUTSIDE every
-    // guard above, best-effort like webhookDelivery. Detect our HY- code (in
-    // the message text) or Meta's ctwa_clid (ad referral), record an
-    // account-scoped signal once per (accountId, identifier), and enqueue the
-    // POST to Platform A. A failure here never blocks the pipeline.
-    await runBestEffort("attribution.signal", async () => {
+    // ---- Conversion funnel: first-touch (new_lead) — OUTSIDE every guard
+    // above, best-effort. Classify the lead source from the inbound
+    // identifiers (our HY- zero-width code → website/code lane, else Meta's
+    // ctwa_clid → ad/ctwa lane), set `conversation.attribution` once, seed the
+    // ONE new_lead conversion event for that lane, and dispatch it. Replaces
+    // the old attribution.recordSignal/sendSignal step: `code` → Platform A
+    // only, `ctwa` → direct CAPI only (no more double-fire). Never blocks.
+    await runBestEffort("conversionEvents.newLead", async () => {
       const code = extractRefCode(message.text);
-      const identifier = code ?? extractCtwaClid(message);
-      if (!identifier) return;
-      const lane: "code" | "ctwa" = code ? "code" : "ctwa";
-      const signalId = await ctx.runMutation(internal.attribution.recordSignal, {
-        accountId,
-        identifier,
-        lane,
-        phone: normalizePhone(from),
-        waMessageId: message.wamid,
-        contactId: res.contactId,
-        conversationId: res.conversationId,
-        firstMessageAt: Date.now(),
-      });
-      if (signalId) {
-        await ctx.scheduler.runAfter(0, internal.attribution.sendSignal, { signalId });
+      const ctwaClid = extractCtwaClid(message);
+      if (!code && !ctwaClid) return;
+      const seeded = await ctx.runMutation(
+        internal.conversionEvents.seedNewLead,
+        {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          waMessageId: message.wamid,
+          phone: normalizePhone(from),
+          firstMessageAt: Date.now(),
+          code: code ?? undefined,
+          ctwaClid: ctwaClid ?? undefined,
+        },
+      );
+      if (seeded) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.conversionEvents.deliverConversionEvent,
+          { conversionEventId: seeded.conversionEventId },
+        );
       }
     });
 
     // ---- CTWA ad-referral capture (adReferrals + campaignAds) — OUTSIDE
-    // every guard above, best-effort like the attribution signal. Records
-    // the raw referral + first-touch and seeds ad->campaign resolution. The
-    // `ctwa_clid` it persists is the durable per-conversation source the
-    // funnel's ad lane reads later. Separate from the `conversation.adReferral`
-    // display denorm written in `ingestInbound`. Never blocks the pipeline.
+    // every guard above, best-effort like the conversion-funnel step above.
+    // Records the raw referral + first-touch and seeds ad->campaign
+    // resolution. The `ctwa_clid` it persists is the durable per-conversation
+    // source the funnel's ad lane reads later. Separate from the
+    // `conversation.adReferral` display denorm written in `ingestInbound`.
+    // Never blocks the pipeline.
     if (message.referral || message.ctwaClid) {
       await runBestEffort("adReferrals.recordAdReferral", () =>
         ctx.runMutation(internal.adReferrals.recordAdReferral, {
