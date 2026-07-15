@@ -1136,4 +1136,54 @@ export default defineSchema({
     .index("by_wamid", ["waMessageId"])
     .index("by_account_result", ["accountId", "landingResult"])
     .index("by_result", ["landingResult"]),
+
+  // ============================================================
+  // CTWA ad-capture (funnel Phase 0). Raw event log: one row per
+  // inbound message carrying a `referral`. `_creationTime` is the
+  // received-at (codebase "rely on _creationTime" convention).
+  // `ctwaClid` is the durable per-conversation ad-click id the funnel's
+  // ad lane reads later. Distinct from the `conversation.adReferral`
+  // display denorm (set once, for the inbox ad-preview card).
+  // ============================================================
+  adReferrals: defineTable({
+    accountId: v.id("accounts"),
+    contactId: v.id("contacts"),
+    conversationId: v.id("conversations"),
+    waMessageId: v.string(),
+    ctwaClid: v.optional(v.string()), // omitted for Status placements
+    adId: v.optional(v.string()), // referral.source_id = Meta ad id
+    sourceType: v.optional(v.string()), // "ad" — resolution guards on this
+    sourceUrl: v.optional(v.string()),
+    headline: v.optional(v.string()),
+    body: v.optional(v.string()),
+    mediaType: v.optional(v.string()),
+    isFirstTouch: v.boolean(), // contact's first-ever ad referral
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_ad", ["accountId", "adId"])
+    .index("by_contact", ["contactId"])
+    .index("by_wamid", ["waMessageId"]),
+
+  // Resolution cache: one row per (account, adId). Names change rarely.
+  // Written `pending` at capture; resolved via Marketing API in `resolveAd`.
+  campaignAds: defineTable({
+    accountId: v.id("accounts"),
+    adId: v.string(),
+    adName: v.optional(v.string()),
+    adSetId: v.optional(v.string()),
+    adSetName: v.optional(v.string()),
+    campaignId: v.optional(v.string()),
+    campaignName: v.optional(v.string()),
+    resolveStatus: v.union(
+      v.literal("pending"),
+      v.literal("resolved"),
+      v.literal("error"),
+    ),
+    attempts: v.number(),
+    lastError: v.optional(v.string()),
+    resolvedAt: v.optional(v.number()),
+  })
+    .index("by_account_ad", ["accountId", "adId"])
+    .index("by_account", ["accountId"])
+    .index("by_status", ["resolveStatus"]),
 });
