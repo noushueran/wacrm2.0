@@ -358,6 +358,13 @@
         "invoice_sent": "Invoice sent",
         "purchased": "Purchased"
       }
+    },
+    "customFields": {
+      "title": "Details",
+      "none": "No fields configured",
+      "saved": "Saved",
+      "failed": "Couldn’t save",
+      "selectPlaceholder": "—"
     }
   },
   "Contacts": {

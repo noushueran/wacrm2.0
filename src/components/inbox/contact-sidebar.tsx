@@ -8,6 +8,7 @@ import { toUiContactNote, toUiDeal } from "@/lib/convex/adapters";
 import type { Contact } from "@/types";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import { LabelPicker } from "./label-picker";
+import { ContactCustomFields } from "./contact-custom-fields";
 import {
   Phone,
   Smartphone,
@@ -25,6 +26,7 @@ import {
   Megaphone,
   ExternalLink,
   ListChecks,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -72,6 +74,7 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
   const tThread = useTranslations("Inbox.messageThread");
   const tFunnel = useTranslations("Inbox.funnel");
   const tLabels = useTranslations("Inbox.labels");
+  const tCustom = useTranslations("Inbox.customFields");
 
   const [copied, setCopied] = useState(false);
   const [newNote, setNewNote] = useState("");
@@ -462,6 +465,21 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
           <div>
             <SectionLabel icon={TagIcon} label={tLabels("title")} />
             <LabelPicker contactId={contact.id} tags={tags} />
+          </div>
+
+          <Divider />
+
+          {/* Custom fields — keyed on contact.id so the section fully
+              remounts on contact switch. ContactSidebar itself never
+              unmounts across contacts (it lives inside the always-mounted
+              ContactPanelDrawer), and FieldInput's text/date/number
+              inputs are uncontrolled (defaultValue) for a smooth typing
+              experience, so without this key they'd keep showing the
+              previous contact's stale value — and silently resave it —
+              until the user actually edited that field. */}
+          <div>
+            <SectionLabel icon={SlidersHorizontal} label={tCustom("title")} />
+            <ContactCustomFields key={contact.id} contactId={contact.id} />
           </div>
 
           <Divider />
