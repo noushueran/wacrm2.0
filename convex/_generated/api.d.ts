@@ -32,6 +32,7 @@ import type * as deals from "../deals.js";
 import type * as files from "../files.js";
 import type * as flows from "../flows.js";
 import type * as flowsEngine from "../flowsEngine.js";
+import type * as funnel from "../funnel.js";
 import type * as http from "../http.js";
 import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
@@ -115,6 +116,7 @@ declare const fullApi: ApiFromModules<{
   files: typeof files;
   flows: typeof flows;
   flowsEngine: typeof flowsEngine;
+  funnel: typeof funnel;
   http: typeof http;
   ingest: typeof ingest;
   invitations: typeof invitations;
