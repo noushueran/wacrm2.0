@@ -323,6 +323,13 @@
       "acquiredViaAd": "Acquired via a Click-to-WhatsApp ad",
       "viewAd": "View ad"
     },
+    "labels": {
+      "title": "Labels",
+      "add": "Add label",
+      "none": "No labels yet",
+      "ungrouped": "Other",
+      "failed": "Couldn’t update labels"
+    },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
       "activeText": "AI assistant is replying automatically",

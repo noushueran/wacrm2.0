@@ -7,6 +7,7 @@ import type { Id } from "../../../convex/_generated/dataModel";
 import { toUiContactNote, toUiDeal } from "@/lib/convex/adapters";
 import type { Contact } from "@/types";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
+import { LabelPicker } from "./label-picker";
 import {
   Phone,
   Smartphone,
@@ -70,6 +71,7 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
   const tFunnel = useTranslations("Inbox.funnel");
+  const tLabels = useTranslations("Inbox.labels");
 
   const [copied, setCopied] = useState(false);
   const [newNote, setNewNote] = useState("");
@@ -456,29 +458,10 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
 
           <Divider />
 
-          {/* Tags */}
+          {/* Labels */}
           <div>
-            <SectionLabel icon={TagIcon} label={tSidebar("tags")} />
-            <div className="mt-2 flex flex-wrap gap-1">
-              {tags.length === 0 ? (
-                <p className="px-1 text-xs text-muted-foreground">
-                  {tSidebar("noTags")}
-                </p>
-              ) : (
-                tags.map((tag) => (
-                  <span
-                    key={tag.id}
-                    className="rounded-full px-2 py-0.5 text-[10px] font-medium"
-                    style={{
-                      backgroundColor: `${tag.color}20`,
-                      color: tag.color,
-                    }}
-                  >
-                    {tag.name}
-                  </span>
-                ))
-              )}
-            </div>
+            <SectionLabel icon={TagIcon} label={tLabels("title")} />
+            <LabelPicker contactId={contact.id} tags={tags} />
           </div>
 
           <Divider />
