@@ -9,7 +9,7 @@ import {
   MessageSquare,
   UserPlus,
   DollarSign,
-  Send,
+  Clock,
 } from 'lucide-react'
 
 import { startOfLocalDay, daysAgoStart, lastNDayKeys } from '@/lib/dashboard/date-utils'
@@ -21,7 +21,8 @@ import { LeadSpendCard } from '@/components/dashboard/lead-spend-card'
 import { QuickActions } from '@/components/dashboard/quick-actions'
 import { ConversationsChart } from '@/components/dashboard/conversations-chart'
 import { PipelineDonut } from '@/components/dashboard/pipeline-donut'
-import { ResponseTimeChart } from '@/components/dashboard/response-time-chart'
+import { ResponsePerformance } from '@/components/dashboard/response-performance'
+import { NeedsAttentionCard } from '@/components/dashboard/needs-attention-panel'
 import { ActivityFeed } from '@/components/dashboard/activity-feed'
 
 import { useTranslations } from 'next-intl'
@@ -95,6 +96,9 @@ export default function DashboardPage() {
   // Fetch up to 50 so the biggest page-size option in the feed (50 rows)
   // is already in memory — switching sizes is then a pure client slice.
   const activityData = useQuery(api.dashboard.activity, accountId ? { limit: 50 } : 'skip')
+  // Exact, role-scoped count of conversations awaiting a reply — powers the
+  // lead "Waiting on reply" KPI. Already deployed (backs the sidebar badge).
+  const unreadData = useQuery(api.conversations.unreadTotal, accountId ? {} : 'skip')
 
   const metrics = metricsData ?? null
   const metricsLoading = metricsData === undefined
@@ -104,6 +108,8 @@ export default function DashboardPage() {
   const responseTimeLoading = responseTimeData === undefined
   const activity = activityData ?? null
   const activityLoading = activityData === undefined
+  const waiting = unreadData ?? 0
+  const waitingLoading = unreadData === undefined
 
   // ConversationsChart takes a per-range record (its contract, so a
   // future full-cache variant stays a drop-in). We only ever subscribe to
@@ -118,18 +124,28 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-5">
-      {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {t('description')}
-        </p>
-      </div>
+      {/* No in-page title — the header now carries "Dashboard". */}
 
       {/* Metric cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Waiting on reply — the act-now number; loads independently of
+            the metrics bundle so it can render as soon as it resolves. */}
+        {waitingLoading ? (
+          <SkeletonCard />
+        ) : (
+          <MetricCard
+            title={t('waitingOnReply')}
+            value={waiting.toLocaleString()}
+            icon={Clock}
+            subtitle={t('awaitingReply')}
+          />
+        )}
         {metricsLoading || !metrics ? (
-          Array.from({ length: 4 }).map((_, i) => <SkeletonCard key={i} />)
+          <>
+            <SkeletonCard />
+            <SkeletonCard />
+            <SkeletonCard />
+          </>
         ) : (
           <>
             <MetricCard
@@ -149,15 +165,26 @@ export default function DashboardPage() {
               title={t('newContactsToday')}
               value={metrics.newContactsToday.current.toLocaleString()}
               icon={UserPlus}
-              delta={{
-                sign:
-                  metrics.newContactsToday.current - metrics.newContactsToday.previous,
-                label: deltaLabel(
-                  metrics.newContactsToday.current - metrics.newContactsToday.previous,
-                  t('vsYesterday'),
-                  t('noChange', { suffix: t('vsYesterday') })
-                ),
-              }}
+              {...(metrics.newLeadsBySource
+                ? {
+                    subtitle: t('leadsSplit', {
+                      ad: metrics.newLeadsBySource.adToday,
+                      direct: metrics.newLeadsBySource.directToday,
+                    }),
+                  }
+                : {
+                    delta: {
+                      sign:
+                        metrics.newContactsToday.current -
+                        metrics.newContactsToday.previous,
+                      label: deltaLabel(
+                        metrics.newContactsToday.current -
+                          metrics.newContactsToday.previous,
+                        t('vsYesterday'),
+                        t('noChange', { suffix: t('vsYesterday') })
+                      ),
+                    },
+                  })}
             />
             <MetricCard
               title={t('openDealsValue')}
@@ -165,23 +192,13 @@ export default function DashboardPage() {
               icon={DollarSign}
               subtitle={t('openDeals', { count: metrics.openDealsCount })}
             />
-            <MetricCard
-              title={t('messagesSentToday')}
-              value={metrics.messagesSentToday.current.toLocaleString()}
-              icon={Send}
-              delta={{
-                sign:
-                  metrics.messagesSentToday.current - metrics.messagesSentToday.previous,
-                label: deltaLabel(
-                  metrics.messagesSentToday.current - metrics.messagesSentToday.previous,
-                  t('vsYesterday'),
-                  t('noChange', { suffix: t('vsYesterday') })
-                ),
-              }}
-            />
           </>
         )}
       </div>
+
+      {/* Needs attention — the operational queue (open conversations
+          awaiting a reply), role-scoped with Unassigned/Mine/All tabs. */}
+      <NeedsAttentionCard />
 
       {/* Lead spend — self-hides (renders null) until an admin sets a
           positive lead value, so no conditional needed here. */}
@@ -215,8 +232,8 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Response time */}
-      <ResponseTimeChart data={responseTime} loading={responseTimeLoading} />
+      {/* Response performance — week-over-week averages vs SLA target. */}
+      <ResponsePerformance data={responseTime} loading={responseTimeLoading} />
 
       {/* Activity feed */}
       <ActivityFeed items={activity} loading={activityLoading} />
