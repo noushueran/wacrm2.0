@@ -14,4 +14,14 @@ crons.interval(
   {},
 );
 
+// Retry CTWA ad->campaign name resolution (campaignAds pending/error with
+// attempts < MAX). Also nudges dormant `pending` rows once a
+// META_ADS_ACCESS_TOKEN is finally configured. Bounded, best-effort.
+crons.interval(
+  "retry-ad-resolution",
+  { minutes: 60 },
+  internal.campaignAds.retryResolutions,
+  {},
+);
+
 export default crons;
