@@ -165,6 +165,14 @@ describe("capability predicates", () => {
     expect(canAccessNav("supervisor", "/settings")).toBe(true);
   });
 
+  it("canAccessNav gates /campaigns to admin+ only", () => {
+    expect(canAccessNav("owner", "/campaigns")).toBe(true);
+    expect(canAccessNav("admin", "/campaigns")).toBe(true);
+    expect(canAccessNav("supervisor", "/campaigns")).toBe(false);
+    expect(canAccessNav("agent", "/campaigns")).toBe(false);
+    expect(canAccessNav("viewer", "/campaigns")).toBe(false);
+  });
+
   it("canAccessSettingsSection: agent/viewer personal-only; supervisor no critical", () => {
     expect(canAccessSettingsSection("agent", "profile")).toBe(true);
     expect(canAccessSettingsSection("agent", "appearance")).toBe(true);
