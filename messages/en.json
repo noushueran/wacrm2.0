@@ -45,6 +45,7 @@
     "menuSignOut": "Sign out"
   },
   "Header": {
+    "brand": "Holidayys WA CRM",
     "dashboard": "Dashboard",
     "inbox": "Inbox",
     "notifications": "Notifications",
