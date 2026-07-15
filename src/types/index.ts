@@ -136,7 +136,16 @@ export interface Tag {
   user_id: string;
   name: string;
   color: string;
+  group_id?: string;
   created_at: string;
+}
+
+export interface TagGroup {
+  id: string;
+  name: string;
+  color?: string;
+  selection_mode: 'single' | 'multi';
+  position: number;
 }
 
 export interface ContactTag {

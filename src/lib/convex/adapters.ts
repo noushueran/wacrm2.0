@@ -26,6 +26,7 @@ import type {
   Profile,
   QuickReply,
   Tag,
+  TagGroup,
   TemplateButton,
   WhatsAppConfig,
 } from "@/types";
@@ -77,7 +78,18 @@ export function toUiTag(doc: Doc<"tags">): Tag {
     user_id: "",
     name: doc.name,
     color: doc.color,
+    group_id: doc.groupId,
     created_at: new Date(doc._creationTime).toISOString(),
+  };
+}
+
+export function toUiTagGroup(doc: Doc<"tagGroups">): TagGroup {
+  return {
+    id: doc._id,
+    name: doc.name,
+    color: doc.color,
+    selection_mode: doc.selectionMode,
+    position: doc.position,
   };
 }
 
