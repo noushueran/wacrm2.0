@@ -289,3 +289,31 @@ Each phase is independently shippable:
 2. **Server-side filter bar + `conversationTags` read-model + time smart-labels.**
    The segmentation/efficiency layer, incl. the backfill.
 3. **Follow-ups** (flag + due date) and the Due today / Overdue / Flagged views.
+
+## Phase 1 — status & deploy checklist (2026-07-16)
+
+**Phase 1 is implemented and merged-ready** on `feat/inbox-tag-label-system`
+(grouped tags + inbox labelling + typed/editable custom fields). Full suite
+1542 passing, `tsc` clean, `next build` succeeds. Phases 2 (server-side
+filtering + time smart-labels) and 3 (follow-ups) remain — separate plans.
+
+**To ship Phase 1:**
+1. **`convex deploy`** to `convex-api.holidayys.co` — publishes the additive
+   `tagGroups` table + `tags.groupId`/`position` fields. Additive/backward-
+   compatible; **no backfill** (existing flat tags become "Ungrouped").
+2. **Merge to `main`** → Netlify builds the frontend. (Convex is a *separate*
+   manual deploy from Netlify — do step 1 too, or Mine/typed-field calls 404.)
+3. **Owner spot-check (data safety):** before relying on typed validation,
+   confirm prod `customFields` has no pre-existing `select`/`multiselect` rows
+   lacking `fieldOptions` (they'd reject every value). The base UI only ever
+   wrote `fieldType: "text"`, so none should exist — verify anyway.
+4. **Auth-gated click-test** (couldn't be verified headlessly): Settings →
+   create a Product group (single-select) + a Destination group (multi);
+   in a chat, assign labels (confirm single-select displacement) and set a
+   typed custom field (dropdown + multiselect chips) and confirm it persists.
+
+**Deferred polish (non-blocking, from review):** prune orphaned i18n keys
+(`Inbox.sidebar.tags/noTags`, `Settings.tagGroups.title/desc`, flat
+`tagsAndFields.*`); add an equality guard to `OptionsEditor`'s blur-save; add
+an in-flight guard to the label-picker toggle; require ≥1 option to create a
+select/multiselect field.
