@@ -72,20 +72,36 @@ export function CustomFieldsPanel() {
   const createField = useMutation(api.customFields.create);
   const renameField = useMutation(api.customFields.rename);
   const removeField = useMutation(api.customFields.remove);
+  const updateField = useMutation(api.customFields.update);
 
   const [newName, setNewName] = useState('');
+  const [newType, setNewType] = useState<
+    'text' | 'select' | 'multiselect' | 'date' | 'number'
+  >('text');
+  const [newOptions, setNewOptions] = useState('');
   const [creating, setCreating] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
 
   async function handleCreate() {
     const name = newName.trim();
     if (!name) return;
+    const isSelect = newType === 'select' || newType === 'multiselect';
+    const options = newOptions
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean);
 
     setCreating(true);
     try {
-      await createField({ fieldName: name, fieldType: 'text' });
+      await createField({
+        fieldName: name,
+        fieldType: newType,
+        ...(isSelect && options.length ? { fieldOptions: { options } } : {}),
+      });
       toast.success(t('toastCreated', { name }));
       setNewName('');
+      setNewType('text');
+      setNewOptions('');
     } catch (err) {
       if (isConvexErrorCode(err, 'DUPLICATE_FIELD')) {
         toast.error(t('toastDuplicate', { name }));
@@ -94,6 +110,22 @@ export function CustomFieldsPanel() {
       }
     } finally {
       setCreating(false);
+    }
+  }
+
+  /** Persists a select/multiselect field's option list, called from
+   *  `OptionsEditor` on blur. Uses a dedicated failure toast (not
+   *  `toastRenameFailed`) since this path never touches the field's
+   *  name. */
+  async function handleSaveOptions(field: CustomField, options: string[]) {
+    try {
+      await updateField({
+        fieldId: field.id as Id<'customFields'>,
+        fieldOptions: { options },
+      });
+      toast.success(t('toastUpdated'));
+    } catch {
+      toast.error(t('toastOptionsFailed'));
     }
   }
 
@@ -147,31 +179,60 @@ export function CustomFieldsPanel() {
   return (
     <div className="space-y-4">
       {/* Create */}
-      <div className="flex items-center gap-2">
-        <Input
-          value={newName}
-          onChange={(e) => setNewName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              void handleCreate();
-            }
-          }}
-          placeholder={t('fieldName')}
-          className="bg-muted text-foreground"
-        />
-        <Button
-          onClick={handleCreate}
-          disabled={creating || !newName.trim()}
-          className="bg-primary hover:bg-primary/90 text-primary-foreground shrink-0"
-        >
-          {creating ? (
-            <Loader2 className="size-4 animate-spin" />
-          ) : (
-            <Plus className="size-4" />
-          )}
-          {t('addField')}
-        </Button>
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void handleCreate();
+              }
+            }}
+            placeholder={t('fieldName')}
+            className="bg-muted text-foreground"
+          />
+          <select
+            value={newType}
+            onChange={(e) => setNewType(e.target.value as typeof newType)}
+            aria-label={t('type')}
+            className="h-9 shrink-0 rounded-md border border-border bg-muted px-2 text-sm text-foreground"
+          >
+            <option value="text">{t('typeText')}</option>
+            <option value="select">{t('typeSelect')}</option>
+            <option value="multiselect">{t('typeMultiselect')}</option>
+            <option value="date">{t('typeDate')}</option>
+            <option value="number">{t('typeNumber')}</option>
+          </select>
+          <Button
+            onClick={handleCreate}
+            disabled={creating || !newName.trim()}
+            className="bg-primary hover:bg-primary/90 text-primary-foreground shrink-0"
+          >
+            {creating ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Plus className="size-4" />
+            )}
+            {t('addField')}
+          </Button>
+        </div>
+        {(newType === 'select' || newType === 'multiselect') && (
+          <Input
+            value={newOptions}
+            onChange={(e) => setNewOptions(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void handleCreate();
+              }
+            }}
+            aria-label={t('options')}
+            placeholder={t('optionsPlaceholder')}
+            className="bg-muted text-foreground"
+          />
+        )}
       </div>
 
       {/* List */}
@@ -194,6 +255,7 @@ export function CustomFieldsPanel() {
                 busy={busyId === field.id}
                 onRename={handleRename}
                 onDelete={handleDelete}
+                onSaveOptions={handleSaveOptions}
               />
             ))}
           </ul>
@@ -210,11 +272,13 @@ function FieldRow({
   busy,
   onRename,
   onDelete,
+  onSaveOptions,
 }: {
   field: CustomField;
   busy: boolean;
   onRename: (field: CustomField, name: string) => Promise<boolean>;
   onDelete: (field: CustomField) => void;
+  onSaveOptions: (field: CustomField, options: string[]) => Promise<void>;
 }) {
   const t = useTranslations('Contacts.customFields');
   const [name, setName] = useState(field.field_name);
@@ -241,6 +305,12 @@ function FieldRow({
         aria-label={t('renameAria', { name: field.field_name })}
         className="focus:border-primary h-8 border-transparent bg-transparent text-foreground hover:border-border"
       />
+      {(field.field_type === 'select' || field.field_type === 'multiselect') && (
+        <OptionsEditor field={field} onSave={onSaveOptions} />
+      )}
+      <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+        {field.field_type}
+      </span>
       <Button
         variant="ghost"
         size="icon-sm"
@@ -256,5 +326,41 @@ function FieldRow({
         )}
       </Button>
     </li>
+  );
+}
+
+/** Inline, comma-separated options editor for a select/multiselect
+ *  `FieldRow`. Controlled local state (like the name `Input` above)
+ *  lets the admin type freely and commits via `onSave` on blur —
+ *  there's no separate save button. */
+function OptionsEditor({
+  field,
+  onSave,
+}: {
+  field: CustomField;
+  onSave: (field: CustomField, options: string[]) => Promise<void>;
+}) {
+  const t = useTranslations('Contacts.customFields');
+  const current = (field.field_options?.options as string[] | undefined) ?? [];
+  const [text, setText] = useState(current.join(', '));
+
+  return (
+    <Input
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={() =>
+        onSave(
+          field,
+          text
+            .split(',')
+            .map((o) => o.trim())
+            .filter(Boolean)
+        )
+      }
+      aria-label={t('options')}
+      title={t('saveOptions')}
+      placeholder={t('optionsPlaceholder')}
+      className="h-8 flex-1 text-xs"
+    />
   );
 }

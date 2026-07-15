@@ -553,7 +553,18 @@
       "toastCreated": "Created \"{name}\".",
       "toastRenameFailed": "Could not rename field.",
       "toastDeleteFailed": "Could not delete field.",
-      "toastDeleted": "Deleted \"{name}\"."
+      "toastDeleted": "Deleted \"{name}\".",
+      "type": "Type",
+      "typeText": "Text",
+      "typeSelect": "Dropdown",
+      "typeMultiselect": "Multi-select",
+      "typeDate": "Date",
+      "typeNumber": "Number",
+      "options": "Options (comma-separated)",
+      "optionsPlaceholder": "UAE Visa, Global Visa, Packages",
+      "saveOptions": "Save options",
+      "toastUpdated": "Field updated",
+      "toastOptionsFailed": "Could not save options."
     }
   },
   "Pipelines": {
