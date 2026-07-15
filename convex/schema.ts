@@ -162,6 +162,20 @@ export default defineSchema({
         startedAt: v.number(),
       }),
     ),
+    // Lead-source classifier for the conversion funnel. Set ONCE, the first
+    // time an attribution identifier is seen on an inbound message (the HY-
+    // zero-width code → website lane, or the Meta `ctwa_clid` → ad lane);
+    // never overwritten. Both identifiers are retained if both ever appear;
+    // `lane` (code-wins) decides which backend the funnel dispatches to, so a
+    // conversation never double-fires. Absent = organic (never reported).
+    attribution: v.optional(
+      v.object({
+        lane: v.union(v.literal("code"), v.literal("ctwa")),
+        code: v.optional(v.string()),
+        ctwaClid: v.optional(v.string()),
+        firstSeenAt: v.number(),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"])
@@ -1136,6 +1150,56 @@ export default defineSchema({
     .index("by_wamid", ["waMessageId"])
     .index("by_account_result", ["accountId", "landingResult"])
     .index("by_result", ["landingResult"]),
+
+  // ============================================================
+  // Unified conversion outbox (funnel Phase 1). One row per
+  // (conversation, stage) that maps to a Meta event. `backend`
+  // discriminates delivery: "platformA" (website/code lane → web Pixel via
+  // go-holidayys) or "capi" (ad/ctwa lane → direct Meta CAPI). `eventId`
+  // (= `${conversationId}:${stage}`) is our dedup key — Meta does not dedupe
+  // business-messaging events. Dormant rows stay `pending` (no attempt bump)
+  // until env is configured; the retry cron resends them.
+  // ============================================================
+  conversionEvents: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    stage: v.union(
+      v.literal("new_lead"),
+      v.literal("qualified"),
+      v.literal("price_quoted"),
+      v.literal("itinerary_created"),
+      v.literal("itinerary_sent"),
+      v.literal("invoice_sent"),
+      v.literal("purchased"),
+    ),
+    lane: v.union(v.literal("code"), v.literal("ctwa")),
+    backend: v.union(v.literal("platformA"), v.literal("capi")),
+    eventName: v.string(), // resolved per lane (web-pixel name | business_messaging name)
+    identifier: v.string(), // HY-code (code lane) | ctwa_clid (ctwa lane)
+    value: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    phone: v.string(),
+    waMessageId: v.string(),
+    firstMessageAt: v.number(),
+    eventId: v.string(), // `${conversationId}:${stage}` — dedup
+    status: v.union(
+      v.literal("pending"),
+      v.literal("sent"),
+      v.literal("unmatched"),
+      v.literal("error"),
+      v.literal("abandoned"),
+    ),
+    attempts: v.number(),
+    lastError: v.optional(v.string()),
+    sentAt: v.optional(v.number()),
+    fbTraceId: v.optional(v.string()),
+    matchResult: v.optional(v.string()),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_event_id", ["eventId"])
+    .index("by_status", ["status"])
+    .index("by_account_stage", ["accountId", "stage"]),
 
   // ============================================================
   // CTWA ad-capture (funnel Phase 0). Raw event log: one row per
