@@ -7,10 +7,11 @@ export type LabelDimension = { group: TagGroup | null; tags: Tag[] };
  *  trailing `group: null` dimension (omitted when there are none). */
 export function groupTags(groups: TagGroup[], tags: Tag[]): LabelDimension[] {
   const ordered = [...groups].sort((a, b) => a.position - b.position);
+  const validIds = new Set(groups.map((g) => g.id));
   const byGroup = new Map<string, Tag[]>();
   const ungrouped: Tag[] = [];
   for (const tag of tags) {
-    if (tag.group_id) {
+    if (tag.group_id && validIds.has(tag.group_id)) {
       const list = byGroup.get(tag.group_id) ?? [];
       list.push(tag);
       byGroup.set(tag.group_id, list);
