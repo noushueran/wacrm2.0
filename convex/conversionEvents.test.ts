@@ -159,6 +159,22 @@ test("platformA: marks unmatched when Platform A returns matched:false", async (
   expect(row?.status).toBe("unmatched");
 });
 
+test("platformA: a malformed 200 body is a retryable error, not terminal unmatched", async () => {
+  process.env.LANDING_CONVERSION_URL = "https://a.example/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "secret";
+  globalThis.fetch = (async () => new Response("<html>not json</html>", { status: 200 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "platformA", lane: "code", eventName: "Lead", identifier: "ABCDEF" });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(1);
+});
+
 test("error path bumps attempts; the bump that reaches MAX retires to abandoned", async () => {
   process.env.META_CAPI_DATASET_ID = "DS1";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";

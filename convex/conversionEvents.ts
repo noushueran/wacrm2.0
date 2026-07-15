@@ -236,7 +236,7 @@ export const deliverConversionEvent = internalAction({
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(`Platform A responded ${res.status}`);
-      const data = (await res.json().catch(() => ({}))) as {
+      const data = (await res.json()) as {
         matched?: boolean;
         firedAt?: number;
         offerSlug?: string;
