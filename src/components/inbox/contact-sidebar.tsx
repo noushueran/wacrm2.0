@@ -23,15 +23,19 @@ import {
   Info,
   Megaphone,
   ExternalLink,
+  ListChecks,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { format } from "date-fns";
 import { useTranslations } from "next-intl";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import { buildFunnelSteps } from "@/lib/inbox/funnelView";
 
 interface ContactSidebarProps {
   contact: Contact | null;
+  conversationId?: string;
 }
 
 type EditForm = {
@@ -62,9 +66,10 @@ function formToState(c: Contact): EditForm {
   };
 }
 
-export function ContactSidebar({ contact }: ContactSidebarProps) {
+export function ContactSidebar({ contact, conversationId }: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
+  const tFunnel = useTranslations("Inbox.funnel");
 
   const [copied, setCopied] = useState(false);
   const [newNote, setNewNote] = useState("");
@@ -95,6 +100,11 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     contactId ? { contactId } : "skip",
   );
   const notes = (noteDocs ?? []).map(toUiContactNote);
+
+  const funnelState = useQuery(
+    api.funnel.getState,
+    conversationId ? { conversationId: conversationId as Id<"conversations"> } : "skip",
+  );
 
   const tags = contact?.tags ?? [];
 
@@ -321,6 +331,50 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
                     {tSidebar("viewAd")}
                     <ExternalLink className="h-3 w-3" />
                   </a>
+                )}
+              </div>
+            </Section>
+          )}
+
+          {conversationId && funnelState && (
+            <Section icon={ListChecks} label={tFunnel("label")}>
+              <div className="px-3 py-2 space-y-1.5">
+                {!funnelState.attributed && (
+                  <p className="text-xs text-muted-foreground">{tFunnel("crmOnly")}</p>
+                )}
+                {buildFunnelSteps(funnelState).map((step) => (
+                  <div key={step.key} className="flex items-center justify-between gap-2">
+                    <span
+                      className={cn(
+                        "text-sm",
+                        step.current
+                          ? "font-medium text-primary"
+                          : step.done
+                            ? "text-foreground"
+                            : "text-muted-foreground",
+                      )}
+                    >
+                      {step.done ? "✓ " : step.current ? "• " : "○ "}
+                      {tFunnel(`stage.${step.key}`)}
+                    </span>
+                    {step.reportsToMeta && (step.done || step.current) && (
+                      <span
+                        className="text-[10px] text-muted-foreground"
+                        title={
+                          step.metaStatus === "sent"
+                            ? tFunnel("reportedToMeta")
+                            : tFunnel("notReportedYet")
+                        }
+                      >
+                        {step.metaStatus === "sent" ? "✓ Meta" : "– Meta"}
+                      </span>
+                    )}
+                  </div>
+                ))}
+                {funnelState.saleValue !== undefined && (
+                  <p className="pt-1 text-sm text-foreground">
+                    {funnelState.saleCurrency} {funnelState.saleValue}
+                  </p>
                 )}
               </div>
             </Section>

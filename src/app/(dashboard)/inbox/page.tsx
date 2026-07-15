@@ -227,6 +227,7 @@ export default function InboxPage() {
             open={contactPanelOpen}
             onClose={handleToggleContactPanel}
             contact={activeContact}
+            conversationId={activeConversationId ?? undefined}
           />
         </div>
       </div>
