@@ -852,6 +852,25 @@
       }
     }
   },
+  "Campaigns": {
+    "title": "Campaigns",
+    "subtitle": "Funnel performance and Meta conversion reporting.",
+    "newLeads": "New leads",
+    "qualified": "Qualified",
+    "purchases": "Purchases",
+    "purchaseValue": "Purchase value",
+    "reportedToMeta": "reported to Meta",
+    "funnelTitle": "Funnel by stage",
+    "metaTitle": "Meta delivery",
+    "meta": {
+      "sent": "Sent",
+      "pending": "Pending",
+      "unmatched": "Unmatched",
+      "error": "Error",
+      "abandoned": "Abandoned",
+      "total": "Total"
+    }
+  },
   "Automations": {
     "list": {
       "title": "Automations",
