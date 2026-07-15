@@ -13,7 +13,7 @@
 - **Offline codegen only.** NEVER run `convex dev`/`deploy`/`codegen`. New field / new table = `convex/schema.ts` only. New module = hand-edit `convex/_generated/api.d.ts` (import + member); no `api.js`.
 - **Stage files EXPLICITLY by exact path.** NEVER `git add -A` (untracked `.claude/worktrees/*` present).
 - **Match file style** (convex files double-quoted). No broad `prettier --write`. Verify with `npm test` / `npm run typecheck` / `npm run build`.
-- **Access guard:** `setStage` uses `ctx.requireRole("agent")` (excludes viewers) + `requireConversationAccess(ctx, conversationId, "view")` — the same mode `conversations.setStatus`/`setAutoreplyPaused` use (own-or-unassigned for agents, all for supervisor+).
+- **Access guard:** `setStage` uses `ctx.requireRole("agent")` (excludes viewers) + `requireConversationAccess(ctx, conversationId, "own")` — the SAME mode `conversations.setStatus` uses (agent must be the conversation's assignee; supervisor+ any; viewers excluded). *(Correction: an earlier draft of this plan wrote `"view"` in error — the shipped code and `setStatus` both use `"own"`.)*
 - **Dormant + reuse:** `setStage` never calls Meta directly — it inserts a `conversionEvents` row and schedules Phase 1's `internal.conversionEvents.deliverConversionEvent` (dormant without env). Dedup via `eventId = ${conversationId}:${stage}`.
 - **Value rule:** `stage === "purchased"` requires `saleValue > 0` (throws `ConvexError` otherwise); currency defaults to the account's `defaultCurrency`.
 - **TDD, frequent commits.** Test harness: `convexTest(schema, modules)` with `import.meta.glob("/convex/**/*.ts")`; `accountMutation`s are called via `t.withIdentity({ subject: \`${userId}|session-…\` })`.
@@ -351,8 +351,8 @@ const STAGE_VALIDATOR = v.union(
  * state only. `purchased` requires a positive `saleValue`.
  *
  * Access mirrors `conversations.setStatus`: `requireRole("agent")` (viewers
- * excluded) + `requireConversationAccess(..., "view")` (own-or-unassigned for
- * agents; all for supervisor+).
+ * excluded) + `requireConversationAccess(..., "own")` (agent must be the
+ * conversation's assignee; all for supervisor+).
  */
 export const setStage = accountMutation({
   args: {
@@ -366,7 +366,7 @@ export const setStage = accountMutation({
     const conversation = await requireConversationAccess(
       ctx,
       args.conversationId,
-      "view",
+      "own",
     );
 
     const stage = args.stage as FunnelStageKey;
