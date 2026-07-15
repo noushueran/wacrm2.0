@@ -38,6 +38,8 @@
     "closeMenu": "Close menu",
     "collapseMenu": "Collapse menu",
     "expandMenu": "Expand menu",
+    "pinSidebar": "Pin sidebar",
+    "unpinSidebar": "Unpin sidebar",
     "defaultUser": "User",
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
@@ -45,6 +47,7 @@
     "menuSignOut": "Sign out"
   },
   "Header": {
+    "brand": "Holidayys WA CRM",
     "dashboard": "Dashboard",
     "inbox": "Inbox",
     "notifications": "Notifications",
@@ -75,7 +78,10 @@
       "newTodayVsYesterday": "new today vs yesterday",
       "vsYesterday": "vs yesterday",
       "openDeals": "{count} open {count, plural, =1 {deal} other {deals}}",
-      "noChange": "No change {suffix}"
+      "noChange": "No change {suffix}",
+      "waitingOnReply": "Waiting on Reply",
+      "awaitingReply": "awaiting a reply",
+      "leadsSplit": "{ad} ads · {direct} direct"
     },
     "quickActions": {
       "newContact": "New Contact",
@@ -137,6 +143,25 @@
       "spent": "Spent",
       "yourSpend": "You've spent {amount} on {count} leads",
       "empty": "No lead spend yet"
+    },
+    "needsAttention": {
+      "title": "Needs Attention",
+      "tabAll": "All",
+      "tabMine": "Mine",
+      "tabUnassigned": "Unassigned",
+      "allCaught": "You're all caught up",
+      "allCaughtHint": "No conversations are waiting on a reply.",
+      "unknown": "Unknown",
+      "adLead": "Ad lead",
+      "noPreview": "No message preview"
+    },
+    "responsePerformance": {
+      "title": "Response Performance",
+      "thisWeek": "This week",
+      "lastWeek": "Last week",
+      "target": "under {minutes}m target",
+      "over": "over {minutes}m target",
+      "noData": "No replies recorded yet"
     }
   },
   "Inbox": {

@@ -377,6 +377,50 @@ test("metrics reports active/new conversations, contacts, open deals, and agent 
   expect(bobResult.openDealsCount).toBe(1);
 });
 
+test("metrics splits new leads by acquisition source (ad vs direct), today and yesterday", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Cara",
+    email: "cara@example.com",
+    role: "admin",
+  });
+
+  const seedLead = (phone: string, ad: boolean) =>
+    t.run((ctx) =>
+      ctx.db.insert("contacts", {
+        accountId,
+        phone,
+        phoneNormalized: phone.replace(/\D/g, ""),
+        ...(ad ? { acquisitionSource: "ad" as const } : {}),
+      }),
+    );
+
+  clock(YESTERDAY_START + 3_600_000);
+  await seedLead("3001", true); // ad, yesterday
+  await seedLead("3002", false); // direct, yesterday
+
+  clock(NOW);
+  await seedLead("3003", true); // ad, today
+  await seedLead("3004", true); // ad, today
+  await seedLead("3005", false); // direct, today
+
+  const res = await asUser.query(api.dashboard.metrics, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  // The pre-existing total must still hold…
+  expect(res.newContactsToday).toEqual({ current: 3, previous: 2 });
+  // …and now split by source.
+  expect(res.newLeadsBySource).toEqual({
+    adToday: 2,
+    directToday: 1,
+    adYesterday: 1,
+    directYesterday: 1,
+  });
+});
+
 // ============================================================
 // conversationsSeries
 // ============================================================
