@@ -673,3 +673,53 @@ test("setForContact last-value-wins when the same customFieldId appears twice in
   expect(values).toHaveLength(1);
   expect(values[0]!.value).toBe("second");
 });
+
+// ============================================================
+// Task 5: Typed fields — options + validation
+// ============================================================
+
+test("create stores options for a select field", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, { name: "Sup", email: "cf1@x.com", role: "supervisor" });
+  const fid = await asUser.mutation(api.customFields.create, {
+    fieldName: "Product Category",
+    fieldType: "select",
+    fieldOptions: { options: ["UAE Visa", "Global Visa", "Packages"] },
+  });
+  const row = await t.run((ctx) => ctx.db.get(fid));
+  expect(row!.fieldType).toBe("select");
+  expect(row!.fieldOptions).toEqual({ options: ["UAE Visa", "Global Visa", "Packages"] });
+});
+
+test("setForContact accepts a valid select value and rejects an off-list one", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Sup", email: "cf2@x.com", role: "supervisor" });
+  const fid = await asUser.mutation(api.customFields.create, {
+    fieldName: "Product Category", fieldType: "select",
+    fieldOptions: { options: ["UAE Visa", "Packages"] },
+  });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+15550003", phoneNormalized: "15550003" }),
+  );
+
+  await asUser.mutation(api.customFields.setForContact, {
+    contactId, values: [{ customFieldId: fid, value: "Packages" }],
+  });
+  const stored = await asUser.query(api.customFields.getForContact, { contactId });
+  expect(stored.map((s) => s.value)).toEqual(["Packages"]);
+
+  await expect(
+    asUser.mutation(api.customFields.setForContact, {
+      contactId, values: [{ customFieldId: fid, value: "Cruise" }],
+    }),
+  ).rejects.toMatchObject({ data: { code: "INVALID_VALUE" } });
+});
+
+test("update switches a field to a new type + options", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, { name: "Sup", email: "cf3@x.com", role: "supervisor" });
+  const fid = await asUser.mutation(api.customFields.create, { fieldName: "Budget", fieldType: "text" });
+  await asUser.mutation(api.customFields.update, { fieldId: fid, fieldType: "number" });
+  const row = await t.run((ctx) => ctx.db.get(fid));
+  expect(row!.fieldType).toBe("number");
+});
