@@ -89,6 +89,27 @@ export const metrics = accountQuery({
       (c) => c._creationTime < todayStartMs,
     ).length;
 
+    // New-leads-by-source split — partitions the ALREADY-collected
+    // `recentContacts` (no extra read) into Click-to-WhatsApp ad leads vs.
+    // everything else ("direct"). `acquisitionSource` is set once, the first
+    // time a contact arrives via an ad referral (see schema.ts), so its
+    // presence is the ad-lead signal. Additive: older clients ignore this
+    // field, newer clients degrade to "no split" if it's ever absent.
+    const isAdLead = (c: (typeof recentContacts)[number]) =>
+      c.acquisitionSource === "ad";
+    const todayContacts = recentContacts.filter(
+      (c) => c._creationTime >= todayStartMs,
+    );
+    const yesterdayContacts = recentContacts.filter(
+      (c) => c._creationTime >= yesterdayStartMs && c._creationTime < todayStartMs,
+    );
+    const newLeadsBySource = {
+      adToday: todayContacts.filter(isAdLead).length,
+      directToday: todayContacts.filter((c) => !isAdLead(c)).length,
+      adYesterday: yesterdayContacts.filter(isAdLead).length,
+      directYesterday: yesterdayContacts.filter((c) => !isAdLead(c)).length,
+    };
+
     // Deals: value-sum + count of every open deal, no time bound.
     // UNBOUNDED: same shape as `openConversations` above — grows with
     // total open deals in the account, not with a time window.
@@ -129,6 +150,7 @@ export const metrics = accountQuery({
         current: newContactsTodayCount,
         previous: newContactsYesterdayCount,
       },
+      newLeadsBySource,
       openDealsValue,
       openDealsCount: openDeals.length,
       messagesSentToday: {
