@@ -1152,27 +1152,8 @@ test("processInbound resolves an inbound voice note's media into storage and att
 // convex/ingest.ts's own comment on the step). Scaffold mirrors the
 // minimal "account + aiConfig + webhook endpoint" processInbound tests
 // above (e.g. the "automations phase matching zero automations" test)
-// — no flows/automations needed. `attributionSignalsFor` below is kept
-// only for the two negative-path tests proving the OLD table is never
-// written by this pipeline anymore.
+// — no flows/automations needed.
 // ============================================================
-
-// Scans (not `.withIndex`) — a helper parameter typed as the bare
-// `ReturnType<typeof convexTest>` loses this suite's concrete index
-// names (see this file's own `tagLink`/`messagesFor` for the identical,
-// already-documented gotcha).
-/** All attributionSignals rows for an account. */
-async function attributionSignalsFor(
-  t: ReturnType<typeof convexTest>,
-  accountId: Id<"accounts">,
-) {
-  return await t.run((ctx) =>
-    ctx.db
-      .query("attributionSignals")
-      .filter((q) => q.eq(q.field("accountId"), accountId))
-      .collect(),
-  );
-}
 
 test("processInbound seeds a code-lane new_lead conversionEvent from an HY- code, and NO attributionSignals row", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
@@ -1300,7 +1281,11 @@ test("processInbound creates no attribution signal when the message carries neit
     message: { type: "text", text: "just saying hello", wamid: "wamid.NONE" },
   });
 
-  expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(0);
 });
 
 test("processInbound does not create a second new_lead conversionEvent when the SAME code message is redelivered (duplicate wamid)", async () => {
@@ -1358,10 +1343,9 @@ test("processInbound does not create a second new_lead conversionEvent when the 
 // HTTP layer and the engine. Reuses this file's own
 // `seedAccount`/`seedAiConfig`/`seedWebhookEndpoint` scaffolding and
 // DRY-RUN env, same as every processInbound test above (the negative
-// case below still reuses `attributionSignalsFor` — it asserts the OLD
-// table stays empty). Each test asserts immediately after
-// `processInbound` returns — before any scheduled fn runs — so every
-// conversionEvents row here is still `"pending"`.
+// case below asserts that no conversionEvents are created). Each test
+// asserts immediately after `processInbound` returns — before any
+// scheduled fn runs — so every conversionEvents row here is still `"pending"`.
 // ============================================================
 
 test("integration seam: a RAW Meta message with referral.ctwa_clid flattens via flattenInboundMessage and ingests via processInbound into a ctwa-lane new_lead conversionEvent", async () => {
@@ -1476,7 +1460,11 @@ test("integration seam: a RAW Meta message with neither a code nor a referral fl
     message: flattened,
   });
 
-  expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(0);
 });
 
 test("processInbound persists the ad referral on the message, denorms it onto the conversation, and marks the contact acquired via ad", async () => {
