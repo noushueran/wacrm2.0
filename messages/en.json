@@ -38,6 +38,8 @@
     "closeMenu": "Close menu",
     "collapseMenu": "Collapse menu",
     "expandMenu": "Expand menu",
+    "pinSidebar": "Pin sidebar",
+    "unpinSidebar": "Unpin sidebar",
     "defaultUser": "User",
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
