@@ -5,7 +5,8 @@ import {
 } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
-import type { Doc } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
+import { resolveEventName, backendForLane } from "./lib/funnel";
 
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
@@ -24,6 +25,77 @@ export const getWabaId = internalQuery({
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .first();
     return cfg?.wabaId ?? null;
+  },
+});
+
+/**
+ * Classifies a conversation's lead source from the identifiers seen on an
+ * inbound message and seeds the ONE `new_lead` conversion event for its
+ * lane. `code` (website HY-code) wins over `ctwa` (ad click) if both are
+ * present; both identifiers are retained on `conversation.attribution`
+ * (set once, never overwritten). Fire-once per conversation via the
+ * deterministic `eventId = ${conversationId}:new_lead` + the `by_event_id`
+ * guard. Returns `{ conversionEventId }` on a fresh insert (so the caller
+ * schedules delivery), or `null` for an organic message (no identifier) or a
+ * conversation whose `new_lead` was already seeded. Replaces the old
+ * `attribution.recordSignal` first-touch write.
+ */
+export const seedNewLead = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    contactId: v.id("contacts"),
+    conversationId: v.id("conversations"),
+    waMessageId: v.string(),
+    phone: v.string(),
+    firstMessageAt: v.number(),
+    code: v.optional(v.string()),
+    ctwaClid: v.optional(v.string()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ conversionEventId: Id<"conversionEvents"> } | null> => {
+    const { accountId, contactId, conversationId, waMessageId, phone, firstMessageAt, code, ctwaClid } =
+      args;
+    if (!code && !ctwaClid) return null; // organic — nothing to attribute
+
+    const lane: "code" | "ctwa" = code ? "code" : "ctwa";
+    const identifier = code ?? ctwaClid!;
+
+    // Classify once — set conversation.attribution if unset (retain both ids).
+    const conversation = await ctx.db.get(conversationId);
+    if (conversation && !conversation.attribution) {
+      await ctx.db.patch(conversationId, {
+        attribution: { lane, code, ctwaClid, firstSeenAt: firstMessageAt },
+      });
+    }
+
+    // Fire-once per conversation.
+    const eventId = `${conversationId}:new_lead`;
+    const existing = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_event_id", (q) => q.eq("eventId", eventId))
+      .first();
+    if (existing) return null;
+
+    const eventName = resolveEventName(lane, "new_lead")!; // new_lead is never internal-only
+    const conversionEventId = await ctx.db.insert("conversionEvents", {
+      accountId,
+      conversationId,
+      contactId,
+      stage: "new_lead",
+      lane,
+      backend: backendForLane(lane),
+      eventName,
+      identifier,
+      phone,
+      waMessageId,
+      firstMessageAt,
+      eventId,
+      status: "pending",
+      attempts: 0,
+    });
+    return { conversionEventId };
   },
 });
 

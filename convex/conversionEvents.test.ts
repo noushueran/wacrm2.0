@@ -190,3 +190,94 @@ test("already-sent row is a no-op (idempotent)", async () => {
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
   expect(calls).toBe(0);
 });
+
+test("seedNewLead (code): sets attribution + a platformA new_lead row, once", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  const first = await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000, code: "ABCDEF",
+  });
+  expect(first).not.toBeNull();
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.attribution?.lane).toBe("code");
+  expect(conv?.attribution?.code).toBe("ABCDEF");
+
+  const rows = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  expect(rows).toHaveLength(1);
+  expect(rows[0].backend).toBe("platformA");
+  expect(rows[0].lane).toBe("code");
+  expect(rows[0].eventName).toBe("Lead");
+  expect(rows[0].identifier).toBe("ABCDEF");
+  expect(rows[0].eventId).toBe(`${conversationId}:new_lead`);
+
+  // Idempotent: a second call for the same conversation seeds nothing new.
+  const second = await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.2",
+    phone: "+15551230000", firstMessageAt: 1_000_050, code: "ABCDEF",
+  });
+  expect(second).toBeNull();
+  const after = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  expect(after).toHaveLength(1);
+});
+
+test("seedNewLead (ctwa): a capi new_lead row with LeadSubmitted", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000, ctwaClid: "clid-9",
+  });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.attribution?.lane).toBe("ctwa");
+  expect(conv?.attribution?.ctwaClid).toBe("clid-9");
+  const rows = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  expect(rows[0].backend).toBe("capi");
+  expect(rows[0].eventName).toBe("LeadSubmitted");
+  expect(rows[0].identifier).toBe("clid-9");
+});
+
+test("seedNewLead: code wins when both identifiers present; both retained", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000, code: "ABCDEF", ctwaClid: "clid-9",
+  });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.attribution?.lane).toBe("code");
+  expect(conv?.attribution?.code).toBe("ABCDEF");
+  expect(conv?.attribution?.ctwaClid).toBe("clid-9");
+  const rows = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  expect(rows[0].backend).toBe("platformA");
+});
+
+test("seedNewLead: returns null and writes nothing for an organic message", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  const res = await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000,
+  });
+  expect(res).toBeNull();
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.attribution).toBeUndefined();
+  const rows = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  expect(rows).toHaveLength(0);
+});
