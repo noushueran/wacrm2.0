@@ -1416,6 +1416,25 @@
         "pink": "Pink"
       }
     },
+    "tagGroups": {
+      "title": "Tag groups",
+      "desc": "Organise labels into dimensions (Product, Destination, Priority…). Single-select groups allow one tag per chat; multi-select allow several.",
+      "newGroupName": "New group name",
+      "single": "Single-select",
+      "multi": "Multi-select",
+      "addGroup": "Add group",
+      "addTag": "Add tag",
+      "tagName": "Tag name",
+      "ungrouped": "Ungrouped",
+      "deleteGroup": "Delete group",
+      "deleteGroupConfirm": "Delete “{name}”? Its tags become ungrouped (they are not deleted).",
+      "deleteTag": "Delete tag",
+      "deleteTagConfirm": "Delete “{name}”? It is removed from every chat.",
+      "created": "Created",
+      "deleted": "Deleted",
+      "failed": "Something went wrong",
+      "nameRequired": "Enter a name"
+    },
     "templates": {
       "title": "Message templates",
       "description": "Create templates and submit them to Meta for approval. Use \"Sync from Meta\" to pull templates approved elsewhere.",
