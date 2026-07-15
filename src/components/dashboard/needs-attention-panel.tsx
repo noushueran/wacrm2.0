@@ -1,7 +1,7 @@
 "use client"
 
 import Link from 'next/link'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { CheckCircle2, Megaphone } from 'lucide-react'
 import { useTranslations } from 'next-intl'
 
@@ -47,6 +47,17 @@ export function NeedsAttentionCard() {
   const tab: QueueTab =
     picked && availableTabs.includes(picked) ? picked : availableTabs[0]
 
+  // "Now" for the wait-duration labels. Seeded via a lazy initializer (called
+  // once by React, not in the render body, which the compiler rejects as
+  // impure) and refreshed on an interval so the "2h 14m" values stay live.
+  // Rows only render once data loads (client-side), so the server/client seed
+  // difference never reaches the DOM — no hydration mismatch.
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60_000)
+    return () => clearInterval(id)
+  }, [])
+
   const data = useQuery(
     api.conversations.list,
     accountId
@@ -68,7 +79,7 @@ export function NeedsAttentionCard() {
       tab={tab}
       onTabChange={setPicked}
       availableTabs={availableTabs}
-      nowMs={Date.now()}
+      nowMs={nowMs}
     />
   )
 }
