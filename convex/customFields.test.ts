@@ -719,7 +719,8 @@ test("update switches a field to a new type + options", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, { name: "Sup", email: "cf3@x.com", role: "supervisor" });
   const fid = await asUser.mutation(api.customFields.create, { fieldName: "Budget", fieldType: "text" });
-  await asUser.mutation(api.customFields.update, { fieldId: fid, fieldType: "number" });
+  await asUser.mutation(api.customFields.update, { fieldId: fid, fieldType: "select", fieldOptions: { options: ["A", "B"] } });
   const row = await t.run((ctx) => ctx.db.get(fid));
-  expect(row!.fieldType).toBe("number");
+  expect(row!.fieldType).toBe("select");
+  expect(row!.fieldOptions).toEqual({ options: ["A", "B"] });
 });
