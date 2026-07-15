@@ -176,6 +176,27 @@ export default defineSchema({
         firstSeenAt: v.number(),
       }),
     ),
+    // Denormalized CURRENT funnel stage for fast inbox render + future
+    // stage-filtering, without scanning `funnelTransitions`. `saleValue`/
+    // `saleCurrency` are captured at the Purchased stage (and optionally at
+    // quote/invoice). The full progress history lives in `funnelTransitions`.
+    funnel: v.optional(
+      v.object({
+        stage: v.union(
+          v.literal("new_lead"),
+          v.literal("qualified"),
+          v.literal("price_quoted"),
+          v.literal("itinerary_created"),
+          v.literal("itinerary_sent"),
+          v.literal("invoice_sent"),
+          v.literal("purchased"),
+        ),
+        stageUpdatedAt: v.number(),
+        stageUpdatedByUserId: v.optional(v.id("users")),
+        saleValue: v.optional(v.number()),
+        saleCurrency: v.optional(v.string()),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"])
@@ -1199,6 +1220,33 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     .index("by_event_id", ["eventId"])
     .index("by_status", ["status"])
+    .index("by_account_stage", ["accountId", "stage"]),
+
+  // Append-only funnel progress log (funnel Phase 2). One row per stage
+  // ENTERED, for every conversation (incl. organic and the internal
+  // `itinerary_created` stage). Powers the stepper (Phase 3) + funnel
+  // analytics (Phase 4). Links to the fired `conversionEvents` row when one
+  // was seeded. `auto` = the ingest-seeded first-touch (Phase 1 seeds the
+  // new_lead conversionEvent; a matching `auto` transition may be backfilled
+  // later — this phase writes only agent-driven `auto:false` rows).
+  funnelTransitions: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    stage: v.union(
+      v.literal("new_lead"),
+      v.literal("qualified"),
+      v.literal("price_quoted"),
+      v.literal("itinerary_created"),
+      v.literal("itinerary_sent"),
+      v.literal("invoice_sent"),
+      v.literal("purchased"),
+    ),
+    byUserId: v.optional(v.id("users")),
+    auto: v.boolean(),
+    conversionEventId: v.optional(v.id("conversionEvents")),
+  })
+    .index("by_conversation", ["conversationId"])
     .index("by_account_stage", ["accountId", "stage"]),
 
   // ============================================================
