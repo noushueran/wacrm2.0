@@ -122,6 +122,8 @@ export function TagGroupsManager() {
                 colorPool={PRESET_COLORS}
                 placeholder={t('tagName')}
                 addLabel={t('addTag')}
+                colorAria={t('tagColor')}
+                failedLabel={t('failed')}
                 onAdd={(name, color) =>
                   createTag({ name, color, groupId: group.id as Id<'tagGroups'> })
                 }
@@ -164,11 +166,13 @@ export function TagGroupsManager() {
 
 /** Inline "add a tag to this group" control: name + colour swatch + add. */
 function AddTagInline({
-  colorPool, placeholder, addLabel, onAdd,
+  colorPool, placeholder, addLabel, colorAria, failedLabel, onAdd,
 }: {
   colorPool: string[];
   placeholder: string;
   addLabel: string;
+  colorAria: string;
+  failedLabel: string;
   onAdd: (name: string, color: string) => Promise<unknown>;
 }) {
   const [name, setName] = useState('');
@@ -178,6 +182,7 @@ function AddTagInline({
     if (!name.trim()) return;
     setBusy(true);
     try { await onAdd(name.trim(), color); setName(''); }
+    catch { toast.error(failedLabel); }
     finally { setBusy(false); }
   }
   return (
@@ -192,7 +197,7 @@ function AddTagInline({
       />
       <button
         type="button"
-        aria-label="tag colour"
+        aria-label={colorAria}
         onClick={() => setColor(colorPool[(colorPool.indexOf(color) + 1) % colorPool.length])}
         className="size-5 rounded"
         style={{ backgroundColor: color }}

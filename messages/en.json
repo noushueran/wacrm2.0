@@ -1433,7 +1433,8 @@
       "created": "Created",
       "deleted": "Deleted",
       "failed": "Something went wrong",
-      "nameRequired": "Enter a name"
+      "nameRequired": "Enter a name",
+      "tagColor": "Tag colour"
     },
     "templates": {
       "title": "Message templates",
