@@ -25,6 +25,7 @@ import type * as broadcasts from "../broadcasts.js";
 import type * as contactNotes from "../contactNotes.js";
 import type * as contacts from "../contacts.js";
 import type * as conversations from "../conversations.js";
+import type * as conversionEvents from "../conversionEvents.js";
 import type * as customFields from "../customFields.js";
 import type * as dashboard from "../dashboard.js";
 import type * as deals from "../deals.js";
@@ -107,6 +108,7 @@ declare const fullApi: ApiFromModules<{
   contactNotes: typeof contactNotes;
   contacts: typeof contacts;
   conversations: typeof conversations;
+  conversionEvents: typeof conversionEvents;
   customFields: typeof customFields;
   dashboard: typeof dashboard;
   deals: typeof deals;
