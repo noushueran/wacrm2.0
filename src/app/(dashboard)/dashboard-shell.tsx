@@ -7,6 +7,7 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
 import { PresenceHeartbeat } from "@/components/presence/presence-heartbeat";
 import { ServiceWorkerManager } from "@/components/pwa/service-worker-manager";
+import { InboxNotifier } from "@/components/pwa/inbox-notifier";
 import { InstallPrompt } from "@/components/pwa/install-prompt";
 import { RequireSection } from "@/components/auth/require-section";
 
@@ -48,6 +49,7 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
           signed in. Headless — renders nothing. */}
       <PresenceHeartbeat />
       <ServiceWorkerManager />
+      <InboxNotifier />
       <Sidebar open={sidebarOpen} onClose={closeSidebar} />
       <div className="flex flex-1 flex-col overflow-hidden">
         <Header onOpenSidebar={() => setSidebarOpen(true)} />
