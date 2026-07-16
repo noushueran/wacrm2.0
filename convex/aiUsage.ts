@@ -34,7 +34,7 @@ export const log = internalMutation({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(v.literal("auto_reply"), v.literal("draft")),
+    mode: v.union(v.literal("auto_reply"), v.literal("draft"), v.literal("classify")),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
     promptTokens: v.number(),

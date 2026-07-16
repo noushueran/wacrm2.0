@@ -148,6 +148,20 @@ export interface TagGroup {
   position: number;
 }
 
+/** One AI classification run on a conversation (`convex/aiTagging.ts`'s
+ *  `tagSuggestions` table) — the inbox "Suggest tags" banner's data shape.
+ *  `suggested_tag_ids` is a flat, group-generic list; the banner resolves
+ *  each id against `api.tags.list` for display (name/color). */
+export interface TagSuggestion {
+  id: string;
+  conversation_id: string;
+  contact_id: string;
+  suggested_tag_ids: string[];
+  note?: string;
+  confidence: 'high' | 'medium' | 'low';
+  status: 'auto_applied' | 'pending' | 'accepted' | 'dismissed';
+}
+
 export interface ContactTag {
   id: string;
   contact_id: string;

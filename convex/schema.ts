@@ -122,6 +122,7 @@ export default defineSchema({
     accountId: v.id("accounts"),
     contactId: v.id("contacts"),
     tagId: v.id("tags"),
+    source: v.optional(v.union(v.literal("ai"), v.literal("manual"))), // unset = manual (backward-compatible)
   })
     .index("by_contact", ["contactId"])
     .index("by_tag", ["tagId"])
@@ -1060,7 +1061,7 @@ export default defineSchema({
   aiUsageLog: defineTable({
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(v.literal("auto_reply"), v.literal("draft")),
+    mode: v.union(v.literal("auto_reply"), v.literal("draft"), v.literal("classify")),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
     promptTokens: v.number(),
@@ -1126,6 +1127,29 @@ export default defineSchema({
       dimensions: 1536,
       filterFields: ["accountId"],
     }),
+
+  // One AI classification of a conversation into the account's tag
+  // catalogue. `suggestedTagIds` is group-generic (a flat validated list
+  // across all tag groups — respects each group's single/multi mode);
+  // the UI renders it grouped. `status` tracks the review lifecycle.
+  tagSuggestions: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    suggestedTagIds: v.array(v.id("tags")),
+    note: v.optional(v.string()),
+    confidence: v.union(v.literal("high"), v.literal("medium"), v.literal("low")),
+    status: v.union(
+      v.literal("auto_applied"),
+      v.literal("pending"),
+      v.literal("accepted"),
+      v.literal("dismissed"),
+    ),
+    model: v.string(),
+    reviewedByUserId: v.optional(v.id("users")),
+  })
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_conversation", ["conversationId"]),
 
   // Ownership record tying a client-uploaded Convex storage object to the
   // account that minted it. Convex `_storage` carries no `accountId` of

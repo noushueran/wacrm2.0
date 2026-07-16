@@ -355,6 +355,19 @@
       "ungrouped": "Other",
       "failed": "Couldn’t update labels"
     },
+    "tagSuggestions": {
+      "title": "AI suggestion",
+      "suggestCta": "Suggest tags",
+      "accept": "Accept",
+      "dismiss": "Dismiss",
+      "accepted": "Labels applied",
+      "errorGeneric": "Couldn’t get a suggestion",
+      "error_ai_not_configured": "Set up the AI assistant in Settings first",
+      "error_forbidden": "You don’t have access",
+      "error_not_found": "Conversation not found",
+      "error_no_account": "No account",
+      "error_no_tags": "No matching tags found for this conversation"
+    },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
       "activeText": "AI assistant is replying automatically",
@@ -1868,6 +1881,11 @@
       "reindex": "Reindex",
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
+    }
+  },
+  "Agents": {
+    "usage": {
+      "classifyLabel": "Tagging"
     }
   }
 }
