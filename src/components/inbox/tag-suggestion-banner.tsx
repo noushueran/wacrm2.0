@@ -42,6 +42,8 @@ function suggestErrorMessage(code: string, t: ReturnType<typeof useTranslations>
       return t('error_not_found');
     case 'no_account':
       return t('error_no_account');
+    case 'no_tags':
+      return t('error_no_tags');
     default:
       return t('errorGeneric');
   }

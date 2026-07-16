@@ -42,13 +42,20 @@ function isDryRun(): boolean {
  * tag name to map back to an id, giving tests a deterministic way to
  * exercise the full classify-then-record pipeline without ever touching
  * a provider. Confidence is pinned to `"low"` — a synthetic guess earns
- * no more than that.
+ * no more than that. When the account's catalogue is entirely empty (no
+ * `tagGroups`/`tags` at all) there's nothing to pick a tag from — and
+ * nothing worth noting either, so `note` comes back empty too. That lets
+ * a dry-run test exercise `suggest`'s empty-classification short-circuit
+ * (`parsed.tagIds.length === 0 && !parsed.note` → `{code: "no_tags"}`)
+ * deterministically, the same way a non-empty catalogue exercises the
+ * normal record path.
  */
 function syntheticClassifyRaw(catalogue: Catalogue): string {
   const tags = catalogue.groups
     .map((g) => g.tags[0]?.name)
     .filter((name): name is string => Boolean(name));
-  return JSON.stringify({ tags, note: "dry-run classification", confidence: "low" });
+  const note = tags.length > 0 ? "dry-run classification" : "";
+  return JSON.stringify({ tags, note, confidence: "low" });
 }
 
 // ------------------------------------------------------------
@@ -123,6 +130,31 @@ export const recordSuggestion = internalMutation({
   },
 });
 
+/**
+ * The account's pending `tagSuggestions` row for a conversation, if any —
+ * `suggest`'s own idempotency guard: called BEFORE any classify work so a
+ * redundant "Suggest tags" click (two agents racing, or one click landing
+ * before the reactive `pendingForConversation` query has re-rendered the
+ * banner out of its CTA face) returns the existing row instead of
+ * inserting a second, orphaned one. Same `by_conversation`-scan-then-
+ * filter shape as `pendingForConversation` near the bottom of this file
+ * (see that query's own comment for why it isn't a compound index) —
+ * kept as a separate `internalQuery` rather than reused directly because
+ * `suggest` is a plain `action` with no `ctx.db` of its own, while
+ * `pendingForConversation` is an `accountQuery` that derives `accountId`
+ * from the authenticated caller rather than taking it as an arg.
+ */
+export const existingPending = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args): Promise<Doc<"tagSuggestions"> | null> => {
+    const rows = await ctx.db
+      .query("tagSuggestions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .collect();
+    return rows.find((r) => r.accountId === args.accountId && r.status === "pending") ?? null;
+  },
+});
+
 // ------------------------------------------------------------
 // suggest — the public entry point.
 // ------------------------------------------------------------
@@ -138,16 +170,28 @@ type SuggestResult =
 
 /**
  * Agent+ "classify this conversation" action. Body: `{conversationId}`.
- * Loads the account's config + the conversation's recent text history
- * (REUSING `aiReply.recentMessages`/`toChatMessages`, the same internals
- * `aiReply.draft` uses), loads the account's tag catalogue, classifies
- * it (a real provider call, or a deterministic synthetic result under
- * `CONVEX_AI_DRY_RUN`), and records the result as a pending suggestion
- * for an agent to review. Usage is logged via `internal.aiUsage.log`
- * (`mode: "classify"`) whenever a real call reported any — mirrors
- * `draft`'s own best-effort usage logging, minus the try/catch: unlike
- * `draft`'s fire-and-forget-but-caught log call, a failure here is
- * allowed to propagate (there's no already-sent reply to protect).
+ * If the conversation already has a pending suggestion (`existingPending`,
+ * above) — two agents both clicking "Suggest tags", or a redundant click
+ * landing before the reactive `pendingForConversation` query has hidden
+ * the CTA — that row is returned as-is rather than reclassifying, so a
+ * race never produces two pending rows and never burns a second (paid)
+ * provider call. Otherwise: loads the account's config + the
+ * conversation's recent text history (REUSING
+ * `aiReply.recentMessages`/`toChatMessages`, the same internals
+ * `aiReply.draft` uses), loads the account's tag catalogue, and
+ * classifies it (a real provider call, or a deterministic synthetic
+ * result under `CONVEX_AI_DRY_RUN`). If that classification came back
+ * with nothing — no tags AND no note — there's nothing worth showing an
+ * agent, so it's returned as `{error, code: "no_tags"}` WITHOUT recording
+ * an empty pending row; otherwise the result is recorded as a pending
+ * suggestion for an agent to review. Usage is logged via
+ * `internal.aiUsage.log` (`mode: "classify"`) whenever a real call
+ * reported any, AFTER that record-or-skip decision (never before — the
+ * account already paid the provider for this classification regardless
+ * of how it comes out, so the spend is logged either way) and wrapped in
+ * try/catch — best-effort, mirrors `draft`'s own usage logging: a
+ * transient log failure must not throw away an already-recorded (or
+ * already-decided-empty) classification.
  *
  * Tenant scoping mirrors `aiReply.draft`: `getAuthUserId` +
  * `internal.accounts.accountContextForUser({userId})` (an action has no
@@ -181,6 +225,24 @@ export const suggest = action({
     });
     if (!conversation) {
       return { error: "Conversation not found", code: "not_found" };
+    }
+
+    // Idempotency guard — deliberately BEFORE any config/catalogue load or
+    // the classify call itself, so a redundant click can't burn a real
+    // provider call: see `existingPending`'s own comment for the race this
+    // closes (or narrows — it's a read here and a later insert below,
+    // across two separate function calls, not one atomic transaction).
+    const existing = await ctx.runQuery(internal.aiTagging.existingPending, {
+      accountId,
+      conversationId: args.conversationId,
+    });
+    if (existing) {
+      return {
+        suggestionId: existing._id,
+        tagIds: existing.suggestedTagIds,
+        note: existing.note,
+        confidence: existing.confidence,
+      };
     }
 
     let config;
@@ -226,19 +288,43 @@ export const suggest = action({
 
     const parsed = parseClassification(raw, catalogue);
 
-    if (usage) {
-      await ctx.runMutation(internal.aiUsage.log, {
-        accountId,
-        conversationId: args.conversationId,
-        mode: "classify",
-        provider: config.provider,
-        model: config.model,
-        promptTokens: usage.promptTokens,
-        completionTokens: usage.completionTokens,
-        totalTokens: usage.totalTokens,
-      });
+    if (parsed.tagIds.length === 0 && !parsed.note) {
+      // Nothing worth showing an agent. A real provider call still
+      // consumed tokens even though it came back empty, so that spend is
+      // still logged (best-effort, same try/catch as the success path
+      // below) — but `recordSuggestion` is skipped: an empty pending row
+      // would just be dead UI weight with nothing to accept, dismiss, or
+      // act on.
+      if (usage) {
+        try {
+          await ctx.runMutation(internal.aiUsage.log, {
+            accountId,
+            conversationId: args.conversationId,
+            mode: "classify",
+            provider: config.provider,
+            model: config.model,
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            totalTokens: usage.totalTokens,
+          });
+        } catch (err) {
+          console.warn("[ai tag suggest] usage log failed:", err);
+        }
+      }
+      return {
+        error: "The AI didn't find any matching tags for this conversation.",
+        code: "no_tags" as const,
+      };
     }
 
+    // Record FIRST, log usage second (and best-effort): the account
+    // already paid the provider for this classification, so a transient
+    // failure logging that spend must never discard the suggestion it
+    // already paid for — unlike a thrown error here, which would roll
+    // back nothing (the insert below already committed) but WOULD
+    // incorrectly surface as a failed `suggest` call to the banner even
+    // though the suggestion is sitting there, pending, un-reachable by
+    // the caller that just "failed".
     const suggestionId = await ctx.runMutation(internal.aiTagging.recordSuggestion, {
       accountId,
       conversationId: args.conversationId,
@@ -248,6 +334,23 @@ export const suggest = action({
       confidence: parsed.confidence,
       model: config.model,
     });
+
+    if (usage) {
+      try {
+        await ctx.runMutation(internal.aiUsage.log, {
+          accountId,
+          conversationId: args.conversationId,
+          mode: "classify",
+          provider: config.provider,
+          model: config.model,
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          totalTokens: usage.totalTokens,
+        });
+      } catch (err) {
+        console.warn("[ai tag suggest] usage log failed:", err);
+      }
+    }
 
     return {
       suggestionId,
@@ -368,12 +471,19 @@ export const dismissSuggestion = accountMutation({
  * The account's pending `tagSuggestions` row for a conversation, if any —
  * lets the inbox banner decide which face to show: the "Suggest tags" CTA
  * when this is `null`, or the accept/dismiss review UI when it's a row.
- * `by_conversation` isn't compound with `status`, so this scans the (small,
- * bounded — `suggest`/`recordSuggestion` never queue a second run while one
- * is already pending) set of a conversation's suggestions and filters
+ * `by_conversation` isn't compound with `status`, so this scans the
+ * (small in practice) set of a conversation's suggestions and filters
  * `status === "pending"` in memory; the `accountId` check is the same
  * belt-and-suspenders cross-tenant guard `requireOwnSuggestion` uses,
  * defensive since `by_conversation` alone can't scope by account.
+ * `suggest` now guards against creating a second pending row itself
+ * (`existingPending`, defined earlier in this file) before it ever
+ * classifies — but that guard is a plain read-then-later-insert split
+ * across two separate function calls, not an atomic/schema-level
+ * uniqueness constraint, so it narrows the race rather than eliminating
+ * it. Don't treat "at most one pending row per conversation" as an
+ * invariant this table enforces; `.find(...)` below deliberately returns
+ * just the first match rather than asserting there's only one.
  */
 export const pendingForConversation = accountQuery({
   args: { conversationId: v.id("conversations") },

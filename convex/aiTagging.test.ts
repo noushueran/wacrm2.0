@@ -139,6 +139,108 @@ test("suggest records a pending suggestion from a dry-run classification", async
   expect(rows[0]!.confidence).toBeDefined();
 });
 
+test("suggest is idempotent: calling it twice on the same conversation returns the same suggestionId and inserts only one row", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  const { conversationId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15550015",
+      phoneNormalized: "15550015",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    });
+    await ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "text" as const,
+      contentText: "UAE Visa please",
+      status: "delivered" as const,
+    });
+    const gid = await ctx.db.insert("tagGroups", {
+      accountId,
+      name: "Product",
+      selectionMode: "single" as const,
+      position: 0,
+    });
+    await ctx.db.insert("tags", {
+      accountId,
+      name: "UAE Visa",
+      color: "#3b82f6",
+      groupId: gid,
+    });
+    return { conversationId };
+  });
+
+  const first = await asUser.action(api.aiTagging.suggest, { conversationId });
+  if ("error" in first) throw new Error(`expected success, got ${first.code}: ${first.error}`);
+
+  const second = await asUser.action(api.aiTagging.suggest, { conversationId });
+  if ("error" in second) throw new Error(`expected success, got ${second.code}: ${second.error}`);
+
+  expect(second.suggestionId).toBe(first.suggestionId);
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("tagSuggestions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+});
+
+test("suggest on an account with an empty tag catalogue returns a no_tags error and records nothing", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  // No tagGroups/tags seeded at all — the dry-run synthetic classifier
+  // (see `syntheticClassifyRaw` in `convex/aiTagging.ts`) then has no
+  // catalogue to pick a tag from and no note either.
+  const { conversationId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15550016",
+      phoneNormalized: "15550016",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    });
+    return { conversationId };
+  });
+
+  const res = await asUser.action(api.aiTagging.suggest, { conversationId });
+
+  expect(res).toEqual({
+    error: "The AI didn't find any matching tags for this conversation.",
+    code: "no_tags",
+  });
+
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("tagSuggestions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(0);
+});
+
 test("suggest returns a forbidden error for a viewer (below the agent role floor)", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
