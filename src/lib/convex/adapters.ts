@@ -27,6 +27,7 @@ import type {
   QuickReply,
   Tag,
   TagGroup,
+  TagSuggestion,
   TemplateButton,
   WhatsAppConfig,
 } from "@/types";
@@ -90,6 +91,20 @@ export function toUiTagGroup(doc: Doc<"tagGroups">): TagGroup {
     color: doc.color,
     selection_mode: doc.selectionMode,
     position: doc.position,
+  };
+}
+
+/** `tagSuggestions` doc -> the inbox banner's UI shape. Plain rename +
+ *  passthrough, same convention as every adapter above. */
+export function toUiTagSuggestion(doc: Doc<"tagSuggestions">): TagSuggestion {
+  return {
+    id: doc._id,
+    conversation_id: doc.conversationId,
+    contact_id: doc.contactId,
+    suggested_tag_ids: doc.suggestedTagIds,
+    note: doc.note,
+    confidence: doc.confidence,
+    status: doc.status,
   };
 }
 
