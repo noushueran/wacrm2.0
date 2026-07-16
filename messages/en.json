@@ -1869,5 +1869,13 @@
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
     }
+  },
+  "Pwa": {
+    "installTitle": "Install Holidayys",
+    "installBody": "Add the app to your device for faster access and notifications.",
+    "installButton": "Install app",
+    "iosInstallTitle": "Install on iPhone/iPad",
+    "iosInstallBody": "Tap the Share icon, then \"Add to Home Screen\" to install and enable notifications.",
+    "dismiss": "Not now"
   }
 }

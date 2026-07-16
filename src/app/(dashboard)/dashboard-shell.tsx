@@ -7,6 +7,7 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
 import { PresenceHeartbeat } from "@/components/presence/presence-heartbeat";
 import { ServiceWorkerManager } from "@/components/pwa/service-worker-manager";
+import { InstallPrompt } from "@/components/pwa/install-prompt";
 import { RequireSection } from "@/components/auth/require-section";
 
 // Auth-gated dashboard shell. Extracted from the layout so the layout
@@ -55,6 +56,7 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
           <RequireSection>{children}</RequireSection>
         </main>
       </div>
+      <InstallPrompt />
     </div>
   );
 }
