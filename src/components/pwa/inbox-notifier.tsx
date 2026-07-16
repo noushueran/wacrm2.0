@@ -55,14 +55,15 @@ function playChime(ctxRef: { current: AudioContext | null }) {
 
 // Headless. While a tab is VISIBLE, shows an in-app toast + chime for a
 // new inbound message (the SW hands off instead of firing an OS
-// notification when a client is visible). De-dupes by tag so the same
-// message never toasts twice, and skips the conversation currently open
-// in the inbox (that message is already streaming in live).
+// notification when a client is visible). Each push delivers exactly one
+// `wa-push` event per tab (ServiceWorkerManager registers a single
+// SW-message listener, and the SW sends one postMessage per push), so no
+// de-dupe is needed here. Skips the conversation currently open in the
+// inbox (that message is already streaming in live).
 export function InboxNotifier() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const seen = useRef<Set<string>>(new Set());
   const audioCtxRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
@@ -70,11 +71,10 @@ export function InboxNotifier() {
 
     const onPush = (e: Event) => {
       const payload = (e as CustomEvent<PushPayload>).detail;
-      if (!payload?.tag || seen.current.has(payload.tag)) return;
+      if (!payload?.tag) return;
       // Skip if the user is already looking at this conversation — the
       // message is already streaming in live via the reactive query.
       if (payload.tag === openConversationId) return;
-      seen.current.add(payload.tag);
 
       playChime(audioCtxRef);
       toast(payload.title, {

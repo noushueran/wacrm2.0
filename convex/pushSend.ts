@@ -21,7 +21,9 @@ export const deliverForMessage = internalAction({
     const privateKey = process.env.VAPID_PRIVATE_KEY;
     const subject = process.env.VAPID_SUBJECT;
     if (!publicKey || !privateKey || !subject) {
-      console.error("[push] VAPID env not configured; skipping send");
+      // Expected configuration state (dormant until the owner sets VAPID
+      // env), not a runtime error — stay silent so this doesn't spam
+      // error-level logs on the ingest hot path for every inbound message.
       return null;
     }
     webpush.setVapidDetails(subject, publicKey, privateKey);
