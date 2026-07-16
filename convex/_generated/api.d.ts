@@ -80,6 +80,7 @@ import type * as notifications from "../notifications.js";
 import type * as pipelines from "../pipelines.js";
 import type * as presence from "../presence.js";
 import type * as push from "../push.js";
+import type * as pushSend from "../pushSend.js";
 import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as send from "../send.js";
@@ -169,6 +170,7 @@ declare const fullApi: ApiFromModules<{
   pipelines: typeof pipelines;
   presence: typeof presence;
   push: typeof push;
+  pushSend: typeof pushSend;
   quickReplies: typeof quickReplies;
   reactions: typeof reactions;
   send: typeof send;
