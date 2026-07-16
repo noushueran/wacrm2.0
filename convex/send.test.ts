@@ -731,3 +731,54 @@ test("agent cannot send.send to a brand-new contact (would create an unassigned 
 
   delete process.env.CONVEX_META_DRY_RUN;
 });
+
+test("send persists replyToMessageId on the outbound reply (DRY-RUN)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+  // The customer message the agent is replying to.
+  const parentId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "Do you have availability?",
+      messageId: "wamid.PARENT",
+      status: "delivered",
+    }),
+  );
+
+  await asUser.action(api.send.send, {
+    conversationId,
+    messageType: "text",
+    contentText: "Yes we do!",
+    replyToMessageId: parentId,
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", conversationId),
+      )
+      .collect(),
+  );
+  const reply = messages.find((m) => m.senderType === "agent");
+  expect(reply).toBeDefined();
+  expect(reply!.replyToMessageId).toBe(parentId);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
