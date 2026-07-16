@@ -23,6 +23,10 @@ export function BottomNav({ onOpenMore }: { onOpenMore: () => void }) {
   const { accountRole } = useAuth();
   const totalUnread = useTotalUnread();
   if (!accountRole) return null;
+  // The inbox is a full-screen messaging surface with its own list↔thread
+  // navigation and the header hamburger drawer — a bottom tab bar there
+  // would overlap the message composer, so it's hidden on /inbox routes.
+  if (pathname.startsWith("/inbox")) return null;
 
   const visible = items.filter((i) => canAccessNav(accountRole, i.href));
 
