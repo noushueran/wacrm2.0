@@ -533,3 +533,47 @@ test("assembleDelivery: a subscription row scoped to a different account is neve
 
   expect(result.jobs.map((j) => j.endpoint)).toEqual(["eOwnerHome"]);
 });
+
+test("assembleDelivery: a conversation belonging to a different account returns no jobs", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: accountAId } = await seedAccountMember(t, {
+    name: "Owner A",
+    email: "owner-a@example.com",
+    role: "owner",
+  });
+  const {
+    accountId: accountBId,
+    userId: ownerBId,
+    asUser: asOwnerB,
+  } = await seedAccountMember(t, {
+    name: "Owner B",
+    email: "owner-b@example.com",
+    role: "owner",
+  });
+
+  // A subscribed, assignable member exists in account B, so if the
+  // conversation-level guard were ever removed, the recipient-resolution
+  // and subscription-loading logic below it would happily find and
+  // return this job — proving the guard itself is what's under test.
+  await asOwnerB.mutation(api.push.subscribe, {
+    endpoint: "eOwnerB",
+    p256dh: "kOwnerB",
+    auth: "aOwnerB",
+  });
+
+  const { conversationId: conversationInB } = await seedConversation(t, {
+    accountId: accountBId,
+    contactName: "Account B Lead",
+    assignedToUserId: ownerBId,
+  });
+
+  // Account A calls assembleDelivery for a conversation it doesn't own.
+  const result = await t.query(internal.push.assembleDelivery, {
+    accountId: accountAId,
+    conversationId: conversationInB,
+    contentType: "text",
+    text: "hi",
+  });
+
+  expect(result).toEqual({ jobs: [] });
+});
