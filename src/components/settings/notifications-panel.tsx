@@ -55,6 +55,21 @@ export function NotificationsPanel() {
         <input
           type="checkbox"
           className="mt-0.5 h-4 w-4"
+          // Inverted mapping: this checkbox reads as "pause", but the stored
+          // preference is `pushEnabled` (on by default), so checked = !pushEnabled.
+          checked={!(prefs?.pushEnabled ?? true)}
+          onChange={(e) => void setPrefs({ pushEnabled: !e.target.checked })}
+        />
+        <span>
+          <span className="block text-sm font-medium text-foreground">{t("muteLabel")}</span>
+          <span className="block text-xs text-muted-foreground">{t("muteHint")}</span>
+        </span>
+      </label>
+
+      <label className="mt-4 flex items-start gap-3 rounded-xl border border-border bg-card p-4">
+        <input
+          type="checkbox"
+          className="mt-0.5 h-4 w-4"
           checked={prefs?.hidePreview ?? false}
           onChange={(e) => void setPrefs({ hidePreview: e.target.checked })}
         />

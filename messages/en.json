@@ -1892,6 +1892,8 @@
     "blocked": "Notifications are blocked in your browser settings. Enable them for this site, then try again.",
     "unsupported": "This browser doesn't support push notifications.",
     "iosInstall": "On iPhone/iPad, install the app first: tap Share, then \"Add to Home Screen\". Then reopen from the home screen to enable notifications.",
+    "muteLabel": "Pause all notifications",
+    "muteHint": "Stop push notifications on all your devices for this account until you turn this back off.",
     "hidePreviewLabel": "Hide message preview",
     "hidePreviewHint": "Show only \"New WhatsApp message\" instead of the sender and text on your lock screen."
   }
