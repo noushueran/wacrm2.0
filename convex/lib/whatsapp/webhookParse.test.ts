@@ -138,6 +138,30 @@ test("flattenInboundMessage: text with no body falls back to undefined (not empt
   ).toEqual({ type: "text", text: undefined, wamid: "wamid.DEFAULT" });
 });
 
+test("flattenInboundMessage: reply — captures context.id as contextWamid", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "text",
+        text: { body: "yes please" },
+        id: "wamid.R",
+        context: { id: "wamid.PARENT" },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "yes please",
+    wamid: "wamid.R",
+    contextWamid: "wamid.PARENT",
+  });
+});
+
+test("flattenInboundMessage: non-reply text has no contextWamid key", () => {
+  const flat = flattenInboundMessage(msg({ type: "text", text: { body: "hello" } }));
+  expect(flat).toEqual({ type: "text", text: "hello", wamid: "wamid.DEFAULT" });
+  expect(flat).not.toHaveProperty("contextWamid");
+});
+
 test("flattenInboundMessage: image — caption as text, id as mediaId, NO mediaUrl (resolution deferred)", () => {
   expect(
     flattenInboundMessage(
