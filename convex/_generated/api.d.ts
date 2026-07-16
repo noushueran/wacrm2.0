@@ -13,6 +13,7 @@ import type * as adReferrals from "../adReferrals.js";
 import type * as aiConfig from "../aiConfig.js";
 import type * as aiKnowledge from "../aiKnowledge.js";
 import type * as aiReply from "../aiReply.js";
+import type * as aiTagging from "../aiTagging.js";
 import type * as aiUsage from "../aiUsage.js";
 import type * as apiKeys from "../apiKeys.js";
 import type * as apiV1 from "../apiV1.js";
@@ -102,6 +103,7 @@ declare const fullApi: ApiFromModules<{
   aiConfig: typeof aiConfig;
   aiKnowledge: typeof aiKnowledge;
   aiReply: typeof aiReply;
+  aiTagging: typeof aiTagging;
   aiUsage: typeof aiUsage;
   apiKeys: typeof apiKeys;
   apiV1: typeof apiV1;
