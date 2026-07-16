@@ -5,13 +5,21 @@ import { useTranslations } from "next-intl";
 import { Bell, BellOff } from "lucide-react";
 import { api } from "../../../convex/_generated/api";
 import { useWebPush } from "@/hooks/use-web-push";
+import { useAuth } from "@/hooks/use-auth";
 
 export function NotificationsPanel() {
   const t = useTranslations("PushSettings");
+  const { canManageMembers } = useAuth();
   const { supported, permission, isSubscribed, iosNeedsInstall, busy, enable, disable } = useWebPush();
 
   const prefs = useQuery(api.push.getPreferences);
   const setPrefs = useMutation(api.push.setPreferences);
+
+  // Admin-only workspace policy — the query is skipped for non-admins
+  // (mirrors `ai-knowledge.tsx`'s own `canEdit ? {} : "skip"` idiom), so
+  // a non-admin never round-trips for a control they won't see anyway.
+  const policy = useQuery(api.push.getAccountPushPolicy, canManageMembers ? {} : "skip");
+  const setPolicy = useMutation(api.push.setAccountPushPolicy);
 
   return (
     <div className="max-w-xl">
@@ -78,6 +86,25 @@ export function NotificationsPanel() {
           <span className="block text-xs text-muted-foreground">{t("hidePreviewHint")}</span>
         </span>
       </label>
+
+      {canManageMembers ? (
+        <div className="mt-8">
+          <h3 className="text-sm font-semibold text-foreground">{t("workspaceHeading")}</h3>
+
+          <label className="mt-3 flex items-start gap-3 rounded-xl border border-border bg-card p-4">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4"
+              checked={policy?.suppressBotHandled ?? false}
+              onChange={(e) => void setPolicy({ suppressBotHandled: e.target.checked })}
+            />
+            <span>
+              <span className="block text-sm font-medium text-foreground">{t("botHandledLabel")}</span>
+              <span className="block text-xs text-muted-foreground">{t("botHandledHint")}</span>
+            </span>
+          </label>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -1895,6 +1895,9 @@
     "muteLabel": "Pause all notifications",
     "muteHint": "Stop push notifications on all your devices for this account until you turn this back off.",
     "hidePreviewLabel": "Hide message preview",
-    "hidePreviewHint": "Show only \"New WhatsApp message\" instead of the sender and text on your lock screen."
+    "hidePreviewHint": "Show only \"New WhatsApp message\" instead of the sender and text on your lock screen.",
+    "workspaceHeading": "Workspace",
+    "botHandledLabel": "Skip push when a flow fully handles the message",
+    "botHandledHint": "If a no-code flow replies and closes out an inbound message on its own, don't page the team for it. Replies from the AI assistant always still notify, since it often hands off to a human."
   }
 }
