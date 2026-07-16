@@ -642,7 +642,8 @@ export function MessageComposer({
         </div>
       ) : (
         <div className="flex items-end gap-2">
-          {/* Attach menu — photo / video / document / voice. */}
+          {/* Attach menu — photo / video / document. Voice moved to the
+              first-class Mic button in the send slot (below). */}
           <DropdownMenu>
             <DropdownMenuTrigger
               disabled={inputsDisabled || busy}
@@ -673,10 +674,6 @@ export function MessageComposer({
               <DropdownMenuItem onClick={() => documentInputRef.current?.click()}>
                 <FileText className="mr-2 h-4 w-4" />
                 {t("document")}
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void startRecording()}>
-                <Mic className="mr-2 h-4 w-4" />
-                {t("voiceNote")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -762,16 +759,35 @@ export function MessageComposer({
             )}
           />
 
-          <GatedButton
-            size="sm"
-            canAct={!readOnly}
-            gateReason="send messages"
-            disabled={!text.trim() || sessionExpired || sending}
-            onClick={handleSend}
-            className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
-          >
-            <Send className="h-4 w-4" />
-          </GatedButton>
+          {/* Send ⇄ Mic swap (WhatsApp-style): an empty box offers a
+              first-class Mic button (tap to record); typing turns it back
+              into Send. Voice is free-form media, so the mic is gated on the
+              24h window + role exactly like the 📎 attach menu. */}
+          {text.trim() ? (
+            <GatedButton
+              size="sm"
+              canAct={!readOnly}
+              gateReason="send messages"
+              disabled={sessionExpired || sending}
+              onClick={handleSend}
+              className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
+            >
+              <Send className="h-4 w-4" />
+            </GatedButton>
+          ) : (
+            <GatedButton
+              size="sm"
+              canAct={!readOnly}
+              gateReason="send voice notes"
+              disabled={inputsDisabled || busy}
+              title={readOnly ? undefined : t("voiceNote")}
+              aria-label={t("voiceNote")}
+              onClick={() => void startRecording()}
+              className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
+            >
+              <Mic className="h-4 w-4" />
+            </GatedButton>
+          )}
         </div>
       )}
 
