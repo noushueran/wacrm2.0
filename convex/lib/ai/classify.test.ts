@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseClassification, type Catalogue } from "./classify";
+import { parseClassification, buildClassifyPrompt, type Catalogue } from "./classify";
 
 const CAT: Catalogue = {
   groups: [
@@ -46,5 +46,23 @@ describe("parseClassification", () => {
     expect(parseClassification("not json at all", CAT)).toEqual({ tagIds: [], confidence: "low" });
     const r = parseClassification('{"tags":[],"confidence":"banana"}', CAT);
     expect(r).toEqual({ tagIds: [], confidence: "low" });
+  });
+});
+
+describe("buildClassifyPrompt", () => {
+  it("lists every group with its options and selection mode, and asks for JSON", () => {
+    const p = buildClassifyPrompt(CAT);
+    expect(p).toContain("Product");
+    expect(p).toContain("UAE Visa");
+    expect(p).toContain("Packages");
+    expect(p).toContain("Destination");
+    expect(p).toContain("Thailand");
+    expect(p.toLowerCase()).toContain("json");
+    // single vs multi guidance is present in some form
+    expect(p.toLowerCase()).toMatch(/one|single|exactly one/);
+  });
+
+  it("handles an empty catalogue without throwing", () => {
+    expect(() => buildClassifyPrompt({ groups: [] })).not.toThrow();
   });
 });

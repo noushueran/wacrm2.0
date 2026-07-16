@@ -36,6 +36,33 @@ function extractJsonObject(raw: string): unknown {
   }
 }
 
+/** System prompt for the classify path. Renders the catalogue as fixed
+ *  option lists and constrains the model to JSON output using only those
+ *  names. Kept deterministic (no timestamps/randomness) so it's testable. */
+export function buildClassifyPrompt(catalogue: Catalogue): string {
+  const groupLines = catalogue.groups.map((g) => {
+    const rule = g.selectionMode === "single" ? "choose at most ONE" : "choose any that apply";
+    const opts = g.tags.map((t) => t.name).join(" | ") || "(no tags defined)";
+    return `- ${g.name} (${rule}): ${opts}`;
+  });
+  const groups = groupLines.length ? groupLines.join("\n") : "- (no tag groups defined)";
+  return [
+    "You classify a customer WhatsApp conversation for a travel agency's CRM.",
+    "Read the conversation, then label it using ONLY the tags below — never invent a tag.",
+    "",
+    "Tag groups:",
+    groups,
+    "",
+    "Also write a one-line internal note summarising what the customer wants,",
+    "and rate your confidence (high only if the conversation clearly supports it).",
+    "",
+    'Reply with ONLY a JSON object, no prose, in exactly this shape:',
+    '{"tags": ["<chosen tag name>", ...], "note": "<one line>", "confidence": "high" | "medium" | "low"}',
+    "Pick at most one tag from any group marked \"choose at most ONE\".",
+    "If nothing fits a group, omit it. If the conversation is unclear, use low confidence.",
+  ].join("\n");
+}
+
 export function parseClassification(raw: string, catalogue: Catalogue): Classification {
   const obj = extractJsonObject(raw) as
     | { tags?: unknown; note?: unknown; confidence?: unknown }
