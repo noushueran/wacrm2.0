@@ -1,9 +1,11 @@
 import { action, internalMutation, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
-import { v } from "convex/values";
-import type { Id } from "./_generated/dataModel";
+import { v, ConvexError } from "convex/values";
+import type { Id, Doc } from "./_generated/dataModel";
+import type { MutationCtx } from "./_generated/server";
 import { hasMinRole } from "./lib/roles";
+import { accountMutation } from "./lib/auth";
 import { toChatMessages } from "./lib/ai/context";
 import { aiContextMessageLimit } from "./lib/ai/defaults";
 import { generateReply } from "./lib/ai/generate";
@@ -253,5 +255,97 @@ export const suggest = action({
       note: parsed.note,
       confidence: parsed.confidence,
     };
+  },
+});
+
+// ============================================================
+// accept/dismiss mutations — backend for suggestion review UI
+// ============================================================
+
+/**
+ * Validates that the suggestion belongs to the current account.
+ * Throws NOT_FOUND if missing or cross-account.
+ */
+async function requireOwnSuggestion(
+  ctx: { db: MutationCtx["db"]; accountId: Id<"accounts"> },
+  suggestionId: Id<"tagSuggestions">,
+): Promise<Doc<"tagSuggestions">> {
+  const sug = await ctx.db.get(suggestionId);
+  if (!sug || sug.accountId !== ctx.accountId) {
+    throw new ConvexError({ code: "NOT_FOUND", entity: "tagSuggestion" });
+  }
+  return sug;
+}
+
+/**
+ * Applies a pending suggestion's tags to the contact with source:"ai",
+ * adds its note (if any) to contactNotes, and marks the suggestion accepted.
+ * Single-select displacement: if a tag's group is `selectionMode:"single"`,
+ * delete other tags from the same group before inserting.
+ */
+export const acceptSuggestion = accountMutation({
+  args: { suggestionId: v.id("tagSuggestions") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    const sug = await requireOwnSuggestion(ctx, args.suggestionId);
+
+    for (const tagId of sug.suggestedTagIds) {
+      const tag = await ctx.db.get(tagId);
+      if (!tag || tag.accountId !== ctx.accountId) continue; // tag deleted since — skip
+
+      // single-select displacement
+      if (tag.groupId) {
+        const group = await ctx.db.get(tag.groupId);
+        if (group?.selectionMode === "single") {
+          const links = await ctx.db
+            .query("contactTags")
+            .withIndex("by_contact", (q) => q.eq("contactId", sug.contactId))
+            .collect();
+          for (const link of links) {
+            if (link.tagId === tagId) continue;
+            const other = await ctx.db.get(link.tagId);
+            if (other?.groupId === tag.groupId) await ctx.db.delete(link._id);
+          }
+        }
+      }
+
+      const existing = await ctx.db
+        .query("contactTags")
+        .withIndex("by_contact_tag", (q) => q.eq("contactId", sug.contactId).eq("tagId", tagId))
+        .first();
+      if (existing) {
+        if (existing.source === undefined) await ctx.db.patch(existing._id, { source: "ai" });
+      } else {
+        await ctx.db.insert("contactTags", {
+          accountId: ctx.accountId,
+          contactId: sug.contactId,
+          tagId,
+          source: "ai",
+        });
+      }
+    }
+
+    if (sug.note) {
+      await ctx.db.insert("contactNotes", {
+        accountId: ctx.accountId,
+        contactId: sug.contactId,
+        noteText: sug.note,
+        createdByUserId: ctx.userId,
+      });
+    }
+
+    await ctx.db.patch(args.suggestionId, { status: "accepted", reviewedByUserId: ctx.userId });
+  },
+});
+
+/**
+ * Marks a pending suggestion as dismissed (no data change to contact/tags).
+ */
+export const dismissSuggestion = accountMutation({
+  args: { suggestionId: v.id("tagSuggestions") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    await requireOwnSuggestion(ctx, args.suggestionId);
+    await ctx.db.patch(args.suggestionId, { status: "dismissed", reviewedByUserId: ctx.userId });
   },
 });

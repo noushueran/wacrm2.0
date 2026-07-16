@@ -175,3 +175,71 @@ test("suggest returns a forbidden error for a viewer (below the agent role floor
 
   expect(res).toEqual({ error: "Forbidden", code: "forbidden" });
 });
+
+/**
+ * Seeds a fresh account with AI configured, for use in accept/dismiss tests.
+ * Returns the authenticated user client + accountId.
+ * The returned user is always admin so they can configure AI; for mutation tests,
+ * ensure your tested mutation calls `ctx.requireRole("agent")` with the expectation
+ * that the test caller has that role or higher.
+ */
+async function seedAccountMemberWithAi(
+  t: TestConvex<typeof schema>,
+  opts: { role?: AccountRole } = {},
+) {
+  const name = "TestAgent";
+  const { userId, accountId, asUser } = await seedAccountMember(t, {
+    name: `${name}`,
+    email: `${name}@example.com`,
+  });
+  await configureAi(asUser);
+  return { userId, accountId, asUser };
+}
+
+test("acceptSuggestion applies tags with source ai + adds the note", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMemberWithAi(t, { role: "agent" });
+  const { contactId, tagId, suggestionId, conversationId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550010", phoneNormalized: "15550010" });
+    const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "UAE Visa", color: "#3b82f6" });
+    const suggestionId = await ctx.db.insert("tagSuggestions", {
+      accountId, conversationId, contactId, suggestedTagIds: [tagId],
+      note: "Wants UAE visa", confidence: "high", status: "pending", model: "m",
+    });
+    return { contactId, tagId, suggestionId, conversationId };
+  });
+
+  await asUser.mutation(api.aiTagging.acceptSuggestion, { suggestionId });
+
+  const links = await t.run((ctx) =>
+    ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+  expect(links.map((l) => l.tagId)).toEqual([tagId]);
+  expect(links[0].source).toBe("ai");
+  const notes = await t.run((ctx) =>
+    ctx.db.query("contactNotes").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+  expect(notes.some((n) => n.noteText.includes("UAE visa"))).toBe(true);
+  const sug = await t.run((ctx) => ctx.db.get(suggestionId));
+  expect(sug!.status).toBe("accepted");
+});
+
+test("dismissSuggestion marks dismissed with no tag applied", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMemberWithAi(t, { role: "agent" });
+  const { contactId, suggestionId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550011", phoneNormalized: "15550011" });
+    const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "Packages", color: "#f59e0b" });
+    const suggestionId = await ctx.db.insert("tagSuggestions", {
+      accountId, conversationId, contactId, suggestedTagIds: [tagId], confidence: "low", status: "pending", model: "m" });
+    return { contactId, suggestionId };
+  });
+
+  await asUser.mutation(api.aiTagging.dismissSuggestion, { suggestionId });
+
+  const links = await t.run((ctx) =>
+    ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+  expect(links).toHaveLength(0);
+  const sug = await t.run((ctx) => ctx.db.get(suggestionId));
+  expect(sug!.status).toBe("dismissed");
+});
