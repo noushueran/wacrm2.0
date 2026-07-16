@@ -30,3 +30,20 @@ export function groupTags(groups: TagGroup[], tags: Tag[]): LabelDimension[] {
 export function isSelected(tag: Tag, selectedIds: Set<string>): boolean {
   return selectedIds.has(tag.id);
 }
+
+export type TagChipRow = { visible: Tag[]; overflow: number };
+
+/** Flattens a contact's tags in group-position order (grouped first by each
+ *  group's `position`, ungrouped last — same order as {@link groupTags}) and
+ *  caps them at `limit`, returning the visible tags plus a `+N` overflow
+ *  count. Used to render compact tag chips on inbox rows and the chat header,
+ *  so the most important labels (earliest groups) survive the cut-off. */
+export function tagChipRow(
+  groups: TagGroup[],
+  tags: Tag[],
+  limit: number,
+): TagChipRow {
+  const ordered = groupTags(groups, tags).flatMap((d) => d.tags);
+  const visible = ordered.slice(0, Math.max(0, limit));
+  return { visible, overflow: ordered.length - visible.length };
+}

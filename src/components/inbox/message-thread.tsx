@@ -14,7 +14,9 @@ import {
   toUiMemberProfile,
   toUiMessage,
   toUiReaction,
+  toUiTagGroup,
 } from "@/lib/convex/adapters";
+import { tagChipRow } from "@/lib/inbox/labels";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
@@ -222,6 +224,11 @@ export function MessageThread({
   // dropdown already consumes. A member added/removed elsewhere surfaces
   // here without a manual refetch.
   const memberDocs = useQuery(api.members.list);
+  const groupDocs = useQuery(api.tagGroups.list);
+  const groups = useMemo(
+    () => (groupDocs ?? []).map(toUiTagGroup),
+    [groupDocs],
+  );
   const profiles = useMemo(
     () => (memberDocs ?? []).map(toUiMemberProfile),
     [memberDocs],
@@ -652,6 +659,7 @@ export function MessageThread({
   }
 
   const displayName = contact.name || contact.phone;
+  const headerChips = tagChipRow(groups, contact.tags ?? [], 6);
   const messageGroups = groupMessagesByDate(messages);
   // Cold first-page load → skeleton (not a blank spinner); loaded-but-empty
   // → empty state; otherwise the message list. A re-visited conversation is
@@ -685,7 +693,7 @@ export function MessageThread({
       {/* Header — solid card surface sits on top of the doodle so the
           name/avatar/dropdowns stay legible. */}
       <div className="flex items-center justify-between gap-2 border-b border-border bg-card px-3 py-3 sm:px-4">
-        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
           {/* Back-to-list button — mobile only. Hidden on lg+ where the
               conversation list is always visible next to the thread. */}
           {onBack && (
@@ -739,6 +747,20 @@ export function MessageThread({
               <Megaphone className="h-3 w-3" />
               {t("adLeadBadge")}
             </Badge>
+          )}
+          {headerChips.visible.map((tag) => (
+            <span
+              key={tag.id}
+              className="hidden shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium sm:inline-flex"
+              style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
+            >
+              {tag.name}
+            </span>
+          ))}
+          {headerChips.overflow > 0 && (
+            <span className="hidden shrink-0 items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground sm:inline-flex">
+              +{headerChips.overflow}
+            </span>
           )}
         </div>
 
