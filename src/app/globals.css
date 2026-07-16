@@ -266,3 +266,10 @@ html[data-theme="rose"] {
 .pt-safe {
   padding-top: env(safe-area-inset-top);
 }
+/* Like `.pb-safe`, but for a bottom-anchored bar that already carries base
+   padding (e.g. the message composer's `p-3`): keep the ~0.75rem base gap
+   AND add the device safe-area inset. Plain `.pb-safe` REPLACES the base
+   padding, so on non-notched devices / desktop it would collapse to 0. */
+.pb-safe-bar {
+  padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+}
