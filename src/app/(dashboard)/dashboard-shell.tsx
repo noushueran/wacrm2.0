@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
+import { BottomNav } from "@/components/layout/bottom-nav";
 import { PresenceHeartbeat } from "@/components/presence/presence-heartbeat";
 import { ServiceWorkerManager } from "@/components/pwa/service-worker-manager";
 import { InboxNotifier } from "@/components/pwa/inbox-notifier";
@@ -53,11 +54,13 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
       <Sidebar open={sidebarOpen} onClose={closeSidebar} />
       <div className="flex flex-1 flex-col overflow-hidden">
         <Header onOpenSidebar={() => setSidebarOpen(true)} />
-        {/* Thinner horizontal padding on mobile so cards have room to breathe. */}
-        <main className="flex-1 overflow-y-auto p-4 sm:p-6">
+        {/* Thinner horizontal padding on mobile so cards have room to breathe.
+            Bottom padding on mobile clears the fixed BottomNav (lg+ hides it). */}
+        <main className="flex-1 overflow-y-auto p-4 pb-20 sm:p-6 lg:pb-6">
           <RequireSection>{children}</RequireSection>
         </main>
       </div>
+      <BottomNav onOpenMore={() => setSidebarOpen(true)} />
       <InstallPrompt />
     </div>
   );
