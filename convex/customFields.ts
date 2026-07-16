@@ -78,6 +78,46 @@ async function findDuplicateFieldName(
   );
 }
 
+const FIELD_OPTIONS = v.object({ options: v.array(v.string()) });
+
+/** Validates one value string against a field's declared type. Throws
+ *  INVALID_VALUE on mismatch. Empty strings are the caller's concern
+ *  (setForContact skips them before calling this). */
+function assertValidFieldValue(
+  field: { _id: Id<"customFields">; fieldType: string; fieldOptions?: unknown },
+  value: string,
+) {
+  const bad = () =>
+    new ConvexError({ code: "INVALID_VALUE", customFieldId: field._id });
+  const opts =
+    (field.fieldOptions as { options?: string[] } | undefined)?.options ?? [];
+  switch (field.fieldType) {
+    case "number":
+      if (!Number.isFinite(Number(value))) throw bad();
+      return;
+    case "date":
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(value)))
+        throw bad();
+      return;
+    case "select":
+      if (!opts.includes(value)) throw bad();
+      return;
+    case "multiselect": {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(value);
+      } catch {
+        throw bad();
+      }
+      if (!Array.isArray(parsed) || parsed.some((x) => !opts.includes(x as string)))
+        throw bad();
+      return;
+    }
+    default:
+      return; // "text" and any legacy freeform type
+  }
+}
+
 // ============================================================
 // Field catalogue (supervisor)
 // ============================================================
@@ -100,7 +140,11 @@ export const list = accountQuery({
 });
 
 export const create = accountMutation({
-  args: { fieldName: v.string(), fieldType: v.string() },
+  args: {
+    fieldName: v.string(),
+    fieldType: v.string(),
+    fieldOptions: v.optional(FIELD_OPTIONS),
+  },
   handler: async (ctx, args) => {
     ctx.requireRole("supervisor");
 
@@ -114,6 +158,7 @@ export const create = accountMutation({
       createdByUserId: ctx.userId,
       fieldName: args.fieldName,
       fieldType: args.fieldType,
+      fieldOptions: args.fieldOptions,
     });
   },
 });
@@ -134,6 +179,23 @@ export const rename = accountMutation({
     }
 
     await ctx.db.patch(args.fieldId, { fieldName: args.fieldName });
+    return args.fieldId;
+  },
+});
+
+export const update = accountMutation({
+  args: {
+    fieldId: v.id("customFields"),
+    fieldType: v.optional(v.string()),
+    fieldOptions: v.optional(FIELD_OPTIONS),
+  },
+  handler: async (ctx, args) => {
+    ctx.requireRole("supervisor");
+    await requireOwnCustomField(ctx, args.fieldId);
+    const patch: Record<string, unknown> = {};
+    if (args.fieldType !== undefined) patch.fieldType = args.fieldType;
+    if (args.fieldOptions !== undefined) patch.fieldOptions = args.fieldOptions;
+    await ctx.db.patch(args.fieldId, patch);
     return args.fieldId;
   },
 });
@@ -227,7 +289,9 @@ export const setForContact = accountMutation({
 
     for (const [customFieldId, value] of byField) {
       const trimmed = value.trim();
-      if (!trimmed) continue; // matches ContactDetailView's `val.trim()` filter
+      if (!trimmed) continue;
+      const field = await ctx.db.get(customFieldId);
+      if (field) assertValidFieldValue(field, trimmed);
       await ctx.db.insert("contactCustomValues", {
         accountId: ctx.accountId,
         contactId: args.contactId,

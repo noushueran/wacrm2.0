@@ -83,6 +83,7 @@ import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
 import type * as send from "../send.js";
 import type * as tags from "../tags.js";
+import type * as tagGroups from "../tagGroups.js";
 import type * as templates from "../templates.js";
 import type * as webhookDelivery from "../webhookDelivery.js";
 import type * as webhookEndpoints from "../webhookEndpoints.js";
@@ -170,6 +171,7 @@ declare const fullApi: ApiFromModules<{
   reactions: typeof reactions;
   send: typeof send;
   tags: typeof tags;
+  tagGroups: typeof tagGroups;
   templates: typeof templates;
   webhookDelivery: typeof webhookDelivery;
   webhookEndpoints: typeof webhookEndpoints;

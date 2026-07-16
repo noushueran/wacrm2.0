@@ -162,3 +162,50 @@ test("supervisor can remove a tag; agent cannot", async () => {
   await sup.asUser.mutation(api.tags.remove, { tagId });
   expect(await t.run((ctx) => ctx.db.get(tagId))).toBeNull();
 });
+
+// ============================================================
+// create with groupId + position
+// ============================================================
+
+test("create attaches a groupId + position when supplied", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, { name: "Sup", email: "sc@x.com", role: "supervisor" });
+  const gid = await asUser.mutation(api.tagGroups.create, { name: "Product", selectionMode: "single" });
+  const tagId = await asUser.mutation(api.tags.create, { name: "UAE Visa", color: "#3b82f6", groupId: gid, position: 2 });
+  const row = await t.run((ctx) => ctx.db.get(tagId));
+  expect(row!.groupId).toBe(gid);
+  expect(row!.position).toBe(2);
+});
+
+// ============================================================
+// update
+// ============================================================
+
+test("update renames, recolors, and moves a tag between groups", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, { name: "Sup", email: "su@x.com", role: "supervisor" });
+  const g1 = await asUser.mutation(api.tagGroups.create, { name: "Product", selectionMode: "single" });
+  const g2 = await asUser.mutation(api.tagGroups.create, { name: "Destination", selectionMode: "multi" });
+  const tagId = await asUser.mutation(api.tags.create, { name: "Thailand", color: "#10b981", groupId: g1 });
+
+  await asUser.mutation(api.tags.update, { tagId, name: "Thailand ✈", color: "#06b6d4", groupId: g2 });
+  const row = await t.run((ctx) => ctx.db.get(tagId));
+  expect(row!.name).toBe("Thailand ✈");
+  expect(row!.color).toBe("#06b6d4");
+  expect(row!.groupId).toBe(g2);
+});
+
+test("update is FORBIDDEN below supervisor and NOT_FOUND cross-account", async () => {
+  const t = convexTest(schema, modules);
+  const sup = await seedAccountMember(t, { name: "Sup", email: "su2@x.com", role: "supervisor" });
+  const ag = await seedAccountMember(t, { name: "Ag", email: "ag3@x.com", role: "agent" });
+  const tagId = await sup.asUser.mutation(api.tags.create, { name: "VIP", color: "#f00" });
+  await expect(
+    ag.asUser.mutation(api.tags.update, { tagId, name: "x" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+
+  const bob = await seedAccountMember(t, { name: "Bo", email: "bo2@x.com", role: "supervisor" });
+  await expect(
+    bob.asUser.mutation(api.tags.update, { tagId, name: "x" }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "tag" } });
+});

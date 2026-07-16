@@ -1,12 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
-import { useMutation, useQuery } from 'convex/react';
-import { toast } from 'sonner';
-import { Loader2, Plus, Tag as TagIcon, X } from 'lucide-react';
-import { toUiTag } from '@/lib/convex/adapters';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import { Tag as TagIcon } from 'lucide-react';
+import { useTranslations } from 'next-intl';
 import {
   Card,
   CardContent,
@@ -14,104 +9,16 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from '@/components/ui/dialog';
-import { cn } from '@/lib/utils';
-import { useTranslations } from 'next-intl';
-import type { Tag } from '@/types';
-
-import { api } from '../../../convex/_generated/api';
-import type { Id } from '../../../convex/_generated/dataModel';
-
-const PRESET_COLORS = [
-  { name: 'red', value: '#ef4444' },
-  { name: 'orange', value: '#f97316' },
-  { name: 'amber', value: '#f59e0b' },
-  { name: 'emerald', value: '#10b981' },
-  { name: 'cyan', value: '#06b6d4' },
-  { name: 'blue', value: '#3b82f6' },
-  { name: 'violet', value: '#8b5cf6' },
-  { name: 'pink', value: '#ec4899' },
-];
+import { TagGroupsManager } from './tag-groups-manager';
 
 /**
- * Tags card — colour-coded contact labels. Creation is an inline row
- * (name + colour swatch + Add); deletion goes through a confirmation
- * dialog since it detaches the tag from every contact.
- *
- * Account-wide, not per-creator: the Supabase-era version filtered by
- * `user_id` here (showing only tags the current user created), but
- * Convex's `tags` table has no creator/user field at all — tags are an
- * account-wide label set, matching what the Contacts page's tag filter
- * already showed. `tags.list` reflects that; this view now shows every
- * tag in the account, same as the Contacts page.
+ * Tags card — colour-coded contact labels, organised into supervisor-
+ * defined groups (Product, Destination, Priority, …). The grouped
+ * create/delete UI lives in `TagGroupsManager`; this component keeps
+ * only the card shell and title strings.
  */
 export function TagManager() {
   const t = useTranslations('Settings.tagsAndFields');
-
-  const tagsResult = useQuery(api.tags.list);
-  const tags = useMemo(() => (tagsResult ?? []).map(toUiTag), [tagsResult]);
-  const loading = tagsResult === undefined;
-
-  const createTag = useMutation(api.tags.create);
-  const removeTag = useMutation(api.tags.remove);
-
-  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [tagToDelete, setTagToDelete] = useState<Tag | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [newTagName, setNewTagName] = useState('');
-  const [selectedColor, setSelectedColor] = useState(PRESET_COLORS[3].value);
-
-  async function handleCreate() {
-    if (!newTagName.trim()) {
-      toast.error(t('nameRequired'));
-      return;
-    }
-
-    try {
-      setSaving(true);
-      await createTag({ name: newTagName.trim(), color: selectedColor });
-
-      toast.success(t('tagCreated'));
-      setNewTagName('');
-      setSelectedColor(PRESET_COLORS[3].value);
-    } catch (err) {
-      console.error('Create error:', err);
-      toast.error(t('failedToCreateTag'));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  function confirmDelete(tag: Tag) {
-    setTagToDelete(tag);
-    setDeleteDialogOpen(true);
-  }
-
-  async function handleDelete() {
-    if (!tagToDelete) return;
-
-    try {
-      setDeleting(true);
-      await removeTag({ tagId: tagToDelete.id as Id<'tags'> });
-
-      toast.success(t('tagDeleted'));
-      setDeleteDialogOpen(false);
-      setTagToDelete(null);
-    } catch (err) {
-      console.error('Delete error:', err);
-      toast.error(t('failedToDeleteTag'));
-    } finally {
-      setDeleting(false);
-    }
-  }
 
   return (
     <Card>
@@ -124,130 +31,9 @@ export function TagManager() {
           {t('tagsDesc')}
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
-        {loading ? (
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="size-6 animate-spin text-primary" />
-          </div>
-        ) : (
-          <>
-            {tags.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {tags.map((tag) => (
-                  <span
-                    key={tag.id}
-                    className="group inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium transition-colors"
-                    style={{
-                      backgroundColor: `${tag.color}20`,
-                      color: tag.color,
-                      border: `1px solid ${tag.color}40`,
-                    }}
-                  >
-                    <span
-                      className="size-2 rounded-full"
-                      style={{ backgroundColor: tag.color }}
-                    />
-                    {tag.name}
-                    <button
-                      type="button"
-                      onClick={() => confirmDelete(tag)}
-                      aria-label={t('deleteAria', { name: tag.name })}
-                      className="ml-0.5 rounded-full p-0.5 opacity-60 transition-opacity hover:bg-black/10 hover:opacity-100 dark:hover:bg-white/10"
-                    >
-                      <X className="size-3" />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {t('noTags')}
-              </p>
-            )}
-
-            {/* Inline create row */}
-            <div className="flex flex-wrap items-center gap-2.5">
-              <Input
-                placeholder={t('placeholder')}
-                value={newTagName}
-                onChange={(e) => setNewTagName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleCreate();
-                }}
-                disabled={saving}
-                maxLength={40}
-                className="min-w-[180px] flex-1"
-              />
-              <div className="flex gap-1.5">
-                {PRESET_COLORS.map((color) => (
-                  <button
-                    key={color.value}
-                    type="button"
-                    onClick={() => setSelectedColor(color.value)}
-                    aria-label={t('useColor', { color: t(`colors.${color.name}` as Parameters<typeof t>[0]) })}
-                    aria-pressed={selectedColor === color.value}
-                    className={cn(
-                      'size-6 rounded-md transition-transform hover:scale-110',
-                      selectedColor === color.value &&
-                        'outline outline-2 outline-offset-2 outline-primary',
-                    )}
-                    style={{ backgroundColor: color.value }}
-                    title={t(`colors.${color.name}` as Parameters<typeof t>[0])}
-                  />
-                ))}
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleCreate}
-                disabled={saving || !newTagName.trim()}
-              >
-                {saving ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Plus className="size-4" />
-                )}
-                {t('addTag')}
-              </Button>
-            </div>
-          </>
-        )}
+      <CardContent>
+        <TagGroupsManager />
       </CardContent>
-
-      {/* Delete confirmation */}
-      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{t('deleteTag')}</DialogTitle>
-            <DialogDescription>
-              {tagToDelete ? t('deleteConfirm', { name: tagToDelete.name }) : null}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={() => setDeleteDialogOpen(false)}
-              disabled={deleting}
-            >
-              {t('cancel')}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleting}
-            >
-              {deleting ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" />
-                  {t('deleting')}
-                </>
-              ) : (
-                t('deleteTag')
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </Card>
   );
 }

@@ -348,6 +348,13 @@
       "acquiredViaAd": "Acquired via a Click-to-WhatsApp ad",
       "viewAd": "View ad"
     },
+    "labels": {
+      "title": "Labels",
+      "add": "Add label",
+      "none": "No labels yet",
+      "ungrouped": "Other",
+      "failed": "Couldn’t update labels"
+    },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
       "activeText": "AI assistant is replying automatically",
@@ -376,6 +383,13 @@
         "invoice_sent": "Invoice sent",
         "purchased": "Purchased"
       }
+    },
+    "customFields": {
+      "title": "Details",
+      "none": "No fields configured",
+      "saved": "Saved",
+      "failed": "Couldn’t save",
+      "selectPlaceholder": "—"
     }
   },
   "Contacts": {
@@ -578,7 +592,18 @@
       "toastCreated": "Created \"{name}\".",
       "toastRenameFailed": "Could not rename field.",
       "toastDeleteFailed": "Could not delete field.",
-      "toastDeleted": "Deleted \"{name}\"."
+      "toastDeleted": "Deleted \"{name}\".",
+      "type": "Type",
+      "typeText": "Text",
+      "typeSelect": "Dropdown",
+      "typeMultiselect": "Multi-select",
+      "typeDate": "Date",
+      "typeNumber": "Number",
+      "options": "Options (comma-separated)",
+      "optionsPlaceholder": "UAE Visa, Global Visa, Packages",
+      "saveOptions": "Save options",
+      "toastUpdated": "Field updated",
+      "toastOptionsFailed": "Could not save options."
     }
   },
   "Pipelines": {
@@ -1440,6 +1465,26 @@
         "violet": "Violet",
         "pink": "Pink"
       }
+    },
+    "tagGroups": {
+      "title": "Tag groups",
+      "desc": "Organise labels into dimensions (Product, Destination, Priority…). Single-select groups allow one tag per chat; multi-select allow several.",
+      "newGroupName": "New group name",
+      "single": "Single-select",
+      "multi": "Multi-select",
+      "addGroup": "Add group",
+      "addTag": "Add tag",
+      "tagName": "Tag name",
+      "ungrouped": "Ungrouped",
+      "deleteGroup": "Delete group",
+      "deleteGroupConfirm": "Delete “{name}”? Its tags become ungrouped (they are not deleted).",
+      "deleteTag": "Delete tag",
+      "deleteTagConfirm": "Delete “{name}”? It is removed from every chat.",
+      "created": "Created",
+      "deleted": "Deleted",
+      "failed": "Something went wrong",
+      "nameRequired": "Enter a name",
+      "tagColor": "Tag colour"
     },
     "templates": {
       "title": "Message templates",
