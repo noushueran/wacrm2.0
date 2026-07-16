@@ -3,6 +3,7 @@ import { convexTest, type TestConvex } from "convex-test";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 
 // Convex function modules for convex-test to resolve `api.*`/`internal.*`
@@ -25,12 +26,14 @@ afterEach(() => {
  * account, and returns a convex-test client already authenticated as
  * that user. Copied verbatim from `convex/aiReply.test.ts` (duplicated
  * per-suite rather than imported — see that file's own comment, which
- * points at `convex/aiKnowledge.test.ts` for the precedent). Role is
- * always "admin" here, which comfortably clears `suggest`'s agent floor.
+ * points at `convex/aiKnowledge.test.ts` for the precedent). Defaults to
+ * "admin" (comfortably clears `suggest`'s agent floor) when `opts.role`
+ * is omitted; pass an explicit `role` to seed a different rank — matches
+ * `convex/aiConfig.test.ts`'s own parametrized `seedAccountMember`.
  */
 async function seedAccountMember(
   t: TestConvex<typeof schema>,
-  opts: { name: string; email: string },
+  opts: { name: string; email: string; role?: AccountRole },
 ) {
   const userId = await t.run((ctx) =>
     ctx.db.insert("users", { name: opts.name, email: opts.email }),
@@ -44,7 +47,7 @@ async function seedAccountMember(
     await ctx.db.insert("memberships", {
       userId,
       accountId: id,
-      role: "admin" as AccountRole,
+      role: opts.role ?? "admin",
       fullName: opts.name,
       email: opts.email,
     });
@@ -177,29 +180,67 @@ test("suggest returns a forbidden error for a viewer (below the agent role floor
 });
 
 /**
+ * Adds a second membership row to an *existing* account — for role-floor
+ * tests where the account's primary member must stay admin (e.g. to
+ * configure AI via the admin-gated `aiConfig.upsert`). Matches
+ * `convex/aiReply.test.ts`'s own `seedTeammate`.
+ */
+async function seedTeammate(
+  t: TestConvex<typeof schema>,
+  opts: { accountId: Id<"accounts">; name: string; email: string; role: AccountRole },
+) {
+  const userId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("users", { name: opts.name, email: opts.email });
+    await ctx.db.insert("memberships", {
+      userId: id,
+      accountId: opts.accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return id;
+  });
+  const asUser = t.withIdentity({ subject: `${userId}|session-${opts.name}` });
+  return { userId, asUser };
+}
+
+/**
  * Seeds a fresh account with AI configured, for use in accept/dismiss tests.
- * Returns the authenticated user client + accountId.
- * The returned user is always admin so they can configure AI; for mutation tests,
- * ensure your tested mutation calls `ctx.requireRole("agent")` with the expectation
- * that the test caller has that role or higher.
+ * Returns an authenticated user client that genuinely holds `opts.role`
+ * (default "admin"). AI config is always upserted by a SEPARATE admin
+ * teammate first — `aiConfig.upsert` is admin+-gated (see `aiConfig.ts`),
+ * so a caller seeded at a lower role couldn't configure it themselves. That
+ * bootstrap admin identity is then discarded (unless "admin" was actually
+ * requested); only the teammate genuinely seeded at `opts.role` is
+ * returned, so a mutation test using it truly exercises that role's
+ * `ctx.requireRole(...)` floor instead of silently running as admin.
  */
 async function seedAccountMemberWithAi(
   t: TestConvex<typeof schema>,
   opts: { role?: AccountRole } = {},
 ) {
-  const name = "TestAgent";
-  const { userId, accountId, asUser } = await seedAccountMember(t, {
-    name: `${name}`,
-    email: `${name}@example.com`,
+  const admin = await seedAccountMember(t, {
+    name: "TestAdmin",
+    email: "TestAdmin@example.com",
   });
-  await configureAi(asUser);
-  return { userId, accountId, asUser };
+  await configureAi(admin.asUser);
+
+  const role = opts.role ?? "admin";
+  if (role === "admin") return admin;
+
+  const { userId, asUser } = await seedTeammate(t, {
+    accountId: admin.accountId,
+    name: "TestAgent",
+    email: "TestAgent@example.com",
+    role,
+  });
+  return { userId, accountId: admin.accountId, asUser };
 }
 
 test("acceptSuggestion applies tags with source ai + adds the note", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMemberWithAi(t, { role: "agent" });
-  const { contactId, tagId, suggestionId, conversationId } = await t.run(async (ctx) => {
+  const { contactId, tagId, suggestionId } = await t.run(async (ctx) => {
     const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550010", phoneNormalized: "15550010" });
     const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
     const tagId = await ctx.db.insert("tags", { accountId, name: "UAE Visa", color: "#3b82f6" });
@@ -207,7 +248,7 @@ test("acceptSuggestion applies tags with source ai + adds the note", async () =>
       accountId, conversationId, contactId, suggestedTagIds: [tagId],
       note: "Wants UAE visa", confidence: "high", status: "pending", model: "m",
     });
-    return { contactId, tagId, suggestionId, conversationId };
+    return { contactId, tagId, suggestionId };
   });
 
   await asUser.mutation(api.aiTagging.acceptSuggestion, { suggestionId });
@@ -219,6 +260,33 @@ test("acceptSuggestion applies tags with source ai + adds the note", async () =>
   const notes = await t.run((ctx) =>
     ctx.db.query("contactNotes").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
   expect(notes.some((n) => n.noteText.includes("UAE visa"))).toBe(true);
+  const sug = await t.run((ctx) => ctx.db.get(suggestionId));
+  expect(sug!.status).toBe("accepted");
+});
+
+test("acceptSuggestion is idempotent: re-invoking on an already-accepted suggestion does not duplicate the note", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMemberWithAi(t, { role: "agent" });
+  const { contactId, tagId, suggestionId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550012", phoneNormalized: "15550012" });
+    const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "Repeat Visa", color: "#22c55e" });
+    const suggestionId = await ctx.db.insert("tagSuggestions", {
+      accountId, conversationId, contactId, suggestedTagIds: [tagId],
+      note: "Wants repeat visa", confidence: "high", status: "pending", model: "m",
+    });
+    return { contactId, tagId, suggestionId };
+  });
+
+  await asUser.mutation(api.aiTagging.acceptSuggestion, { suggestionId });
+  await asUser.mutation(api.aiTagging.acceptSuggestion, { suggestionId }); // re-invoke on the now-accepted suggestion
+
+  const links = await t.run((ctx) =>
+    ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+  expect(links.map((l) => l.tagId)).toEqual([tagId]); // tag link count unchanged, not duplicated
+  const notes = await t.run((ctx) =>
+    ctx.db.query("contactNotes").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+  expect(notes).toHaveLength(1); // exactly one note, not duplicated by the second accept
   const sug = await t.run((ctx) => ctx.db.get(suggestionId));
   expect(sug!.status).toBe("accepted");
 });

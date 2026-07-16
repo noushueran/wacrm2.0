@@ -282,12 +282,18 @@ async function requireOwnSuggestion(
  * adds its note (if any) to contactNotes, and marks the suggestion accepted.
  * Single-select displacement: if a tag's group is `selectionMode:"single"`,
  * delete other tags from the same group before inserting.
+ * Idempotent: re-invoking on a suggestion that's no longer "pending" (already
+ * accepted or dismissed) is a no-op. The tag upsert below is naturally safe
+ * to repeat (it looks up `by_contact_tag` before inserting), but the
+ * `contactNotes` insert below is NOT — without this guard, re-invoking on an
+ * already-accepted suggestion would insert a duplicate note every time.
  */
 export const acceptSuggestion = accountMutation({
   args: { suggestionId: v.id("tagSuggestions") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
     const sug = await requireOwnSuggestion(ctx, args.suggestionId);
+    if (sug.status !== "pending") return; // already reviewed — no-op
 
     for (const tagId of sug.suggestedTagIds) {
       const tag = await ctx.db.get(tagId);
@@ -340,12 +346,16 @@ export const acceptSuggestion = accountMutation({
 
 /**
  * Marks a pending suggestion as dismissed (no data change to contact/tags).
+ * Idempotent: re-invoking on a suggestion that's no longer "pending" is a
+ * no-op — in particular, this won't flip an already-accepted suggestion
+ * back to dismissed.
  */
 export const dismissSuggestion = accountMutation({
   args: { suggestionId: v.id("tagSuggestions") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireOwnSuggestion(ctx, args.suggestionId);
+    const sug = await requireOwnSuggestion(ctx, args.suggestionId);
+    if (sug.status !== "pending") return; // already reviewed — no-op
     await ctx.db.patch(args.suggestionId, { status: "dismissed", reviewedByUserId: ctx.userId });
   },
 });
