@@ -1674,6 +1674,7 @@
       "overview": "Overview",
       "profile": "Your profile",
       "appearance": "Appearance",
+      "notifications": "Notifications",
       "whatsapp": "WhatsApp",
       "templates": "Templates",
       "quick-replies": "Quick replies",
@@ -1877,5 +1878,17 @@
     "iosInstallTitle": "Install on iPhone/iPad",
     "iosInstallBody": "Tap the Share icon, then \"Add to Home Screen\" to install and enable notifications.",
     "dismiss": "Not now"
+  },
+  "PushSettings": {
+    "title": "Notifications",
+    "desc": "Get a push notification on this device when a new WhatsApp message needs you.",
+    "enable": "Enable on this device",
+    "enabled": "Notifications are on for this device",
+    "disable": "Turn off",
+    "blocked": "Notifications are blocked in your browser settings. Enable them for this site, then try again.",
+    "unsupported": "This browser doesn't support push notifications.",
+    "iosInstall": "On iPhone/iPad, install the app first: tap Share, then \"Add to Home Screen\". Then reopen from the home screen to enable notifications.",
+    "hidePreviewLabel": "Hide message preview",
+    "hidePreviewHint": "Show only \"New WhatsApp message\" instead of the sender and text on your lock screen."
   }
 }
