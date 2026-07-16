@@ -1657,3 +1657,75 @@ test("processInbound pins the conversation adReferral image to the FIRST ad — 
   // the guard, this flips to Ad B's URL and the assertion fails.
   expect(convAfterB!.adReferral?.storedImageUrl).toBe(pinnedUrl);
 });
+
+// ============================================================
+// Inbound reply linkage — the customer's `context.id` (the wamid of the
+// message they replied to) resolves to the parent's internal id so the
+// inbox renders the quote.
+// ============================================================
+
+test("ingestInbound links a reply to its parent via contextWamid", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  // Pre-seed the contact + conversation + our outbound message (the one the
+  // customer replies to) so ingestInbound reuses that conversation.
+  const { conversationId, parentId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "15559990000",
+      phoneNormalized: "15559990000",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    });
+    const parentId = await ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "agent" as const,
+      contentType: "text" as const,
+      contentText: "Here is your quote",
+      messageId: "wamid.OURS",
+      status: "sent" as const,
+    });
+    return { conversationId, parentId };
+  });
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15559990000",
+    name: "Cust",
+    message: {
+      type: "text",
+      text: "thanks!",
+      wamid: "wamid.THEIRS",
+      contextWamid: "wamid.OURS",
+    },
+  });
+
+  expect(res.conversationId).toBe(conversationId);
+  const stored = await t.run((ctx) => ctx.db.get(res.messageId));
+  expect(stored!.replyToMessageId).toBe(parentId);
+});
+
+test("ingestInbound leaves replyToMessageId undefined when contextWamid matches nothing", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15559990001",
+    name: "Cust",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.NEW",
+      contextWamid: "wamid.MISSING",
+    },
+  });
+
+  const stored = await t.run((ctx) => ctx.db.get(res.messageId));
+  expect(stored!.replyToMessageId).toBeUndefined();
+});

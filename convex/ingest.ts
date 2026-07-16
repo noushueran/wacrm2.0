@@ -90,6 +90,7 @@ const inboundMessageValidator = v.object({
   mediaUrl: v.optional(v.string()),
   wamid: v.string(),
   interactiveReplyId: v.optional(v.string()),
+  contextWamid: v.optional(v.string()),
   ctwaClid: v.optional(v.string()),
   referral: v.optional(
     v.object({
@@ -241,6 +242,24 @@ export const ingestInbound = internalMutation({
     // message-insert + denorm all commit as ONE transaction — see that
     // module's own doc comment on `appendInternal`, which foreshadows
     // exactly this caller.
+    // Reply linkage: the webhook's `context.id` (surfaced as `contextWamid`)
+    // is the wamid of the message the customer replied to. Map it to that
+    // message's internal id, scoped to THIS conversation — wamids aren't
+    // globally unique (see the dedup guard above) and a reply always targets
+    // a message in the same chat. Not found (e.g. a reply to a pre-CRM
+    // message we never stored) → left undefined, and the bubble renders
+    // plainly instead of a quote.
+    let replyToMessageId: Id<"messages"> | undefined;
+    const parentWamid = message.contextWamid;
+    if (parentWamid) {
+      const parent = await ctx.db
+        .query("messages")
+        .withIndex("by_message_id", (q) => q.eq("messageId", parentWamid))
+        .filter((q) => q.eq(q.field("conversationId"), conversationId))
+        .first();
+      replyToMessageId = parent?._id;
+    }
+
     const appendArgs: AppendMessageArgs = {
       accountId,
       conversationId,
@@ -250,6 +269,7 @@ export const ingestInbound = internalMutation({
       mediaUrl: message.mediaUrl,
       messageId: message.wamid,
       interactiveReplyId: message.interactiveReplyId,
+      replyToMessageId,
       referral: message.referral,
     };
     const messageId = await insertMessageAndUpdateConversation(
