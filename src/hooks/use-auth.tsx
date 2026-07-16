@@ -213,6 +213,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     try {
+      // Best-effort: unsubscribe this device's push subscription before
+      // the session ends. The server `pushSubscriptions` row is also
+      // pruned lazily on the next failed send (410) if this lingers, but
+      // doing it here stops the device from receiving further pushes
+      // immediately. Never let it block sign-out.
+      try {
+        if ("serviceWorker" in navigator) {
+          const reg = await navigator.serviceWorker.ready;
+          const sub = await reg.pushManager?.getSubscription?.();
+          await sub?.unsubscribe();
+        }
+      } catch {
+        // best-effort — never block sign-out
+      }
       await convexSignOut();
     } finally {
       // Full navigation (not router.push) so every provider/subscription
