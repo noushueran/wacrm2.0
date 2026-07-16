@@ -40,6 +40,7 @@ import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
 import type * as leadCharges from "../leadCharges.js";
 import type * as lib_ai_chunk from "../lib/ai/chunk.js";
+import type * as lib_ai_classify from "../lib/ai/classify.js";
 import type * as lib_ai_context from "../lib/ai/context.js";
 import type * as lib_ai_defaults from "../lib/ai/defaults.js";
 import type * as lib_ai_embeddings from "../lib/ai/embeddings.js";
@@ -128,6 +129,7 @@ declare const fullApi: ApiFromModules<{
   invitations: typeof invitations;
   leadCharges: typeof leadCharges;
   "lib/ai/chunk": typeof lib_ai_chunk;
+  "lib/ai/classify": typeof lib_ai_classify;
   "lib/ai/context": typeof lib_ai_context;
   "lib/ai/defaults": typeof lib_ai_defaults;
   "lib/ai/embeddings": typeof lib_ai_embeddings;
