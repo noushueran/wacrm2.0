@@ -311,3 +311,44 @@ test("dismissSuggestion marks dismissed with no tag applied", async () => {
   const sug = await t.run((ctx) => ctx.db.get(suggestionId));
   expect(sug!.status).toBe("dismissed");
 });
+
+test("pendingForConversation returns the pending row, then null once it's reviewed", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId, suggestionId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15550014",
+      phoneNormalized: "15550014",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "Flights", color: "#0ea5e9" });
+    const suggestionId = await ctx.db.insert("tagSuggestions", {
+      accountId,
+      conversationId,
+      contactId,
+      suggestedTagIds: [tagId],
+      confidence: "medium",
+      status: "pending",
+      model: "m",
+    });
+    return { conversationId, suggestionId };
+  });
+
+  const pending = await asUser.query(api.aiTagging.pendingForConversation, { conversationId });
+  expect(pending?._id).toBe(suggestionId);
+  expect(pending?.status).toBe("pending");
+
+  await t.run((ctx) => ctx.db.patch(suggestionId, { status: "dismissed" }));
+
+  const afterDismiss = await asUser.query(api.aiTagging.pendingForConversation, { conversationId });
+  expect(afterDismiss).toBeNull();
+});

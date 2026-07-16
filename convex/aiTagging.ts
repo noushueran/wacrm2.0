@@ -5,7 +5,7 @@ import { v, ConvexError } from "convex/values";
 import type { Id, Doc } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
 import { hasMinRole } from "./lib/roles";
-import { accountMutation } from "./lib/auth";
+import { accountMutation, accountQuery } from "./lib/auth";
 import { toChatMessages } from "./lib/ai/context";
 import { aiContextMessageLimit } from "./lib/ai/defaults";
 import { generateReply } from "./lib/ai/generate";
@@ -357,5 +357,31 @@ export const dismissSuggestion = accountMutation({
     const sug = await requireOwnSuggestion(ctx, args.suggestionId);
     if (sug.status !== "pending") return; // already reviewed — no-op
     await ctx.db.patch(args.suggestionId, { status: "dismissed", reviewedByUserId: ctx.userId });
+  },
+});
+
+// ============================================================
+// pendingForConversation — backend for the inbox "Suggest tags" banner
+// ============================================================
+
+/**
+ * The account's pending `tagSuggestions` row for a conversation, if any —
+ * lets the inbox banner decide which face to show: the "Suggest tags" CTA
+ * when this is `null`, or the accept/dismiss review UI when it's a row.
+ * `by_conversation` isn't compound with `status`, so this scans the (small,
+ * bounded — `suggest`/`recordSuggestion` never queue a second run while one
+ * is already pending) set of a conversation's suggestions and filters
+ * `status === "pending"` in memory; the `accountId` check is the same
+ * belt-and-suspenders cross-tenant guard `requireOwnSuggestion` uses,
+ * defensive since `by_conversation` alone can't scope by account.
+ */
+export const pendingForConversation = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("tagSuggestions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .collect();
+    return rows.find((r) => r.accountId === ctx.accountId && r.status === "pending") ?? null;
   },
 });
