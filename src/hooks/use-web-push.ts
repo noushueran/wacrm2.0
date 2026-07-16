@@ -57,10 +57,15 @@ export function useWebPush() {
           applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY) as unknown as BufferSource,
         }));
       const json = sub.toJSON();
+      const p256dh = json.keys?.p256dh;
+      const auth = json.keys?.auth;
+      // A userVisibleOnly subscription always carries both keys; bail instead
+      // of persisting an un-encryptable (empty-key) subscription if it doesn't.
+      if (!p256dh || !auth) return;
       await subscribeMut({
         endpoint: sub.endpoint,
-        p256dh: json.keys?.p256dh ?? "",
-        auth: json.keys?.auth ?? "",
+        p256dh,
+        auth,
         userAgent: navigator.userAgent,
       });
       setIsSubscribed(true);
