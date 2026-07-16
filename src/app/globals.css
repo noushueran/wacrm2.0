@@ -239,3 +239,30 @@ html[data-theme="rose"] {
     @apply font-sans;
   }
 }
+
+/* Mobile / PWA ergonomics. */
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Never let a stray wide child scroll the whole page sideways on phones. */
+  body {
+    overflow-x: hidden;
+  }
+  /* iOS: inputs ≥16px don't trigger the zoom-on-focus. */
+  @media (max-width: 640px) {
+    input,
+    textarea,
+    select {
+      font-size: 16px;
+    }
+  }
+}
+
+/* Safe-area helpers for the shell + bottom nav + composer. */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
