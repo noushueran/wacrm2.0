@@ -50,7 +50,7 @@ export function InstallPrompt() {
   if (dismissed || (!deferred && !showIOS)) return null;
 
   return (
-    <div className="fixed inset-x-3 bottom-3 z-50 mx-auto max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg lg:left-auto lg:right-6">
+    <div className="fixed inset-x-3 bottom-20 z-50 mx-auto max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg lg:bottom-6 lg:left-auto lg:right-6">
       <button
         type="button"
         onClick={close}
