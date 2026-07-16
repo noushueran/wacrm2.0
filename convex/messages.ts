@@ -101,6 +101,11 @@ export interface AppendMessageArgs {
   /** Click-to-WhatsApp ad referral (inbound-only), stored verbatim on the
    *  message row. `storedImageUrl` is filled later (Task 3). */
   referral?: AdReferral;
+  /** Internal id of the message this one replies to (WhatsApp quoted reply).
+   *  Outbound: the agent's reply target, threaded from `send`/`metaSend`.
+   *  Inbound: resolved from the webhook's `context.id` in `ingest`. The
+   *  inbox reads it back as `reply_to_message_id` to render the quote. */
+  replyToMessageId?: Id<"messages">;
 }
 
 export async function insertMessageAndUpdateConversation(
@@ -121,6 +126,7 @@ export async function insertMessageAndUpdateConversation(
     interactiveReplyId,
     aiGenerated,
     referral,
+    replyToMessageId,
   } = args;
 
   const newMessageId = await ctx.db.insert("messages", {
@@ -136,6 +142,7 @@ export async function insertMessageAndUpdateConversation(
     interactiveReplyId,
     aiGenerated,
     referral,
+    replyToMessageId,
     status: "sent",
   });
 
@@ -210,6 +217,7 @@ export const append = accountMutation({
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
@@ -271,6 +279,7 @@ export const appendInternal = internalMutation({
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args) => {
     const conversation = await requireOwnConversation(
