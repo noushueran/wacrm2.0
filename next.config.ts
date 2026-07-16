@@ -68,6 +68,8 @@ const SECURITY_HEADERS = [
       // origin.
       `media-src 'self' blob: ${CONVEX_URL}`,
       "font-src 'self' data:",
+      "worker-src 'self'",
+      "manifest-src 'self'",
       // Convex: the https origin (initial handshake, long-poll fallback,
       // and the file-upload POST files.generateUploadUrl hands back) plus
       // its wss:// twin for the reactive-query socket. All Meta API calls
