@@ -171,6 +171,9 @@ export default function FlowsPage() {
 
   return (
     <div className="space-y-6 p-6">
+      <p className="mb-3 rounded-lg border border-border bg-muted/40 p-2 text-xs text-muted-foreground lg:hidden">
+        {t("bestOnDesktop")}
+      </p>
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">

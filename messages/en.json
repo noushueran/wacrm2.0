@@ -610,6 +610,7 @@
   },
   "Pipelines": {
     "page": {
+      "bestOnDesktop": "This editor works best on a larger screen.",
       "selectPipeline": "Select Pipeline",
       "noPipelinesYet": "No pipelines yet",
       "managePipelines": "Manage Pipelines",
@@ -1136,6 +1137,7 @@
     "list": {
       "title": "Flows",
       "beta": "Beta",
+      "bestOnDesktop": "This editor works best on a larger screen.",
       "description": "Build branching, button-driven WhatsApp conversations. Useful for menus, FAQs, and triage before a human steps in.",
       "newFlow": "New flow",
       "statusDraft": "Draft",
