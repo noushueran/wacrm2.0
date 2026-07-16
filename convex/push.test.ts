@@ -577,3 +577,181 @@ test("assembleDelivery: a conversation belonging to a different account returns 
 
   expect(result).toEqual({ jobs: [] });
 });
+
+// ============================================================
+// Opt-in account policy: "don't push for an inbound message a no-code
+// flow fully handled." Default OFF (unset `suppressBotHandledPush` must
+// never suppress — backward compatible with every test above, none of
+// which pass `flowConsumed` at all). Suppression requires BOTH
+// `flowConsumed: true` on the call AND the account flag ON.
+// ============================================================
+
+test("assembleDelivery: flowConsumed=true AND the account's suppressBotHandledPush=true returns no jobs", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const { userId: annaId, asUser: asAnna } = await seedTeammate(t, {
+    accountId,
+    name: "Anna",
+    email: "anna@example.com",
+    role: "agent",
+  });
+  // A subscribed assignee exists, so if the gate were missing (or
+  // checked the wrong flag/arg), this would happily produce a job —
+  // proving the gate itself is what's under test.
+  await asAnna.mutation(api.push.subscribe, {
+    endpoint: "eAnna",
+    p256dh: "kAnna",
+    auth: "aAnna",
+  });
+  await asOwner.mutation(api.push.setAccountPushPolicy, {
+    suppressBotHandled: true,
+  });
+
+  const { conversationId } = await seedConversation(t, {
+    accountId,
+    contactName: "Ravi Kumar",
+    assignedToUserId: annaId,
+  });
+
+  const result = await t.query(internal.push.assembleDelivery, {
+    accountId,
+    conversationId,
+    contentType: "text",
+    text: "handled entirely by the flow",
+    flowConsumed: true,
+  });
+
+  expect(result.jobs).toEqual([]);
+});
+
+test("assembleDelivery: flowConsumed=true but suppressBotHandledPush is OFF (default) — jobs ARE produced", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const { userId: annaId, asUser: asAnna } = await seedTeammate(t, {
+    accountId,
+    name: "Anna",
+    email: "anna@example.com",
+    role: "agent",
+  });
+  await asAnna.mutation(api.push.subscribe, {
+    endpoint: "eAnna",
+    p256dh: "kAnna",
+    auth: "aAnna",
+  });
+  // No setAccountPushPolicy call — the flag stays at its default (unset).
+
+  const { conversationId } = await seedConversation(t, {
+    accountId,
+    contactName: "Ravi Kumar",
+    assignedToUserId: annaId,
+  });
+
+  const result = await t.query(internal.push.assembleDelivery, {
+    accountId,
+    conversationId,
+    contentType: "text",
+    text: "handled entirely by the flow",
+    flowConsumed: true,
+  });
+
+  expect(result.jobs).toHaveLength(1);
+  expect(result.jobs[0]).toMatchObject({
+    endpoint: "eAnna",
+    p256dh: "kAnna",
+    auth: "aAnna",
+  });
+});
+
+test("assembleDelivery: flowConsumed=false but suppressBotHandledPush=true — jobs ARE produced (suppression requires BOTH)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const { userId: annaId, asUser: asAnna } = await seedTeammate(t, {
+    accountId,
+    name: "Anna",
+    email: "anna@example.com",
+    role: "agent",
+  });
+  await asAnna.mutation(api.push.subscribe, {
+    endpoint: "eAnna",
+    p256dh: "kAnna",
+    auth: "aAnna",
+  });
+  await asOwner.mutation(api.push.setAccountPushPolicy, {
+    suppressBotHandled: true,
+  });
+
+  const { conversationId } = await seedConversation(t, {
+    accountId,
+    contactName: "Ravi Kumar",
+    assignedToUserId: annaId,
+  });
+
+  const result = await t.query(internal.push.assembleDelivery, {
+    accountId,
+    conversationId,
+    contentType: "text",
+    text: "a message the flow did NOT consume",
+    flowConsumed: false,
+  });
+
+  expect(result.jobs).toHaveLength(1);
+  expect(result.jobs[0]).toMatchObject({
+    endpoint: "eAnna",
+    p256dh: "kAnna",
+    auth: "aAnna",
+  });
+});
+
+test("setAccountPushPolicy: an admin can set the policy and getAccountPushPolicy reflects it", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAdmin } = await seedAccountMember(t, {
+    name: "Amara Admin",
+    email: "amara@example.com",
+    role: "admin",
+  });
+
+  expect(await asAdmin.query(api.push.getAccountPushPolicy, {})).toEqual({
+    suppressBotHandled: false,
+  });
+
+  await asAdmin.mutation(api.push.setAccountPushPolicy, {
+    suppressBotHandled: true,
+  });
+
+  expect(await asAdmin.query(api.push.getAccountPushPolicy, {})).toEqual({
+    suppressBotHandled: true,
+  });
+});
+
+test("setAccountPushPolicy: a non-admin (agent) is rejected with FORBIDDEN", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Amara Admin",
+    email: "amara@example.com",
+    role: "admin",
+  });
+  const { asUser: asAgent } = await seedTeammate(t, {
+    accountId,
+    name: "Alan Agent",
+    email: "alan@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asAgent.mutation(api.push.setAccountPushPolicy, {
+      suppressBotHandled: true,
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});

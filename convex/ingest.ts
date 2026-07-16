@@ -692,6 +692,7 @@ export const processInbound = internalAction({
         conversationId: res.conversationId,
         contentType: message.type,
         text: message.text,
+        flowConsumed,
       }),
     );
 

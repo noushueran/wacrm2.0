@@ -105,6 +105,33 @@ export const setPreferences = accountMutation({
   },
 });
 
+// ---- Client-facing: account-wide policy (admin) -----------------------
+//
+// Opt-in, OFF by default: "don't send a push for an inbound message a
+// no-code flow fully handled." Read is any-role (so the panel can show
+// current state before deciding whether to render the admin control);
+// write is admin+, same floor as other critical-settings mutations
+// (`aiKnowledge.create`, `aiConfig.upsert`, …).
+
+export const getAccountPushPolicy = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    const account = await ctx.db.get(ctx.accountId);
+    return { suppressBotHandled: account?.suppressBotHandledPush ?? false };
+  },
+});
+
+export const setAccountPushPolicy = accountMutation({
+  args: { suppressBotHandled: v.boolean() },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    await ctx.db.patch(ctx.accountId, {
+      suppressBotHandledPush: args.suppressBotHandled,
+    });
+    return null;
+  },
+});
+
 // ---- Internal: assembly + pruning (called by the Node sender) --------
 
 export const deleteByEndpoint = internalMutation({
@@ -125,11 +152,22 @@ export const assembleDelivery = internalQuery({
     conversationId: v.id("conversations"),
     contentType: v.string(),
     text: v.optional(v.string()),
+    flowConsumed: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) {
       return { jobs: [] as { endpoint: string; p256dh: string; auth: string; payload: PushPayload }[] };
+    }
+
+    // Opt-in account policy: skip push entirely when a flow fully
+    // handled this inbound message. `flowConsumed` undefined = false =
+    // never suppresses (backward compatible — default is "notify on
+    // every message"). AI-assistant replies never set `flowConsumed`,
+    // so they're never suppressed by this gate.
+    const account = await ctx.db.get(args.accountId);
+    if (args.flowConsumed && account?.suppressBotHandledPush) {
+      return { jobs: [] };
     }
 
     const members = await ctx.db

@@ -15,6 +15,7 @@ export const deliverForMessage = internalAction({
     conversationId: v.id("conversations"),
     contentType: v.string(),
     text: v.optional(v.string()),
+    flowConsumed: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     const publicKey = process.env.VAPID_PUBLIC_KEY;
@@ -33,6 +34,7 @@ export const deliverForMessage = internalAction({
       conversationId: args.conversationId,
       contentType: args.contentType,
       text: args.text,
+      flowConsumed: args.flowConsumed,
     });
 
     await Promise.all(

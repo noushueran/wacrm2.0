@@ -12,6 +12,7 @@ export default defineSchema({
     defaultCurrency: v.string(), // ISO-4217, default "USD"
     ownerUserId: v.id("users"),
     leadValue: v.optional(v.number()), // flat per-lead charge; unset/<=0 = feature OFF
+    suppressBotHandledPush: v.optional(v.boolean()), // opt-in: skip push when a flow fully handled the inbound message
   }).index("by_owner", ["ownerUserId"]),
 
   // Append-only spend ledger — one row = one agent charged once for one
