@@ -3,6 +3,7 @@ import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { requireConversationAccess } from "./lib/conversationAccess";
+import { loadEnabledConfig, recordOutboundSend } from "./lib/qualification/track";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import type { AdReferral } from "./lib/whatsapp/webhookParse";
@@ -287,7 +288,31 @@ export const appendInternal = internalMutation({
       args.accountId,
       args.conversationId,
     );
-    return await insertMessageAndUpdateConversation(ctx, args, conversation);
+    const result = await insertMessageAndUpdateConversation(ctx, args, conversation);
+
+    // Qualification P0 (spec §6): every outbound send — inbox agent
+    // send, automations, flows, broadcasts, AI replies, REST v1 — flows
+    // through this one persist step, so this is THE outbound tracking
+    // hook. try/catch: a tracking bug must never fail a send that
+    // already went out to Meta. Inbound rows persist via
+    // `ingest.ingestInbound` (never here), but guard on senderType
+    // anyway since this validator also admits "customer".
+    if (args.senderType === "agent" || args.senderType === "bot") {
+      try {
+        const config = await loadEnabledConfig(ctx, args.accountId);
+        if (config) {
+          await recordOutboundSend(ctx, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            senderType: args.senderType,
+            now: Date.now(),
+          });
+        }
+      } catch (err) {
+        console.error("[qualification] outbound tracking failed:", err);
+      }
+    }
+    return result;
   },
 });
 

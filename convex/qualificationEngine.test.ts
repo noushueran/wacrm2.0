@@ -77,6 +77,38 @@ test("onInbound never opens a session for an admin-alert number (loop guard)", a
   expect(await sessionsFor(t, conversationId)).toHaveLength(0);
 });
 
+test("appendInternal (agent send) opens an outbound session and stamps humanTouchedAt", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, conversationId } = await seed(t);
+  await t.mutation(internal.messages.appendInternal, {
+    accountId, conversationId, senderType: "agent",
+    contentType: "text", contentText: "Hello from an agent",
+  });
+  const rows = await sessionsFor(t, conversationId);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].origin).toBe("outbound");
+  expect(rows[0].humanTouchedAt).toBeGreaterThan(0);
+});
+
+test("appendInternal (bot send) opens a session but never sets humanTouchedAt; disabled config no-ops", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, conversationId } = await seed(t);
+  await t.mutation(internal.messages.appendInternal, {
+    accountId, conversationId, senderType: "bot",
+    contentType: "text", contentText: "template blast",
+  });
+  const rows = await sessionsFor(t, conversationId);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].humanTouchedAt).toBeUndefined();
+
+  const off = await seed(t, { enabled: false });
+  await t.mutation(internal.messages.appendInternal, {
+    accountId: off.accountId, conversationId: off.conversationId, senderType: "agent",
+    contentType: "text", contentText: "hi",
+  });
+  expect(await sessionsFor(t, off.conversationId)).toHaveLength(0);
+});
+
 test("onInbound leaves closed conversations alone", async () => {
   const t = convexTest(schema, modules);
   const { accountId, contactId, conversationId } = await seed(t);
