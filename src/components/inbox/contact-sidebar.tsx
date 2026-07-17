@@ -8,6 +8,7 @@ import { toUiContactNote, toUiDeal } from "@/lib/convex/adapters";
 import type { Contact } from "@/types";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import { LabelPicker } from "./label-picker";
+import { TagSuggestionBanner } from "./tag-suggestion-banner";
 import { ContactCustomFields } from "./contact-custom-fields";
 import {
   Phone,
@@ -460,6 +461,15 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
           </Section>
 
           <Divider />
+
+          {/* AI tag suggestion banner — conversationId-scoped (a pending
+              classification is keyed by conversation, not contact), so
+              only rendered once a conversation is actually selected,
+              same `conversationId &&` guard the funnel Section above
+              uses. */}
+          {conversationId && (
+            <TagSuggestionBanner contactId={contact.id} conversationId={conversationId} />
+          )}
 
           {/* Labels */}
           <div>

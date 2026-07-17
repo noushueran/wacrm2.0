@@ -23,6 +23,15 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
+  // Absolute base for every relative metadata URL (Open Graph / Twitter
+  // images, canonical links). Without it Next.js falls back to
+  // `localhost:3000` and emits a build-time warning, and social crawlers
+  // that unfurl a shared link (e.g. the /join invite page) would receive a
+  // localhost image URL. Prefers the deployment's own env var, falling back
+  // to the known production origin.
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_SITE_URL ?? "https://wa.holidayys.co"
+  ),
   title: {
     default: "Holidayys WA CRM",
     template: "%s — Holidayys WA CRM",

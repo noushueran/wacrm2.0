@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ModeToggle } from "@/components/layout/mode-toggle";
+import { NotificationBell } from "@/components/layout/notification-bell";
 import { canAccessNav } from "@/lib/auth/roles";
 
 const pageTitles: Record<string, string> = {
@@ -90,6 +91,9 @@ export function Header({ onOpenSidebar }: HeaderProps) {
 
       <div className="flex items-center gap-1 sm:gap-2">
         <ModeToggle />
+
+        {/* Sits next to the profile; self-gates so viewers see no bell. */}
+        <NotificationBell />
 
         <DropdownMenu>
         <DropdownMenuTrigger

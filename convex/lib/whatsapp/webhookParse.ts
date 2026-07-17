@@ -280,6 +280,9 @@ export interface FlattenedInboundMessage {
   wamid: string;
   interactiveReplyId?: string;
   ctwaClid?: string;
+  /** wamid of the message this one replies to (Meta `context.id`), so the
+   *  inbox can render the customer's reply as a quote of our message. */
+  contextWamid?: string;
   referral?: AdReferral;
 }
 
@@ -324,7 +327,13 @@ export function flattenInboundMessage(
         thumbnailUrl: r!.thumbnail_url,
       }
     : undefined;
-  return { ...base, ...(ctwaClid ? { ctwaClid } : {}), ...(referral ? { referral } : {}) };
+  const contextWamid = message.context?.id || undefined;
+  return {
+    ...base,
+    ...(ctwaClid ? { ctwaClid } : {}),
+    ...(contextWamid ? { contextWamid } : {}),
+    ...(referral ? { referral } : {}),
+  };
 }
 
 function flattenByType(

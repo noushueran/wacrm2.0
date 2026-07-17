@@ -148,6 +148,41 @@ test("list never exposes tokenHash", async () => {
   expect(rows[0]).not.toHaveProperty("tokenHash");
 });
 
+test("list excludes an invitation once it has been redeemed (only outstanding invites are pending)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner } = await seedOwner(t, {
+    name: "Nadia",
+    email: "nadia@example.com",
+  });
+
+  // Two outstanding invites...
+  await asOwner.mutation(api.invitations.create, {
+    role: "viewer",
+    label: "Still pending",
+  });
+  const used = await asOwner.mutation(api.invitations.create, {
+    role: "agent",
+    label: "Will be accepted",
+  });
+
+  // ...one of which a brand-new user actually redeems via the real join
+  // path. `redeem` marks the row used (sets `acceptedAt`) rather than
+  // deleting it, so a naive `list` would still surface it as "pending".
+  const { asUser: asNewUser } = await seedOwner(t, {
+    name: "Femi",
+    email: "femi@example.com",
+  });
+  await asNewUser.mutation(api.invitations.redeem, {
+    tokenHash: await hashInviteToken(used.token),
+  });
+
+  // Only the still-outstanding invite should come back.
+  const rows = await asOwner.query(api.invitations.list, {});
+  expect(rows).toHaveLength(1);
+  expect(rows[0].label).toBe("Still pending");
+  expect(rows.every((r) => r.acceptedAt === undefined)).toBe(true);
+});
+
 test("revoke deletes an invitation scoped to the caller's own account", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asOwner } = await seedOwner(t, {

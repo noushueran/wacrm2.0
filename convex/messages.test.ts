@@ -715,3 +715,38 @@ test("setMediaUrl attaches a mediaUrl to a message that had none", async () => {
     "https://convex.test/api/storage/voice-1",
   );
 });
+
+test("appendInternal persists replyToMessageId (reply linkage)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Ann",
+    email: "ann@example.com",
+    role: "agent",
+  });
+  const { conversationId } = await seedConv(t, accountId, {
+    phone: "15550001111",
+    name: "Cust",
+  });
+  const parentId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "Any availability?",
+      status: "delivered",
+    }),
+  );
+
+  const replyId = await t.mutation(internal.messages.appendInternal, {
+    accountId,
+    conversationId,
+    senderType: "agent",
+    contentType: "text",
+    contentText: "Yes!",
+    replyToMessageId: parentId,
+  });
+
+  const stored = await t.run((ctx) => ctx.db.get(replyId));
+  expect(stored!.replyToMessageId).toBe(parentId);
+});

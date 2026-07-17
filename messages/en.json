@@ -64,7 +64,12 @@
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
     "menuSettings": "Settings",
-    "menuSignOut": "Sign out"
+    "menuSignOut": "Sign out",
+    "notificationsUnread": "{count} unread",
+    "notificationsMarkAllRead": "Mark all as read",
+    "notificationsViewAll": "View all notifications",
+    "notificationsEmpty": "No notifications yet",
+    "notificationsEmptyHint": "You'll see an alert here when someone assigns you a conversation."
   },
   "ModeToggle": {
     "switchMode": "Switch to {mode} mode"
@@ -356,6 +361,19 @@
       "none": "No labels yet",
       "ungrouped": "Other",
       "failed": "Couldn’t update labels"
+    },
+    "tagSuggestions": {
+      "title": "AI suggestion",
+      "suggestCta": "Suggest tags",
+      "accept": "Accept",
+      "dismiss": "Dismiss",
+      "accepted": "Labels applied",
+      "errorGeneric": "Couldn’t get a suggestion",
+      "error_ai_not_configured": "Set up the AI assistant in Settings first",
+      "error_forbidden": "You don’t have access",
+      "error_not_found": "Conversation not found",
+      "error_no_account": "No account",
+      "error_no_tags": "No matching tags found for this conversation"
     },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
@@ -1899,5 +1917,10 @@
     "workspaceHeading": "Workspace",
     "botHandledLabel": "Skip push when a flow fully handles the message",
     "botHandledHint": "If a no-code flow replies and closes out an inbound message on its own, don't page the team for it. Replies from the AI assistant always still notify, since it often hands off to a human."
+  },
+  "Agents": {
+    "usage": {
+      "classifyLabel": "Tagging"
+    }
   }
 }
