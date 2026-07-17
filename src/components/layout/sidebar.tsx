@@ -231,17 +231,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
       >
         {/* Logo + pin row. */}
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-          <Link href="/dashboard" className="flex items-center gap-2">
+          {/* Mark only — the wordmark lives in the header. aria-label carries
+              the name the removed text used to provide. */}
+          <Link href="/dashboard" aria-label={t("title")} className="flex items-center">
             <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <MessageSquare className="h-4 w-4" />
-            </span>
-            <span
-              className={cn(
-                "text-sm font-semibold text-foreground",
-                revealOnExpand,
-              )}
-            >
-              {t("title")}
             </span>
           </Link>
           <div className="flex items-center gap-1">
