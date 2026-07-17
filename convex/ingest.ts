@@ -616,6 +616,21 @@ export const processInbound = internalAction({
       });
     }
 
+    // ---- Qualification session tracking (P0 — spec §6). Every
+    // non-duplicate inbound counts as customer activity: upsert the
+    // session and bump the 24h/72h clocks BEFORE the reply engines run,
+    // so nothing downstream (flow-consumed or not) can lose the signal.
+    // Dormant-safe: no enabled config → the mutation no-ops. P1 adds
+    // the analysis step separately (after flows, before the AI reply).
+    await runBestEffort("qualificationEngine.onInbound", () =>
+      ctx.runMutation(internal.qualificationEngine.onInbound, {
+        accountId,
+        conversationId: res.conversationId,
+        contactId: res.contactId,
+        phoneNormalized: normalizePhone(from),
+      }),
+    );
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.
