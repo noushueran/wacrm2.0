@@ -1710,11 +1710,23 @@
       "deals": "Deals & currency",
       "members": "Team members",
       "api": "API keys",
-      "conversions": "Conversions"
+      "conversions": "Conversions",
+      "qualification": "Lead qualification"
     },
     "groups": {
       "account": "Account",
       "workspace": "Workspace"
+    },
+    "qualification": {
+      "title": "Lead qualification",
+      "description": "AI-driven qualification on every chat: questions from your service documents, automatic follow-ups, lead scoring, and a Meta signal when a lead qualifies.",
+      "enableLabel": "Enable lead qualification",
+      "enableDesc": "Dormant until enabled. Turning this on starts tracking qualification sessions for new conversations.",
+      "defaultsTitle": "Active configuration",
+      "hours": "Follow-up hours: {start}–{end} {tz} · {days}",
+      "cadence": "Up to {count} follow-ups within {window}h · qualify at score ≥ {threshold}",
+      "fallbackFields": "Fallback questions (used when no service document matches):",
+      "comingSoon": "Question editing, follow-up cadence, admin WhatsApp alerts and the Leads workspace arrive with the next phases — this switch only enables session tracking for now."
     },
     "profile": {
       "title": "Your profile",
