@@ -8,6 +8,11 @@ import { NextRequest, NextResponse, type NextFetchEvent } from "next/server";
 // *our* routing decisions — who gets redirected where — in isolation.
 let mockAuthed = false;
 
+// How many times the handler asked `isAuthenticated()`. That call is an
+// uncached network round-trip to the Convex backend, so "did we ask at
+// all?" is a behavior worth asserting, not an implementation detail.
+let authCallCount = 0;
+
 vi.mock("@convex-dev/auth/nextjs/server", () => ({
   // Invoke our handler with a mock `convexAuth`, mirroring the real
   // wrapper's fallback of `NextResponse.next()` when the handler returns
@@ -28,7 +33,10 @@ vi.mock("@convex-dev/auth/nextjs/server", () => ({
       const result = await handler(request, {
         event: {},
         convexAuth: {
-          isAuthenticated: async () => mockAuthed,
+          isAuthenticated: async () => {
+            authCallCount++;
+            return mockAuthed;
+          },
           getToken: async () => (mockAuthed ? "token" : undefined),
         },
       });
@@ -68,6 +76,7 @@ async function run(url: string) {
 
 beforeEach(() => {
   mockAuthed = false;
+  authCallCount = 0;
 });
 
 afterEach(() => vi.clearAllMocks());
@@ -110,5 +119,49 @@ describe("middleware — Convex Auth route gating", () => {
     const res = await run("https://app.test/api/whatsapp/webhook");
     expect(res.status).not.toBe(401);
     expect(res.headers.get("location")).toBeNull();
+  });
+});
+
+describe("middleware — root entry point", () => {
+  // `/` used to fall through to `app/page.tsx`, which redirected to
+  // /dashboard unconditionally — so a signed-out visitor was bounced
+  // / -> /dashboard -> /login, paying a full round trip per hop. The
+  // decision needs the auth state, which this middleware already has.
+  it("sends a signed-out visitor straight to /login, not via /dashboard", async () => {
+    mockAuthed = false;
+    const res = await run("https://app.test/");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
+    expect(res.headers.get("location")).not.toContain("/dashboard");
+  });
+
+  it("sends a signed-in visitor to /dashboard", async () => {
+    mockAuthed = true;
+    const res = await run("https://app.test/");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/dashboard");
+  });
+});
+
+describe("middleware — skips the auth round-trip when the route cannot need it", () => {
+  // `isAuthenticated()` is an uncached `fetchQuery` to the self-hosted
+  // Convex backend. Asking before deciding whether the answer is even
+  // relevant spends a round trip on routes that will never use it.
+  it("does not ask who the caller is for a public route", async () => {
+    mockAuthed = false;
+    await run("https://app.test/join/some-invite-token");
+    expect(authCallCount).toBe(0);
+  });
+
+  it("does not ask who the caller is for a static asset the matcher still catches", async () => {
+    mockAuthed = false;
+    await run("https://app.test/opus/encoderWorker.min.js");
+    expect(authCallCount).toBe(0);
+  });
+
+  it("still asks on a protected route, where the answer decides the outcome", async () => {
+    mockAuthed = true;
+    await run("https://app.test/inbox");
+    expect(authCallCount).toBe(1);
   });
 });
