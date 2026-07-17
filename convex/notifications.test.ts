@@ -207,6 +207,161 @@ test("list orders notifications newest-first", async () => {
 });
 
 // ============================================================
+// listRecent / unreadCount — the header bell's bounded reads. The bell
+// mounts on every authenticated page, so unlike `list` (the
+// /notifications page, loaded only when visited) neither of these may
+// grow with the caller's notification history.
+// ============================================================
+
+/** An authenticated convex-test client, as `seedAccountMember` returns. */
+type AsUser = ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
+
+/** Creates `count` notifications for `userId`, oldest first. */
+async function seedNotifications(
+  asUser: AsUser,
+  userId: Id<"users">,
+  count: number,
+) {
+  const ids: Id<"notifications">[] = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(
+      await asUser.mutation(api.notifications.create, {
+        userId,
+        type: "conversation_assigned",
+        title: `N${i}`,
+      }),
+    );
+  }
+  return ids;
+}
+
+test("listRecent returns only the newest `limit` notifications, newest-first", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const ids = await seedNotifications(asUser, userId, 5);
+
+  const recent = await asUser.query(api.notifications.listRecent, { limit: 2 });
+  expect(recent.map((n) => n._id)).toEqual([ids[4], ids[3]]);
+});
+
+test("listRecent clamps a non-positive limit instead of throwing", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  await seedNotifications(asUser, userId, 3);
+
+  // A negative limit makes Convex's `.take()` throw; the bell subscribes
+  // to this on every page, so a bad client value must degrade to empty,
+  // never a 500.
+  const recent = await asUser.query(api.notifications.listRecent, {
+    limit: -1,
+  });
+  expect(recent).toEqual([]);
+});
+
+test("listRecent never returns a teammate's notifications", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const bobUserId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("users", {
+      name: "Bob",
+      email: "bob@example.com",
+    });
+    await ctx.db.insert("memberships", {
+      userId: id,
+      accountId,
+      role: "agent",
+      fullName: "Bob",
+      email: "bob@example.com",
+    });
+    return id;
+  });
+
+  await asAlice.mutation(api.notifications.create, {
+    userId: bobUserId,
+    type: "conversation_assigned",
+    title: "For Bob",
+  });
+
+  expect(
+    await asAlice.query(api.notifications.listRecent, { limit: 6 }),
+  ).toEqual([]);
+});
+
+test("unreadCount returns the exact number of unread notifications below the cap", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const ids = await seedNotifications(asUser, userId, 3);
+  await asUser.mutation(api.notifications.markRead, { notificationId: ids[0] });
+
+  expect(await asUser.query(api.notifications.unreadCount, {})).toBe(2);
+});
+
+test("unreadCount saturates at 10 so the badge can render '9+' without an unbounded read", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await seedNotifications(asUser, userId, 25);
+
+  // Saturates rather than reporting 25: `formatUnreadBadge` only needs
+  // exact values 1-9 and renders anything >9 as "9+", so the read stops
+  // at the cap instead of walking the caller's whole history.
+  expect(await asUser.query(api.notifications.unreadCount, {})).toBe(10);
+});
+
+test("unreadCount never counts a teammate's unread notifications", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const bobUserId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("users", {
+      name: "Bob",
+      email: "bob@example.com",
+    });
+    await ctx.db.insert("memberships", {
+      userId: id,
+      accountId,
+      role: "agent",
+      fullName: "Bob",
+      email: "bob@example.com",
+    });
+    return id;
+  });
+
+  await asAlice.mutation(api.notifications.create, {
+    userId: bobUserId,
+    type: "conversation_assigned",
+    title: "For Bob",
+  });
+
+  expect(await asAlice.query(api.notifications.unreadCount, {})).toBe(0);
+});
+
+// ============================================================
 // markRead / markAllRead — scoped to the caller
 // ============================================================
 

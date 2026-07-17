@@ -772,6 +772,24 @@ export default defineSchema({
     body: v.optional(v.string()),
     readAt: v.optional(v.number()),
   })
+    // Every read here is "this recipient, in this account" — binding both
+    // on the index replaces a `by_user` scan of the caller's whole
+    // cross-account history plus a JS `accountId` filter. Ordering falls
+    // through to the appended `_creationTime`, so `.order("desc")` still
+    // yields newest-first for `list`/`listRecent`.
+    .index("by_user_account", ["userId", "accountId"])
+    // Adds `readAt` so the unread set is an index range, not a filter:
+    // the header bell mounts app-wide and must never read the caller's
+    // whole history to render a badge capped at "9+". `markAllRead`
+    // patches through the same range. A separate index from
+    // `by_user_account` because that one orders by `_creationTime` —
+    // `readAt` sits between, so neither can serve the other's query.
+    .index("by_user_account_read", ["userId", "accountId", "readAt"])
+    // Kept alongside the two indexes above: callers added after this
+    // branch was cut (qualification engine + its tests) still read
+    // `by_user`/`by_account`, and dropping a live index mid-deploy is
+    // exactly the failure mode the deploy runbook forbids. Redundant with
+    // the composite indexes for THIS module's queries only.
     .index("by_account", ["accountId"])
     .index("by_user", ["userId"]),
 
