@@ -213,7 +213,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
       <aside
         className={cn(
           // Mobile: fixed drawer that slides in from the left.
-          "group fixed inset-y-0 left-0 z-40 flex h-full w-64 flex-col overflow-hidden whitespace-nowrap border-r border-border bg-card",
+          // `pt-safe`: this is `fixed`, so it is positioned against the
+          // viewport and does NOT inherit the shell's `pt-safe` — without its
+          // own the brand/pin row (and the first nav items) render under the
+          // iOS status bar in the installed PWA. Inset is 0 on desktop.
+          "group fixed inset-y-0 left-0 z-40 flex h-full w-64 flex-col overflow-hidden whitespace-nowrap border-r border-border bg-card pt-safe",
           "transition-[transform,width,box-shadow] duration-200 ease-out will-change-transform",
           open ? "translate-x-0" : "-translate-x-full",
           // Desktop: always visible. Collapsed rail expands over content on

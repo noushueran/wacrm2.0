@@ -46,7 +46,16 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
   if (!user) return null;
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-background">
+    // `pt-safe` keeps the header out from under the iOS status bar. The
+    // installed PWA runs `viewport-fit=cover` + `black-translucent`, so the
+    // web view extends to the physical top of the screen — without this the
+    // whole h-14 header (hamburger, brand, title, bell, avatar) renders
+    // underneath the ~59px status bar and is unreachable. Tailwind's
+    // border-box means the padding comes OUT of h-dvh rather than adding to
+    // it, so the flex children below still fit exactly. Safe on desktop,
+    // where the inset is 0. The fixed sidebar can't inherit this and carries
+    // its own `pt-safe`.
+    <div className="flex h-dvh overflow-hidden bg-background pt-safe">
       {/* Reports this tab's online/away presence once we know a user is
           signed in. Headless — renders nothing. */}
       <PresenceHeartbeat />
