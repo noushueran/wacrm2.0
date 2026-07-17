@@ -1,20 +1,35 @@
 import { convexTest, type TestConvex } from "convex-test";
-import { expect, test } from "vitest";
-import { internal } from "./_generated/api";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import { holidayysDefaultConfig } from "./lib/qualification/defaults";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
+// Same two-flag DRY-RUN convention as aiReply.test.ts: the analysis
+// pass skips the real LLM under CONVEX_AI_DRY_RUN, and any Meta send it
+// might trigger later phases stays synthetic under CONVEX_META_DRY_RUN.
+beforeEach(() => {
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  process.env.CONVEX_META_DRY_RUN = "1";
+});
+afterEach(() => {
+  delete process.env.CONVEX_AI_DRY_RUN;
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
 async function seed(
   t: ReturnType<typeof convexTest>,
   opts: { enabled: boolean; adminPhones?: string[] } = { enabled: true },
 ) {
-  return await t.run(async (ctx) => {
+  const base = await t.run(async (ctx) => {
     const userId = await ctx.db.insert("users", { name: "U", email: "u@example.com" });
     const accountId = await ctx.db.insert("accounts", {
       name: "A", defaultCurrency: "AED", ownerUserId: userId,
+    });
+    await ctx.db.insert("memberships", {
+      userId, accountId, role: "admin", fullName: "U", email: "u@example.com",
     });
     await ctx.db.insert("qualificationConfigs", {
       accountId,
@@ -28,8 +43,42 @@ async function seed(
     const conversationId = await ctx.db.insert("conversations", {
       accountId, contactId, status: "open", unreadCount: 0,
     });
-    return { accountId, contactId, conversationId };
+    return { userId, accountId, contactId, conversationId };
   });
+  const asUser = t.withIdentity({ subject: `${base.userId}|session-u` });
+  return { ...base, asUser };
+}
+
+/** Admin upsert of an active AI config (encrypts the key properly). */
+async function configureAi(
+  asUser: ReturnType<TestConvex<typeof schema>["withIdentity"]>,
+) {
+  await asUser.mutation(api.aiConfig.upsert, {
+    provider: "openai" as const,
+    model: "gpt-4o-mini",
+    isActive: true,
+    autoReplyEnabled: true,
+    autoReplyMaxPerConversation: 3,
+    apiKey: "sk-test-key",
+  });
+}
+
+async function seedCustomerMessage(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  conversationId: Id<"conversations">,
+  text: string,
+) {
+  await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: text,
+      status: "delivered",
+    }),
+  );
 }
 
 // `TestConvex<typeof schema>` for `.withIndex` — same documented gotcha
@@ -121,4 +170,117 @@ test("onInbound leaves closed conversations alone", async () => {
     accountId, conversationId, contactId, phoneNormalized: "971500000001",
   });
   expect(await sessionsFor(t, conversationId)).toHaveLength(0);
+});
+
+// ---- P1: analysis pipeline (DRY-RUN synthetic — see syntheticAnalysisRaw) ----
+
+test("analyzeInbound extracts fields, score and pendingQuestion into the session", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId,
+    "field:nationality=Indian;field:travel_dates=August; score:70");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  const byKey = Object.fromEntries(s.fields.map((f) => [f.key, f.value]));
+  expect(byKey.nationality).toBe("Indian");
+  expect(byKey.travel_dates).toBe("August");
+  expect(s.score).toBe(70);
+  expect(s.answeredCount).toBe(2);
+  expect(s.expectedCount).toBeGreaterThanOrEqual(2);
+  expect(s.serviceName).toBe("UAE visa");
+  expect(s.pendingQuestion?.text).toBeTruthy();
+  expect(s.checklistSatisfiedAt).toBeUndefined();
+  expect(s.status).toBe("collecting");
+});
+
+test("analyzeInbound stamps readiness when checklist satisfied + score >= threshold + >=3 answers", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.checklistSatisfiedAt).toBeGreaterThan(0);
+  expect(s.status).toBe("collecting"); // completion is P2's job
+});
+
+test("analyzeInbound does NOT stamp readiness below the answer floor", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.checklistSatisfiedAt).toBeUndefined();
+});
+
+test("opt-out intent closes the session and silences the bot", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId, "[[STOP]] please stop messaging");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.status).toBe("opted_out");
+  expect(s.closedReason).toBe("opted_out");
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+});
+
+test("wants-human intent hands off to the human queue while the session keeps collecting", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId, "[[HUMAN]] can I talk to someone");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.status).toBe("collecting");
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+  expect(conversation?.status).toBe("pending");
+  expect(conversation?.aiHandoffSummary).toContain("human");
+});
+
+test("analyzeInbound is a no-op without an active AI config or on terminal sessions", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  // no aiConfig at all
+  await seedCustomerMessage(t, accountId, conversationId, "field:x=1");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  let rows = await sessionsFor(t, conversationId);
+  expect(rows.length === 0 || rows[0].fields.length === 0).toBe(true);
+
+  // terminal session
+  const second = await seed(t);
+  await configureAi(second.asUser);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId: second.accountId, conversationId: second.conversationId,
+      contactId: second.contactId, status: "expired", origin: "inbound",
+      fields: [], expectedCount: 0, answeredCount: 0,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  await seedCustomerMessage(t, second.accountId, second.conversationId, "field:x=1");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: second.accountId, conversationId: second.conversationId,
+    contactId: second.contactId,
+  });
+  rows = await sessionsFor(t, second.conversationId);
+  expect(rows[0].fields).toHaveLength(0);
 });
