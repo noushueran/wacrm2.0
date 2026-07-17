@@ -108,20 +108,33 @@ test("recordInboundActivity bumps the clock and clears a pending follow-up, only
   expect(s.lastCustomerMessageAt).toBe(6000); // terminal session untouched
 });
 
-test("recordOutboundSend creates an outbound session; only agent sends set humanTouchedAt", async () => {
+test("recordOutboundSend creates an outbound session; only agent sends set humanTouchedAt; admin numbers excluded", async () => {
   const t = convexTest(schema, modules);
   const { accountId, conversationId } = await seed(t);
   await t.run(async (ctx) => {
-    await recordOutboundSend(ctx, { accountId, conversationId, senderType: "bot", now: 100 });
+    const config = (await loadEnabledConfig(ctx, accountId))!;
+    await recordOutboundSend(ctx, { accountId, conversationId, senderType: "bot", now: 100, config });
   });
   let [s] = await sessionsFor(t, conversationId);
   expect(s.origin).toBe("outbound");
   expect(s.humanTouchedAt).toBeUndefined();
   await t.run(async (ctx) => {
-    await recordOutboundSend(ctx, { accountId, conversationId, senderType: "agent", now: 200 });
+    const config = (await loadEnabledConfig(ctx, accountId))!;
+    await recordOutboundSend(ctx, { accountId, conversationId, senderType: "agent", now: 200, config });
   });
   [s] = await sessionsFor(t, conversationId);
   expect(s.humanTouchedAt).toBe(200);
+
+  // loop guard: a send to a configured admin-alert number opens NO session
+  const adminAcct = await seed(t, { enabled: true, adminPhones: ["+971 50 000 0001"] });
+  await t.run(async (ctx) => {
+    const config = (await loadEnabledConfig(ctx, adminAcct.accountId))!;
+    await recordOutboundSend(ctx, {
+      accountId: adminAcct.accountId, conversationId: adminAcct.conversationId,
+      senderType: "bot", now: 300, config,
+    });
+  });
+  expect(await sessionsFor(t, adminAcct.conversationId)).toHaveLength(0);
 });
 
 test("loadEnabledConfig returns null when disabled; isAdminAlertNumber matches normalized phones", async () => {

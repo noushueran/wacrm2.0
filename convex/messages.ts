@@ -306,6 +306,7 @@ export const appendInternal = internalMutation({
             conversationId: args.conversationId,
             senderType: args.senderType,
             now: Date.now(),
+            config,
           });
         }
       } catch (err) {

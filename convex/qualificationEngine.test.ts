@@ -196,7 +196,7 @@ test("analyzeInbound extracts fields, score and pendingQuestion into the session
   expect(s.status).toBe("collecting");
 });
 
-test("analyzeInbound stamps readiness when checklist satisfied + score >= threshold + >=3 answers", async () => {
+test("analyzeInbound stamps readiness AND completes when checklist satisfied + score >= threshold + >=3 answers", async () => {
   const t = convexTest(schema, modules);
   const { accountId, contactId, conversationId, asUser } = await seed(t);
   await configureAi(asUser);
@@ -207,7 +207,7 @@ test("analyzeInbound stamps readiness when checklist satisfied + score >= thresh
   });
   const [s] = await sessionsFor(t, conversationId);
   expect(s.checklistSatisfiedAt).toBeGreaterThan(0);
-  expect(s.status).toBe("collecting"); // completion is P2's job
+  expect(s.status).toBe("qualified"); // P2: readiness triggers completion
 });
 
 test("analyzeInbound does NOT stamp readiness below the answer floor", async () => {
@@ -332,4 +332,148 @@ test("getObjectives falls back to the first unanswered required basic field when
   });
   // looking_for is answered → next required basic field is travel_dates
   expect(objectives?.nextQuestion).toContain("travel");
+});
+
+// ---- P2: completion pipeline ----
+
+async function seedAttributed(t: ReturnType<typeof convexTest>) {
+  const base = await seed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.patch(base.conversationId, {
+      attribution: { lane: "ctwa", ctwaClid: "clid-123", firstSeenAt: 111 },
+    });
+  });
+  await configureAi(base.asUser);
+  return base;
+}
+
+function transitionsFor(t: TestConvex<typeof schema>, conversationId: Id<"conversations">) {
+  return t.run((ctx) =>
+    ctx.db.query("funnelTransitions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+}
+
+test("readiness completes the lead: session qualified, funnel auto-advanced, Meta event seeded, handoff + notification", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, userId } = await seedAttributed(t);
+  await seedCustomerMessage(t, accountId, conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.status).toBe("qualified");
+  expect(s.qualifiedAt).toBeGreaterThan(0);
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation?.funnel?.stage).toBe("qualified");
+  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+  expect(conversation?.status).toBe("pending");
+  expect(conversation?.aiHandoffSummary).toContain("Qualified lead");
+
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents")
+      .withIndex("by_event_id", (q) => q.eq("eventId", `${conversationId}:qualified`))
+      .collect());
+  expect(events).toHaveLength(1);
+  expect(events[0].eventName).toBe("QualifiedLead");
+
+  const notifications = await t.run((ctx) =>
+    ctx.db.query("notifications")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .collect());
+  expect(notifications.some((n) => n.type === "lead_qualified")).toBe(true);
+});
+
+test("completion never downgrades a human-advanced funnel stage and is idempotent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedAttributed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversationId, {
+      funnel: { stage: "price_quoted", stageUpdatedAt: 1 },
+    });
+  });
+  await seedCustomerMessage(t, accountId, conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  });
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId, conversationId, contactId,
+  }); // second run: terminal session → no-op
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation?.funnel?.stage).toBe("price_quoted"); // untouched
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.status).toBe("qualified");
+  const transitions = await transitionsFor(t, conversationId);
+  expect(transitions.filter((tr) => tr.stage === "qualified")).toHaveLength(0);
+});
+
+test("sendClosingMessage sends the configured text as a bot message on a qualified session only", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedAttributed(t);
+  // not qualified yet → nothing sent
+  await t.action(internal.qualificationEngine.sendClosingMessage, { accountId, conversationId });
+  let messages = await t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+  expect(messages).toHaveLength(0);
+
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "qualified", origin: "inbound",
+      fields: [], expectedCount: 0, answeredCount: 3, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  await t.action(internal.qualificationEngine.sendClosingMessage, { accountId, conversationId });
+  messages = await t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+  expect(messages).toHaveLength(1);
+  expect(messages[0].senderType).toBe("bot");
+  expect(messages[0].contentText).toContain("travel expert");
+});
+
+test("sendAdminAlerts creates a silenced internal conversation, sends the alert, and never opens a session on it", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seedAttributed(t);
+  await asUser.mutation(api.qualification.updateConfig, {
+    patch: { adminAlertEnabled: true, adminAlertPhones: ["+971 55 999 8888"] },
+  });
+  const sessionId = await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "qualified", origin: "inbound",
+      fields: [{ key: "destination", label: "Destination", value: "Bali", confidence: "high", updatedAt: 1 }],
+      expectedCount: 3, answeredCount: 3, score: 82, serviceName: "Packages",
+      summary: "Bali family trip", qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await t.action(internal.qualificationEngine.sendAdminAlerts, { accountId, sessionId });
+
+  const adminContact = await t.run((ctx) =>
+    ctx.db.query("contacts")
+      .withIndex("by_account_phone", (q) =>
+        q.eq("accountId", accountId).eq("phoneNormalized", "971559998888"))
+      .unique());
+  expect(adminContact).toBeTruthy();
+  const adminConversation = await t.run((ctx) =>
+    ctx.db.query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", adminContact!._id))
+      .unique());
+  expect(adminConversation?.aiAutoreplyDisabled).toBe(true);
+  const alertMessages = await t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", adminConversation!._id))
+      .collect());
+  expect(alertMessages).toHaveLength(1);
+  expect(alertMessages[0].contentText).toContain("+971500000001"); // customer phone
+  expect(alertMessages[0].contentText).toContain("82");
+  // loop guard: the alert send must NOT have opened a qualification session
+  expect(await sessionsFor(t, adminConversation!._id)).toHaveLength(0);
 });

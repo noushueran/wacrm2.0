@@ -40,3 +40,29 @@ export function buildInboundPayload(input: {
     tag,
   };
 }
+
+/**
+ * Qualified-lead push (qualification P2). `hidePreview` collapses to a
+ * generic body (no name/score on the lock screen) but keeps the routing
+ * url + tag. Tag is distinct from the inbound-message tag so a lead
+ * alert never coalesces away an unread-message notification.
+ */
+export function buildQualifiedLeadPayload(input: {
+  contactName?: string | null;
+  serviceName?: string | null;
+  score?: number | null;
+  conversationId: string;
+  hidePreview: boolean;
+}): PushPayload {
+  const url = `/inbox?c=${input.conversationId}`;
+  const tag = `qualified-${input.conversationId}`;
+  if (input.hidePreview) {
+    return { title: "Holidayys WA CRM", body: "New qualified lead", url, tag };
+  }
+  const parts = [
+    input.contactName?.trim() || "New lead",
+    input.serviceName?.trim() || null,
+    input.score !== null && input.score !== undefined ? `score ${input.score}/100` : null,
+  ].filter(Boolean);
+  return { title: "🎯 New qualified lead", body: parts.join(" · "), url, tag };
+}

@@ -114,7 +114,10 @@ export async function recordInboundActivity(
  * Outbound persist hook (spec §6): ensures an outbound-origin session
  * exists for chats WE start (agent outreach, broadcasts, engine sends);
  * a manual agent send additionally stamps `humanTouchedAt` so the
- * follow-up engine yields to the human working the thread.
+ * follow-up engine yields to the human working the thread. Takes the
+ * already-loaded enabled config so it can apply the SAME admin-number
+ * loop guard as `onInbound` — the lead-alert send itself flows through
+ * this hook, and must never open a session on its own alert channel.
  */
 export async function recordOutboundSend(
   ctx: DbCtx,
@@ -123,10 +126,15 @@ export async function recordOutboundSend(
     conversationId: Id<"conversations">;
     senderType: "agent" | "bot";
     now: number;
+    config: Doc<"qualificationConfigs">;
   },
 ): Promise<void> {
   const conversation = await ctx.db.get(args.conversationId);
   if (!conversation || conversation.accountId !== args.accountId) return;
+  const contact = await ctx.db.get(conversation.contactId);
+  if (contact && isAdminAlertNumber(args.config, contact.phoneNormalized)) {
+    return; // loop guard (spec §9)
+  }
   const sessionId = await ensureSession(ctx, {
     accountId: args.accountId,
     conversationId: args.conversationId,
