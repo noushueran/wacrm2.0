@@ -1104,7 +1104,12 @@ export default defineSchema({
   aiUsageLog: defineTable({
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(v.literal("auto_reply"), v.literal("draft"), v.literal("classify")),
+    mode: v.union(
+      v.literal("auto_reply"),
+      v.literal("draft"),
+      v.literal("classify"),
+      v.literal("qualify"),
+    ),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
     promptTokens: v.number(),
@@ -1470,6 +1475,11 @@ export default defineSchema({
     }))),
     expectedCount: v.number(),
     answeredCount: v.number(),
+    // Readiness marker (P1): stamped when the doc checklist is satisfied
+    // AND score >= threshold AND >= 3 answers. P2's completion pipeline
+    // consumes it; status flips to "qualified" only there, so a P1-only
+    // build never half-completes a lead.
+    checklistSatisfiedAt: v.optional(v.number()),
     pendingQuestion: v.optional(v.object({
       key: v.string(),
       text: v.string(),

@@ -49,10 +49,15 @@ test("schema accepts qualificationConfigs, qualificationSessions and lead_qualif
       accountId, conversationId, contactId,
       status: "collecting", origin: "inbound",
       fields: [], expectedCount: 0, answeredCount: 0,
+      checklistSatisfiedAt: 123,
       followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
     });
     await ctx.db.insert("notifications", {
       accountId, userId, type: "lead_qualified", title: "New qualified lead",
+    });
+    await ctx.db.insert("aiUsageLog", {
+      accountId, mode: "qualify", provider: "openai", model: "gpt-test",
+      promptTokens: 1, completionTokens: 1, totalTokens: 2,
     });
     expect(configId).toBeDefined();
     const bySession = await ctx.db
