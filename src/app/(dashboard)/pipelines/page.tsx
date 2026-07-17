@@ -235,6 +235,9 @@ export default function PipelinesPage() {
 
   return (
     <div className="space-y-6">
+      <p className="mb-3 rounded-lg border border-border bg-muted/40 p-2 text-xs text-muted-foreground lg:hidden">
+        {t("bestOnDesktop")}
+      </p>
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">

@@ -35,11 +35,13 @@
     "roleSupervisor": "Supervisor",
     "roleAgent": "Agent",
     "roleViewer": "Viewer",
+    "openMenu": "Open menu",
     "closeMenu": "Close menu",
     "collapseMenu": "Collapse menu",
     "expandMenu": "Expand menu",
     "pinSidebar": "Pin sidebar",
     "unpinSidebar": "Unpin sidebar",
+    "more": "More",
     "defaultUser": "User",
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
@@ -626,6 +628,7 @@
   },
   "Pipelines": {
     "page": {
+      "bestOnDesktop": "This editor works best on a larger screen.",
       "selectPipeline": "Select Pipeline",
       "noPipelinesYet": "No pipelines yet",
       "managePipelines": "Manage Pipelines",
@@ -1152,6 +1155,7 @@
     "list": {
       "title": "Flows",
       "beta": "Beta",
+      "bestOnDesktop": "This editor works best on a larger screen.",
       "description": "Build branching, button-driven WhatsApp conversations. Useful for menus, FAQs, and triage before a human steps in.",
       "newFlow": "New flow",
       "statusDraft": "Draft",
@@ -1692,6 +1696,7 @@
       "overview": "Overview",
       "profile": "Your profile",
       "appearance": "Appearance",
+      "notifications": "Notifications",
       "whatsapp": "WhatsApp",
       "templates": "Templates",
       "quick-replies": "Quick replies",
@@ -1887,6 +1892,31 @@
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
     }
+  },
+  "Pwa": {
+    "installTitle": "Install Holidayys",
+    "installBody": "Add the app to your device for faster access and notifications.",
+    "installButton": "Install app",
+    "iosInstallTitle": "Install on iPhone/iPad",
+    "iosInstallBody": "Tap the Share icon, then \"Add to Home Screen\" to install and enable notifications.",
+    "dismiss": "Not now"
+  },
+  "PushSettings": {
+    "title": "Notifications",
+    "desc": "Get a push notification on this device when a new WhatsApp message needs you.",
+    "enable": "Enable on this device",
+    "enabled": "Notifications are on for this device",
+    "disable": "Turn off",
+    "blocked": "Notifications are blocked in your browser settings. Enable them for this site, then try again.",
+    "unsupported": "This browser doesn't support push notifications.",
+    "iosInstall": "On iPhone/iPad, install the app first: tap Share, then \"Add to Home Screen\". Then reopen from the home screen to enable notifications.",
+    "muteLabel": "Pause all notifications",
+    "muteHint": "Stop push notifications on all your devices for this account until you turn this back off.",
+    "hidePreviewLabel": "Hide message preview",
+    "hidePreviewHint": "Show only \"New WhatsApp message\" instead of the sender and text on your lock screen.",
+    "workspaceHeading": "Workspace",
+    "botHandledLabel": "Skip push when a flow fully handles the message",
+    "botHandledHint": "If a no-code flow replies and closes out an inbound message on its own, don't page the team for it. Replies from the AI assistant always still notify, since it often hands off to a human."
   },
   "Agents": {
     "usage": {

@@ -179,6 +179,7 @@ export type SettingsSectionKey =
   | "overview"
   | "profile"
   | "appearance"
+  | "notifications"
   | "whatsapp"
   | "templates"
   | "quick-replies"
@@ -188,7 +189,12 @@ export type SettingsSectionKey =
   | "api"
   | "conversions";
 
-const PERSONAL_SECTIONS: SettingsSectionKey[] = ["overview", "profile", "appearance"];
+const PERSONAL_SECTIONS: SettingsSectionKey[] = [
+  "overview",
+  "profile",
+  "appearance",
+  "notifications",
+];
 // `conversions` renders `api.attribution.listConversions`, which is
 // itself `ctx.requireRole("admin")`-gated (it exposes raw lead phone
 // numbers) — same threshold as `whatsapp`/`api`/`members`, so it joins

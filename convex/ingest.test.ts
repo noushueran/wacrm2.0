@@ -803,6 +803,30 @@ test("processInbound on a brand-new contact runs the full fan-out in order: inge
   expect(endpoint!.lastDeliveryAt).toBeDefined();
 });
 
+// pushSend.deliverForMessage has no persisted side effect to assert on
+// (unlike webhookDelivery.dispatch's `endpoint.lastDeliveryAt` above) —
+// no VAPID env is configured in this suite (vitest.config.ts sets only
+// ENCRYPTION_KEY/META_APP_SECRET), so the REAL action (convex-test wires
+// every `internal.*` action for real, not a mock — see `modules` above)
+// hits its own early-return guard and resolves silently (no log — see
+// pushSend.ts). Asserting that `processInbound` still resolves with its
+// normal result is the proof the real (unmocked, arg-validated) dispatch
+// to `internal.pushSend.deliverForMessage` is wired into the fan-out
+// without breaking ingestion.
+test("processInbound dispatches pushSend.deliverForMessage as part of the fan-out (best-effort; no VAPID env in tests so it skips sending, but ingestion still completes normally)", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello", wamid: "wamid.PUSH1" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(result.flowConsumed).toBe(false);
+});
+
 test("processInbound: AI reply stands down when an active new_message_received automation exists, even though that automation itself still fires", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";

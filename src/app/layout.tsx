@@ -43,6 +43,12 @@ export const metadata: Metadata = {
   },
   icons: {
     icon: [{ url: "/icon" }],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180" }],
+  },
+  appleWebApp: {
+    capable: true,
+    title: "Holidayys",
+    statusBarStyle: "black-translucent",
   },
   formatDetection: {
     email: false,
@@ -52,8 +58,12 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#020617",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#020617" },
+  ],
   colorScheme: "dark light",
+  viewportFit: "cover",
 };
 
 // Inline boot script — runs before React hydrates so the user's

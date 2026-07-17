@@ -168,7 +168,7 @@ export function DashboardSectionSkeleton() {
  */
 export function InboxSectionSkeleton() {
   return (
-    <div className="-m-4 flex h-[calc(100vh-3.5rem)] overflow-hidden sm:-m-6">
+    <div className="-m-4 flex h-[calc(100dvh-3.5rem)] overflow-hidden sm:-m-6">
       {/* Conversation list */}
       <div className="flex w-full flex-col border-r border-border md:w-80 lg:w-96">
         <div className="border-b border-border p-4">
