@@ -40,6 +40,16 @@ import { buildFunnelSteps } from "@/lib/inbox/funnelView";
 interface ContactSidebarProps {
   contact: Contact | null;
   conversationId?: string;
+  /**
+   * Whether the panel is actually visible. Its usual host
+   * (`ContactPanelDrawer`) keeps this mounted and hides it with a
+   * transform rather than unmounting it, and the panel defaults closed
+   * and is force-closed on every conversation switch — so without this
+   * gate each chat click fires the queries below for a pane nobody is
+   * looking at. Defaults to true for a caller that renders the sidebar
+   * inline/always-visible.
+   */
+  open?: boolean;
 }
 
 type EditForm = {
@@ -70,7 +80,11 @@ function formToState(c: Contact): EditForm {
   };
 }
 
-export function ContactSidebar({ contact, conversationId }: ContactSidebarProps) {
+export function ContactSidebar({
+  contact,
+  conversationId,
+  open = true,
+}: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
   const tFunnel = useTranslations("Inbox.funnel");
@@ -94,22 +108,27 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
 
   // Deals + notes are reactive Convex queries keyed on the contact —
   // switching contacts (or another tab editing the same contact)
-  // updates these automatically, no fetch-on-mount effect needed.
+  // updates these automatically, no fetch-on-mount effect needed. All
+  // three also gate on `open`: the panel is hidden by transform, not
+  // unmounted, so an ungated query here is a round-trip per chat click
+  // for a pane that isn't on screen. They resolve when it opens.
   const dealDocs = useQuery(
     api.deals.listByContact,
-    contactId ? { contactId } : "skip",
+    open && contactId ? { contactId } : "skip",
   );
   const deals = (dealDocs ?? []).map(toUiDeal);
 
   const noteDocs = useQuery(
     api.contactNotes.listForContact,
-    contactId ? { contactId } : "skip",
+    open && contactId ? { contactId } : "skip",
   );
   const notes = (noteDocs ?? []).map(toUiContactNote);
 
   const funnelState = useQuery(
     api.funnel.getState,
-    conversationId ? { conversationId: conversationId as Id<"conversations"> } : "skip",
+    open && conversationId
+      ? { conversationId: conversationId as Id<"conversations"> }
+      : "skip",
   );
 
   const tags = contact?.tags ?? [];

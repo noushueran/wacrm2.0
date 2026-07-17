@@ -72,7 +72,11 @@ export function ContactPanelDrawer({
           </button>
         </div>
         <div className="min-h-0 flex-1">
-          <ContactSidebar contact={contact} conversationId={conversationId} />
+          <ContactSidebar
+            contact={contact}
+            conversationId={conversationId}
+            open={open}
+          />
         </div>
       </aside>
     </>

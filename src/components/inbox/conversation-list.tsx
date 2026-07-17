@@ -1,13 +1,12 @@
 "use client";
 
-import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, memo } from "react";
 import { useQuery } from "convex/react";
 import type { PaginationStatus } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import {
   matchesContactFilters,
   resolveAssignee,
-  type AssigneeDisplay,
 } from "@/lib/inbox/conversations";
 import { PrefetchThread } from "@/components/inbox/prefetch-thread";
 import { toUiTag, toUiTagGroup, toUiMemberProfile } from "@/lib/convex/adapters";
@@ -101,7 +100,9 @@ export function ConversationList({
   // so the picker always lists every tag (not just ones currently in
   // use by a loaded conversation).
   const tagDocs = useQuery(api.tags.list);
-  const tags = (tagDocs ?? []).map(toUiTag);
+  // Memoized so `tagsById` below can hold — a fresh array here rebuilt
+  // that map on every render.
+  const tags = useMemo(() => (tagDocs ?? []).map(toUiTag), [tagDocs]);
 
   // Tag groups — order each row's tag chips by the group's own position
   // (most important dimensions first, so they survive the +N cut-off).
@@ -461,7 +462,8 @@ export function ConversationList({
                 conversation={conv}
                 isActive={conv.id === activeConversationId}
                 onSelect={handleSelect}
-                assignee={resolveAssignee(conv, user?.id, profilesById)}
+                currentUserId={user?.id}
+                profilesById={profilesById}
                 onHover={handleHover}
                 onHoverEnd={handleHoverEnd}
                 t={t}
@@ -505,7 +507,12 @@ interface ConversationItemProps {
   conversation: Conversation;
   isActive: boolean;
   onSelect: (conversation: Conversation) => void;
-  assignee: AssigneeDisplay;
+  /** Inputs for this row's assignee chip, rather than a pre-resolved
+   *  `AssigneeDisplay` — resolving it in the parent's `.map` produced a
+   *  fresh object per row on every render, which defeated the memo. Both
+   *  of these are stable. */
+  currentUserId: string | undefined;
+  profilesById: Map<string, Profile>;
   /** Pointer entered this row — parent debounces then prefetches it. */
   onHover: (conversationId: string) => void;
   /** Pointer left this row before the debounce fired — cancel it. */
@@ -514,11 +521,17 @@ interface ConversationItemProps {
   groups: TagGroup[];
 }
 
-function ConversationItem({
+/**
+ * Memoized: hovering a row flips the parent's `prefetchId` state, so the
+ * list re-renders constantly as the pointer moves down it. With every
+ * prop here value-stable, the other 29 rows now skip that render.
+ */
+const ConversationItem = memo(function ConversationItem({
   conversation,
   isActive,
   onSelect,
-  assignee,
+  currentUserId,
+  profilesById,
   onHover,
   onHoverEnd,
   t,
@@ -528,6 +541,10 @@ function ConversationItem({
   const displayName = contact?.name || contact?.phone || t("unknown");
   const initials = displayName.charAt(0).toUpperCase();
   const chips = tagChipRow(groups, contact?.tags ?? [], 3);
+  const assignee = useMemo(
+    () => resolveAssignee(conversation, currentUserId, profilesById),
+    [conversation, currentUserId, profilesById],
+  );
 
   const handleClick = useCallback(() => {
     onSelect(conversation);
@@ -631,4 +648,4 @@ function ConversationItem({
       </div>
     </button>
   );
-}
+});

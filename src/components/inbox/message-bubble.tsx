@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { cn } from "@/lib/utils";
 import type { Message, MessageReaction } from "@/types";
 import {
@@ -65,6 +65,12 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
   const [src, setSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
+  // The object URL we minted, held in a ref so cleanup can revoke the URL
+  // that was actually created. Cleanup can't read it off `src`: the effect
+  // below runs before `loadImage`'s await resolves, so a closure over
+  // `src` captures null and the revoke never fires — every proxied image
+  // then leaks its blob for the lifetime of the tab.
+  const blobUrlRef = useRef<string | null>(null);
 
   const loadImage = useCallback(async () => {
     if (!url) return;
@@ -76,6 +82,7 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
         if (!res.ok) throw new Error("Failed to load media");
         const blob = await res.blob();
         const blobUrl = URL.createObjectURL(blob);
+        blobUrlRef.current = blobUrl;
         setSrc(blobUrl);
       } catch {
         setError(true);
@@ -91,11 +98,11 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
   useEffect(() => {
     loadImage();
     return () => {
-      if (src?.startsWith("blob:")) {
-        URL.revokeObjectURL(src);
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadImage]);
 
   if (error) {

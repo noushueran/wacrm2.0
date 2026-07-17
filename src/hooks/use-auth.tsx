@@ -181,35 +181,76 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Only "loading a profile" once we know there IS a user to load one for.
   const profileLoading = isAuthenticated && me === undefined;
 
+  // `me` is `undefined` while the query is in flight and `null` for an
+  // authenticated-but-unbootstrapped user — both mean "no profile row".
+  const hasProfile = me != null;
+
+  // The three objects below are memoized on their own *fields* rather
+  // than on `me`'s identity. Roughly three dozen components read this
+  // context and several close over these objects in a dependency list
+  // (the message thread's `postReaction`/`handleClaim` take `user`), so a
+  // push that only touched, say, the account name must not hand every one
+  // of them a fresh object. The `??` fallbacks inside are inert —
+  // `isAuthenticated`/`hasProfile` already imply the fields are there —
+  // but TS can't narrow `me` through those flags, and narrowing it
+  // properly would put `me` itself back in the dep list and defeat the
+  // point.
+
   // Truthy the instant we're authenticated — independent of the profile
   // query — so the dashboard route guard (`!loading && !user`) never
   // bounces an authenticated user to /login during the `me` fetch window.
   // `id`/`email` fill in reactively when `me` resolves.
-  const user: AuthUser | null = isAuthenticated
-    ? { id: me?.userId ?? "", email: me?.email ?? null }
-    : null;
+  const user: AuthUser | null = useMemo(
+    () =>
+      isAuthenticated
+        ? { id: me?.userId ?? "", email: me?.email ?? null }
+        : null,
+    [isAuthenticated, me?.userId, me?.email],
+  );
 
-  const profile: Profile | null = me
-    ? {
-        id: me.userId,
-        full_name: me.name,
-        email: me.email ?? "",
-        avatar_url: me.avatarUrl,
-        role: null,
-        beta_features: [],
-        account_id: me.accountId,
-        account_role: me.accountRole,
-      }
-    : null;
+  const profile: Profile | null = useMemo(
+    () =>
+      hasProfile
+        ? {
+            id: me?.userId ?? "",
+            full_name: me?.name ?? null,
+            email: me?.email ?? "",
+            avatar_url: me?.avatarUrl ?? null,
+            role: null,
+            beta_features: [],
+            account_id: me?.accountId ?? null,
+            account_role: me?.accountRole ?? null,
+          }
+        : null,
+    [
+      hasProfile,
+      me?.userId,
+      me?.name,
+      me?.email,
+      me?.avatarUrl,
+      me?.accountId,
+      me?.accountRole,
+    ],
+  );
 
-  const account: AccountSummary | null = me
-    ? {
-        id: me.account.id,
-        name: me.account.name,
-        default_currency: me.account.defaultCurrency,
-        leadValue: me.account.leadValue ?? 0,
-      }
-    : null;
+  const account: AccountSummary | null = useMemo(
+    () =>
+      hasProfile
+        ? {
+            id: me?.account.id ?? "",
+            name: me?.account.name ?? "",
+            default_currency: me?.account.defaultCurrency ?? DEFAULT_CURRENCY,
+            leadValue: me?.account.leadValue ?? 0,
+          }
+        : null,
+    [
+      hasProfile,
+      me?.account.id,
+      me?.account.name,
+      me?.account.defaultCurrency,
+      me?.account.leadValue,
+    ],
+  );
 
   const signOut = useCallback(async () => {
     try {
@@ -246,24 +287,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [me?.accountRole, me?.accountId]);
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        profile,
-        loading,
-        profileLoading,
-        signOut,
-        refreshProfile,
-        account,
-        defaultCurrency: account?.default_currency ?? DEFAULT_CURRENCY,
-        leadValue: account?.leadValue ?? 0,
-        ...derived,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  // The context value itself must be memoized, not just its parts: an
+  // object literal here is a new identity on every AuthProvider render,
+  // which re-renders every one of the ~36 consumers — the sidebar, the
+  // header, the conversation list, the message thread — even when no auth
+  // state moved at all, and defeats `derived` above entirely.
+  const value: AuthContextValue = useMemo(
+    () => ({
+      user,
+      profile,
+      loading,
+      profileLoading,
+      signOut,
+      refreshProfile,
+      account,
+      defaultCurrency: account?.default_currency ?? DEFAULT_CURRENCY,
+      leadValue: account?.leadValue ?? 0,
+      ...derived,
+    }),
+    [
+      user,
+      profile,
+      loading,
+      profileLoading,
+      signOut,
+      refreshProfile,
+      account,
+      derived,
+    ],
   );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 /**

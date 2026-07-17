@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 import { useAction, useConvex, useMutation } from "convex/react";
 // Cached variants — keep each per-conversation subscription
 // (messages.listByConversation, reactions.forConversation) warm for a few
@@ -37,6 +37,7 @@ import type {
   ConversationStatus,
   MessageTemplate,
   InteractiveMessagePayload,
+  Profile,
 } from "@/types";
 import {
   MessageSquare,
@@ -168,7 +169,6 @@ export function MessageThread({
 
   const { user, accountRole } = useAuth();
   const convex = useConvex();
-  const { getPresence, getRow, now } = usePresence();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
@@ -265,7 +265,13 @@ export function MessageThread({
       ? { conversationId: conversationId as Id<"conversations"> }
       : "skip",
   );
-  const reactions = (reactionDocs ?? []).map(toUiReaction);
+  // Memoized so `reactionsByMessageId` below can actually hold its
+  // identity — a fresh array here rebuilt that map on every render, which
+  // handed every bubble a brand-new reaction array.
+  const reactions = useMemo(
+    () => (reactionDocs ?? []).map(toUiReaction),
+    [reactionDocs],
+  );
 
   // 24-hour session timer
   const sessionInfo = useMemo(() => {
@@ -493,6 +499,12 @@ export function MessageThread({
     return map;
   }, [messages]);
 
+  // Date-bucketed for the separators. Memoized (and hoisted above the
+  // `!conversation` guard below, where a hook can't go) because grouping
+  // costs a `new Date()` + a date-fns `format()` per message on every
+  // render otherwise.
+  const messageGroups = useMemo(() => groupMessagesByDate(messages), [messages]);
+
   // Bucket reactions by their target message_id for O(1) per-bubble lookup.
   const reactionsByMessageId = useMemo(() => {
     const map = new Map<string, MessageReaction[]>();
@@ -660,7 +672,10 @@ export function MessageThread({
 
   const displayName = contact.name || contact.phone;
   const headerChips = tagChipRow(groups, contact.tags ?? [], 6);
-  const messageGroups = groupMessagesByDate(messages);
+  // Author label for a quoted *customer* message. Note the "Unknown"
+  // fallback differs from `contactDisplayName`'s "Customer" above — kept
+  // as-is so the two quote paths render exactly what they did before.
+  const quoteAuthorName = contact.name || contact.phone || "Unknown";
   // Cold first-page load → skeleton (not a blank spinner); loaded-but-empty
   // → empty state; otherwise the message list. A re-visited conversation is
   // served from the query cache, so `area` is "list" immediately and the
@@ -855,41 +870,13 @@ export function MessageThread({
               >
                 {accountRole && canAssignToOthers(accountRole) ? (
                   <>
-                    {profiles.length === 0 ? (
-                      <DropdownMenuItem disabled className="text-sm text-muted-foreground">
-                        {t("noTeammates")}
-                      </DropdownMenuItem>
-                    ) : (
-                      profiles.map((p) => {
-                        const isSelected = p.user_id === assignedAgentId;
-                        const presence = getPresence(p.user_id);
-                        return (
-                          <DropdownMenuItem
-                            key={p.id}
-                            onClick={() => handleAssignChange(p.user_id)}
-                            className={cn(
-                              "text-sm",
-                              isSelected ? "text-primary" : "text-popover-foreground"
-                            )}
-                          >
-                            <PresenceDot
-                              status={presence}
-                              label={presenceLabel(
-                                presence,
-                                getRow(p.user_id)?.last_seen_at ?? null,
-                                now
-                              )}
-                              className="mr-2"
-                            />
-                            <span className="flex-1">
-                              {p.full_name}
-                              {p.user_id === user?.id ? t("me") : ""}
-                            </span>
-                            {isSelected && <Check className="ml-2 h-3 w-3" />}
-                          </DropdownMenuItem>
-                        );
-                      })
-                    )}
+                    <AssigneeOptions
+                      profiles={profiles}
+                      assignedAgentId={assignedAgentId}
+                      currentUserId={user?.id}
+                      onAssign={handleAssignChange}
+                      t={t}
+                    />
                     {assignedAgentId && (
                       <>
                         <DropdownMenuSeparator className="bg-border" />
@@ -969,52 +956,25 @@ export function MessageThread({
                 </div>
                 {/* Messages */}
                 <div className="space-y-2">
-                  {group.messages.map((msg) => {
-                    const parent = msg.reply_to_message_id
-                      ? messagesById.get(msg.reply_to_message_id)
-                      : null;
-                    const reply = parent
-                      ? {
-                          authorLabel:
-                            parent.sender_type === "agent" || parent.sender_type === "bot"
-                              ? t("me")
-                              : contact?.name || contact?.phone || "Unknown",
-                          preview: buildReplyPreview(parent, tQuote),
-                        }
-                      : null;
-                    const msgReactions = reactionsByMessageId.get(msg.id);
-                    // Toggle is computed at the call site — `msgReactions`
-                    // and `user?.id` are already in scope, no extra hook.
-                    const handlePillToggle = (emoji: string) => {
-                      const own = msgReactions?.find(
-                        (r) =>
-                          r.actor_type === "agent" &&
-                          r.actor_id === user?.id,
-                      );
-                      const next = own?.emoji === emoji ? "" : emoji;
-                      void postReaction(msg.id, next);
-                    };
-                    return (
-                      <MessageActions
-                        key={msg.id}
-                        message={msg}
-                        canReact={canReact}
-                        onReply={() => handleStartReply(msg)}
-                        onReact={(emoji) => {
-                          if (emoji) void postReaction(msg.id, emoji);
-                        }}
-                      >
-                        <MessageBubble
-                          message={msg}
-                          reply={reply}
-                          reactions={msgReactions}
-                          currentUserId={user?.id}
-                          onToggleReaction={handlePillToggle}
-                          canReact={canReact}
-                        />
-                      </MessageActions>
-                    );
-                  })}
+                  {group.messages.map((msg) => (
+                    <ThreadMessage
+                      key={msg.id}
+                      message={msg}
+                      parent={
+                        msg.reply_to_message_id
+                          ? (messagesById.get(msg.reply_to_message_id) ?? null)
+                          : null
+                      }
+                      reactions={reactionsByMessageId.get(msg.id)}
+                      currentUserId={user?.id}
+                      canReact={canReact}
+                      quoteAuthorName={quoteAuthorName}
+                      onStartReply={handleStartReply}
+                      onPostReaction={postReaction}
+                      t={t}
+                      tQuote={tQuote}
+                    />
+                  ))}
                 </div>
               </div>
             ))}
@@ -1114,6 +1074,167 @@ export function MessageThread({
     </div>
   );
 }
+
+/**
+ * Teammate rows for the assign dropdown.
+ *
+ * `usePresence` lives here rather than in `MessageThread` because its
+ * ~15s re-derive tick exists solely to age these dots from online to
+ * offline, and presence is read nowhere else in the thread. Base UI
+ * unmounts a closed menu popup (`keepMounted` defaults to false), so a
+ * closed dropdown — the overwhelmingly common case — now costs neither
+ * the tick's re-render nor the `presence.list` subscription. The dots
+ * resolve on open instead of being kept permanently warm.
+ */
+function AssigneeOptions({
+  profiles,
+  assignedAgentId,
+  currentUserId,
+  onAssign,
+  t,
+}: {
+  profiles: Profile[];
+  assignedAgentId: string | null;
+  currentUserId: string | undefined;
+  onAssign: (agentId: string) => void;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  const { getPresence, getRow, now } = usePresence();
+
+  if (profiles.length === 0) {
+    return (
+      <DropdownMenuItem disabled className="text-sm text-muted-foreground">
+        {t("noTeammates")}
+      </DropdownMenuItem>
+    );
+  }
+
+  return (
+    <>
+      {profiles.map((p) => {
+        const isSelected = p.user_id === assignedAgentId;
+        const presence = getPresence(p.user_id);
+        return (
+          <DropdownMenuItem
+            key={p.id}
+            onClick={() => onAssign(p.user_id)}
+            className={cn(
+              "text-sm",
+              isSelected ? "text-primary" : "text-popover-foreground",
+            )}
+          >
+            <PresenceDot
+              status={presence}
+              label={presenceLabel(
+                presence,
+                getRow(p.user_id)?.last_seen_at ?? null,
+                now,
+              )}
+              className="mr-2"
+            />
+            <span className="flex-1">
+              {p.full_name}
+              {p.user_id === currentUserId ? t("me") : ""}
+            </span>
+            {isSelected && <Check className="ml-2 h-3 w-3" />}
+          </DropdownMenuItem>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * One message row: hover toolbar + bubble.
+ *
+ * Memoized, and fed only value-stable props, so the thread re-rendering
+ * for its own reasons (a reply draft opening, a status/funnel push, the
+ * template modal) re-renders just the rows whose data actually moved
+ * instead of all 30. The quote object and the three handlers are built
+ * per row here — inline in the parent's `.map` they were fresh on every
+ * render, which is what defeated any memo on the bubble.
+ */
+const ThreadMessage = memo(function ThreadMessage({
+  message,
+  parent,
+  reactions,
+  currentUserId,
+  canReact,
+  quoteAuthorName,
+  onStartReply,
+  onPostReaction,
+  t,
+  tQuote,
+}: {
+  message: Message;
+  /** The quoted message, already resolved via the thread's id map. */
+  parent: Message | null;
+  reactions: MessageReaction[] | undefined;
+  currentUserId: string | undefined;
+  canReact: boolean;
+  /** Author label to show when the quoted message is the customer's. */
+  quoteAuthorName: string;
+  onStartReply: (message: Message) => void;
+  onPostReaction: (messageId: string, emoji: string) => void;
+  t: ReturnType<typeof useTranslations>;
+  tQuote: ReturnType<typeof useTranslations>;
+}) {
+  const reply = useMemo(
+    () =>
+      parent
+        ? {
+            authorLabel:
+              parent.sender_type === "agent" || parent.sender_type === "bot"
+                ? t("me")
+                : quoteAuthorName,
+            preview: buildReplyPreview(parent, tQuote),
+          }
+        : null,
+    [parent, quoteAuthorName, t, tQuote],
+  );
+
+  const handleReply = useCallback(
+    () => onStartReply(message),
+    [onStartReply, message],
+  );
+
+  const handleReact = useCallback(
+    (emoji: string) => {
+      if (emoji) onPostReaction(message.id, emoji);
+    },
+    [onPostReaction, message.id],
+  );
+
+  // Toggle semantics for a pill click (re-picking your own emoji clears
+  // it) — computed here, where this row's reactions are already in scope.
+  const handlePillToggle = useCallback(
+    (emoji: string) => {
+      const own = reactions?.find(
+        (r) => r.actor_type === "agent" && r.actor_id === currentUserId,
+      );
+      onPostReaction(message.id, own?.emoji === emoji ? "" : emoji);
+    },
+    [reactions, currentUserId, onPostReaction, message.id],
+  );
+
+  return (
+    <MessageActions
+      message={message}
+      canReact={canReact}
+      onReply={handleReply}
+      onReact={handleReact}
+    >
+      <MessageBubble
+        message={message}
+        reply={reply}
+        reactions={reactions}
+        currentUserId={currentUserId}
+        onToggleReaction={handlePillToggle}
+        canReact={canReact}
+      />
+    </MessageActions>
+  );
+});
 
 /**
  * Placeholder shown while a conversation's first page of messages is
