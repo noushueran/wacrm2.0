@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/hooks/use-auth";
-import { LogOut, Menu, MessageSquare, Settings as SettingsIcon, User } from "lucide-react";
+import { LogOut, Menu, Settings as SettingsIcon, User } from "lucide-react";
 import {
   Avatar,
   AvatarFallback,
@@ -73,15 +73,13 @@ export function Header({ onOpenSidebar }: HeaderProps) {
         >
           <Menu className="h-5 w-5" />
         </button>
-        {/* Brand — lifted out of the sidebar so it stays visible even when
-            the rail is collapsed. The wordmark hides on mobile to save width. */}
-        <Link href="/dashboard" className="flex shrink-0 items-center gap-2">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <MessageSquare className="h-4 w-4" />
-          </span>
-          <span className="hidden text-sm font-semibold text-foreground sm:inline">
-            {t("brand")}
-          </span>
+        {/* Brand wordmark. The mark itself lives in the sidebar rail, so the
+            header carries the name alone. Hidden on mobile to save width. */}
+        <Link
+          href="/dashboard"
+          className="hidden shrink-0 text-sm font-semibold text-foreground sm:inline"
+        >
+          {t("brand")}
         </Link>
         <span className="hidden h-5 w-px shrink-0 bg-border sm:block" aria-hidden />
         <h1 className="truncate text-base font-semibold text-foreground sm:text-lg">
