@@ -227,7 +227,17 @@ export default defineSchema({
     // Convex sorts a missing field before every present value, so in
     // `.order("desc")` those rows deterministically fall to the end of
     // the page rather than scattering randomly or erroring.
-    .index("by_account_last_message", ["accountId", "lastMessageAt"]),
+    .index("by_account_last_message", ["accountId", "lastMessageAt"])
+    // `unreadTotal` (the app-wide sidebar badge) counts this account's
+    // conversations with `unreadCount > 0`. Ranging that test on the
+    // index instead of filtering in JS bounds both the read set and —
+    // because a Convex subscription re-runs when any document it read
+    // changes — the invalidation set: without it, the `lastMessageAt`
+    // patch every message writes re-runs a full-account scan for every
+    // connected client. Deliberately NOT a prefix of `by_account`:
+    // Convex appends `_creationTime` to each index, so `by_account` is
+    // `["accountId", "_creationTime"]` and cannot express this range.
+    .index("by_account_unread", ["accountId", "unreadCount"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -558,6 +568,14 @@ export default defineSchema({
     whatsappMessageId: v.optional(v.string()), // Meta wamid (migration 003)
   })
     .index("by_broadcast", ["broadcastId"])
+    // `maybeFinalizeBroadcast` runs once per delivered recipient and asks
+    // "is any recipient still pending?". `.filter()` runs *after* the
+    // index scan, so on `by_broadcast` alone each probe walked past the
+    // already-resolved recipients piling up at the front of the range —
+    // O(N^2) reads to finalize an N-recipient broadcast. Binding `status`
+    // makes that probe O(1); `startSendingInternal`'s pending set uses
+    // the same range.
+    .index("by_broadcast_status", ["broadcastId", "status"])
     .index("by_account", ["accountId"])
     .index("by_wamid", ["whatsappMessageId"]),
 

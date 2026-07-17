@@ -756,6 +756,84 @@ test("unreadTotal does not count another account's unread conversations", async 
   expect(await asBob.query(api.conversations.unreadTotal, {})).toBe(1);
 });
 
+/**
+ * Seeds one account holding three *unread* conversations — one assigned
+ * to `agent`, one unassigned (the claimable pool), one assigned to a
+ * teammate — plus a read (unreadCount: 0) one that no scope may ever
+ * count. This is the fixture the role-scope tests below share: each
+ * asserts the slice of those three its own `conversationScope` allows.
+ */
+async function seedUnreadScopeFixture(t: ReturnType<typeof convexTest>) {
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const agent = await seedUserInAccount(t, accountId, {
+    name: "Agent",
+    email: "agent@example.com",
+    role: "agent",
+  });
+  const teammate = await seedUserInAccount(t, accountId, {
+    name: "Teammate",
+    email: "teammate@example.com",
+    role: "agent",
+  });
+  const contactId = await asOwner.mutation(api.contacts.create, {
+    phone: "111",
+  });
+
+  await seedConversation(t, {
+    accountId,
+    contactId,
+    unreadCount: 1,
+    assignedToUserId: agent.userId,
+  });
+  await seedConversation(t, { accountId, contactId, unreadCount: 1 });
+  await seedConversation(t, {
+    accountId,
+    contactId,
+    unreadCount: 1,
+    assignedToUserId: teammate.userId,
+  });
+  await seedConversation(t, { accountId, contactId, unreadCount: 0 });
+
+  return { accountId, agent, teammate };
+}
+
+test("unreadTotal for an agent counts their own and the unassigned pool, but not a teammate's", async () => {
+  const t = convexTest(schema, modules);
+  const { agent } = await seedUnreadScopeFixture(t);
+
+  expect(await agent.asUser.query(api.conversations.unreadTotal, {})).toBe(2);
+});
+
+test("unreadTotal for a supervisor counts every unread conversation including a teammate's", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedUnreadScopeFixture(t);
+  const supervisor = await seedUserInAccount(t, accountId, {
+    name: "Supervisor",
+    email: "supervisor@example.com",
+    role: "supervisor",
+  });
+
+  expect(await supervisor.asUser.query(api.conversations.unreadTotal, {})).toBe(
+    3,
+  );
+});
+
+test("unreadTotal for a viewer counts only the unassigned pool", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedUnreadScopeFixture(t);
+  const viewer = await seedUserInAccount(t, accountId, {
+    name: "Viewer",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+
+  expect(await viewer.asUser.query(api.conversations.unreadTotal, {})).toBe(1);
+});
+
 // ============================================================
 // assign — target must be a real member of the same account
 // ============================================================
