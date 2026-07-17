@@ -701,7 +701,11 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
   }
 
   return (
-    <div className="fixed inset-0 flex flex-col bg-background">
+    // `pt-safe`: full-screen `fixed` overlay outside the shell, so it does not
+    // inherit the shell's inset. Without it the top bar — which holds the only
+    // way back to /automations — sits under the iOS status bar in the
+    // installed PWA and the editor becomes a trap. Inset is 0 on desktop.
+    <div className="fixed inset-0 flex flex-col bg-background pt-safe">
       {/* Top bar. At sub-sm widths the "Active" label is hidden and the
           switch moves to the right of the save button, so the name input
           gets maximum width. */}

@@ -259,17 +259,48 @@ html[data-theme="rose"] {
   }
 }
 
-/* Safe-area helpers for the shell + bottom nav + composer. */
+/* Safe-area helpers for the shell + bottom nav + composer.
+
+   `env(safe-area-inset-*)` is only ever non-zero on a real notched device in
+   standalone mode — it is ALWAYS 0 in a desktop browser, which makes safe-area
+   bugs invisible in local dev and impossible to regression-test. Reading the
+   insets once into custom properties fixes that: override `--safe-top` on
+   :root (devtools, or the `[data-simulate-safe-area]` hook below) to reproduce
+   an iPhone's inset on any machine. */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* The app header (`Header`, h-14) and the sidebar's brand row. Anything
+     computing "viewport minus header" must use this, never a literal 3.5rem. */
+  --app-header-h: 3.5rem;
+}
+
+/* Test/dev hook: `<html data-simulate-safe-area>` fakes an iPhone 15 Pro's
+   insets so the standalone-PWA layout can be checked in a normal browser. */
+[data-simulate-safe-area] {
+  --safe-top: 59px;
+  --safe-bottom: 34px;
+}
+
 .pb-safe {
-  padding-bottom: env(safe-area-inset-bottom);
+  padding-bottom: var(--safe-bottom);
 }
 .pt-safe {
-  padding-top: env(safe-area-inset-top);
+  padding-top: var(--safe-top);
 }
 /* Like `.pb-safe`, but for a bottom-anchored bar that already carries base
    padding (e.g. the message composer's `p-3`): keep the ~0.75rem base gap
    AND add the device safe-area inset. Plain `.pb-safe` REPLACES the base
    padding, so on non-notched devices / desktop it would collapse to 0. */
 .pb-safe-bar {
-  padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+  padding-bottom: calc(0.75rem + var(--safe-bottom));
+}
+
+/* Height of a full-bleed surface that sits under the app header (the inbox and
+   its skeleton). The shell reserves `--safe-top` via `pt-safe`, so that inset
+   is NOT available to children and must come out of the height too — otherwise
+   the surface overflows by exactly the status-bar height and pushes its own
+   footer (the composer) below the fold. */
+.h-app-content {
+  height: calc(100dvh - var(--app-header-h) - var(--safe-top));
 }
