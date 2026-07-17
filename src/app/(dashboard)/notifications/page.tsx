@@ -5,21 +5,16 @@ import { useMutation } from "convex/react";
 import { useQuery } from "@/lib/convex/cached";
 import { useRouter } from "next/navigation";
 import type { Notification } from "@/types";
-import { Bell, CheckCheck, Loader2, UserPlus } from "lucide-react";
+import { Bell, CheckCheck, Loader2 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { toUiNotification, convexErrorMessage } from "@/lib/convex/adapters";
+import { TYPE_ICON, notificationHref } from "@/lib/notifications/shared";
 
 import { api } from "../../../../convex/_generated/api";
 import type { Id } from "../../../../convex/_generated/dataModel";
-
-// Icon per notification type. Only one type exists today
-// (conversation_assigned) but this keeps future types a one-line add.
-const TYPE_ICON: Record<Notification["type"], typeof Bell> = {
-  conversation_assigned: UserPlus,
-};
 
 export default function NotificationsPage() {
   const router = useRouter();
@@ -57,9 +52,8 @@ export default function NotificationsPage() {
   const handleClick = useCallback(
     (n: Notification) => {
       if (!n.read_at) markRead(n.id);
-      if (n.conversation_id) {
-        router.push(`/inbox?c=${n.conversation_id}`);
-      }
+      const href = notificationHref(n);
+      if (href) router.push(href);
     },
     [markRead, router],
   );

@@ -62,7 +62,12 @@
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
     "menuSettings": "Settings",
-    "menuSignOut": "Sign out"
+    "menuSignOut": "Sign out",
+    "notificationsUnread": "{count} unread",
+    "notificationsMarkAllRead": "Mark all as read",
+    "notificationsViewAll": "View all notifications",
+    "notificationsEmpty": "No notifications yet",
+    "notificationsEmptyHint": "You'll see an alert here when someone assigns you a conversation."
   },
   "ModeToggle": {
     "switchMode": "Switch to {mode} mode"
