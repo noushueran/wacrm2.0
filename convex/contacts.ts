@@ -4,6 +4,7 @@ import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { normalizePhone, maskPhone } from "./lib/phone";
 import { hasMinRole } from "./lib/roles";
+import { matchesContactSearch } from "./lib/contactSearch";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -71,6 +72,92 @@ async function requireOwnContact(
   return contact;
 }
 
+/** Formats a running number as the human-readable contact code, e.g.
+ *  1 -> "HC-000001". Pad is a 6-digit MINIMUM (natural width beyond). */
+export function formatContactCode(n: number): string {
+  return `HC-${String(n).padStart(6, "0")}`;
+}
+
+/**
+ * Atomically allocates the next `HC-…` code for `accountId` by
+ * incrementing the account's `("contacts")` counter row (creating it at 1
+ * the first time). Convex mutations are transactional with optimistic-
+ * concurrency retry, so two concurrent creates can't collide on a number.
+ * Takes a bare `db` so it works from `accountMutation`, the plain-`{db}`
+ * `findOrCreateContactByPhone`, and the `internalMutation` inbound path.
+ */
+export async function allocateContactCode(
+  db: MutationCtx["db"],
+  accountId: Id<"accounts">,
+): Promise<string> {
+  const existing = await db
+    .query("counters")
+    .withIndex("by_account_name", (q) =>
+      q.eq("accountId", accountId).eq("name", "contacts"),
+    )
+    .first();
+  if (existing) {
+    const next = existing.value + 1;
+    await db.patch(existing._id, { value: next });
+    return formatContactCode(next);
+  }
+  await db.insert("counters", { accountId, name: "contacts", value: 1 });
+  return formatContactCode(1);
+}
+
+/**
+ * One-shot migration: assign `HC-…` codes to every contact that lacks one,
+ * per account, in `_creationTime` order, and seed each account's
+ * `("contacts")` counter to the highest number in use. Idempotent — coded
+ * contacts are skipped and the counter never moves backwards, so it is safe
+ * to re-run. Run once after deploying the schema change.
+ */
+export const backfillContactCodes = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const accounts = await ctx.db.query("accounts").collect();
+    for (const account of accounts) {
+      const contacts = await ctx.db
+        .query("contacts")
+        .withIndex("by_account", (q) => q.eq("accountId", account._id))
+        .collect();
+      contacts.sort((a, b) => a._creationTime - b._creationTime);
+
+      // Start from whichever is higher: the existing counter, or the max
+      // numeric code already assigned (covers a counter that lags reality).
+      const counter = await ctx.db
+        .query("counters")
+        .withIndex("by_account_name", (q) =>
+          q.eq("accountId", account._id).eq("name", "contacts"),
+        )
+        .first();
+      let next = counter?.value ?? 0;
+      for (const c of contacts) {
+        if (c.contactCode) {
+          const n = Number(c.contactCode.replace(/\D/g, ""));
+          if (Number.isFinite(n) && n > next) next = n;
+        }
+      }
+
+      for (const c of contacts) {
+        if (c.contactCode) continue;
+        next += 1;
+        await ctx.db.patch(c._id, { contactCode: formatContactCode(next) });
+      }
+
+      if (counter) {
+        if (next !== counter.value) await ctx.db.patch(counter._id, { value: next });
+      } else if (next > 0) {
+        await ctx.db.insert("counters", {
+          accountId: account._id,
+          name: "contacts",
+          value: next,
+        });
+      }
+    }
+  },
+});
+
 export const create = accountMutation({
   args: {
     phone: v.string(),
@@ -90,11 +177,13 @@ export const create = accountMutation({
     if (dup) {
       throw new ConvexError({ code: "DUPLICATE_PHONE", contactId: dup._id });
     }
+    const contactCode = await allocateContactCode(ctx.db, ctx.accountId);
     return await ctx.db.insert("contacts", {
       accountId: ctx.accountId,
       createdByUserId: ctx.userId,
       phone: args.phone,
       phoneNormalized,
+      contactCode,
       name: args.name,
       email: args.email,
       company: args.company,
@@ -109,33 +198,43 @@ export const list = accountQuery({
   },
   handler: async (ctx, args) => {
     const { search, paginationOpts } = args;
+    const term = search?.trim();
 
-    // `search_name` only covers `name` (see convex/schema.ts) — phone/
-    // email search for the paginated list view is left as a documented
-    // gap (see the schema's "Search note"); `filterByTags` below is
-    // where full name/phone/email search is actually needed and
-    // implemented, since it already materializes full docs in memory.
-    const result = search
-      ? await ctx.db
-          .query("contacts")
-          .withSearchIndex("search_name", (q) =>
-            q.search("name", search).eq("accountId", ctx.accountId),
-          )
-          .paginate(paginationOpts)
-      : await ctx.db
-          .query("contacts")
-          .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-          .order("desc")
-          .paginate(paginationOpts);
+    const embedAndMask = async (contact: Doc<"contacts">) => {
+      const withTags = await embedTags(ctx, contact);
+      return hasMinRole(ctx.role, "supervisor")
+        ? withTags
+        : maskContactPhone(withTags);
+    };
 
-    const page = await Promise.all(
-      result.page.map(async (contact) => {
-        const withTags = await embedTags(ctx, contact);
-        return hasMinRole(ctx.role, "supervisor")
-          ? withTags
-          : maskContactPhone(withTags);
-      }),
-    );
+    if (term) {
+      // Full name/phone/email/ID search: scan the account's contacts in
+      // memory (same approach as `filterByTags`), newest-first, and page
+      // manually with the cursor as a stringified offset. Bounded by the
+      // account's own contact count; search does not use the name index
+      // (`search_name`, see convex/schema.ts) — that index only covers
+      // `name`, so matching phone/email/`HC-…` id requires scanning full
+      // docs via `matchesContactSearch` instead.
+      const all = await ctx.db
+        .query("contacts")
+        .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+        .order("desc")
+        .collect();
+      const matched = all.filter((c) => matchesContactSearch(c, term));
+      const offset = paginationOpts.cursor
+        ? Number(paginationOpts.cursor)
+        : 0;
+      const end = offset + paginationOpts.numItems;
+      const page = await Promise.all(matched.slice(offset, end).map(embedAndMask));
+      return { page, isDone: end >= matched.length, continueCursor: String(end) };
+    }
+
+    const result = await ctx.db
+      .query("contacts")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .order("desc")
+      .paginate(paginationOpts);
+    const page = await Promise.all(result.page.map(embedAndMask));
     return { ...result, page };
   },
 });
@@ -197,14 +296,12 @@ export const filterByTags = accountQuery({
         contact !== null && contact.accountId === ctx.accountId,
     );
 
-    const term = search?.trim().toLowerCase();
+    // Same matcher as `list`'s search branch — name/phoneNormalized/email/
+    // contactCode with lenient ID matching — so contact-ID (and digit-based
+    // phone) search works identically whether or not a tag filter is active.
+    const term = search?.trim();
     const matched = term
-      ? contacts.filter(
-          (contact) =>
-            contact.name?.toLowerCase().includes(term) ||
-            contact.phone.toLowerCase().includes(term) ||
-            contact.email?.toLowerCase().includes(term),
-        )
+      ? contacts.filter((contact) => matchesContactSearch(contact, term))
       : contacts;
 
     matched.sort((a, b) => b._creationTime - a._creationTime);
@@ -557,10 +654,12 @@ export async function findOrCreateContactByPhone(
     .first();
   if (existing) return { contactId: existing._id, created: false };
 
+  const contactCode = await allocateContactCode(ctx.db, accountId);
   const contactId = await ctx.db.insert("contacts", {
     accountId,
     phone: input.phone,
     phoneNormalized,
+    contactCode,
     name: input.name ?? input.phone,
     email: input.email,
     company: input.company,

@@ -3,7 +3,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useAction, useMutation, useQuery } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
+import { useCan } from '@/hooks/use-can';
+import { useOpenContactChat } from '@/hooks/use-open-contact-chat';
 import { formatCurrency } from '@/lib/currency';
+import { formatPhoneDisplay } from '@/lib/whatsapp/phone-utils';
+import { isCompletePhoneNumber } from '@/lib/whatsapp/phone-input-logic';
 import { toast } from 'sonner';
 import type { MessageTemplate } from '@/types';
 import {
@@ -29,6 +33,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { PhoneInput } from '@/components/ui/phone-input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
@@ -44,6 +49,8 @@ import {
   Save,
   DollarSign,
   LayoutTemplate,
+  Hash,
+  MessageSquare,
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 
@@ -65,8 +72,11 @@ export function ContactDetailView({
 }: ContactDetailViewProps) {
   const t = useTranslations('Contacts.detailView');
   const { defaultCurrency } = useAuth();
+  const canEdit = useCan('send-messages');
 
   const [copiedPhone, setCopiedPhone] = useState(false);
+  const openChat = useOpenContactChat();
+  const [copiedId, setCopiedId] = useState(false);
 
   // Send template — lets the business initiate (or re-open) a conversation
   // with this contact by sending an approved template. The send route
@@ -80,6 +90,13 @@ export function ContactDetailView({
   const [editEmail, setEditEmail] = useState('');
   const [editCompany, setEditCompany] = useState('');
   const [savingDetails, setSavingDetails] = useState(false);
+  // Live validity of the composed `+E.164` value — same reasoning as
+  // `contact-form.tsx`'s `phoneInvalid`: `PhoneInput`'s `composeE164`
+  // falls back to `+<dialCode><digits>` for incomplete input, so this is
+  // computed straight from `editPhone` (no "touched" flag) so the inline
+  // error appears as the user types.
+  const editPhoneInvalid =
+    editPhone.trim().length > 0 && !isCompletePhoneNumber(editPhone);
 
   // Tags tab
   const [savingTags, setSavingTags] = useState(false);
@@ -176,6 +193,11 @@ export function ContactDetailView({
   async function saveDetails() {
     if (!contactId || !editPhone.trim()) {
       toast.error(t('toastPhoneRequired'));
+      return;
+    }
+
+    if (!isCompletePhoneNumber(editPhone)) {
+      toast.error(t('phoneInvalid'));
       return;
     }
 
@@ -340,13 +362,29 @@ export function ContactDetailView({
                       className="flex items-center gap-1 hover:text-primary transition-colors cursor-pointer"
                     >
                       <Phone className="size-3" />
-                      {contact.phone}
+                      {formatPhoneDisplay(contact.phone)}
                       {copiedPhone ? (
                         <Check className="size-3 text-primary" />
                       ) : (
                         <Copy className="size-3" />
                       )}
                     </button>
+                    {contact.contact_code && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await navigator.clipboard.writeText(contact.contact_code!);
+                          setCopiedId(true);
+                          setTimeout(() => setCopiedId(false), 2000);
+                        }}
+                        className="flex items-center gap-1 font-mono hover:text-primary transition-colors cursor-pointer"
+                        aria-label={t('copyId')}
+                      >
+                        <Hash className="size-3" />
+                        {contact.contact_code}
+                        {copiedId ? <Check className="size-3 text-primary" /> : <Copy className="size-3" />}
+                      </button>
+                    )}
                     {contact.email && (
                       <span className="flex items-center gap-1">
                         <Mail className="size-3" />
@@ -362,7 +400,18 @@ export function ContactDetailView({
                   </div>
                 </div>
               </div>
-              <div className="mt-3">
+              <div className="mt-3 flex items-center gap-2">
+                {canEdit && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void openChat(contact.id)}
+                    className="border-border text-muted-foreground hover:bg-muted"
+                  >
+                    <MessageSquare className="size-4" />
+                    {t('openChatBtn')}
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   onClick={() => setTemplatePickerOpen(true)}
@@ -429,11 +478,13 @@ export function ContactDetailView({
                     <Label className="text-muted-foreground text-xs">
                       {t('phone')} <span className="text-red-400">*</span>
                     </Label>
-                    <Input
+                    <PhoneInput
                       value={editPhone}
-                      onChange={(e) => setEditPhone(e.target.value)}
-                      className="bg-muted border-border text-foreground h-8 text-sm"
+                      onChange={setEditPhone}
                     />
+                    {editPhoneInvalid && (
+                      <p className="text-xs text-red-400">{t('phoneInvalid')}</p>
+                    )}
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-muted-foreground text-xs">{t('email')}</Label>

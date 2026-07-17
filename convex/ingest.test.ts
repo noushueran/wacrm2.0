@@ -1753,3 +1753,30 @@ test("ingestInbound leaves replyToMessageId undefined when contextWamid matches 
   const stored = await t.run((ctx) => ctx.db.get(res.messageId));
   expect(stored!.replyToMessageId).toBeUndefined();
 });
+
+// ============================================================
+// contactCode — sequential HC-000001-style per-account identifier
+// (Contact Section Enhancements, Task 2). `ingestInbound`'s
+// contact-create branch must go through the same `allocateContactCode`
+// helper `contacts.create`/`findOrCreateContactByPhone` already use, so
+// a contact created via inbound WhatsApp ingestion also gets a code.
+// ============================================================
+
+test("ingestInbound assigns a contact code when it creates a new contact", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "+971501234567",
+    name: "Guest",
+    message: {
+      type: "text",
+      text: "hello",
+      wamid: "wamid.CONTACT-CODE",
+    },
+  });
+
+  const contact = await t.run((ctx) => ctx.db.get(res.contactId));
+  expect(contact!.contactCode).toBe("HC-000001");
+});

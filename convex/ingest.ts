@@ -2,6 +2,7 @@ import { internalAction, internalMutation } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
+import { allocateContactCode } from "./contacts";
 import {
   insertMessageAndUpdateConversation,
   type AppendMessageArgs,
@@ -177,10 +178,12 @@ export const ingestInbound = internalMutation({
       // `name` is only ever set on CREATE — an existing contact's name
       // (possibly hand-edited by an agent since) is never overwritten by
       // a later inbound message's WhatsApp profile name.
+      const contactCode = await allocateContactCode(ctx.db, accountId);
       contactId = await ctx.db.insert("contacts", {
         accountId,
         phone: from,
         phoneNormalized,
+        contactCode,
         name,
       });
     }

@@ -6,6 +6,7 @@ import { usePaginatedQuery, useQuery } from '@/lib/convex/cached';
 import { toast } from 'sonner';
 import type { Contact, Tag } from '@/types';
 import { toUiContact, toUiTag } from '@/lib/convex/adapters';
+import { formatPhoneDisplay } from '@/lib/whatsapp/phone-utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -42,6 +43,7 @@ import {
   Plus,
   Upload,
   MoreHorizontal,
+  MessageSquare,
   Pencil,
   Trash2,
   Loader2,
@@ -57,6 +59,7 @@ import { ContactDetailView } from '@/components/contacts/contact-detail-view';
 import { ImportModal } from '@/components/contacts/import-modal';
 import { CustomFieldsManager } from '@/components/contacts/custom-fields-manager';
 import { useCan } from '@/hooks/use-can';
+import { useOpenContactChat } from '@/hooks/use-open-contact-chat';
 import { GatedButton } from '@/components/ui/gated-button';
 import { useTranslations } from 'next-intl';
 
@@ -69,6 +72,7 @@ export default function ContactsPage() {
   const t = useTranslations('Contacts.page');
   const canEdit = useCan('send-messages');
   const canEditSettings = useCan('edit-settings');
+  const openChat = useOpenContactChat();
 
   const [search, setSearch] = useState('');
   // Offset-based pagination — only meaningful while a tag filter is
@@ -136,9 +140,9 @@ export default function ContactsPage() {
     { initialNumItems: PAGE_SIZE },
   );
 
-  // Tag-filtered list — offset-paginated (the only read here that
-  // supports full name/phone/email search, since `contacts.list`'s
-  // search index only covers `name`; see convex/contacts.ts).
+  // Tag-filtered list — offset-paginated (`filterByTags` supports
+  // limit/offset). filterByTags searches name/phone/email only; contacts.list
+  // above additionally supports ID search.
   const filtered = useQuery(
     api.contacts.filterByTags,
     usingTagFilter
@@ -486,6 +490,7 @@ export default function ContactsPage() {
                   aria-label="Select all contacts on this page"
                 />
               </TableHead>
+              <TableHead className="text-muted-foreground hidden sm:table-cell">{t('tableColumns.contactId')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.name')}</TableHead>
               <TableHead className="text-muted-foreground">{t('tableColumns.phone')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.email')}</TableHead>
@@ -498,7 +503,7 @@ export default function ContactsPage() {
           <TableBody>
             {loading ? (
               <TableRow className="border-border">
-                <TableCell colSpan={8} className="text-center py-12">
+                <TableCell colSpan={9} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Loader2 className="size-6 animate-spin text-primary" />
                     <p className="text-sm text-muted-foreground">{t('loading')}</p>
@@ -507,7 +512,7 @@ export default function ContactsPage() {
               </TableRow>
             ) : contacts.length === 0 ? (
               <TableRow className="border-border">
-                <TableCell colSpan={8} className="text-center py-12">
+                <TableCell colSpan={9} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Users className="size-8 text-muted-foreground" />
                     <p className="text-sm text-muted-foreground">
@@ -545,11 +550,14 @@ export default function ContactsPage() {
                       aria-label={`Select ${contact.name || contact.phone}`}
                     />
                   </TableCell>
+                  <TableCell className="text-muted-foreground font-mono text-xs hidden sm:table-cell">
+                    {contact.contact_code || '—'}
+                  </TableCell>
                   <TableCell className="text-foreground font-medium">
                     {contact.name || <span className="text-muted-foreground italic">{t('unnamed')}</span>}
                   </TableCell>
                   <TableCell className="text-muted-foreground font-mono text-xs">
-                    {contact.phone}
+                    {formatPhoneDisplay(contact.phone)}
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden md:table-cell text-sm">
                     {contact.email || <span className="text-muted-foreground">-</span>}
@@ -607,6 +615,21 @@ export default function ContactsPage() {
                         align="end"
                         className="bg-popover border-border"
                       >
+                        {canEdit && (
+                          <>
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void openChat(contact.id);
+                              }}
+                              className="text-popover-foreground focus:bg-muted focus:text-foreground"
+                            >
+                              <MessageSquare className="size-4" />
+                              {t('openChatAction')}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="bg-border" />
+                          </>
+                        )}
                         <DropdownMenuItem
                           onClick={(e) => {
                             e.stopPropagation();

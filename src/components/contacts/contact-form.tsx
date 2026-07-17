@@ -11,6 +11,7 @@ import {
   toUiContact,
   toUiTag,
 } from '@/lib/convex/adapters';
+import { isCompletePhoneNumber } from '@/lib/whatsapp/phone-input-logic';
 import {
   Dialog,
   DialogContent,
@@ -21,6 +22,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { PhoneInput } from '@/components/ui/phone-input';
 import { Label } from '@/components/ui/label';
 import { Loader2, AlertTriangle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
@@ -80,6 +82,14 @@ export function ContactForm({
   );
   const dupContact = dupContactDoc ? toUiContact(dupContactDoc) : null;
 
+  // Live validity of the composed `+E.164` value — `PhoneInput`'s
+  // `composeE164` falls back to `+<dialCode><digits>` for incomplete
+  // input (e.g. dial-code-only or a too-short number), so a non-empty
+  // `phone` isn't necessarily a saveable one. Computed from `phone`
+  // directly (no "touched"/"submitted" flag) so the message appears as
+  // the user types, same as `phoneHint`/`dupContact` below.
+  const phoneInvalid = phone.trim().length > 0 && !isCompletePhoneNumber(phone);
+
   const tagsResult = useQuery(api.tags.list);
   const tags = useMemo(
     () => (tagsResult ?? []).map(toUiTag),
@@ -117,6 +127,11 @@ export function ContactForm({
 
     if (!phone.trim()) {
       toast.error(t('phoneRequired'));
+      return;
+    }
+
+    if (!isCompletePhoneNumber(phone)) {
+      toast.error(t('phoneInvalid'));
       return;
     }
 
@@ -220,15 +235,14 @@ export function ContactForm({
             <Label htmlFor="cf-phone" className="text-muted-foreground">
               {t('phoneLabel')} <span className="text-red-400">*</span>
             </Label>
-            <Input
+            <PhoneInput
               id="cf-phone"
               value={phone}
-              onChange={(e) => {
-                setPhone(e.target.value);
+              onChange={(next) => {
+                setPhone(next);
                 if (dupContactId) setDupContactId(null);
               }}
               placeholder={t('phonePlaceholder')}
-              className="bg-muted border-border text-foreground placeholder:text-muted-foreground"
             />
             {dupContact ? (
               <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-2.5 py-2 text-xs text-red-300">
@@ -246,6 +260,8 @@ export function ContactForm({
                   )}
                 </div>
               </div>
+            ) : phoneInvalid ? (
+              <p className="text-xs text-red-400">{t('phoneInvalid')}</p>
             ) : (
               <p className="text-xs text-muted-foreground">
                 {t('phoneHint')}

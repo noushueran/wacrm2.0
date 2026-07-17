@@ -1,3 +1,5 @@
+import { parsePhoneNumberFromString } from 'libphonenumber-js'
+
 /**
  * Sanitize phone number for Meta WhatsApp API.
  * Meta requires digits only — no + prefix, no spaces, no dashes.
@@ -118,4 +120,23 @@ export function phoneVariants(sanitized: string): string[] {
  */
 export function isRecipientNotAllowedError(message: string): boolean {
   return /131030|not in allowed list|not in the allowed list/i.test(message)
+}
+
+/**
+ * Human-facing international format, e.g. "+971 50 123 4567". Normalizes a
+ * digits-only or `00`-prefixed value to `+E.164` first, then formats via
+ * libphonenumber-js; falls back to `formatPhoneIntl` (bare `+digits`) when
+ * the number can't be parsed into a valid, dialable number for its country
+ * (libphonenumber-js's safe parser returns a structurally-parsed but
+ * `isValid() === false` result for garbage input like "123" rather than
+ * `undefined`, so both cases are checked). Blank input returns "".
+ */
+export function formatPhoneDisplay(phone: string): string {
+  if (!phone || !phone.trim()) return ''
+  let digits = phone.replace(/\D/g, '')
+  if (digits.startsWith('00')) digits = digits.slice(2)
+  if (!digits) return ''
+  const parsed = parsePhoneNumberFromString(`+${digits}`)
+  if (parsed && parsed.isValid()) return parsed.formatInternational()
+  return formatPhoneIntl(phone)
 }

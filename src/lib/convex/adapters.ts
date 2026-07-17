@@ -121,6 +121,7 @@ export function toUiContact(
     name: doc.name,
     email: doc.email,
     company: doc.company,
+    contact_code: doc.contactCode,
     alt_phone: doc.altPhone,
     address: doc.address,
     city: doc.city,

@@ -2,7 +2,7 @@
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { ConvexError } from "convex/values";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -620,6 +620,40 @@ test("list search_name matches by name prefix and stays scoped to the caller's a
   expect(result.page[0]!.name).toBe("Jonas Petraitis");
 });
 
+test("list search matches by phone digits, email, and contact ID (not just name)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor", // supervisor+ so the phone isn't masked in the result
+  });
+
+  await asUser.mutation(api.contacts.create, {
+    phone: "+971501234567",
+    name: "Jonas",
+    email: "jonas@travel.com",
+  }); // HC-000001
+  await asUser.mutation(api.contacts.create, { phone: "222", name: "Marija" });
+
+  const byPhone = await asUser.query(api.contacts.list, {
+    search: "50123",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byPhone.page.map((c) => c.name)).toEqual(["Jonas"]);
+
+  const byEmail = await asUser.query(api.contacts.list, {
+    search: "travel.com",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byEmail.page.map((c) => c.name)).toEqual(["Jonas"]);
+
+  const byId = await asUser.query(api.contacts.list, {
+    search: "HC-000001",
+    paginationOpts: { numItems: 50, cursor: null },
+  });
+  expect(byId.page.map((c) => c.name)).toEqual(["Jonas"]);
+});
+
 test("assignTag is idempotent — assigning the same tag twice does not duplicate the link", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
@@ -1024,6 +1058,47 @@ test("filterByTags applies name/phone/email search on top of the tag match", asy
   expect(result.items[0]!._id).toBe(c1);
 });
 
+test("filterByTags matches by contact ID under an active tag filter", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+
+  const tagA = await asUser.mutation(api.tags.create, {
+    name: "A",
+    color: "#000",
+  });
+  // Phones deliberately contain no "1", so the ID-search terms below match
+  // ONLY via `contactCode`, not incidentally via the phone number.
+  const c1 = await asUser.mutation(api.contacts.create, {
+    phone: "555",
+    name: "Jonas",
+  }); // HC-000001
+  const c2 = await asUser.mutation(api.contacts.create, {
+    phone: "777",
+    name: "Marija",
+  }); // HC-000002
+  // Both carry the tag, so a match must come from the ID, not the tag set.
+  await asUser.mutation(api.contacts.assignTag, { contactId: c1, tagId: tagA });
+  await asUser.mutation(api.contacts.assignTag, { contactId: c2, tagId: tagA });
+
+  // Previously ID search silently returned nothing while a tag filter was
+  // active (filterByTags matched name/phone/email only). Full code, bare
+  // number, and zero-padded number now all resolve to c1 (not c2).
+  for (const search of ["HC-000001", "1", "000001"]) {
+    const result = await asUser.query(api.contacts.filterByTags, {
+      tagIds: [tagA],
+      search,
+      limit: 10,
+      offset: 0,
+    });
+    expect(result.total).toBe(1);
+    expect(result.items[0]!._id).toBe(c1);
+  }
+});
+
 test("filterByTags paginates with offset/limit while total reflects every match", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, {
@@ -1280,6 +1355,289 @@ test("update persists the extended contact fields", async () => {
   expect(doc?.nationality).toBe("Indian");
   expect(doc?.preferredDestination).toBe("Maldives");
   expect(doc?.notes).toBe("VIP — prefers window seat");
+});
+
+// ============================================================
+// contactCode — sequential HC-000001-style per-account identifier
+// (Contact Section Enhancements, Task 1).
+// ============================================================
+
+test("create assigns sequential HC- contact codes per account, starting at HC-000001", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const firstId = await asUser.mutation(api.contacts.create, { phone: "111" });
+  const secondId = await asUser.mutation(api.contacts.create, { phone: "222" });
+
+  const first = await t.run((ctx) => ctx.db.get(firstId));
+  const second = await t.run((ctx) => ctx.db.get(secondId));
+  expect(first!.contactCode).toBe("HC-000001");
+  expect(second!.contactCode).toBe("HC-000002");
+});
+
+test("contact codes are numbered independently per account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+
+  const aliceId = await asAlice.mutation(api.contacts.create, { phone: "111" });
+  const bobId = await asBob.mutation(api.contacts.create, { phone: "111" });
+
+  const alice = await t.run((ctx) => ctx.db.get(aliceId));
+  const bob = await t.run((ctx) => ctx.db.get(bobId));
+  expect(alice!.contactCode).toBe("HC-000001");
+  expect(bob!.contactCode).toBe("HC-000001");
+});
+
+// ============================================================
+// contactCode via findOrCreateByPhoneInternal (Contact Section
+// Enhancements, Task 2) — the account-explicit find-or-create the
+// public API uses must allocate a code on the CREATE branch only; a
+// FIND must never burn a number.
+// ============================================================
+
+test("findOrCreateByPhoneInternal assigns a contact code on create, none extra on find", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const created = await t.mutation(
+    internal.contacts.findOrCreateByPhoneInternal,
+    { accountId, phone: "+971501234567", name: "Guest" },
+  );
+  expect(created.created).toBe(true);
+  const row = await t.run((ctx) => ctx.db.get(created.contactId));
+  expect(row!.contactCode).toBe("HC-000001");
+
+  const found = await t.mutation(
+    internal.contacts.findOrCreateByPhoneInternal,
+    { accountId, phone: "+971501234567" },
+  );
+  expect(found.created).toBe(false);
+  expect(found.contactId).toBe(created.contactId);
+
+  // No wasted number: the counter only advanced once.
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(1);
+});
+
+// ============================================================
+// backfillContactCodes (Contact Section Enhancements, Task 3) — the
+// one-shot migration that codes contacts created before this feature
+// existed.
+// ============================================================
+
+test("backfillContactCodes assigns codes in creation order, is idempotent, and seeds the counter", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  // Insert three code-less contacts directly (simulating pre-migration
+  // rows), in the REVERSE of their expected code order — phone "333" is
+  // created first, "111" last. If codes were assigned by anything other
+  // than true `_creationTime` order (e.g. phone value, or whatever
+  // incidental order `.collect()` happened to return), this would
+  // produce a different, easily-distinguishable result; ascending
+  // insertion order couldn't have told the two apart.
+  const ids: Id<"contacts">[] = [];
+  for (const phone of ["333", "222", "111"]) {
+    const id = await t.run((ctx) =>
+      ctx.db.insert("contacts", { accountId, phone, phoneNormalized: phone }),
+    );
+    ids.push(id);
+  }
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  const codes = await Promise.all(
+    ids.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  // ids[0] ("333") was created FIRST, so it gets the LOWEST code — even
+  // though "333" is numerically/lexically the largest phone value.
+  expect(codes).toEqual(["HC-000001", "HC-000002", "HC-000003"]);
+
+  // Idempotent: re-running changes nothing.
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+  const codesAgain = await Promise.all(
+    ids.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  expect(codesAgain).toEqual(["HC-000001", "HC-000002", "HC-000003"]);
+
+  // Counter is seeded to the highest number used, so the next create
+  // continues at HC-000004 rather than colliding at HC-000001.
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(3);
+});
+
+test("backfillContactCodes seeds past a counter that lags an already-assigned code's numeric suffix", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  // An already-coded contact whose numeric suffix (50) is HIGHER than the
+  // counter row below (3) — simulates a counter that drifted behind
+  // reality (e.g. codes assigned by some path other than
+  // `allocateContactCode`). Without the "bump past the max assigned code"
+  // logic (convex/contacts.ts:134-139), the backfill below would trust the
+  // stale counter, hand the code-less contact HC-000004, and leave the
+  // counter at 4 — a future `create` would eventually count up to 50 and
+  // collide with this contact's existing HC-000050.
+  await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "111",
+      phoneNormalized: "111",
+      contactCode: "HC-000050",
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("counters", { accountId, name: "contacts", value: 3 }),
+  );
+
+  // A code-less contact that still needs backfilling.
+  const codelessId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "222",
+      phoneNormalized: "222",
+    }),
+  );
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  // Continues from the true max (50), not the stale counter (3): lands on
+  // HC-000051, never colliding with the existing HC-000050.
+  const codeless = await t.run((ctx) => ctx.db.get(codelessId));
+  expect(codeless!.contactCode).toBe("HC-000051");
+
+  const counter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", accountId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(counter!.value).toBe(51);
+});
+
+test("backfillContactCodes scopes numbering and counters independently per account", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: aliceId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { accountId: bobId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const { accountId: carolId } = await seedAccountMember(t, {
+    name: "Carol",
+    email: "carol@example.com",
+    role: "agent",
+  });
+
+  // Alice gets two code-less contacts, Bob gets one, Carol gets none at
+  // all — she should come out of a global backfill run completely
+  // untouched.
+  const aliceIds: Id<"contacts">[] = [];
+  for (const phone of ["a1", "a2"]) {
+    const id = await t.run((ctx) =>
+      ctx.db.insert("contacts", {
+        accountId: aliceId,
+        phone,
+        phoneNormalized: phone,
+      }),
+    );
+    aliceIds.push(id);
+  }
+  const bobContactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId: bobId,
+      phone: "b1",
+      phoneNormalized: "b1",
+    }),
+  );
+
+  await t.mutation(internal.contacts.backfillContactCodes, {});
+
+  const aliceCodes = await Promise.all(
+    aliceIds.map((id) => t.run((ctx) => ctx.db.get(id).then((c) => c!.contactCode))),
+  );
+  expect(aliceCodes).toEqual(["HC-000001", "HC-000002"]);
+
+  // Bob's own sequence starts at HC-000001 too, not HC-000003 — proving
+  // his numbering doesn't continue on from Alice's.
+  const bobContact = await t.run((ctx) => ctx.db.get(bobContactId));
+  expect(bobContact!.contactCode).toBe("HC-000001");
+
+  const aliceCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", aliceId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  const bobCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", bobId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  const carolCounter = await t.run((ctx) =>
+    ctx.db
+      .query("counters")
+      .withIndex("by_account_name", (q) =>
+        q.eq("accountId", carolId).eq("name", "contacts"),
+      )
+      .first(),
+  );
+  expect(aliceCounter!.value).toBe(2);
+  expect(bobCounter!.value).toBe(1);
+  // Carol had zero contacts, so the backfill never touches her: no counter
+  // row is conjured out of nowhere (`next` stays 0, and the mutation only
+  // inserts a counter when `next > 0`).
+  expect(carolCounter).toBeNull();
 });
 
 // ============================================================

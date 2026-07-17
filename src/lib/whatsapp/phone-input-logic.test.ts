@@ -1,0 +1,63 @@
+import { describe, expect, it } from "vitest";
+import {
+  DEFAULT_COUNTRY,
+  composeE164,
+  formatAsYouType,
+  isCompletePhoneNumber,
+  isValidNationalNumber,
+  listCountryOptions,
+  splitE164,
+} from "./phone-input-logic";
+
+describe("phone-input-logic", () => {
+  it("defaults to the UAE", () => {
+    expect(DEFAULT_COUNTRY).toBe("AE");
+  });
+
+  it("lists countries with dial codes and a flag, including AE +971", () => {
+    const opts = listCountryOptions();
+    const ae = opts.find((o) => o.country === "AE");
+    expect(ae?.dialCode).toBe("971");
+    expect(ae?.flag).toBe("🇦🇪");
+    expect(opts.length).toBeGreaterThan(100);
+  });
+
+  it("composes a national number into E.164", () => {
+    expect(composeE164("AE", "50 123 4567")).toBe("+971501234567");
+    expect(composeE164("GB", "7700 900123")).toBe("+447700900123");
+  });
+
+  it("validates a national number for its country", () => {
+    expect(isValidNationalNumber("AE", "50 123 4567")).toBe(true);
+    expect(isValidNationalNumber("AE", "123")).toBe(false);
+  });
+
+  it("only treats a complete, valid +E.164 number as complete (gates save on composeE164's incomplete-input fallback)", () => {
+    // Confirmed directly against the installed libphonenumber-js@^1.13.8's
+    // isValidPhoneNumber before asserting, same as this file's other tests:
+    //   isValidPhoneNumber("+971501234567") -> true  (full valid AE number)
+    //   isValidPhoneNumber("+971")          -> false (dial code only)
+    //   isValidPhoneNumber("")              -> false (empty)
+    //   isValidPhoneNumber("+9715")         -> false (too short)
+    expect(isCompletePhoneNumber("+971501234567")).toBe(true);
+    expect(isCompletePhoneNumber("+971")).toBe(false);
+    expect(isCompletePhoneNumber("")).toBe(false);
+    expect(isCompletePhoneNumber("+9715")).toBe(false);
+  });
+
+  it("splits an E.164 value back into country + national number", () => {
+    expect(splitE164("+971501234567")).toEqual({
+      country: "AE",
+      national: "501234567",
+    });
+    expect(splitE164("")).toBeNull();
+  });
+
+  it("live-formats an AE number as the user types it (AsYouType), inserting spaces", () => {
+    // libphonenumber-js's AsYouType only recognizes the domestic trunk-0
+    // form as it's typed, so "0501234567" (not "501234567") is the input
+    // that actually exercises its progressive space-insertion — confirmed
+    // against the installed libphonenumber-js@^1.13.8 AsYouType directly.
+    expect(formatAsYouType("AE", "0501234567")).toBe("050 123 4567");
+  });
+});

@@ -428,6 +428,7 @@
       "clearSelection": "Clear",
       "deleteSelected": "Delete selected",
       "tableColumns": {
+        "contactId": "Contact ID",
         "name": "Name",
         "phone": "Phone",
         "email": "Email",
@@ -440,6 +441,7 @@
       "noContactsYet": "No contacts yet.",
       "addFirstContact": "Add your first contact",
       "unnamed": "Unnamed",
+      "openChatAction": "Open chat",
       "editAction": "Edit",
       "deleteAction": "Delete",
       "showingPagination": "Showing {start}-{end} of {total}",
@@ -466,8 +468,8 @@
       "nameLabel": "Name",
       "namePlaceholder": "Jane Doe",
       "phoneLabel": "Phone Number",
-      "phonePlaceholder": "+1234567890",
-      "phoneHint": "Include country code, e.g. +1 for US",
+      "phonePlaceholder": "50 123 4567",
+      "phoneHint": "Pick the country, then enter the local number.",
       "emailLabel": "Email",
       "emailPlaceholder": "jane@example.com",
       "companyLabel": "Company",
@@ -489,7 +491,8 @@
       "dupSimilar": "A contact with a very similar number already exists.",
       "loadingTags": "Loading tags...",
       "noTagsAvailable": "No tags available. Create tags in Settings.",
-      "phoneRequired": "Phone number is required"
+      "phoneRequired": "Phone number is required",
+      "phoneInvalid": "Enter a valid phone number for the selected country."
     },
     "detailView": {
       "tabs": {
@@ -516,6 +519,7 @@
       "email": "Email",
       "company": "Company",
       "createdAt": "Created At",
+      "copyId": "Copy ID",
       "customFields": "Custom Fields",
       "noCustomFields": "No custom fields defined. Create them in Settings.",
       "manageFields": "Manage fields",
@@ -538,9 +542,11 @@
         "noTagsAvailable": "No tags available. Create tags in Settings."
       },
       "sendTemplateBtn": "Send template",
+      "openChatBtn": "Open chat",
       "saveChangesBtn": "Save Changes",
       "saveCustomFieldsBtn": "Save Custom Fields",
       "toastPhoneRequired": "Phone number is required",
+      "phoneInvalid": "Enter a valid phone number for the selected country.",
       "toastUpdateFailed": "Failed to update contact",
       "toastUpdated": "Contact updated",
       "toastNotAuthenticated": "Not authenticated",
