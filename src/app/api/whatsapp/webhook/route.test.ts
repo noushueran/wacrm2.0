@@ -90,6 +90,31 @@ describe("POST /api/whatsapp/webhook (thin proxy)", () => {
     );
   });
 
+  it("bounds the forward with an abort timeout, so a hung Convex cannot leave Meta with no response at all", async () => {
+    // Without a signal this `await fetch` blocks until the platform kills
+    // the function — Meta then receives nothing and retries, while the
+    // original is still hung. The 200 below is already returned regardless
+    // of the forward's outcome, so aborting costs nothing not already
+    // accepted.
+    const fetchMock = vi.fn<(input: string | URL, init?: RequestInit) => Promise<Response>>(
+      async () => new Response(JSON.stringify({ status: "received" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const rawBody = JSON.stringify({ entry: [] });
+    await POST(
+      new Request("http://localhost/api/whatsapp/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": signedHeader(rawBody) },
+        body: rawBody,
+      }),
+    );
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect(init?.signal?.aborted).toBe(false);
+  });
+
   it("still acks 200 to Meta even when the Convex httpAction is unreachable (fetch throws)", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal(

@@ -52,6 +52,16 @@ function proxySecretHeaders(): Record<string, string> {
   return { 'x-wacrm-proxy-secret': secret }
 }
 
+// Ceiling on the forward to Convex. Without it, a hung or very slow
+// Convex backend blocks this function until the platform kills it —
+// Meta then gets NO response at all and retries, and those retries
+// arrive while the original is still hung (self-amplifying). Both
+// handlers below already return regardless of the forward's outcome, so
+// aborting costs nothing that isn't already accepted; Convex's own
+// wamid dedup (`convex/ingest.ts`'s `ingestInbound`) covers the
+// duplicate-delivery side.
+const FORWARD_TIMEOUT_MS = 5_000
+
 // GET - Webhook verification. No signature to check (Meta's handshake
 // has none) — just relay the query string to Convex's own GET
 // httpAction and pass its response straight back to Meta.
@@ -64,6 +74,7 @@ export async function GET(request: Request) {
     const response = await fetch(target, {
       method: 'GET',
       headers: proxySecretHeaders(),
+      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     })
     const text = await response.text()
     return new Response(text, {
@@ -115,6 +126,7 @@ export async function POST(request: Request) {
         'content-type': 'application/json',
       },
       body: rawBody,
+      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.error(

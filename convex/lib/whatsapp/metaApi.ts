@@ -78,6 +78,45 @@ import type { MetaTemplateSubmitPayload } from "./templateComponents";
 const META_API_VERSION = "v21.0";
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`;
 
+/**
+ * Ceiling on a Graph API call. Meta answers these in well under a second
+ * in the normal case; this is a hang guard, not a latency budget.
+ */
+const META_TIMEOUT_MS = 10_000;
+
+/**
+ * Ceiling on a media *download* — the one call here that moves bytes
+ * rather than JSON (WhatsApp allows up to ~16 MB), so it gets materially
+ * more room than a Graph call.
+ */
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * `fetch` with a mandatory abort timeout — the single choke point every
+ * call in this module goes through.
+ *
+ * This module is the shared client for *every* outbound Meta call,
+ * including `broadcasts.deliverOne`'s per-recipient send. A bare `fetch`
+ * has no timeout, so a hung connection stalls its action indefinitely
+ * with no ceiling. Routing through one helper (rather than repeating
+ * `signal:` at each call site) means a Meta call added later cannot
+ * silently omit it. Mirrors what `webhookDelivery` and the AI providers
+ * already do at their own fetches.
+ *
+ * On expiry `fetch` rejects with a `TimeoutError`, which propagates to
+ * the caller exactly as a network error already would.
+ */
+async function metaFetch(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = META_TIMEOUT_MS,
+): Promise<Response> {
+  return await fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
 export interface MetaSendResult {
   messageId: string;
 }
@@ -156,7 +195,7 @@ export async function verifyPhoneNumber(
 ): Promise<MetaPhoneInfo> {
   const { phoneNumberId, accessToken } = args;
   const url = `${META_API_BASE}/${phoneNumberId}?fields=id,display_phone_number,verified_name,quality_rating`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok) {
@@ -212,7 +251,7 @@ export async function registerPhoneNumber(
 ): Promise<RegisterPhoneNumberResult> {
   const { phoneNumberId, accessToken, pin } = args;
   const url = `${META_API_BASE}/${phoneNumberId}/register`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -260,7 +299,7 @@ export async function subscribeWabaToApp(
 ): Promise<void> {
   const { wabaId, accessToken } = args;
   const url = `${META_API_BASE}/${wabaId}/subscribed_apps`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}` },
   });
@@ -294,7 +333,7 @@ export async function getSubscribedApps(
 ): Promise<SubscribedApp[]> {
   const { wabaId, accessToken } = args;
   const url = `${META_API_BASE}/${wabaId}/subscribed_apps`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok) {
@@ -329,7 +368,7 @@ export async function getMediaUrl(
   args: GetMediaUrlArgs,
 ): Promise<{ url: string; mimeType: string }> {
   const { mediaId, accessToken } = args;
-  const response = await fetch(`${META_API_BASE}/${mediaId}`, {
+  const response = await metaFetch(`${META_API_BASE}/${mediaId}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok) {
@@ -358,9 +397,12 @@ export async function downloadMedia(
   args: DownloadMediaArgs,
 ): Promise<{ buffer: ArrayBuffer; contentType: string }> {
   const { downloadUrl, accessToken } = args;
-  const response = await fetch(downloadUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  const response = await metaFetch(
+    downloadUrl,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    // Moves up to ~16 MB of bytes, unlike every JSON call above.
+    MEDIA_DOWNLOAD_TIMEOUT_MS,
+  );
   if (!response.ok) {
     throw new Error(`Media download failed: ${response.status}`);
   }
@@ -403,7 +445,7 @@ export async function sendTextMessage(
   if (contextMessageId) {
     body.context = { message_id: contextMessageId };
   }
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -474,7 +516,7 @@ export async function sendMediaMessage(
   };
   if (contextMessageId) body.context = { message_id: contextMessageId };
 
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -548,7 +590,7 @@ export async function sendTemplateMessage(
     body.context = { message_id: contextMessageId };
   }
 
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -588,7 +630,7 @@ export async function sendReactionMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args;
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -734,7 +776,7 @@ export async function sendInteractiveButtons(
   if (contextMessageId) body.context = { message_id: contextMessageId };
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -881,7 +923,7 @@ export async function sendInteractiveList(
   if (contextMessageId) body.context = { message_id: contextMessageId };
 
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -956,7 +998,7 @@ export async function submitMessageTemplate(
 ): Promise<SubmitMessageTemplateResult> {
   const { wabaId, accessToken, payload } = args;
   const url = `${META_API_BASE}/${wabaId}/message_templates`;
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1017,7 +1059,7 @@ export async function editMessageTemplate(
   const { metaTemplateId, accessToken, components, category } = args;
   const body: Record<string, unknown> = { components };
   if (category) body.category = category;
-  const response = await fetch(`${META_API_BASE}/${metaTemplateId}`, {
+  const response = await metaFetch(`${META_API_BASE}/${metaTemplateId}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1096,7 +1138,7 @@ export async function listMessageTemplates(
 
   while (nextUrl && pageCount < TEMPLATE_LIST_PAGE_CAP) {
     pageCount++;
-    const response = await fetch(nextUrl, {
+    const response = await metaFetch(nextUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!response.ok) {
