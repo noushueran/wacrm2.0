@@ -1118,11 +1118,14 @@ test("processInbound resolves an inbound voice note's media into storage and att
   });
   vi.stubGlobal("fetch", fetchMock);
 
+  vi.useFakeTimers();
   await t.action(internal.ingest.processInbound, {
     accountId,
     from: "15559990000",
     message: { type: "audio", mediaId: "meta-audio-1", wamid: "wamid.VOICE1" },
   });
+  // The download is scheduled, not awaited (see the test below) — drain it.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const message = await t.run((ctx) =>
     ctx.db
@@ -1136,6 +1139,93 @@ test("processInbound resolves an inbound voice note's media into storage and att
   expect(message!.mediaUrl).toBeTruthy();
   // Both Meta round-trips happened (resolve id -> url, then download).
   expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+test("processInbound schedules media resolution instead of blocking the fan-out on the download", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await t.run(async (ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId,
+      phoneNumberId: "pn-acme",
+      accessToken: await encrypt("secret-token"),
+      status: "connected",
+    }),
+  );
+  const fetchMock = vi.fn(async () => {
+    throw new Error("no media fetch may happen on processInbound's own path");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15559990000",
+    message: { type: "audio", mediaId: "meta-audio-1", wamid: "wamid.VOICE2" },
+  });
+
+  // Nothing downstream of the media block reads `mediaUrl`, so the customer's
+  // flows/automations/AI reply must not wait out a 16MB Meta CDN download to
+  // get their answer: `processInbound` returns with the work handed off.
+  expect(fetchMock).not.toHaveBeenCalled();
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  expect(scheduled.map((s) => s.name)).toContain(
+    "ingest:resolveInboundAttachments",
+  );
+});
+
+test("a Meta retry (duplicate wamid) schedules no second download — the dedup guard still fronts the media work", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await t.run(async (ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId,
+      phoneNumberId: "pn-acme",
+      accessToken: await encrypt("secret-token"),
+      status: "connected",
+    }),
+  );
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
+
+  const message = {
+    type: "audio" as const,
+    mediaId: "meta-audio-1",
+    wamid: "wamid.RETRY1",
+  };
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15559990000",
+    message,
+  });
+  const afterFirst = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+
+  // Meta re-delivers the same wamid.
+  const res = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15559990000",
+    message,
+  });
+
+  expect(res.duplicate).toBe(true);
+  const afterRetry = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  // The `duplicate` early-out returns before the schedule is ever reached, so
+  // a retry can't orphan a second copy in storage — the same invariant the
+  // inline version relied on, preserved by the call site's ordering.
+  expect(
+    afterRetry.filter((s) => s.name === "ingest:resolveInboundAttachments"),
+  ).toHaveLength(
+    afterFirst.filter((s) => s.name === "ingest:resolveInboundAttachments")
+      .length,
+  );
 });
 
 // ============================================================
@@ -1573,6 +1663,7 @@ test("processInbound downloads the ad image into storage and attaches storedImag
   );
   vi.stubGlobal("fetch", fetchMock);
 
+  vi.useFakeTimers();
   await t.action(internal.ingest.processInbound, {
     accountId,
     from: "15551230000",
@@ -1583,6 +1674,8 @@ test("processInbound downloads the ad image into storage and attaches storedImag
       referral: { sourceType: "ad", headline: "Pkg", imageUrl: "https://scontent.example/ad.jpg" },
     },
   });
+  // The download is scheduled, not awaited — drain it.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const message = await t.run((ctx) =>
     ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADIMG1")).first(),
@@ -1617,8 +1710,10 @@ test("processInbound pins the conversation adReferral image to the FIRST ad — 
   });
   vi.stubGlobal("fetch", fetchMock);
 
-  const sendAd = (wamid: string, headline: string, imageUrl: string) =>
-    t.action(internal.ingest.processInbound, {
+  // The attachment download is scheduled, not awaited — drain it after each
+  // send so the stored URLs are observable.
+  const sendAd = async (wamid: string, headline: string, imageUrl: string) => {
+    await t.action(internal.ingest.processInbound, {
       accountId,
       from: "15551230000",
       message: {
@@ -1628,6 +1723,10 @@ test("processInbound pins the conversation adReferral image to the FIRST ad — 
         referral: { sourceType: "ad", headline, imageUrl },
       },
     });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+  };
+
+  vi.useFakeTimers();
 
   // ---- Ad A: the FIRST ad on this (new) conversation ----
   await sendAd("wamid.ADA", "Ad A", "https://scontent.example/adA.jpg");

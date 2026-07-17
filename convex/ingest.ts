@@ -537,6 +537,65 @@ export async function runBestEffort(
   }
 }
 
+/**
+ * Pulls an inbound message's attachments into Convex storage and attaches the
+ * durable URLs: the Meta `mediaId` download (voice note / image / video /
+ * document — a signed Graph fetch neither `flattenInboundMessage` nor the
+ * `ingestInbound` mutation can do, so the row lands with no `mediaUrl`, which
+ * the inbox renders as an "unavailable" bubble) and, for an ad-referral
+ * message, the referral image (a DIRECT public CDN url, so a plain
+ * `storeFromUrl` with no auth headers re-hosts it — same durability, and the
+ * ad card then survives Meta's CDN url expiring).
+ *
+ * Scheduled by `processInbound` rather than awaited inline: this is display-
+ * side only, so the engines it used to sit in front of no longer wait on it.
+ * Each half is independently best-effort — a media that won't fetch leaves the
+ * "unavailable" bubble rather than costing the other half its own attempt.
+ */
+export const resolveInboundAttachments = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    messageId: v.id("messages"),
+    conversationId: v.id("conversations"),
+    mediaId: v.optional(v.string()),
+    adImageUrl: v.optional(v.string()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const { accountId, messageId, conversationId, mediaId, adImageUrl } = args;
+
+    if (mediaId) {
+      await runBestEffort("whatsappConfig.resolveInboundMedia", async () => {
+        const resolved = await ctx.runAction(
+          internal.whatsappConfig.resolveInboundMedia,
+          { accountId, mediaId },
+        );
+        if (resolved) {
+          await ctx.runMutation(internal.messages.setMediaUrl, {
+            messageId,
+            mediaUrl: resolved.url,
+          });
+        }
+      });
+    }
+
+    if (adImageUrl) {
+      await runBestEffort("ingest.storeAdReferralImage", async () => {
+        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+          url: adImageUrl,
+        });
+        const url = await ctx.storage.getUrl(storageId);
+        if (url) {
+          await ctx.runMutation(internal.messages.setAdReferralImage, {
+            messageId,
+            conversationId,
+            storedImageUrl: url,
+          });
+        }
+      });
+    }
+  },
+});
+
 export const processInbound = internalAction({
   args: {
     accountId: v.id("accounts"),
@@ -564,53 +623,36 @@ export const processInbound = internalAction({
       return { duplicate: true, flowConsumed: false };
     }
 
-    // ---- Inbound media resolution ----
-    // A media message (voice note / image / video / document) arrives as
-    // a bare Meta `mediaId`: `flattenInboundMessage` can't resolve it (a
-    // signed Graph fetch is real network I/O), and neither can the
-    // `ingestInbound` mutation, so the row was just persisted with no
-    // `mediaUrl` — which the inbox renders as an "unavailable" bubble.
-    // Now — AFTER the dedup check, so a Meta retry can't re-download and
-    // orphan a second copy in storage — pull the bytes into Convex
-    // storage and attach the durable URL to the already-persisted
-    // message. Best-effort: `resolveInboundMedia` returns null on any
-    // failure, leaving the "unavailable" bubble rather than derailing the
-    // fan-out below (a media that won't fetch must not cost the customer
-    // their flow/automation/AI reply).
-    if (message.mediaId && !message.mediaUrl) {
-      const resolved = await ctx.runAction(
-        internal.whatsappConfig.resolveInboundMedia,
-        { accountId, mediaId: message.mediaId },
-      );
-      if (resolved) {
-        await ctx.runMutation(internal.messages.setMediaUrl, {
+    // ---- Inbound media + ad-referral image → storage (scheduled) ----
+    // Both are Meta CDN downloads (up to 16MB apiece) and both are purely
+    // display-side: nothing below this point reads `mediaUrl` — not
+    // flowsEngine, not automationsEngine, not aiReply, and not
+    // `buildMessageReceivedPayload` (which emits wamid/content_type/text
+    // only). Awaiting them here bought nothing and made the customer wait
+    // out a download for their auto-reply, so they're handed to the
+    // scheduler instead (see `resolveInboundAttachments`).
+    //
+    // Still placed AFTER the dedup check above, which is what keeps a Meta
+    // retry from re-downloading and orphaning a second copy in storage: the
+    // `duplicate` early-out returns before this line is ever reached, so the
+    // invariant now lives in this call site's ordering rather than in the
+    // download itself.
+    const adImageUrl =
+      message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
+    const mediaId =
+      message.mediaId && !message.mediaUrl ? message.mediaId : undefined;
+    if (mediaId || adImageUrl) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.ingest.resolveInboundAttachments,
+        {
+          accountId,
           messageId: res.messageId,
-          mediaUrl: resolved.url,
-        });
-      }
-    }
-
-    // ---- Ad-referral image → storage ----
-    // The referral gives a DIRECT public CDN url (not a Meta mediaId), so a
-    // plain `storeFromUrl` (no auth headers) re-hosts it into Convex storage
-    // — same durability the inbound-media block gives voice notes/photos,
-    // so the ad card never breaks when Meta's CDN url expires. After the
-    // dedup guard above, so a Meta retry can't orphan a second copy.
-    const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
-    if (adImageSrc) {
-      await runBestEffort("ingest.storeAdReferralImage", async () => {
-        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
-          url: adImageSrc,
-        });
-        const url = await ctx.storage.getUrl(storageId);
-        if (url) {
-          await ctx.runMutation(internal.messages.setAdReferralImage, {
-            messageId: res.messageId,
-            conversationId: res.conversationId,
-            storedImageUrl: url,
-          });
-        }
-      });
+          conversationId: res.conversationId,
+          mediaId,
+          adImageUrl,
+        },
+      );
     }
 
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`

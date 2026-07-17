@@ -10,6 +10,16 @@ import type { Doc } from "./_generated/dataModel";
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_RESOLVE_ATTEMPTS = 5;
 
+/**
+ * Delay between each `resolveAd` the retry cron schedules. The cron pulls up
+ * to 100 rows and every one is an external Marketing API GET; firing them all
+ * at `runAfter(0)` is a 100-call burst against the same Graph host we're
+ * asking for names, which invites the 429s that then burn `attempts`. Mirrors
+ * `broadcasts.ts`'s `DELIVER_STAGGER_MS` — Convex's scheduler already IS the
+ * queue, so a flat per-row interval is all it takes.
+ */
+const RESOLVE_STAGGER_MS = 100;
+
 export const getById = internalQuery({
   args: { campaignAdId: v.id("campaignAds") },
   handler: async (ctx, args): Promise<Doc<"campaignAds"> | null> =>
@@ -135,17 +145,20 @@ export const getResolvable = internalQuery({
 
 /**
  * Cron entry point (`convex/crons.ts`): pulls the retry batch and
- * re-schedules `resolveAd` for each. Tiny by design — all resolution
- * logic (dormant/idempotent/error) lives in `resolveAd`.
+ * re-schedules `resolveAd` for each, `RESOLVE_STAGGER_MS` apart. Tiny by
+ * design — all resolution logic (dormant/idempotent/error) lives in
+ * `resolveAd`.
  */
 export const retryResolutions = internalAction({
   args: {},
   handler: async (ctx): Promise<void> => {
     const rows = await ctx.runQuery(internal.campaignAds.getResolvable, {});
-    for (const row of rows) {
-      await ctx.scheduler.runAfter(0, internal.campaignAds.resolveAd, {
-        campaignAdId: row._id,
-      });
+    for (const [i, row] of rows.entries()) {
+      await ctx.scheduler.runAfter(
+        i * RESOLVE_STAGGER_MS,
+        internal.campaignAds.resolveAd,
+        { campaignAdId: row._id },
+      );
     }
   },
 });

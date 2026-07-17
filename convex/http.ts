@@ -10,6 +10,7 @@ import {
   isTemplateWebhookField,
   parseTemplateStatusUpdate,
   resolveContactName,
+  type MetaRecipientStatus,
   type MetaWebhookBody,
   type MetaWebhookChange,
 } from "./lib/whatsapp/webhookParse";
@@ -64,6 +65,42 @@ function checkProxySecret(request: Request): boolean {
 }
 
 /**
+ * Buckets a `value.statuses[]` batch by wamid, preserving arrival order
+ * within each bucket and dropping statuses we don't model (Meta is free to
+ * add new ones; an unrecognized one is skipped, and a wamid left with none
+ * yields no bucket at all).
+ *
+ * The grouping is what makes the batch safe to parallelize: both mutations
+ * a status drives are read-modify-write against a single row, and
+ * `broadcasts.isValidStatusTransition` enforces a
+ * pending->sent->delivered->read ladder over that read. Two statuses for the
+ * SAME wamid run concurrently would each read the same "before" state, each
+ * pass the ladder check, and then race to write — leaving the recipient on
+ * whichever landed last. Two statuses for DIFFERENT wamids touch different
+ * rows and cannot interfere. Exported for direct unit testing: convex-test
+ * runs mutations serially, so an end-to-end test can't reproduce the race
+ * this prevents.
+ */
+export function groupStatusesByWamid(
+  statuses: Array<{ id: string; status: string }>,
+): Array<[string, MetaRecipientStatus[]]> {
+  const groups = new Map<string, MetaRecipientStatus[]>();
+  for (const status of statuses) {
+    if (!isRecipientStatus(status.status)) {
+      console.warn(
+        "[webhook httpAction] unrecognized recipient status, skipping:",
+        status.status,
+      );
+      continue;
+    }
+    const group = groups.get(status.id);
+    if (group) group.push(status.status);
+    else groups.set(status.id, [status.status]);
+  }
+  return [...groups];
+}
+
+/**
  * One `entry[].changes[]` element. Wrapped in its own try/catch by the
  * caller so one malformed/failing change can't abandon the rest of the
  * batch (mirrors this codebase's `runBestEffort` philosophy elsewhere —
@@ -109,24 +146,28 @@ async function processChange(
   }
 
   if (value.statuses) {
-    for (const status of value.statuses) {
-      if (!isRecipientStatus(status.status)) {
-        console.warn(
-          "[webhook httpAction] unrecognized recipient status, skipping:",
-          status.status,
-        );
-        continue;
-      }
-      await ctx.runMutation(internal.messages.updateDeliveryStatusByWamid, {
-        wamid: status.id,
-        status: status.status,
-        accountId: accountId ?? undefined,
-      });
-      await ctx.runMutation(internal.broadcasts.recordRecipientStatusByWamid, {
-        wamid: status.id,
-        status: status.status,
-      });
-    }
+    // 2N sequential mutations on the inline, pre-ack path. The two per
+    // status touch different tables and don't gate each other, so they go
+    // together; distinct wamids own distinct rows, so those go together
+    // too. Same-wamid statuses stay strictly ordered — see
+    // `groupStatusesByWamid`.
+    await Promise.all(
+      groupStatusesByWamid(value.statuses).map(async ([wamid, statuses]) => {
+        for (const status of statuses) {
+          await Promise.all([
+            ctx.runMutation(internal.messages.updateDeliveryStatusByWamid, {
+              wamid,
+              status,
+              accountId: accountId ?? undefined,
+            }),
+            ctx.runMutation(internal.broadcasts.recordRecipientStatusByWamid, {
+              wamid,
+              status,
+            }),
+          ]);
+        }
+      }),
+    );
   }
 
   if (value.messages) {

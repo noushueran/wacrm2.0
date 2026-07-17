@@ -333,12 +333,24 @@ export const sendSignal = internalAction({
 // A `sendSignal` attempt can leave a row `"error"` (non-2xx, network
 // failure, or a missing env var — see that function's own comment),
 // or a row can be stuck `"pending"` if its originally-scheduled
-// `sendSignal` never ran at all. `convex/crons.ts` runs `retryPending`
-// on an interval to sweep both cases back through `sendSignal`, which
-// is safe to call again for either status — see `sendSignal`'s own
-// "already matched" early-out.
+// `sendSignal` never ran at all. `retryPending` sweeps both cases back
+// through `sendSignal`, which is safe to call again for either status —
+// see `sendSignal`'s own "already matched" early-out.
 //
-// `getPendingToRetry` is global (no `accountId` arg): the cron has no
+// DORMANT — nothing calls `retryPending`. This comment used to claim
+// `convex/crons.ts` ran it on an interval; that has never been true.
+// `crons.ts` registers `conversionEvents.retryConversionEvents` and
+// `campaignAds.retryResolutions`, and nothing else. This entire internal
+// half of the module (`recordSignal` -> `sendSignal` -> `patchResult`,
+// plus this sweep) was superseded by `convex/conversionEvents.ts`, which
+// owns the unified funnel outbox for both lanes and carries its own cron
+// entry; `ingest.ts` seeds through `conversionEvents.seedNewLead` now.
+// Retained rather than deleted because `attributionSignals` still has a
+// live read surface (`listConversions` below — the admin conversions
+// tab) and this is the table's only retry path should its write side
+// ever be revived. `getPendingToRetry` exists solely to feed this.
+//
+// `getPendingToRetry` is global (no `accountId` arg): a cron sweep has no
 // account context to scope by, so it reads the `by_result` index
 // (`landingResult` only) rather than `by_account_result` — finding
 // candidates across every account without a full table scan.
@@ -348,12 +360,12 @@ export const sendSignal = internalAction({
  * Retry candidates: `landingResult` is `"error"` OR `"pending"`, capped
  * at 100 rows total. A row that exhausts its retries is retired to
  * `"abandoned"` by `patchResult` (see `MAX_ATTEMPTS`), so it leaves these
- * two partitions entirely — the point being that this global, every-15-
- * minute sweep never has to read past an ever-growing wall of
- * permanently-dead rows (they sort oldest-first, at the front) to reach
- * the live ones. The `attempts < MAX_ATTEMPTS` filter below is a cheap
- * backstop for that same invariant — a still-`"error"`/`"pending"` row
- * should never have reached the cap — not the primary mechanism.
+ * two partitions entirely — the point being that this global sweep never
+ * has to read past an ever-growing wall of permanently-dead rows (they
+ * sort oldest-first, at the front) to reach the live ones. The
+ * `attempts < MAX_ATTEMPTS` filter below is a cheap backstop for that
+ * same invariant — a still-`"error"`/`"pending"` row should never have
+ * reached the cap — not the primary mechanism.
  *
  * Queries the two statuses separately through the `by_result` index —
  * never a full scan — each independently bounded to `.take(100)`
@@ -379,8 +391,7 @@ export const getPendingToRetry = internalQuery({
 });
 
 /**
- * Cron-facing entry point (`convex/crons.ts`, every 15 minutes): pulls
- * this batch of retry candidates and re-schedules `sendSignal` for
+ * Pulls this batch of retry candidates and re-schedules `sendSignal` for
  * each — the same "action does `runQuery` then fans out via the
  * scheduler" shape as `broadcasts.ts`'s `send`. An `internalAction`
  * rather than a mutation specifically because it needs `ctx.runQuery`
@@ -388,6 +399,11 @@ export const getPendingToRetry = internalQuery({
  * `ctx.runQuery`/`ctx.runMutation`. Kept deliberately tiny: all the
  * actual retry logic (idempotency, error handling) already lives in
  * `sendSignal` itself.
+ *
+ * Unreachable — no cron registers this (see the section header). If it is
+ * ever revived, stagger the fan-out below the way `conversionEvents` and
+ * `campaignAds` now do: 100 concurrent `runAfter(0)` POSTs is precisely
+ * the self-inflicted burst that made those two rate-limit themselves.
  */
 export const retryPending = internalAction({
   args: {},

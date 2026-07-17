@@ -354,11 +354,20 @@ export const dispatchInbound = internalAction({
       // race-proof check at the point a reply is actually sent.
       if (replyCountSoFar >= config.autoReplyMaxPerConversation) return;
 
-      const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-        limit: aiContextMessageLimit(),
-      });
+      // Independent of each other — neither gates the other, and both key
+      // only off the account/conversation — so they cost one round-trip
+      // together rather than two in a row. (`aiKnowledge.retrieve` below
+      // stays sequential: it genuinely needs `queryText` from the history.)
+      const [historyRows, hasKb] = await Promise.all([
+        ctx.runQuery(internal.aiReply.recentMessages, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          limit: aiContextMessageLimit(),
+        }),
+        ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
+          accountId: args.accountId,
+        }),
+      ]);
       const messages = toChatMessages(historyRows);
       if (messages.length === 0) return; // nothing to reply to
 
@@ -368,9 +377,6 @@ export const dispatchInbound = internalAction({
       // skipped entirely when there's nothing to retrieve — see
       // `hasKnowledgeChunks`'s own doc comment).
       let knowledge: string[] = [];
-      const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
-        accountId: args.accountId,
-      });
       if (hasKb) {
         knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, {
           accountId: args.accountId,
