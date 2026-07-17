@@ -150,3 +150,42 @@ test("getSessionForConversation returns progress for accessible conversations, n
     asAgent.query(api.qualification.getSessionForConversation, { conversationId }),
   ).rejects.toThrow();
 });
+
+test("leadsBoard: supervisor+ gets summary + score-sorted leads; agents are denied", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await t.run(async (ctx) => {
+    const mk = async (phone: string, status: "collecting" | "qualified", score: number) => {
+      const contactId = await ctx.db.insert("contacts", {
+        accountId: admin.accountId, phone, phoneNormalized: phone.replace(/\D/g, ""), name: `C${score}`,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        accountId: admin.accountId, contactId, status: "open", unreadCount: 0,
+      });
+      await ctx.db.insert("qualificationSessions", {
+        accountId: admin.accountId, conversationId, contactId,
+        status, origin: "inbound",
+        fields: [{ key: "destination", label: "Destination", value: "Bali", confidence: "high", updatedAt: 1 }],
+        expectedCount: 4, answeredCount: 1, score, serviceName: "Packages",
+        followUpsSent: 1, phrasingCursor: 1, sendAttemptErrors: 0,
+        ...(status === "qualified" ? { qualifiedAt: 5 } : {}),
+      });
+    };
+    await mk("+971500000010", "qualified", 60);
+    await mk("+971500000011", "qualified", 90);
+    await mk("+971500000012", "collecting", 40);
+  });
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {});
+  expect(board.summary.qualified).toBe(2);
+  expect(board.summary.collecting).toBe(1);
+  const qualifiedScores = board.leads
+    .filter((l) => l.status === "qualified")
+    .map((l) => l.score);
+  expect(qualifiedScores).toEqual([90, 60]); // highest first — the sales queue
+  expect(board.leads[0].contactName).toBe("C90");
+  expect(board.leads[0].fields[0].value).toBe("Bali");
+
+  const agent = await seedMember(t, "agent");
+  await expect(agent.as.query(api.qualification.leadsBoard, {})).rejects.toThrow();
+});

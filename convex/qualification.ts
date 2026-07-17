@@ -123,3 +123,165 @@ export const getSessionForConversation = accountQuery({
     };
   },
 });
+
+// ============================================================
+// The Leads workspace query (P4 — spec §10). Supervisor+ (matches the
+// app's nav philosophy: agents work their assigned leads from the
+// Inbox; the cross-account sales queue is a supervisor surface).
+// ONE round-trip: summary counts + the score-sorted lead list with the
+// joins the board renders (contact, assignee, source, answers).
+// Bounded: per-status `take` caps — no unbounded collects (the
+// campaigns.overview scale lesson).
+// ============================================================
+
+const LEAD_STATUSES = [
+  "collecting",
+  "qualified",
+  "expired",
+  "opted_out",
+  "disqualified",
+] as const;
+
+export const leadsBoard = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    ctx.requireRole("supervisor");
+
+    const caps: Record<(typeof LEAD_STATUSES)[number], number> = {
+      collecting: 200,
+      qualified: 200,
+      expired: 50,
+      opted_out: 50,
+      disqualified: 50,
+    };
+
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .collect();
+    const memberName = new Map(
+      memberships.map((m) => [m.userId, m.fullName ?? m.email ?? "Member"]),
+    );
+
+    const summary: Record<string, number> = {};
+    const leads: {
+      sessionId: string;
+      conversationId: string;
+      status: string;
+      origin: string;
+      score: number | null;
+      serviceName: string | null;
+      summary: string | null;
+      answeredCount: number;
+      expectedCount: number;
+      followUpsSent: number;
+      nextFollowUpAt: number | null;
+      qualifiedAt: number | null;
+      closedReason: string | null;
+      startedAt: number;
+      contactName: string;
+      contactPhone: string;
+      source: "ad" | "website" | "organic";
+      assigneeName: string | null;
+      fields: { key: string; label: string | null; value: string; confidence: string }[];
+      scoreBreakdown: { criterion: string; marks: number; maxMarks: number; reason: string | null }[];
+    }[] = [];
+
+    for (const status of LEAD_STATUSES) {
+      const rows = await ctx.db
+        .query("qualificationSessions")
+        .withIndex("by_account_status", (q) =>
+          q.eq("accountId", ctx.accountId).eq("status", status),
+        )
+        .order("desc")
+        .take(caps[status]);
+      summary[status] = rows.length;
+
+      for (const s of rows) {
+        const contact = await ctx.db.get(s.contactId);
+        const conversation = await ctx.db.get(s.conversationId);
+        if (!contact || !conversation) continue;
+        const source: "ad" | "website" | "organic" =
+          conversation.attribution?.lane === "ctwa" || conversation.adReferral
+            ? "ad"
+            : conversation.attribution?.lane === "code"
+              ? "website"
+              : "organic";
+        leads.push({
+          sessionId: s._id,
+          conversationId: s.conversationId,
+          status: s.status,
+          origin: s.origin,
+          score: s.score ?? null,
+          serviceName: s.serviceName ?? null,
+          summary: s.summary ?? null,
+          answeredCount: s.answeredCount,
+          expectedCount: s.expectedCount,
+          followUpsSent: s.followUpsSent,
+          nextFollowUpAt: s.nextFollowUpAt ?? null,
+          qualifiedAt: s.qualifiedAt ?? null,
+          closedReason: s.closedReason ?? null,
+          startedAt: s._creationTime,
+          contactName: contact.name?.trim() || contact.phone,
+          contactPhone: contact.phone, // supervisor+ always sees phones (canSeeContactPhone)
+          source,
+          assigneeName: conversation.assignedToUserId
+            ? (memberName.get(conversation.assignedToUserId) ?? null)
+            : null,
+          fields: s.fields.map((f) => ({
+            key: f.key,
+            label: f.label ?? null,
+            value: f.value,
+            confidence: f.confidence,
+          })),
+          scoreBreakdown: (s.scoreBreakdown ?? []).map((b) => ({
+            criterion: b.criterion,
+            marks: b.marks,
+            maxMarks: b.maxMarks,
+            reason: b.reason ?? null,
+          })),
+        });
+      }
+    }
+
+    // The sales queue: qualified first by score desc, then in-progress by
+    // score desc, then the closed states, newest first within ties.
+    const statusRank: Record<string, number> = {
+      qualified: 0,
+      collecting: 1,
+      expired: 2,
+      opted_out: 3,
+      disqualified: 4,
+    };
+    leads.sort((a, b) => {
+      const rank = statusRank[a.status] - statusRank[b.status];
+      if (rank !== 0) return rank;
+      const score = (b.score ?? -1) - (a.score ?? -1);
+      if (score !== 0) return score;
+      return b.startedAt - a.startedAt;
+    });
+
+    const qualifiedScores = leads
+      .filter((l) => l.status === "qualified" && l.score !== null)
+      .map((l) => l.score as number);
+    const totalTracked = LEAD_STATUSES.reduce((n, s) => n + (summary[s] ?? 0), 0);
+
+    return {
+      summary: {
+        collecting: summary.collecting ?? 0,
+        qualified: summary.qualified ?? 0,
+        expired: summary.expired ?? 0,
+        opted_out: summary.opted_out ?? 0,
+        disqualified: summary.disqualified ?? 0,
+        total: totalTracked,
+        qualificationRate:
+          totalTracked > 0 ? Math.round(((summary.qualified ?? 0) / totalTracked) * 100) : 0,
+        avgScore:
+          qualifiedScores.length > 0
+            ? Math.round(qualifiedScores.reduce((a, b) => a + b, 0) / qualifiedScores.length)
+            : 0,
+      },
+      leads,
+    };
+  },
+});
