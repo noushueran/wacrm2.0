@@ -237,7 +237,13 @@ export default defineSchema({
     // connected client. Deliberately NOT a prefix of `by_account`:
     // Convex appends `_creationTime` to each index, so `by_account` is
     // `["accountId", "_creationTime"]` and cannot express this range.
-    .index("by_account_unread", ["accountId", "unreadCount"]),
+    .index("by_account_unread", ["accountId", "unreadCount"])
+    // `dashboard.metrics` counts this account's OPEN conversations.
+    // Unlike `by_account_unread` above, `status` changes rarely
+    // (open/pending/closed), so this entry almost never moves — it costs
+    // the per-message write path essentially nothing, and it keeps closed
+    // conversations out of the dashboard's read (and invalidation) set.
+    .index("by_account_status", ["accountId", "status"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -384,6 +390,12 @@ export default defineSchema({
     updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
+    // `dashboard.metrics` and `dashboard.pipelineDonut` both aggregate
+    // this account's OPEN deals; without this they scanned every deal and
+    // dropped won/lost ones in JS. `by_account` is kept: it is
+    // `["accountId", "_creationTime"]`, which this index cannot stand in
+    // for — `dashboard.activity` still reads every deal in creation order.
+    .index("by_account_status", ["accountId", "status"])
     .index("by_pipeline", ["pipelineId"])
     .index("by_stage", ["stageId"])
     .index("by_contact", ["contactId"]),

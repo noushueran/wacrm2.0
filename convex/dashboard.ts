@@ -57,12 +57,17 @@ export const metrics = accountQuery({
     // today-vs-yesterday, not yesterday's open count). All three are
     // derived from one collected array rather than three separate
     // scans. UNBOUNDED: this reads every currently-open conversation in
-    // the account, with no time window — there's no `(accountId,
-    // status)` index today to narrow it further (see report).
+    // Bound to the open rows by `by_account_status` rather than scanning
+    // the account's whole conversation set and filtering in JS. Still
+    // unbounded in the number of OPEN conversations (inherent to a count
+    // of them), but closed ones are no longer read — which also narrows
+    // the invalidation set, since this query is re-run on every write it
+    // read and a closed conversation's writes no longer qualify.
     const openConversations = await ctx.db
       .query("conversations")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
     const newOpenToday = openConversations.filter(
       (c) => c._creationTime >= todayStartMs,
@@ -111,12 +116,15 @@ export const metrics = accountQuery({
     };
 
     // Deals: value-sum + count of every open deal, no time bound.
-    // UNBOUNDED: same shape as `openConversations` above — grows with
-    // total open deals in the account, not with a time window.
+    // Same `by_account_status` bound as `openConversations` above: won
+    // and lost deals are no longer read, so they no longer invalidate
+    // this query either. Grows with the account's OPEN deals, which is
+    // what it is counting.
     const openDeals = await ctx.db
       .query("deals")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
     const openDealsValue = openDeals.reduce((sum, d) => sum + d.value, 0);
 
@@ -215,14 +223,14 @@ export const pipelineDonut = accountQuery({
       .collect();
     stages.sort((a, b) => a.position - b.position);
 
-    // UNBOUNDED: every open deal in the account, no time bound — same
-    // shape/cost as `metrics`'s `openDeals` above (in fact the same
-    // underlying rows; each caller re-reads independently since there's
-    // no cross-request cache in Convex).
+    // Same `by_account_status` bound as `metrics`'s `openDeals` — and in
+    // fact the same underlying rows, re-read independently (Convex has no
+    // cross-request cache, so the two queries cannot share the scan).
     const openDeals = await ctx.db
       .query("deals")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
 
     const byStage = new Map<Id<"pipelineStages">, { count: number; total: number }>();
@@ -401,11 +409,18 @@ export const activity = accountQuery({
       .order("desc")
       .filter((q) => q.eq(q.field("senderType"), "customer"))
       .take(10);
-    for (const message of recentCustomerMessages) {
-      const conversation = await ctx.db.get(message.conversationId);
-      const contact = conversation
-        ? await ctx.db.get(conversation.contactId)
-        : null;
+    // Two parallel waves rather than a per-message `get` chain. The
+    // conversation -> contact hop is genuinely dependent (the contact id
+    // comes off the conversation), but nothing depends across messages,
+    // so this is 2 round-trips instead of 2 per message.
+    const messageConversations = await Promise.all(
+      recentCustomerMessages.map((m) => ctx.db.get(m.conversationId)),
+    );
+    const messageContacts = await Promise.all(
+      messageConversations.map((c) => (c ? ctx.db.get(c.contactId) : null)),
+    );
+    recentCustomerMessages.forEach((message, i) => {
+      const contact = messageContacts[i];
       const who = contact?.name || contact?.phone || "Unknown";
       items.push({
         id: `msg-${message._id}`,
@@ -414,7 +429,7 @@ export const activity = accountQuery({
         atMs: message._creationTime,
         href: `/inbox?c=${message.conversationId}`,
       });
-    }
+    });
 
     // Contacts, newest 10 — pure index-ordered take, no filter
     // predicate, so this one is genuinely bounded regardless of table
@@ -452,8 +467,12 @@ export const activity = accountQuery({
     allDeals.sort(
       (a, b) => (b.updatedAt ?? b._creationTime) - (a.updatedAt ?? a._creationTime),
     );
-    for (const deal of allDeals.slice(0, 10)) {
-      const stage = await ctx.db.get(deal.stageId);
+    const recentDeals = allDeals.slice(0, 10);
+    const dealStages = await Promise.all(
+      recentDeals.map((deal) => ctx.db.get(deal.stageId)),
+    );
+    recentDeals.forEach((deal, i) => {
+      const stage = dealStages[i];
       items.push({
         id: `deal-${deal._id}`,
         kind: "deal",
@@ -463,7 +482,7 @@ export const activity = accountQuery({
         atMs: deal.updatedAt ?? deal._creationTime,
         href: "/pipelines",
       });
-    }
+    });
 
     // Broadcasts, newest 5 — pure index-ordered take, bounded.
     const recentBroadcasts = await ctx.db
@@ -492,11 +511,21 @@ export const activity = accountQuery({
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .order("desc")
       .take(10);
-    for (const log of recentAutoLogs) {
-      const automation = await ctx.db.get(log.automationId);
-      const contact = log.contactId ? await ctx.db.get(log.contactId) : null;
+    // One wave: unlike the message loop above, a log's automation and its
+    // contact are independent of each other (both ids come off the log),
+    // so neither dimension has to wait on the other.
+    const [logAutomations, logContacts] = await Promise.all([
+      Promise.all(recentAutoLogs.map((log) => ctx.db.get(log.automationId))),
+      Promise.all(
+        recentAutoLogs.map((log) =>
+          log.contactId ? ctx.db.get(log.contactId) : null,
+        ),
+      ),
+    ]);
+    recentAutoLogs.forEach((log, i) => {
+      const contact = logContacts[i];
       const who = contact?.name || contact?.phone || "a contact";
-      const autoName = automation?.name || "Automation";
+      const autoName = logAutomations[i]?.name || "Automation";
       items.push({
         id: `auto-${log._id}`,
         kind: "automation",
@@ -505,7 +534,7 @@ export const activity = accountQuery({
         } ${who}`,
         atMs: log._creationTime,
       });
-    }
+    });
 
     return items
       .sort((a, b) => b.atMs - a.atMs)
