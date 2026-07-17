@@ -88,7 +88,17 @@ test("capi: dormant without env leaves the row pending (no attempt bump)", async
 test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", async () => {
   process.env.META_CAPI_DATASET_ID = "DS1";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";
-  let captured: any = null;
+  let captured:
+    | {
+        data: Array<{
+          event_name: string;
+          action_source: string;
+          messaging_channel: string;
+          user_data: Record<string, string>;
+          custom_data: Record<string, unknown>;
+        }>;
+      }
+    | null = null;
   globalThis.fetch = (async (_url: string, init: RequestInit) => {
     captured = JSON.parse(init.body as string);
     return new Response(JSON.stringify({ fbtrace_id: "trace-9" }), { status: 200 });
@@ -103,7 +113,7 @@ test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", as
 
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
-  const ev = captured.data[0];
+  const ev = captured!.data[0];
   expect(ev.event_name).toBe("Purchase");
   expect(ev.action_source).toBe("business_messaging");
   expect(ev.messaging_channel).toBe("whatsapp");
@@ -118,7 +128,9 @@ test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", as
 test("platformA: POSTs code + stage/event and marks sent on matched", async () => {
   process.env.LANDING_CONVERSION_URL = "https://a.example/whatsapp-conversion";
   process.env.WA_CONVERSION_SHARED_SECRET = "secret";
-  let captured: any = null;
+  let captured:
+    | { code: string; stage: string; event: string; phone: string }
+    | null = null;
   let authHeader: string | null = null;
   globalThis.fetch = (async (_url: string, init: RequestInit) => {
     captured = JSON.parse(init.body as string);
@@ -134,10 +146,10 @@ test("platformA: POSTs code + stage/event and marks sent on matched", async () =
 
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
-  expect(captured.code).toBe("ABCDEF");
-  expect(captured.stage).toBe("new_lead");
-  expect(captured.event).toBe("Lead");
-  expect(captured.phone).toBe("+15551230000");
+  expect(captured!.code).toBe("ABCDEF");
+  expect(captured!.stage).toBe("new_lead");
+  expect(captured!.event).toBe("Lead");
+  expect(captured!.phone).toBe("+15551230000");
   expect(authHeader).toBe("Bearer secret");
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("sent");
