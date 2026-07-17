@@ -50,19 +50,26 @@ export function NotificationBell() {
   const [open, setOpen] = useState(false);
   const [markingAll, setMarkingAll] = useState(false);
 
-  // Reactive — `api.notifications.list` is a live Convex subscription scoped
-  // to the caller, so the badge and rows update on their own as notifications
-  // arrive or are marked read. No optimistic wiring needed.
-  const notificationsResult = useQuery(api.notifications.list);
-  const notifications = useMemo(
-    () => notificationsResult?.map(toUiNotification) ?? null,
-    [notificationsResult],
+  // Reactive — both are live Convex subscriptions scoped to the caller, so
+  // the badge and rows update on their own as notifications arrive or are
+  // marked read. No optimistic wiring needed.
+  //
+  // Deliberately NOT `api.notifications.list` (which the /notifications page
+  // uses): this bell mounts on every authenticated page, and `list` reads the
+  // caller's entire notification history. These two are index-bounded — the
+  // rows stop at POPOVER_LIMIT, and the count saturates at its own cap — so
+  // what the bell reads no longer grows with history.
+  const recentResult = useQuery(api.notifications.listRecent, {
+    limit: POPOVER_LIMIT,
+  });
+  const recent = useMemo(
+    () => recentResult?.map(toUiNotification) ?? null,
+    [recentResult],
   );
 
-  const unreadCount = useMemo(
-    () => notifications?.filter((n) => !n.read_at).length ?? 0,
-    [notifications],
-  );
+  // Saturates at the server's cap (>= 10), which `formatUnreadBadge` renders
+  // as "9+" — visually identical to an exact count, but a bounded read.
+  const unreadCount = useQuery(api.notifications.unreadCount) ?? 0;
 
   const markReadMutation = useMutation(api.notifications.markRead);
   const markAllReadMutation = useMutation(api.notifications.markAllRead);
@@ -107,7 +114,6 @@ export function NotificationBell() {
   }
 
   const badge = formatUnreadBadge(unreadCount);
-  const recent = notifications?.slice(0, POPOVER_LIMIT) ?? [];
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -154,7 +160,7 @@ export function NotificationBell() {
           </button>
         </div>
 
-        {notifications === null ? (
+        {recent === null ? (
           <div className="flex h-24 items-center justify-center">
             <Loader2 className="h-5 w-5 animate-spin text-primary" />
           </div>
