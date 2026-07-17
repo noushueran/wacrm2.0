@@ -36,6 +36,7 @@ import { useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { buildFunnelSteps } from "@/lib/inbox/funnelView";
+import { listSectionState } from "@/lib/inbox/view";
 
 interface ContactSidebarProps {
   contact: Contact | null;
@@ -100,6 +101,10 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
     contactId ? { contactId } : "skip",
   );
   const deals = (dealDocs ?? []).map(toUiDeal);
+  // Distinguish "still loading" (dealDocs === undefined) from "loaded, no
+  // deals" so the section never flashes "No deals yet" during the cold
+  // round-trip on first open — a falsehood an agent could act on.
+  const dealsState = listSectionState(dealDocs);
 
   const noteDocs = useQuery(
     api.contactNotes.listForContact,
@@ -498,7 +503,12 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
           <div>
             <SectionLabel icon={DollarSign} label={tSidebar("deals")} />
             <div className="mt-2 space-y-2">
-              {deals.length === 0 ? (
+              {dealsState === "loading" ? (
+                <div className="space-y-2" aria-hidden>
+                  <div className="h-14 animate-pulse rounded-lg bg-muted" />
+                  <div className="h-14 animate-pulse rounded-lg bg-muted" />
+                </div>
+              ) : dealsState === "empty" ? (
                 <p className="px-1 text-xs text-muted-foreground">
                   {tSidebar("noDeals")}
                 </p>

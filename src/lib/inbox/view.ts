@@ -45,3 +45,19 @@ export function messageAreaState(
   if (messageCount === 0) return "empty";
   return "list";
 }
+
+/**
+ * What a Convex-`useQuery`-backed list section (deals, notes, …) should
+ * render. A reactive query is `undefined` while its first result is in
+ * flight and an array once loaded. Callers that write `docs ?? []`
+ * collapse those two states, so a still-loading section wrongly asserts
+ * its empty message (e.g. "No deals yet") for the whole cold round-trip.
+ * Feed the RAW query result here to keep "loading" distinct from "empty".
+ */
+export function listSectionState(
+  docs: readonly unknown[] | undefined,
+): MessageAreaState {
+  if (docs === undefined) return "loading";
+  if (docs.length === 0) return "empty";
+  return "list";
+}

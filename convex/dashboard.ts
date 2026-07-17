@@ -417,11 +417,18 @@ export const activity = accountQuery({
       .order("desc")
       .filter((q) => q.eq(q.field("senderType"), "customer"))
       .take(10);
-    for (const message of recentCustomerMessages) {
-      const conversation = await ctx.db.get(message.conversationId);
-      const contact = conversation
-        ? await ctx.db.get(conversation.contactId)
-        : null;
+    // Two parallel waves rather than a per-message `get` chain. The
+    // conversation -> contact hop is genuinely dependent (the contact id
+    // comes off the conversation), but nothing depends across messages,
+    // so this is 2 round-trips instead of 2 per message.
+    const messageConversations = await Promise.all(
+      recentCustomerMessages.map((m) => ctx.db.get(m.conversationId)),
+    );
+    const messageContacts = await Promise.all(
+      messageConversations.map((c) => (c ? ctx.db.get(c.contactId) : null)),
+    );
+    recentCustomerMessages.forEach((message, i) => {
+      const contact = messageContacts[i];
       const who = contact?.name || contact?.phone || "Unknown";
       items.push({
         id: `msg-${message._id}`,
@@ -430,7 +437,7 @@ export const activity = accountQuery({
         atMs: message._creationTime,
         href: `/inbox?c=${message.conversationId}`,
       });
-    }
+    });
 
     // Contacts, newest 10 — pure index-ordered take, no filter
     // predicate, so this one is genuinely bounded regardless of table
@@ -474,8 +481,12 @@ export const activity = accountQuery({
       .withIndex("by_account_updated", (q) => q.eq("accountId", ctx.accountId))
       .order("desc")
       .take(10);
-    for (const deal of recentDeals) {
-      const stage = await ctx.db.get(deal.stageId);
+    // One wave for the stage lookups — nothing depends across deals.
+    const dealStages = await Promise.all(
+      recentDeals.map((deal) => ctx.db.get(deal.stageId)),
+    );
+    recentDeals.forEach((deal, i) => {
+      const stage = dealStages[i];
       items.push({
         id: `deal-${deal._id}`,
         kind: "deal",
@@ -485,7 +496,7 @@ export const activity = accountQuery({
         atMs: deal.updatedAt ?? deal._creationTime,
         href: "/pipelines",
       });
-    }
+    });
 
     // Broadcasts, newest 5 — pure index-ordered take, bounded.
     const recentBroadcasts = await ctx.db
@@ -514,11 +525,21 @@ export const activity = accountQuery({
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .order("desc")
       .take(10);
-    for (const log of recentAutoLogs) {
-      const automation = await ctx.db.get(log.automationId);
-      const contact = log.contactId ? await ctx.db.get(log.contactId) : null;
+    // One wave: unlike the message loop above, a log's automation and its
+    // contact are independent of each other (both ids come off the log),
+    // so neither dimension has to wait on the other.
+    const [logAutomations, logContacts] = await Promise.all([
+      Promise.all(recentAutoLogs.map((log) => ctx.db.get(log.automationId))),
+      Promise.all(
+        recentAutoLogs.map((log) =>
+          log.contactId ? ctx.db.get(log.contactId) : null,
+        ),
+      ),
+    ]);
+    recentAutoLogs.forEach((log, i) => {
+      const contact = logContacts[i];
       const who = contact?.name || contact?.phone || "a contact";
-      const autoName = automation?.name || "Automation";
+      const autoName = logAutomations[i]?.name || "Automation";
       items.push({
         id: `auto-${log._id}`,
         kind: "automation",
@@ -527,7 +548,7 @@ export const activity = accountQuery({
         } ${who}`,
         atMs: log._creationTime,
       });
-    }
+    });
 
     return items
       .sort((a, b) => b.atMs - a.atMs)
