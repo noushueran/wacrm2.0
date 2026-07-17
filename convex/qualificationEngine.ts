@@ -19,12 +19,19 @@ import { latestUserMessage } from "./lib/ai/query";
 import { toChatMessages } from "./lib/ai/context";
 import { generateReply } from "./lib/ai/generate";
 import { applyStageTransition } from "./funnel";
+import {
+  clampToWorkingHours,
+  computeNextFollowUpAt,
+  isSessionExpired,
+  withinServiceWindow,
+  pickFollowUpText,
+} from "./lib/qualification/schedule";
 import { insertNotification } from "./notifications";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import type { AccountRole } from "./lib/roles";
 import { normalizePhone } from "./lib/phone";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
 // Qualification engine internals (P0: tracking only — spec §6 of
@@ -59,12 +66,28 @@ export const onInbound = internalMutation({
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
     if (conversation.status === "closed") return;
+    const now = Date.now();
     await recordInboundActivity(ctx, {
       accountId: args.accountId,
       conversationId: args.conversationId,
       contactId: args.contactId,
-      now: Date.now(),
+      now,
     });
+    // Arm the follow-up clock (spec §6 step 4) — unconditionally while
+    // the session is collecting, independent of whether the assistant
+    // replies. Any later inbound re-arms; completion/terminal intents
+    // clear it. `recordInboundActivity` just cleared the previous value,
+    // so this is the single arming point.
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .unique();
+    if (session && session.status === "collecting") {
+      const at = computeNextFollowUpAt(config, session.followUpsSent, now);
+      if (at !== null) {
+        await ctx.db.patch(session._id, { nextFollowUpAt: at });
+      }
+    }
   },
 });
 
@@ -756,5 +779,309 @@ export const sendAdminAlerts = internalAction({
     } catch (err) {
       console.error("[qualification] admin alerts failed:", err);
     }
+  },
+});
+
+// ============================================================
+// P3 — the follow-up engine (spec §8). A 5-minute cron sweeps due
+// sessions (`by_due`, bounded — the retryConversionEvents shape) and
+// fans each out to `sendFollowUp`, which re-checks EVERY guard at send
+// time, then sends free-form (inside the 24h window, rotating the
+// pre-written phrasings) or the approved re-engagement template
+// (outside it). All state changes go through small mutations so a
+// mid-flight crash never double-sends.
+// ============================================================
+
+export const getDueSessions = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Doc<"qualificationSessions">[]> => {
+    const now = Date.now();
+    return await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_due", (q) =>
+        q.eq("status", "collecting").gt("nextFollowUpAt", 0).lte("nextFollowUpAt", now),
+      )
+      .take(100);
+  },
+});
+
+export const sweepFollowUps = internalAction({
+  args: {},
+  handler: async (ctx): Promise<void> => {
+    const due = await ctx.runQuery(internal.qualificationEngine.getDueSessions, {});
+    for (const session of due) {
+      await ctx.scheduler.runAfter(0, internal.qualificationEngine.sendFollowUp, {
+        sessionId: session._id,
+      });
+    }
+  },
+});
+
+type FollowUpVerdict =
+  | { kind: "skip" }
+  | { kind: "clear" }
+  | { kind: "expire"; reason: string }
+  | { kind: "reschedule"; at: number }
+  | { kind: "sendText"; to: string; text: string; nextCursor: number }
+  | {
+      kind: "sendTemplate";
+      to: string;
+      templateName: string;
+      language: string | null;
+      params: string[];
+      contentText: string;
+    };
+
+/**
+ * The guard chain (spec §8), evaluated at SEND time — arming happened
+ * minutes-to-hours earlier and anything may have changed since. Order
+ * matters: expiry always wins (the 3-day rule applies even to threads a
+ * human paused), then human-owned threads yield until the expiry check
+ * (extraction may still qualify them), then hours, then the 24h window
+ * picks the channel.
+ */
+export const followUpContext = internalQuery({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args): Promise<FollowUpVerdict> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return { kind: "skip" };
+    const config = await loadEnabledConfig(ctx, session.accountId);
+    if (!config) return { kind: "clear" };
+    const now = Date.now();
+    if (!session.nextFollowUpAt || session.nextFollowUpAt > now) return { kind: "skip" };
+    // Outbound-origin sessions with no reply yet have no service window
+    // at all — passive by design (spec §8; outboundNudgesEnabled is a
+    // future lever). Defensive: arming only happens on inbound.
+    if (!session.lastCustomerMessageAt) return { kind: "clear" };
+
+    if (isSessionExpired(session.lastCustomerMessageAt, now, config.sessionWindowHours)) {
+      return { kind: "expire", reason: "no_response" };
+    }
+    const conversation = await ctx.db.get(session.conversationId);
+    if (!conversation || conversation.accountId !== session.accountId) {
+      return { kind: "clear" };
+    }
+    if (conversation.status === "closed") {
+      return { kind: "expire", reason: "conversation_closed" };
+    }
+    // One more visit right after expiry so the sweep can close the file.
+    const expiryRevisit =
+      session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
+    if (conversation.aiAutoreplyDisabled) return { kind: "reschedule", at: expiryRevisit };
+    if (
+      session.humanTouchedAt &&
+      session.humanTouchedAt > session.lastCustomerMessageAt
+    ) {
+      return { kind: "reschedule", at: expiryRevisit };
+    }
+    if (session.followUpsSent >= config.maxFollowUps) {
+      return { kind: "reschedule", at: expiryRevisit };
+    }
+    const clamped = clampToWorkingHours(now, config);
+    if (clamped > now) return { kind: "reschedule", at: clamped };
+
+    const contact = await ctx.db.get(session.contactId);
+    if (!contact) return { kind: "clear" };
+
+    if (withinServiceWindow(session.lastCustomerMessageAt, now)) {
+      const picked = pickFollowUpText(session, config);
+      return {
+        kind: "sendText",
+        to: contact.phone,
+        text: picked.text,
+        nextCursor: picked.nextCursor,
+      };
+    }
+    if (config.reengagementTemplateName) {
+      const name = contact.name?.trim() || "there";
+      return {
+        kind: "sendTemplate",
+        to: contact.phone,
+        templateName: config.reengagementTemplateName,
+        language: config.reengagementTemplateLanguage ?? null,
+        params: [name],
+        contentText:
+          `Hi ${name}! We're still here to prepare your travel options — ` +
+          "reply and we'll pick up right where we left off.",
+      };
+    }
+    // Window closed and no approved template: nothing compliant to send.
+    // Wait out the 72h clock (surfaced as a Settings warning).
+    return { kind: "reschedule", at: expiryRevisit };
+  },
+});
+
+export const markSessionExpired = internalMutation({
+  args: { sessionId: v.id("qualificationSessions"), reason: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return;
+    await ctx.db.patch(args.sessionId, {
+      status: "expired",
+      closedReason: args.reason,
+      nextFollowUpAt: undefined,
+    });
+  },
+});
+
+export const setNextFollowUpAt = internalMutation({
+  args: {
+    sessionId: v.id("qualificationSessions"),
+    at: v.union(v.number(), v.null()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return;
+    await ctx.db.patch(args.sessionId, {
+      nextFollowUpAt: args.at === null ? undefined : args.at,
+    });
+  },
+});
+
+/** Books the slot AFTER a successful send: attempt count, phrasing
+ *  rotation, next rung of the ladder (or the expiry revisit when the
+ *  ladder/cap is exhausted). */
+export const recordFollowUpSent = internalMutation({
+  args: {
+    sessionId: v.id("qualificationSessions"),
+    nextCursor: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return;
+    const config = await loadEnabledConfig(ctx, session.accountId);
+    const now = Date.now();
+    const sent = session.followUpsSent + 1;
+    let next: number | null = null;
+    if (config) {
+      next = computeNextFollowUpAt(config, sent, now);
+      if (next === null && session.lastCustomerMessageAt) {
+        next = session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
+      }
+    }
+    await ctx.db.patch(args.sessionId, {
+      followUpsSent: sent,
+      sendAttemptErrors: 0,
+      ...(args.nextCursor !== undefined ? { phrasingCursor: args.nextCursor } : {}),
+      nextFollowUpAt: next ?? undefined,
+    });
+  },
+});
+
+/** Bounded send-failure retry: +30min, three strikes skips the slot
+ *  (mirrors the outbox's attempts cap). */
+export const recordFollowUpError = internalMutation({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args): Promise<void> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return;
+    const errors = session.sendAttemptErrors + 1;
+    if (errors >= 3) {
+      const config = await loadEnabledConfig(ctx, session.accountId);
+      const now = Date.now();
+      const sent = session.followUpsSent + 1; // slot consumed
+      let next: number | null = null;
+      if (config) {
+        next = computeNextFollowUpAt(config, sent, now);
+        if (next === null && session.lastCustomerMessageAt) {
+          next = session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
+        }
+      }
+      await ctx.db.patch(args.sessionId, {
+        followUpsSent: sent,
+        sendAttemptErrors: 0,
+        nextFollowUpAt: next ?? undefined,
+      });
+      return;
+    }
+    await ctx.db.patch(args.sessionId, {
+      sendAttemptErrors: errors,
+      nextFollowUpAt: Date.now() + 30 * 60_000,
+    });
+  },
+});
+
+export const sendFollowUp = internalAction({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const verdict = await ctx.runQuery(internal.qualificationEngine.followUpContext, {
+        sessionId: args.sessionId,
+      });
+      const session = { sessionId: args.sessionId };
+      switch (verdict.kind) {
+        case "skip":
+          return;
+        case "clear":
+          await ctx.runMutation(internal.qualificationEngine.setNextFollowUpAt, {
+            ...session,
+            at: null,
+          });
+          return;
+        case "expire":
+          await ctx.runMutation(internal.qualificationEngine.markSessionExpired, {
+            ...session,
+            reason: verdict.reason,
+          });
+          return;
+        case "reschedule":
+          await ctx.runMutation(internal.qualificationEngine.setNextFollowUpAt, {
+            ...session,
+            at: verdict.at,
+          });
+          return;
+        case "sendText":
+        case "sendTemplate": {
+          const meta = await ctx.runQuery(internal.qualificationEngine.sendTarget, {
+            sessionId: args.sessionId,
+          });
+          if (!meta) return;
+          try {
+            if (verdict.kind === "sendText") {
+              await ctx.runAction(internal.metaSend.sendText, {
+                accountId: meta.accountId,
+                conversationId: meta.conversationId,
+                to: verdict.to,
+                text: verdict.text,
+              });
+              await ctx.runMutation(internal.qualificationEngine.recordFollowUpSent, {
+                ...session,
+                nextCursor: verdict.nextCursor,
+              });
+            } else {
+              await ctx.runAction(internal.metaSend.sendTemplate, {
+                accountId: meta.accountId,
+                conversationId: meta.conversationId,
+                to: verdict.to,
+                templateName: verdict.templateName,
+                language: verdict.language ?? undefined,
+                params: verdict.params,
+                contentText: verdict.contentText,
+              });
+              await ctx.runMutation(internal.qualificationEngine.recordFollowUpSent, session);
+            }
+          } catch (err) {
+            console.error("[qualification] follow-up send failed:", err);
+            await ctx.runMutation(internal.qualificationEngine.recordFollowUpError, session);
+          }
+          return;
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] follow-up failed:", err);
+    }
+  },
+});
+
+/** Tiny address lookup for `sendFollowUp` (an action has no db). */
+export const sendTarget = internalQuery({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ accountId: Id<"accounts">; conversationId: Id<"conversations"> } | null> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session) return null;
+    return { accountId: session.accountId, conversationId: session.conversationId };
   },
 });

@@ -90,7 +90,15 @@ export function withinServiceWindow(lastCustomerMessageAt: number, nowMs: number
 type PickInput = {
   phrasingCursor: number;
   pendingQuestion?: { key: string; text: string; alternates: string[] };
-  fields: { key: string; confidence: "high" | "medium" | "low" }[];
+  // Structurally compatible with the session's stored field rows —
+  // extra props (value, updatedAt, label) are welcome and ignored.
+  fields: {
+    key: string;
+    confidence: "high" | "medium" | "low";
+    value?: string;
+    label?: string;
+    updatedAt?: number;
+  }[];
 };
 
 /**

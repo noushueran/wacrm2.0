@@ -23,4 +23,15 @@ crons.interval(
   {},
 );
 
+// Qualification follow-ups (spec §8): sweep due collecting sessions
+// (by_due, take 100) and fan out sendFollowUp per row — every guard
+// (expiry, human takeover, working hours, 24h window) re-checked at
+// send time. No-op while the feature is disabled (no due rows exist).
+crons.interval(
+  "qualification-follow-ups",
+  { minutes: 5 },
+  internal.qualificationEngine.sweepFollowUps,
+  {},
+);
+
 export default crons;

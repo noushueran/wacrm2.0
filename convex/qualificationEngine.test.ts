@@ -477,3 +477,148 @@ test("sendAdminAlerts creates a silenced internal conversation, sends the alert,
   // loop guard: the alert send must NOT have opened a qualification session
   expect(await sessionsFor(t, adminConversation!._id)).toHaveLength(0);
 });
+
+// ---- P3: follow-up engine ----
+
+async function seedAllHours(t: TestConvex<typeof schema>) {
+  const base = await seed(t);
+  await t.run(async (ctx) => {
+    const config = await ctx.db.query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", base.accountId)).unique();
+    // 24/7 window so these tests never depend on the wall clock; the
+    // working-hours clamp itself is covered by schedule.test.ts.
+    await ctx.db.patch(config!._id, { workStartMinute: 0, workEndMinute: 1440, workDays: [0, 1, 2, 3, 4, 5, 6] });
+  });
+  await configureAi(base.asUser);
+  return base;
+}
+
+async function seedDueSession(
+  t: ReturnType<typeof convexTest>,
+  base: { accountId: Id<"accounts">; contactId: Id<"contacts">; conversationId: Id<"conversations"> },
+  overrides: Record<string, unknown> = {},
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "collecting", origin: "inbound",
+      fields: [], expectedCount: 4, answeredCount: 1,
+      pendingQuestion: {
+        key: "travel_dates",
+        text: "When are you planning to travel?",
+        alternates: ["Rough month works too — when?"],
+      },
+      lastCustomerMessageAt: Date.now() - 2 * 3_600_000, // 2h ago: inside 24h
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+      nextFollowUpAt: Date.now() - 1000,
+      ...overrides,
+    }),
+  );
+}
+
+function messagesFor(t: TestConvex<typeof schema>, conversationId: Id<"conversations">) {
+  return t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+}
+
+test("onInbound arms the follow-up clock while fields are missing", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedAllHours(t);
+  await t.mutation(internal.qualificationEngine.onInbound, {
+    accountId, conversationId, contactId, phoneNormalized: "971500000001",
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now());
+});
+
+test("sendFollowUp inside the 24h window sends the rotating free-form question", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  let msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].senderType).toBe("bot");
+  expect(msgs[0].contentText).toBe("When are you planning to travel?");
+  let [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(1);
+  expect(s.phrasingCursor).toBe(1);
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now());
+
+  // force due again → the ALTERNATE phrasing goes out
+  await t.run((ctx) => ctx.db.patch(sessionId, { nextFollowUpAt: Date.now() - 1000 }));
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(2);
+  expect(msgs[1].contentText).toBe("Rough month works too — when?");
+  [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(2);
+});
+
+test("sendFollowUp beyond 24h uses the re-engagement template, or waits for expiry without one", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  // no template configured → no message, rescheduled towards expiry
+  const sessionId = await seedDueSession(t, base, {
+    lastCustomerMessageAt: Date.now() - 30 * 3_600_000, // 30h ago: window closed
+  });
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  let [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(0);
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now());
+
+  // with a template configured → template message
+  await base.asUser.mutation(api.qualification.updateConfig, {
+    patch: { reengagementTemplateName: "qualification_followup", reengagementTemplateLanguage: "en" },
+  });
+  await t.run((ctx) => ctx.db.patch(sessionId, { nextFollowUpAt: Date.now() - 1000 }));
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  const msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].contentType).toBe("template");
+  expect(msgs[0].templateName).toBe("qualification_followup");
+  [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(1);
+});
+
+test("sendFollowUp expires a session silent for 72h and yields to humans", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base, {
+    lastCustomerMessageAt: Date.now() - 73 * 3_600_000,
+  });
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  let [s] = await sessionsFor(t, base.conversationId);
+  expect(s.status).toBe("expired");
+  expect(s.closedReason).toBe("no_response");
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+
+  // human engaged → no send, rescheduled (extraction may still qualify it)
+  const second = await seedAllHours(t);
+  const humanSession = await seedDueSession(t, second, {
+    humanTouchedAt: Date.now() - 1 * 3_600_000, // newer than lastCustomerMessageAt
+    lastCustomerMessageAt: Date.now() - 2 * 3_600_000,
+  });
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId: humanSession });
+  [s] = await sessionsFor(t, second.conversationId);
+  expect(s.status).toBe("collecting");
+  expect(s.followUpsSent).toBe(0);
+  expect(await messagesFor(t, second.conversationId)).toHaveLength(0);
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now());
+});
+
+test("getDueSessions picks only due collecting sessions", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await seedDueSession(t, base); // due
+  const other = await seedAllHours(t);
+  await seedDueSession(t, other, { nextFollowUpAt: Date.now() + 3_600_000 }); // future
+  const third = await seedAllHours(t);
+  await seedDueSession(t, third, { status: "expired", nextFollowUpAt: Date.now() - 500 }); // terminal
+  const due = await t.query(internal.qualificationEngine.getDueSessions, {});
+  expect(due).toHaveLength(1);
+  expect(due[0].conversationId).toBe(base.conversationId);
+});
