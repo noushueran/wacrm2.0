@@ -10,6 +10,7 @@ import { useAction, useConvex, useMutation } from "convex/react";
 import { useQuery, usePaginatedQuery } from "@/lib/convex/cached";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
+import { QualificationChip } from "@/components/inbox/qualification-chip";
 import {
   toUiMemberProfile,
   toUiMessage,
@@ -755,6 +756,11 @@ export function MessageThread({
               {t("adLeadBadge")}
             </Badge>
           )}
+          <QualificationChip
+            conversationId={
+              conversationId ? (conversationId as Id<"conversations">) : null
+            }
+          />
           {headerChips.visible.map((tag) => (
             <span
               key={tag.id}

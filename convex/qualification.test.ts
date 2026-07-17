@@ -102,3 +102,51 @@ test("updateConfig rejects invalid values and non-admin callers", async () => {
     supervisor.as.mutation(api.qualification.updateConfig, { patch: { enabled: true } }),
   ).rejects.toThrow(); // FORBIDDEN — admin-gated (spec §12)
 });
+
+test("getSessionForConversation returns progress for accessible conversations, null without a session, NOT_FOUND out of scope", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const { contactId, conversationId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId: admin.accountId, phone: "+971500000009", phoneNormalized: "971500000009",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId: admin.accountId, contactId, status: "open", unreadCount: 0,
+    });
+    return { contactId, conversationId };
+  });
+
+  // no session yet → null
+  expect(
+    await admin.as.query(api.qualification.getSessionForConversation, { conversationId }),
+  ).toBeNull();
+
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId: admin.accountId, conversationId, contactId,
+      status: "collecting", origin: "inbound",
+      fields: [{ key: "destination", label: "Destination", value: "Bali", confidence: "high", updatedAt: 1 }],
+      expectedCount: 4, answeredCount: 1, score: 40,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const progress = await admin.as.query(api.qualification.getSessionForConversation, { conversationId });
+  expect(progress).toMatchObject({
+    status: "collecting", answeredCount: 1, expectedCount: 4, score: 40, ready: false,
+  });
+  expect(progress?.missingHint).toBeTruthy();
+
+  // an agent teammate must NOT see a colleague-assigned conversation's session
+  const agentUserId = await t.run(async (ctx) => {
+    const uid = await ctx.db.insert("users", { name: "Ag", email: "ag@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId: admin.accountId, role: "agent", fullName: "Ag", email: "ag@example.com",
+    });
+    await ctx.db.patch(conversationId, { assignedToUserId: admin.userId });
+    return uid;
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|s2` });
+  await expect(
+    asAgent.query(api.qualification.getSessionForConversation, { conversationId }),
+  ).rejects.toThrow();
+});

@@ -230,6 +230,10 @@
       "yesterday": "Yesterday",
       "adLeadBadge": "Ad lead"
     },
+    "qualification": {
+      "qualifiedBadge": "Qualified",
+      "progressTitle": "Lead qualification — next: {hint}"
+    },
     "sessionTimer": {
       "expired": "Expired",
       "xhRemaining": "{hours}h remaining",

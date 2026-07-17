@@ -1,5 +1,6 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
+import { requireConversationAccess } from "./lib/conversationAccess";
 import { holidayysDefaultConfig } from "./lib/qualification/defaults";
 import { validateConfigPatch, type QualificationConfigPatch } from "./lib/qualification/validate";
 
@@ -74,5 +75,51 @@ export const updateConfig = accountMutation({
       return existing._id;
     }
     return await ctx.db.insert("qualificationConfigs", merged);
+  },
+});
+
+/**
+ * Inbox chip data (spec §10): one conversation's qualification progress.
+ * Access mirrors the thread itself — `requireConversationAccess(...,
+ * "view")` (agents: own + unassigned; supervisor+: all; viewers may
+ * look). Null when the conversation has no session (feature off, admin
+ * channel, or pre-feature history) so the chip simply doesn't render.
+ */
+export const getSessionForConversation = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    await requireConversationAccess(ctx, args.conversationId, "view");
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .unique();
+    if (!session || session.accountId !== ctx.accountId) return null;
+
+    // Tooltip hint: the next thing the engine wants to know.
+    let missingHint: string | null = session.pendingQuestion?.text ?? null;
+    if (!missingHint && session.status === "collecting") {
+      const config = await ctx.db
+        .query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+        .unique();
+      const answered = new Set(
+        session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
+      );
+      // Same absent-row fallback as `getConfig` above: defaults apply
+      // until an admin persists a config.
+      const basicFields = config?.basicFields ?? holidayysDefaultConfig().basicFields;
+      missingHint =
+        basicFields.find((f) => f.required && !answered.has(f.key))?.label ?? null;
+    }
+
+    return {
+      status: session.status,
+      answeredCount: session.answeredCount,
+      expectedCount: session.expectedCount,
+      score: session.score ?? null,
+      serviceName: session.serviceName ?? null,
+      ready: !!session.checklistSatisfiedAt,
+      missingHint,
+    };
   },
 });
