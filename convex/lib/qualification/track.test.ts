@@ -1,4 +1,4 @@
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { expect, test } from "vitest";
 import schema from "../../schema";
 import type { Id } from "../../_generated/dataModel";
@@ -38,8 +38,12 @@ async function seed(
   });
 }
 
+// `TestConvex<typeof schema>` (not the bare `ReturnType<typeof convexTest>`
+// the seed helper uses) because this calls `.withIndex`: the
+// unparameterized type loses the concrete index names — the same
+// documented gotcha as `convex/funnel.test.ts`'s `eventsFor`.
 function sessionsFor(
-  t: ReturnType<typeof convexTest>,
+  t: TestConvex<typeof schema>,
   conversationId: Id<"conversations">,
 ) {
   return t.run((ctx) =>

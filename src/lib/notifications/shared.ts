@@ -1,15 +1,14 @@
-import { UserPlus } from "lucide-react";
+import { BadgeCheck, UserPlus } from "lucide-react";
 
 import type { Notification, NotificationType } from "@/types";
 
 /**
- * Icon per notification type. Only one type exists today
- * (`conversation_assigned`); this map keeps a second type a one-line add.
- * Shared by the full notifications page and the header notification bell so
- * the two can never drift on iconography.
+ * Icon per notification type. Shared by the full notifications page and
+ * the header notification bell so the two can never drift on iconography.
  */
 export const TYPE_ICON: Record<NotificationType, typeof UserPlus> = {
   conversation_assigned: UserPlus,
+  lead_qualified: BadgeCheck,
 };
 
 /**

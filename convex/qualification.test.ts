@@ -1,8 +1,26 @@
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
+import { api } from "./_generated/api";
 import schema from "./schema";
+import type { AccountRole } from "./lib/roles";
 
 const modules = import.meta.glob("/convex/**/*.ts");
+
+async function seedMember(t: ReturnType<typeof convexTest>, role: AccountRole) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@example.com` }),
+  );
+  const accountId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", {
+      name: "A", defaultCurrency: "AED", ownerUserId: userId,
+    });
+    await ctx.db.insert("memberships", {
+      userId, accountId: id, role, fullName: role, email: `${role}@example.com`,
+    });
+    return id;
+  });
+  return { userId, accountId, as: t.withIdentity({ subject: `${userId}|s` }) };
+}
 
 test("schema accepts qualificationConfigs, qualificationSessions and lead_qualified notifications", async () => {
   const t = convexTest(schema, modules);
@@ -43,4 +61,39 @@ test("schema accepts qualificationConfigs, qualificationSessions and lead_qualif
       .unique();
     expect(bySession?._id).toBe(sessionId);
   });
+});
+
+test("getConfig returns seeded defaults when no row exists, and the row after updateConfig", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const before = await admin.as.query(api.qualification.getConfig, {});
+  expect(before.isPersisted).toBe(false);
+  expect(before.enabled).toBe(false);
+  expect(before.workStartMinute).toBe(600);
+
+  await admin.as.mutation(api.qualification.updateConfig, { patch: { enabled: true } });
+  const after = await admin.as.query(api.qualification.getConfig, {});
+  expect(after.isPersisted).toBe(true);
+  expect(after.enabled).toBe(true);
+  expect(after.basicFields.length).toBe(4); // defaults seeded alongside the patch
+});
+
+test("updateConfig rejects invalid values and non-admin callers", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { qualifyThresholdScore: 150 },
+    }),
+  ).rejects.toThrow();
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { workStartMinute: 1300, workEndMinute: 600 },
+    }),
+  ).rejects.toThrow();
+
+  const supervisor = await seedMember(t, "supervisor");
+  await expect(
+    supervisor.as.mutation(api.qualification.updateConfig, { patch: { enabled: true } }),
+  ).rejects.toThrow(); // FORBIDDEN — admin-gated (spec §12)
 });

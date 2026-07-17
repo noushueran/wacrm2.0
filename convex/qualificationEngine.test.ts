@@ -1,4 +1,4 @@
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { expect, test } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
@@ -32,8 +32,10 @@ async function seed(
   });
 }
 
+// `TestConvex<typeof schema>` for `.withIndex` — same documented gotcha
+// as `convex/funnel.test.ts`'s `eventsFor` / `track.test.ts`'s helper.
 function sessionsFor(
-  t: ReturnType<typeof convexTest>,
+  t: TestConvex<typeof schema>,
   conversationId: Id<"conversations">,
 ) {
   return t.run((ctx) =>
