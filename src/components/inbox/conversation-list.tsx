@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useMemo, useRef, useEffect, memo } from "react";
-import { useQuery } from "convex/react";
+import { useQuery } from "@/lib/convex/cached";
 import type { PaginationStatus } from "convex/react";
 import { api } from "../../../convex/_generated/api";
 import {
