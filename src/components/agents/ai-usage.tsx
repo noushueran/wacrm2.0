@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from 'convex/react';
-import { BarChart3, Bot, PencilLine } from 'lucide-react';
+import { BarChart3, Bot, PencilLine, Tag } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 import {
@@ -24,6 +24,7 @@ import { BarChart } from '@/components/tremor/bar-chart';
 import { formatCompactNumber } from '@/lib/currency';
 import { format, parseISO } from 'date-fns';
 import { daysAgoStart, lastNDayKeys, localDayKey } from '@/lib/dashboard/date-utils';
+import { useTranslations } from 'next-intl';
 
 import { api } from '../../../convex/_generated/api';
 
@@ -39,6 +40,7 @@ interface UsageResponse {
   by_mode: {
     auto_reply: { calls: number; tokens: number };
     draft: { calls: number; tokens: number };
+    classify: { calls: number; tokens: number };
   };
   by_model: {
     model: string;
@@ -59,6 +61,7 @@ const WINDOWS = [7, 30, 90] as const;
 export function AiUsageCard() {
   const { accountId, accountRole, profileLoading } = useAuth();
   const canView = accountRole ? canEditSettings(accountRole) : false;
+  const t = useTranslations('Agents.usage');
 
   const [days, setDays] = useState<number>(30);
 
@@ -92,6 +95,7 @@ export function AiUsageCard() {
     const byMode = {
       auto_reply: { calls: 0, tokens: 0 },
       draft: { calls: 0, tokens: 0 },
+      classify: { calls: 0, tokens: 0 },
     };
     const modelMap = new Map<
       string,
@@ -190,7 +194,7 @@ export function AiUsageCard() {
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
               <Stat label="Total tokens" value={formatCompactNumber(data.totals.total_tokens)} />
               <Stat label="LLM calls" value={String(data.totals.calls)} />
               <Stat
@@ -202,6 +206,11 @@ export function AiUsageCard() {
                 label="Drafts"
                 value={formatCompactNumber(data.by_mode.draft.tokens)}
                 icon={PencilLine}
+              />
+              <Stat
+                label={t('classifyLabel')}
+                value={formatCompactNumber(data.by_mode.classify.tokens)}
+                icon={Tag}
               />
             </div>
 

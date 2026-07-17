@@ -18,14 +18,57 @@ export const list = accountQuery({
 });
 
 export const create = accountMutation({
-  args: { name: v.string(), color: v.string() },
+  args: {
+    name: v.string(),
+    color: v.string(),
+    groupId: v.optional(v.id("tagGroups")),
+    position: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
     ctx.requireRole("supervisor");
+    if (args.groupId) {
+      const group = await ctx.db.get(args.groupId);
+      if (!group || group.accountId !== ctx.accountId) {
+        throw new ConvexError({ code: "NOT_FOUND", entity: "tagGroup" });
+      }
+    }
     return await ctx.db.insert("tags", {
       accountId: ctx.accountId,
       name: args.name,
       color: args.color,
+      groupId: args.groupId,
+      position: args.position,
     });
+  },
+});
+
+export const update = accountMutation({
+  args: {
+    tagId: v.id("tags"),
+    name: v.optional(v.string()),
+    color: v.optional(v.string()),
+    groupId: v.optional(v.id("tagGroups")),
+    position: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    ctx.requireRole("supervisor");
+    const tag = await ctx.db.get(args.tagId);
+    if (!tag || tag.accountId !== ctx.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "tag" });
+    }
+    if (args.groupId) {
+      const group = await ctx.db.get(args.groupId);
+      if (!group || group.accountId !== ctx.accountId) {
+        throw new ConvexError({ code: "NOT_FOUND", entity: "tagGroup" });
+      }
+    }
+    const patch: Record<string, unknown> = {};
+    if (args.name !== undefined) patch.name = args.name;
+    if (args.color !== undefined) patch.color = args.color;
+    if (args.groupId !== undefined) patch.groupId = args.groupId;
+    if (args.position !== undefined) patch.position = args.position;
+    await ctx.db.patch(args.tagId, patch);
+    return args.tagId;
   },
 });
 

@@ -1639,3 +1639,45 @@ test("backfillContactCodes scopes numbering and counters independently per accou
   // inserts a counter when `next > 0`).
   expect(carolCounter).toBeNull();
 });
+
+// ============================================================
+// assignTag — single-select group displacement (Task 4)
+// ============================================================
+
+test("assignTag displaces the prior tag from a single-select group", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Sup", email: "ss@x.com", role: "supervisor" });
+  const gid = await asUser.mutation(api.tagGroups.create, { name: "Product", selectionMode: "single" });
+  const uae = await asUser.mutation(api.tags.create, { name: "UAE Visa", color: "#3b82f6", groupId: gid });
+  const pkg = await asUser.mutation(api.tags.create, { name: "Packages", color: "#f59e0b", groupId: gid });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+15550001", phoneNormalized: "15550001" }),
+  );
+
+  await asUser.mutation(api.contacts.assignTag, { contactId, tagId: uae });
+  await asUser.mutation(api.contacts.assignTag, { contactId, tagId: pkg }); // same single group
+
+  const links = await t.run((ctx) =>
+    ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect(),
+  );
+  expect(links.map((l) => l.tagId)).toEqual([pkg]); // UAE displaced
+});
+
+test("assignTag keeps both tags for a multi-select group", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Sup", email: "sm@x.com", role: "supervisor" });
+  const gid = await asUser.mutation(api.tagGroups.create, { name: "Destination", selectionMode: "multi" });
+  const th = await asUser.mutation(api.tags.create, { name: "Thailand", color: "#10b981", groupId: gid });
+  const ba = await asUser.mutation(api.tags.create, { name: "Bali", color: "#06b6d4", groupId: gid });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+15550002", phoneNormalized: "15550002" }),
+  );
+
+  await asUser.mutation(api.contacts.assignTag, { contactId, tagId: th });
+  await asUser.mutation(api.contacts.assignTag, { contactId, tagId: ba });
+
+  const links = await t.run((ctx) =>
+    ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect(),
+  );
+  expect(links.map((l) => l.tagId).sort()).toEqual([th, ba].sort());
+});

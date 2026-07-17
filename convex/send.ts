@@ -155,6 +155,7 @@ export const send = action({
           // Dashboard sends are agent-initiated, not automation/flow bot
           // sends — see `metaSend.ts`'s own doc comment on the default.
           senderType: "agent",
+          replyToMessageId: args.replyToMessageId,
         });
       }
       case "template": {
@@ -177,6 +178,7 @@ export const send = action({
           // Dashboard sends are agent-initiated, not automation/flow bot
           // sends — see `metaSend.ts`'s own doc comment on the default.
           senderType: "agent",
+          replyToMessageId: args.replyToMessageId,
         });
       }
       case "interactive": {
@@ -194,6 +196,7 @@ export const send = action({
           // Dashboard sends are agent-initiated, not automation/flow bot
           // sends — see `metaSend.ts`'s own doc comment on the default.
           senderType: "agent",
+          replyToMessageId: args.replyToMessageId,
         });
       }
       case "text": {
@@ -209,6 +212,7 @@ export const send = action({
           // Dashboard sends are agent-initiated, not automation/flow bot
           // sends — see `metaSend.ts`'s own doc comment on the default.
           senderType: "agent",
+          replyToMessageId: args.replyToMessageId,
         });
       }
     }

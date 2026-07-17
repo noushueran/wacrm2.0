@@ -149,9 +149,16 @@ export function canAssignToOthers(role: AccountRole): boolean {
 export const AGENT_NAV = ["/inbox", "/notifications"] as const;
 export const VIEWER_NAV = ["/inbox"] as const;
 
+/** Sections gated to admin+ even though supervisors otherwise see all nav. */
+export const ADMIN_ONLY_NAV = ["/campaigns"] as const;
+
 export function canAccessNav(role: AccountRole, href: string): boolean {
   // Match the concrete href or a nested route under it.
   const base = "/" + (href.split("/")[1] ?? "");
+  // Admin-only sections (e.g. Campaigns) override the supervisor+ blanket.
+  if ((ADMIN_ONLY_NAV as readonly string[]).includes(base)) {
+    return hasMinRole(role, "admin");
+  }
   if (hasMinRole(role, "supervisor")) return true; // supervisor/admin/owner: all
   if (role === "agent") return (AGENT_NAV as readonly string[]).includes(base);
   if (role === "viewer") return (VIEWER_NAV as readonly string[]).includes(base);

@@ -10,10 +10,11 @@ import {
   type AssigneeDisplay,
 } from "@/lib/inbox/conversations";
 import { PrefetchThread } from "@/components/inbox/prefetch-thread";
-import { toUiTag, toUiMemberProfile } from "@/lib/convex/adapters";
+import { toUiTag, toUiTagGroup, toUiMemberProfile } from "@/lib/convex/adapters";
+import { tagChipRow } from "@/lib/inbox/labels";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
-import type { Conversation, ConversationStatus, Tag, Profile } from "@/types";
+import type { Conversation, ConversationStatus, Tag, TagGroup, Profile } from "@/types";
 import { Search, ChevronDown, X } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -101,6 +102,14 @@ export function ConversationList({
   // use by a loaded conversation).
   const tagDocs = useQuery(api.tags.list);
   const tags = (tagDocs ?? []).map(toUiTag);
+
+  // Tag groups — order each row's tag chips by the group's own position
+  // (most important dimensions first, so they survive the +N cut-off).
+  const groupDocs = useQuery(api.tagGroups.list);
+  const groups = useMemo(
+    () => (groupDocs ?? []).map(toUiTagGroup),
+    [groupDocs],
+  );
 
   // Current user + account roster — resolve each row's assignee chip
   // (a teammate's name/initial, or "You"). `api.members.list` is already
@@ -456,6 +465,7 @@ export function ConversationList({
                 onHover={handleHover}
                 onHoverEnd={handleHoverEnd}
                 t={t}
+                groups={groups}
               />
             ))}
             {/* Load more — Convex cursor pagination. Not gated on the
@@ -501,6 +511,7 @@ interface ConversationItemProps {
   /** Pointer left this row before the debounce fired — cancel it. */
   onHoverEnd: () => void;
   t: ReturnType<typeof useTranslations>;
+  groups: TagGroup[];
 }
 
 function ConversationItem({
@@ -511,10 +522,12 @@ function ConversationItem({
   onHover,
   onHoverEnd,
   t,
+  groups,
 }: ConversationItemProps) {
   const contact = conversation.contact;
   const displayName = contact?.name || contact?.phone || t("unknown");
   const initials = displayName.charAt(0).toUpperCase();
+  const chips = tagChipRow(groups, contact?.tags ?? [], 3);
 
   const handleClick = useCallback(() => {
     onSelect(conversation);
@@ -597,6 +610,24 @@ function ConversationItem({
             />
           </div>
         </div>
+        {chips.visible.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1">
+            {chips.visible.map((tag) => (
+              <span
+                key={tag.id}
+                className="rounded-full px-2 py-0.5 text-[10px] font-medium"
+                style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
+              >
+                {tag.name}
+              </span>
+            ))}
+            {chips.overflow > 0 && (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                +{chips.overflow}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </button>
   );

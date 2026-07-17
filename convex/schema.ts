@@ -77,6 +77,17 @@ export default defineSchema({
     nationality: v.optional(v.string()),
     preferredDestination: v.optional(v.string()),
     notes: v.optional(v.string()),
+    // Lead-acquisition provenance. Set ONCE, the first time a contact
+    // arrives via a Click-to-WhatsApp ad referral; never overwritten.
+    acquisitionSource: v.optional(v.literal("ad")),
+    acquisitionAd: v.optional(
+      v.object({
+        headline: v.optional(v.string()),
+        sourceId: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        firstSeenAt: v.number(),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_account_phone", ["accountId", "phoneNormalized"])
@@ -86,10 +97,28 @@ export default defineSchema({
     }),
 
   // A label defined per-account and attached to contacts via `contactTags`.
+  // Optionally belongs to a `tagGroups` dimension (Product, Destination, …);
+  // ungrouped tags (groupId unset) remain valid — pre-grouping tags stay usable.
   tags: defineTable({
     accountId: v.id("accounts"),
     name: v.string(),
     color: v.string(),
+    groupId: v.optional(v.id("tagGroups")),
+    position: v.optional(v.number()),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_group", ["groupId"]),
+
+  // A dimension that tags are organised under. `selectionMode: "single"`
+  // means a contact holds at most one tag from this group (e.g. Priority);
+  // "multi" allows several (e.g. Destination). `position` orders groups
+  // in the UI.
+  tagGroups: defineTable({
+    accountId: v.id("accounts"),
+    name: v.string(),
+    color: v.optional(v.string()),
+    selectionMode: v.union(v.literal("single"), v.literal("multi")),
+    position: v.number(),
   }).index("by_account", ["accountId"]),
 
   // Join table between `contacts` and `tags`.
@@ -97,6 +126,7 @@ export default defineSchema({
     accountId: v.id("accounts"),
     contactId: v.id("contacts"),
     tagId: v.id("tags"),
+    source: v.optional(v.union(v.literal("ai"), v.literal("manual"))), // unset = manual (backward-compatible)
   })
     .index("by_contact", ["contactId"])
     .index("by_tag", ["tagId"])
@@ -149,6 +179,56 @@ export default defineSchema({
     // uniform trigger parity across every such table (P1 review) — the
     // dashboard's inbox sort and the v1 API contract both expose it.
     updatedAt: v.optional(v.number()),
+    // Denormalized Click-to-WhatsApp ad summary — presence flags this
+    // conversation as an "ad lead" for the inbox badge without scanning
+    // messages. `startedAt` anchors the 72h free-entry-point indicator
+    // (set once, on the first ad message).
+    adReferral: v.optional(
+      v.object({
+        headline: v.optional(v.string()),
+        body: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+        imageUrl: v.optional(v.string()),
+        storedImageUrl: v.optional(v.string()),
+        startedAt: v.number(),
+      }),
+    ),
+    // Lead-source classifier for the conversion funnel. Set ONCE, the first
+    // time an attribution identifier is seen on an inbound message (the HY-
+    // zero-width code → website lane, or the Meta `ctwa_clid` → ad lane);
+    // never overwritten. Both identifiers are retained if both ever appear;
+    // `lane` (code-wins) decides which backend the funnel dispatches to, so a
+    // conversation never double-fires. Absent = organic (never reported).
+    attribution: v.optional(
+      v.object({
+        lane: v.union(v.literal("code"), v.literal("ctwa")),
+        code: v.optional(v.string()),
+        ctwaClid: v.optional(v.string()),
+        firstSeenAt: v.number(),
+      }),
+    ),
+    // Denormalized CURRENT funnel stage for fast inbox render + future
+    // stage-filtering, without scanning `funnelTransitions`. `saleValue`/
+    // `saleCurrency` are captured at the Purchased stage (and optionally at
+    // quote/invoice). The full progress history lives in `funnelTransitions`.
+    funnel: v.optional(
+      v.object({
+        stage: v.union(
+          v.literal("new_lead"),
+          v.literal("qualified"),
+          v.literal("price_quoted"),
+          v.literal("itinerary_created"),
+          v.literal("itinerary_sent"),
+          v.literal("invoice_sent"),
+          v.literal("purchased"),
+        ),
+        stageUpdatedAt: v.number(),
+        stageUpdatedByUserId: v.optional(v.id("users")),
+        saleValue: v.optional(v.number()),
+        saleCurrency: v.optional(v.string()),
+      }),
+    ),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"])
@@ -212,6 +292,23 @@ export default defineSchema({
     // default). Already surfaced optional in `src/types/index.ts`
     // (`Message.ai_generated?: boolean`).
     aiGenerated: v.optional(v.boolean()),
+    // The full Click-to-WhatsApp ad referral, on the FIRST inbound message
+    // that carried it. `storedImageUrl` is the durable Convex-storage copy
+    // of the ad image (Task 3), patched in after ingest.
+    referral: v.optional(
+      v.object({
+        sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+        sourceId: v.optional(v.string()),
+        sourceUrl: v.optional(v.string()),
+        headline: v.optional(v.string()),
+        body: v.optional(v.string()),
+        mediaType: v.optional(v.union(v.literal("image"), v.literal("video"))),
+        imageUrl: v.optional(v.string()),
+        videoUrl: v.optional(v.string()),
+        thumbnailUrl: v.optional(v.string()),
+        storedImageUrl: v.optional(v.string()),
+      }),
+    ),
   })
     .index("by_conversation", ["conversationId"])
     .index("by_message_id", ["messageId"])
@@ -977,7 +1074,7 @@ export default defineSchema({
   aiUsageLog: defineTable({
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(v.literal("auto_reply"), v.literal("draft")),
+    mode: v.union(v.literal("auto_reply"), v.literal("draft"), v.literal("classify")),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
     promptTokens: v.number(),
@@ -1044,6 +1141,29 @@ export default defineSchema({
       filterFields: ["accountId"],
     }),
 
+  // One AI classification of a conversation into the account's tag
+  // catalogue. `suggestedTagIds` is group-generic (a flat validated list
+  // across all tag groups — respects each group's single/multi mode);
+  // the UI renders it grouped. `status` tracks the review lifecycle.
+  tagSuggestions: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    suggestedTagIds: v.array(v.id("tags")),
+    note: v.optional(v.string()),
+    confidence: v.union(v.literal("high"), v.literal("medium"), v.literal("low")),
+    status: v.union(
+      v.literal("auto_applied"),
+      v.literal("pending"),
+      v.literal("accepted"),
+      v.literal("dismissed"),
+    ),
+    model: v.string(),
+    reviewedByUserId: v.optional(v.id("users")),
+  })
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_conversation", ["conversationId"]),
+
   // Ownership record tying a client-uploaded Convex storage object to the
   // account that minted it. Convex `_storage` carries no `accountId` of
   // its own — a storage id, once minted, resolves for anyone holding it —
@@ -1106,4 +1226,135 @@ export default defineSchema({
     .index("by_wamid", ["waMessageId"])
     .index("by_account_result", ["accountId", "landingResult"])
     .index("by_result", ["landingResult"]),
+
+  // ============================================================
+  // Unified conversion outbox (funnel Phase 1). One row per
+  // (conversation, stage) that maps to a Meta event. `backend`
+  // discriminates delivery: "platformA" (website/code lane → web Pixel via
+  // go-holidayys) or "capi" (ad/ctwa lane → direct Meta CAPI). `eventId`
+  // (= `${conversationId}:${stage}`) is our dedup key — Meta does not dedupe
+  // business-messaging events. Dormant rows stay `pending` (no attempt bump)
+  // until env is configured; the retry cron resends them.
+  // ============================================================
+  conversionEvents: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    stage: v.union(
+      v.literal("new_lead"),
+      v.literal("qualified"),
+      v.literal("price_quoted"),
+      v.literal("itinerary_created"),
+      v.literal("itinerary_sent"),
+      v.literal("invoice_sent"),
+      v.literal("purchased"),
+    ),
+    lane: v.union(v.literal("code"), v.literal("ctwa")),
+    backend: v.union(v.literal("platformA"), v.literal("capi")),
+    eventName: v.string(), // resolved per lane (web-pixel name | business_messaging name)
+    identifier: v.string(), // HY-code (code lane) | ctwa_clid (ctwa lane)
+    value: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    phone: v.string(),
+    waMessageId: v.string(),
+    firstMessageAt: v.number(),
+    eventId: v.string(), // `${conversationId}:${stage}` — dedup
+    status: v.union(
+      v.literal("pending"),
+      v.literal("sent"),
+      v.literal("unmatched"),
+      v.literal("error"),
+      v.literal("abandoned"),
+    ),
+    attempts: v.number(),
+    lastError: v.optional(v.string()),
+    sentAt: v.optional(v.number()),
+    fbTraceId: v.optional(v.string()),
+    matchResult: v.optional(v.string()),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_event_id", ["eventId"])
+    .index("by_status", ["status"])
+    // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
+    // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
+    .index("by_account", ["accountId"]),
+
+  // Append-only funnel progress log (funnel Phase 2). One row per stage
+  // ENTERED, for every conversation (incl. organic and the internal
+  // `itinerary_created` stage). Powers the stepper (Phase 3) + funnel
+  // analytics (Phase 4). Links to the fired `conversionEvents` row when one
+  // was seeded. `auto` = the ingest-seeded first-touch (Phase 1 seeds the
+  // new_lead conversionEvent; a matching `auto` transition may be backfilled
+  // later — this phase writes only agent-driven `auto:false` rows).
+  funnelTransitions: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    stage: v.union(
+      v.literal("new_lead"),
+      v.literal("qualified"),
+      v.literal("price_quoted"),
+      v.literal("itinerary_created"),
+      v.literal("itinerary_sent"),
+      v.literal("invoice_sent"),
+      v.literal("purchased"),
+    ),
+    byUserId: v.optional(v.id("users")),
+    auto: v.boolean(),
+    conversionEventId: v.optional(v.id("conversionEvents")),
+  })
+    .index("by_conversation", ["conversationId"])
+    // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
+    // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
+    .index("by_account", ["accountId"]),
+
+  // ============================================================
+  // CTWA ad-capture (funnel Phase 0). Raw event log: one row per
+  // inbound message carrying a `referral`. `_creationTime` is the
+  // received-at (codebase "rely on _creationTime" convention).
+  // `ctwaClid` is the durable per-conversation ad-click id the funnel's
+  // ad lane reads later. Distinct from the `conversation.adReferral`
+  // display denorm (set once, for the inbox ad-preview card).
+  // ============================================================
+  adReferrals: defineTable({
+    accountId: v.id("accounts"),
+    contactId: v.id("contacts"),
+    conversationId: v.id("conversations"),
+    waMessageId: v.string(),
+    ctwaClid: v.optional(v.string()), // omitted for Status placements
+    adId: v.optional(v.string()), // referral.source_id = Meta ad id
+    sourceType: v.optional(v.string()), // "ad" — resolution guards on this
+    sourceUrl: v.optional(v.string()),
+    headline: v.optional(v.string()),
+    body: v.optional(v.string()),
+    mediaType: v.optional(v.string()),
+    isFirstTouch: v.boolean(), // contact's first-ever ad referral
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_ad", ["accountId", "adId"])
+    .index("by_contact", ["contactId"])
+    .index("by_wamid", ["waMessageId"]),
+
+  // Resolution cache: one row per (account, adId). Names change rarely.
+  // Written `pending` at capture; resolved via Marketing API in `resolveAd`.
+  campaignAds: defineTable({
+    accountId: v.id("accounts"),
+    adId: v.string(),
+    adName: v.optional(v.string()),
+    adSetId: v.optional(v.string()),
+    adSetName: v.optional(v.string()),
+    campaignId: v.optional(v.string()),
+    campaignName: v.optional(v.string()),
+    resolveStatus: v.union(
+      v.literal("pending"),
+      v.literal("resolved"),
+      v.literal("error"),
+    ),
+    attempts: v.number(),
+    lastError: v.optional(v.string()),
+    resolvedAt: v.optional(v.number()),
+  })
+    .index("by_account_ad", ["accountId", "adId"])
+    .index("by_account", ["accountId"])
+    .index("by_status", ["resolveStatus"]),
 });

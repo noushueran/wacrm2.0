@@ -479,3 +479,52 @@ test("Task 4 — an out-of-union value is rejected by the schema validator", asy
     ),
   ).rejects.toThrow();
 });
+
+test("tagGroups table accepts a group and a tag can reference it", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, groupId } = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "S", email: "s@x.com" });
+    const accountId = await ctx.db.insert("accounts", {
+      name: "A", defaultCurrency: "USD", ownerUserId: userId,
+    });
+    const groupId = await ctx.db.insert("tagGroups", {
+      accountId, name: "Product", selectionMode: "single", position: 0,
+    });
+    await ctx.db.insert("tags", {
+      accountId, name: "UAE Visa", color: "#3b82f6", groupId, position: 0,
+    });
+    return { accountId, groupId };
+  });
+  const group = await t.run((ctx) => ctx.db.get(groupId));
+  expect(group!.selectionMode).toBe("single");
+  const tags = await t.run((ctx) =>
+    ctx.db.query("tags").withIndex("by_group", (q) => q.eq("groupId", groupId)).collect(),
+  );
+  expect(tags).toHaveLength(1);
+  expect(tags[0].accountId).toBe(accountId);
+});
+
+test("tagSuggestions row inserts and is queryable by_account_status", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, sugId } = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "S", email: "s@x.com" });
+    const accountId = await ctx.db.insert("accounts", { name: "A", defaultCurrency: "USD", ownerUserId: userId });
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550001", phoneNormalized: "15550001" });
+    const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "UAE Visa", color: "#3b82f6" });
+    const sugId = await ctx.db.insert("tagSuggestions", {
+      accountId, conversationId, contactId,
+      suggestedTagIds: [tagId], note: "Asking about UAE visa", confidence: "high", status: "pending", model: "test-model",
+    });
+    // provenance + classify-mode also valid:
+    await ctx.db.insert("contactTags", { accountId, contactId, tagId, source: "ai" });
+    await ctx.db.insert("aiUsageLog", { accountId, conversationId, mode: "classify", provider: "openai", model: "m", promptTokens: 1, completionTokens: 1, totalTokens: 2 });
+    return { accountId, sugId };
+  });
+  const pending = await t.run((ctx) =>
+    ctx.db.query("tagSuggestions").withIndex("by_account_status", (q) => q.eq("accountId", accountId).eq("status", "pending")).collect(),
+  );
+  expect(pending).toHaveLength(1);
+  expect(pending[0]._id).toBe(sugId);
+  expect(pending[0].suggestedTagIds).toHaveLength(1);
+});

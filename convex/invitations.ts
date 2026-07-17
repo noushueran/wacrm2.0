@@ -174,7 +174,14 @@ export const create = accountMutation({
 });
 
 /**
- * Admin+ lists the caller's own account's outstanding invites.
+ * Admin+ lists the caller's own account's OUTSTANDING invites — links that
+ * haven't been redeemed yet. Redeeming an invite marks its row used (sets
+ * `acceptedAt`; see `redeem` below) rather than deleting it, so accepted
+ * invites are filtered out here: they're no longer "pending", and the
+ * Settings → Members "Pending invitations" list + count both render exactly
+ * what this returns. (Expired-but-unredeemed links are still returned — the
+ * UI labels them "Expired" so an admin can revoke the dead link.)
+ *
  * `tokenHash` is deliberately stripped from every row before it's
  * returned — nothing in the UI needs it (it's a lookup key for
  * `peek`/`redeem`, not a display field), so it never leaves the server,
@@ -191,7 +198,13 @@ export const list = accountQuery({
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .collect();
 
-    return invitations.map((invitation) => ({
+    // A redeemed invite keeps its row (marked `acceptedAt`, not deleted),
+    // so drop accepted invites — this list is strictly the pending ones.
+    const pending = invitations.filter(
+      (invitation) => invitation.acceptedAt === undefined
+    );
+
+    return pending.map((invitation) => ({
       _id: invitation._id,
       _creationTime: invitation._creationTime,
       accountId: invitation.accountId,

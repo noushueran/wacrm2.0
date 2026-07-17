@@ -11,6 +11,7 @@ interface ContactPanelDrawerProps {
   open: boolean;
   onClose: () => void;
   contact: Contact | null;
+  conversationId?: string;
 }
 
 /**
@@ -24,6 +25,7 @@ export function ContactPanelDrawer({
   open,
   onClose,
   contact,
+  conversationId,
 }: ContactPanelDrawerProps) {
   const t = useTranslations("Inbox.sidebar");
 
@@ -70,7 +72,7 @@ export function ContactPanelDrawer({
           </button>
         </div>
         <div className="min-h-0 flex-1">
-          <ContactSidebar contact={contact} />
+          <ContactSidebar contact={contact} conversationId={conversationId} />
         </div>
       </aside>
     </>

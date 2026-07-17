@@ -138,6 +138,30 @@ test("flattenInboundMessage: text with no body falls back to undefined (not empt
   ).toEqual({ type: "text", text: undefined, wamid: "wamid.DEFAULT" });
 });
 
+test("flattenInboundMessage: reply — captures context.id as contextWamid", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "text",
+        text: { body: "yes please" },
+        id: "wamid.R",
+        context: { id: "wamid.PARENT" },
+      }),
+    ),
+  ).toEqual({
+    type: "text",
+    text: "yes please",
+    wamid: "wamid.R",
+    contextWamid: "wamid.PARENT",
+  });
+});
+
+test("flattenInboundMessage: non-reply text has no contextWamid key", () => {
+  const flat = flattenInboundMessage(msg({ type: "text", text: { body: "hello" } }));
+  expect(flat).toEqual({ type: "text", text: "hello", wamid: "wamid.DEFAULT" });
+  expect(flat).not.toHaveProperty("contextWamid");
+});
+
 test("flattenInboundMessage: image — caption as text, id as mediaId, NO mediaUrl (resolution deferred)", () => {
   expect(
     flattenInboundMessage(
@@ -387,4 +411,61 @@ test("flattenInboundMessage: reaction with a referral still returns null (a refe
       }),
     ),
   ).toBeNull();
+});
+
+// ------------------------------------------------------------
+// flattenInboundMessage: full ad referral (creative preview)
+// ------------------------------------------------------------
+
+test("flattenInboundMessage: lifts the full referral creative alongside ctwaClid", () => {
+  const result = flattenInboundMessage(
+    msg({
+      type: "text",
+      text: { body: "Hello, how can I get more info?" },
+      id: "wamid.AD1",
+      referral: {
+        ctwa_clid: "clid-1",
+        source_id: "120210000",
+        source_type: "ad",
+        source_url: "https://fb.me/ad123",
+        headline: "Dubai 5N/6D Package",
+        body: "Starting AED 1,499 per person",
+        media_type: "image",
+        image_url: "https://scontent.example/ad.jpg",
+      } as MetaWebhookMessage["referral"],
+    }),
+  );
+  expect(result?.ctwaClid).toBe("clid-1");
+  expect(result?.referral).toEqual({
+    sourceType: "ad",
+    sourceId: "120210000",
+    sourceUrl: "https://fb.me/ad123",
+    headline: "Dubai 5N/6D Package",
+    body: "Starting AED 1,499 per person",
+    mediaType: "image",
+    imageUrl: "https://scontent.example/ad.jpg",
+    videoUrl: undefined,
+    thumbnailUrl: undefined,
+  });
+});
+
+test("flattenInboundMessage: a referral with only ctwa_clid/source_id attaches NO referral object (nothing to preview)", () => {
+  const result = flattenInboundMessage(
+    msg({ type: "text", text: { body: "hi" }, referral: { ctwa_clid: "abc", source_id: "AD1" } }),
+  );
+  expect(result?.ctwaClid).toBe("abc");
+  expect(result?.referral).toBeUndefined();
+});
+
+test("flattenInboundMessage: an image ad carries both mediaId and the referral creative", () => {
+  const result = flattenInboundMessage(
+    msg({
+      type: "image",
+      image: { id: "media-9", caption: "See offer" },
+      referral: { ctwa_clid: "z", headline: "Offer", image_url: "https://scontent.example/x.jpg" } as MetaWebhookMessage["referral"],
+    }),
+  );
+  expect(result?.mediaId).toBe("media-9");
+  expect(result?.referral?.headline).toBe("Offer");
+  expect(result?.referral?.imageUrl).toBe("https://scontent.example/x.jpg");
 });

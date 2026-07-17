@@ -23,6 +23,8 @@
   --color-chart-3: var(--chart-3);
   --color-chart-2: var(--chart-2);
   --color-chart-1: var(--chart-1);
+  --color-chart-incoming: var(--chart-incoming);
+  --color-chart-outgoing: var(--chart-outgoing);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -108,6 +110,11 @@ html[data-mode="dark"] {
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
+  /* Dashboard conversation-trend series. `incoming` is a fixed blue tuned
+   * for the dark surface; `outgoing` tracks the chosen accent so the chart
+   * recolours with the theme. Light-mode counterparts live below. */
+  --chart-incoming: oklch(0.72 0.14 240);
+  --chart-outgoing: var(--primary);
   --radius: 0.625rem;
   --sidebar: oklch(0.16 0.01 260);
   --sidebar-foreground: oklch(0.985 0 0);
@@ -137,6 +144,10 @@ html[data-mode="light"] {
   --chart-3: oklch(0.7 0.06 260);
   --chart-4: oklch(0.8 0.04 260);
   --chart-5: oklch(0.87 0.03 260);
+  /* Light-mode conversation-trend series — a deeper blue for contrast
+   * against the near-white surface; outgoing still tracks the accent. */
+  --chart-incoming: oklch(0.55 0.16 240);
+  --chart-outgoing: var(--primary);
   --radius: 0.625rem;
   --sidebar: oklch(0.985 0.002 260);
   --sidebar-foreground: oklch(0.21 0.01 260);

@@ -5,6 +5,7 @@ import { paginationOptsValidator } from "convex/server";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
+import type { AdReferral } from "./lib/whatsapp/webhookParse";
 
 // ============================================================
 // Messages — the Inbox thread view (`listByConversation`) plus the
@@ -97,6 +98,14 @@ export interface AppendMessageArgs {
   // can't drift" comment on `insertMessageAndUpdateConversation`.
   interactiveReplyId?: string;
   aiGenerated?: boolean;
+  /** Click-to-WhatsApp ad referral (inbound-only), stored verbatim on the
+   *  message row. `storedImageUrl` is filled later (Task 3). */
+  referral?: AdReferral;
+  /** Internal id of the message this one replies to (WhatsApp quoted reply).
+   *  Outbound: the agent's reply target, threaded from `send`/`metaSend`.
+   *  Inbound: resolved from the webhook's `context.id` in `ingest`. The
+   *  inbox reads it back as `reply_to_message_id` to render the quote. */
+  replyToMessageId?: Id<"messages">;
 }
 
 export async function insertMessageAndUpdateConversation(
@@ -116,6 +125,8 @@ export async function insertMessageAndUpdateConversation(
     interactivePayload,
     interactiveReplyId,
     aiGenerated,
+    referral,
+    replyToMessageId,
   } = args;
 
   const newMessageId = await ctx.db.insert("messages", {
@@ -130,6 +141,8 @@ export async function insertMessageAndUpdateConversation(
     interactivePayload,
     interactiveReplyId,
     aiGenerated,
+    referral,
+    replyToMessageId,
     status: "sent",
   });
 
@@ -204,6 +217,7 @@ export const append = accountMutation({
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
@@ -265,6 +279,7 @@ export const appendInternal = internalMutation({
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args) => {
     const conversation = await requireOwnConversation(
@@ -395,5 +410,47 @@ export const setMediaUrl = internalMutation({
     const message = await ctx.db.get(args.messageId);
     if (!message) return;
     await ctx.db.patch(args.messageId, { mediaUrl: args.mediaUrl });
+  },
+});
+
+/** Attach the durable Convex-storage URL of a downloaded ad image to both
+ *  the message's `referral` and the conversation's `adReferral` denorm.
+ *  Best-effort partner to `ingest.processInbound`'s ad-image step.
+ *
+ *  The MESSAGE patch is unconditional — every ad message records its OWN
+ *  stored image. The CONVERSATION patch is set-once (only when
+ *  `storedImageUrl` is still empty), mirroring `ingestInbound`'s "first ad
+ *  wins" for the whole `adReferral` denorm: a returning contact who clicks
+ *  a DIFFERENT ad reuses the same conversation, whose `adReferral` still
+ *  pins Ad A's headline/imageUrl — so its `storedImageUrl` must stay Ad A's
+ *  too, never flipping to the later ad's image (which would desync the card:
+ *  Ad A's headline over Ad B's picture). */
+export const setAdReferralImage = internalMutation({
+  args: {
+    messageId: v.id("messages"),
+    conversationId: v.id("conversations"),
+    storedImageUrl: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (message?.referral) {
+      await ctx.db.patch(args.messageId, {
+        referral: { ...message.referral, storedImageUrl: args.storedImageUrl },
+      });
+    }
+    const conversation = await ctx.db.get(args.conversationId);
+    // "First-image-only" pin: this guard only checks whether storedImageUrl
+    // is still empty, not whether THIS message is the first ad's — so if
+    // the first ad's image download failed (leaving it empty), a LATER,
+    // DIFFERENT ad's image can fill it in here while the denorm's
+    // headline/imageUrl stay pinned to the first ad. Currently harmless
+    // (nothing renders `conversation.adReferral`'s image), but a future
+    // task that does render it should tighten this to "is this the first
+    // ad's message" instead.
+    if (conversation?.adReferral && !conversation.adReferral.storedImageUrl) {
+      await ctx.db.patch(args.conversationId, {
+        adReferral: { ...conversation.adReferral, storedImageUrl: args.storedImageUrl },
+      });
+    }
   },
 });

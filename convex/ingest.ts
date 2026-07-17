@@ -91,7 +91,21 @@ const inboundMessageValidator = v.object({
   mediaUrl: v.optional(v.string()),
   wamid: v.string(),
   interactiveReplyId: v.optional(v.string()),
+  contextWamid: v.optional(v.string()),
   ctwaClid: v.optional(v.string()),
+  referral: v.optional(
+    v.object({
+      sourceType: v.optional(v.union(v.literal("ad"), v.literal("post"))),
+      sourceId: v.optional(v.string()),
+      sourceUrl: v.optional(v.string()),
+      headline: v.optional(v.string()),
+      body: v.optional(v.string()),
+      mediaType: v.optional(v.union(v.literal("image"), v.literal("video"))),
+      imageUrl: v.optional(v.string()),
+      videoUrl: v.optional(v.string()),
+      thumbnailUrl: v.optional(v.string()),
+    }),
+  ),
 });
 
 export const ingestInbound = internalMutation({
@@ -231,6 +245,24 @@ export const ingestInbound = internalMutation({
     // message-insert + denorm all commit as ONE transaction — see that
     // module's own doc comment on `appendInternal`, which foreshadows
     // exactly this caller.
+    // Reply linkage: the webhook's `context.id` (surfaced as `contextWamid`)
+    // is the wamid of the message the customer replied to. Map it to that
+    // message's internal id, scoped to THIS conversation — wamids aren't
+    // globally unique (see the dedup guard above) and a reply always targets
+    // a message in the same chat. Not found (e.g. a reply to a pre-CRM
+    // message we never stored) → left undefined, and the bubble renders
+    // plainly instead of a quote.
+    let replyToMessageId: Id<"messages"> | undefined;
+    const parentWamid = message.contextWamid;
+    if (parentWamid) {
+      const parent = await ctx.db
+        .query("messages")
+        .withIndex("by_message_id", (q) => q.eq("messageId", parentWamid))
+        .filter((q) => q.eq(q.field("conversationId"), conversationId))
+        .first();
+      replyToMessageId = parent?._id;
+    }
+
     const appendArgs: AppendMessageArgs = {
       accountId,
       conversationId,
@@ -240,12 +272,44 @@ export const ingestInbound = internalMutation({
       mediaUrl: message.mediaUrl,
       messageId: message.wamid,
       interactiveReplyId: message.interactiveReplyId,
+      replyToMessageId,
+      referral: message.referral,
     };
     const messageId = await insertMessageAndUpdateConversation(
       ctx,
       appendArgs,
       conversation,
     );
+
+    // ---- (4b) ad-lead denorm + contact acquisition (set once) ----
+    // `conversation` is the pre-patch doc, so `.adReferral` reflects state
+    // BEFORE this message — the correct "already an ad lead?" check.
+    if (message.referral) {
+      if (!conversation.adReferral) {
+        await ctx.db.patch(conversationId, {
+          adReferral: {
+            headline: message.referral.headline,
+            body: message.referral.body,
+            sourceUrl: message.referral.sourceUrl,
+            sourceType: message.referral.sourceType,
+            imageUrl: message.referral.imageUrl ?? message.referral.thumbnailUrl,
+            startedAt: Date.now(),
+          },
+        });
+      }
+      const contactForAcq = existingContact ?? (await ctx.db.get(contactId));
+      if (contactForAcq && !contactForAcq.acquisitionSource) {
+        await ctx.db.patch(contactId, {
+          acquisitionSource: "ad",
+          acquisitionAd: {
+            headline: message.referral.headline,
+            sourceId: message.referral.sourceId,
+            sourceUrl: message.referral.sourceUrl,
+            firstSeenAt: Date.now(),
+          },
+        });
+      }
+    }
 
     return {
       contactId,
@@ -529,6 +593,29 @@ export const processInbound = internalAction({
       }
     }
 
+    // ---- Ad-referral image → storage ----
+    // The referral gives a DIRECT public CDN url (not a Meta mediaId), so a
+    // plain `storeFromUrl` (no auth headers) re-hosts it into Convex storage
+    // — same durability the inbound-media block gives voice notes/photos,
+    // so the ad card never breaks when Meta's CDN url expires. After the
+    // dedup guard above, so a Meta retry can't orphan a second copy.
+    const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
+    if (adImageSrc) {
+      await runBestEffort("ingest.storeAdReferralImage", async () => {
+        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+          url: adImageSrc,
+        });
+        const url = await ctx.storage.getUrl(storageId);
+        if (url) {
+          await ctx.runMutation(internal.messages.setAdReferralImage, {
+            messageId: res.messageId,
+            conversationId: res.conversationId,
+            storedImageUrl: url,
+          });
+        }
+      });
+    }
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.
@@ -619,30 +706,58 @@ export const processInbound = internalAction({
       }),
     );
 
-    // ---- Attribution signal (verified-WhatsApp conversion) — OUTSIDE every
-    // guard above, best-effort like webhookDelivery. Detect our HY- code (in
-    // the message text) or Meta's ctwa_clid (ad referral), record an
-    // account-scoped signal once per (accountId, identifier), and enqueue the
-    // POST to Platform A. A failure here never blocks the pipeline.
-    await runBestEffort("attribution.signal", async () => {
+    // ---- Conversion funnel: first-touch (new_lead) — OUTSIDE every guard
+    // above, best-effort. Classify the lead source from the inbound
+    // identifiers (our HY- zero-width code → website/code lane, else Meta's
+    // ctwa_clid → ad/ctwa lane), set `conversation.attribution` once, seed the
+    // ONE new_lead conversion event for that lane, and dispatch it. Replaces
+    // the old attribution.recordSignal/sendSignal step: `code` → Platform A
+    // only, `ctwa` → direct CAPI only (no more double-fire). Never blocks.
+    await runBestEffort("conversionEvents.newLead", async () => {
       const code = extractRefCode(message.text);
-      const identifier = code ?? extractCtwaClid(message);
-      if (!identifier) return;
-      const lane: "code" | "ctwa" = code ? "code" : "ctwa";
-      const signalId = await ctx.runMutation(internal.attribution.recordSignal, {
-        accountId,
-        identifier,
-        lane,
-        phone: normalizePhone(from),
-        waMessageId: message.wamid,
-        contactId: res.contactId,
-        conversationId: res.conversationId,
-        firstMessageAt: Date.now(),
-      });
-      if (signalId) {
-        await ctx.scheduler.runAfter(0, internal.attribution.sendSignal, { signalId });
+      const ctwaClid = extractCtwaClid(message);
+      if (!code && !ctwaClid) return;
+      const seeded = await ctx.runMutation(
+        internal.conversionEvents.seedNewLead,
+        {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          waMessageId: message.wamid,
+          phone: normalizePhone(from),
+          firstMessageAt: Date.now(),
+          code: code ?? undefined,
+          ctwaClid: ctwaClid ?? undefined,
+        },
+      );
+      if (seeded) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.conversionEvents.deliverConversionEvent,
+          { conversionEventId: seeded.conversionEventId },
+        );
       }
     });
+
+    // ---- CTWA ad-referral capture (adReferrals + campaignAds) — OUTSIDE
+    // every guard above, best-effort like the conversion-funnel step above.
+    // Records the raw referral + first-touch and seeds ad->campaign
+    // resolution. The `ctwa_clid` it persists is the durable per-conversation
+    // source the funnel's ad lane reads later. Separate from the
+    // `conversation.adReferral` display denorm written in `ingestInbound`.
+    // Never blocks the pipeline.
+    if (message.referral || message.ctwaClid) {
+      await runBestEffort("adReferrals.recordAdReferral", () =>
+        ctx.runMutation(internal.adReferrals.recordAdReferral, {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          waMessageId: message.wamid,
+          ctwaClid: message.ctwaClid,
+          referral: message.referral ?? {},
+        }),
+      );
+    }
 
     return { duplicate: false, flowConsumed };
   },

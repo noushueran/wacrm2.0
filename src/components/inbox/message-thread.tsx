@@ -14,7 +14,9 @@ import {
   toUiMemberProfile,
   toUiMessage,
   toUiReaction,
+  toUiTagGroup,
 } from "@/lib/convex/adapters";
+import { tagChipRow } from "@/lib/inbox/labels";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
@@ -25,6 +27,7 @@ import {
   INITIAL_MESSAGE_PAGE_SIZE,
   messageAreaState,
 } from "@/lib/inbox/view";
+import { adFreeWindowRemainingMs } from "@/lib/inbox/adWindow";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
 import type {
   Conversation,
@@ -44,6 +47,7 @@ import {
   ArrowLeft,
   Loader2,
   ChevronRight,
+  Megaphone,
 } from "lucide-react";
 import { format, isToday, isYesterday, differenceInHours } from "date-fns";
 import { useTranslations } from "next-intl";
@@ -56,6 +60,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { MessageBubble } from "./message-bubble";
 import { MessageActions } from "./message-actions";
 import { MessageComposer, type SendMediaPayload } from "./message-composer";
@@ -65,6 +77,7 @@ import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
 import { canAssignToOthers } from "@/lib/auth/roles";
+import { UI_FUNNEL_STAGES } from "@/lib/inbox/funnel";
 
 interface ReplyDraft {
   id: string;
@@ -166,12 +179,56 @@ export function MessageThread({
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
+  const tFunnel = useTranslations("Inbox.funnel");
+  const funnelState = useQuery(
+    api.funnel.getState,
+    conversationId ? { conversationId: conversationId as Id<"conversations"> } : "skip",
+  );
+  const setStageMutation = useMutation(api.funnel.setStage);
+  const [purchaseOpen, setPurchaseOpen] = useState(false);
+  const [purchaseAmount, setPurchaseAmount] = useState("");
+
+  const applyStage = useCallback(
+    async (stage: string, saleValue?: number) => {
+      if (!conversation) return;
+      try {
+        await setStageMutation({
+          conversationId: conversation.id as Id<"conversations">,
+          stage: stage as never,
+          ...(saleValue !== undefined ? { saleValue } : {}),
+        });
+      } catch (err) {
+        console.error("Failed to update stage:", err);
+        toast.error(tFunnel("updateError"));
+      }
+    },
+    [conversation, setStageMutation, tFunnel],
+  );
+
+  const handleStageSelect = useCallback(
+    (stage: string) => {
+      const def = UI_FUNNEL_STAGES.find((s) => s.key === stage);
+      if (def?.needsValue) {
+        setPurchaseAmount("");
+        setPurchaseOpen(true);
+        return;
+      }
+      void applyStage(stage);
+    },
+    [applyStage],
+  );
+
   // The assign dropdown's teammate list — every member of the account,
   // via reactive `api.members.list` (the Convex counterpart to the old
   // Supabase `profiles` read), mapped to the `Profile` shape the
   // dropdown already consumes. A member added/removed elsewhere surfaces
   // here without a manual refetch.
   const memberDocs = useQuery(api.members.list);
+  const groupDocs = useQuery(api.tagGroups.list);
+  const groups = useMemo(
+    () => (groupDocs ?? []).map(toUiTagGroup),
+    [groupDocs],
+  );
   const profiles = useMemo(
     () => (memberDocs ?? []).map(toUiMemberProfile),
     [memberDocs],
@@ -236,6 +293,25 @@ export function MessageThread({
 
     return { expired, remaining };
   }, [messages, tTimer]);
+
+  // Ad-lead free-entry-point window (72h, cost-only). Shown in the composer
+  // once the 24h free-form window has closed, so agents know template
+  // re-engagement is free. `null` when not an ad lead or the 72h has run out.
+  const adFreeWindowLabel = useMemo(() => {
+    // `conversation` is nullable here (this memo runs before the
+    // `!conversation` render guard below), so chain past it too.
+    const startedIso = conversation?.ad_referral?.started_at;
+    if (!startedIso) return null;
+    const remainingMs = adFreeWindowRemainingMs(
+      new Date(startedIso).getTime(),
+      Date.now(),
+    );
+    if (remainingMs <= 0) return null;
+    const hoursLeft = remainingMs / (60 * 60 * 1000);
+    return hoursLeft >= 1
+      ? tTimer("adFreeXhRemaining", { hours: Math.floor(hoursLeft) })
+      : tTimer("adFreeXmRemaining", { minutes: Math.floor(hoursLeft * 60) });
+  }, [conversation?.ad_referral?.started_at, tTimer]);
 
   // Reset the server-side unread_count to 0 whenever an unread count
   // surfaces on the active conversation — covers both (a) opening a
@@ -583,6 +659,7 @@ export function MessageThread({
   }
 
   const displayName = contact.name || contact.phone;
+  const headerChips = tagChipRow(groups, contact.tags ?? [], 6);
   const messageGroups = groupMessagesByDate(messages);
   // Cold first-page load → skeleton (not a blank spinner); loaded-but-empty
   // → empty state; otherwise the message list. A re-visited conversation is
@@ -602,6 +679,13 @@ export function MessageThread({
   // assign-dropdown's agent-limited actions and the composer swap below.
   const mine = assignedAgentId === user?.id;
   const isPool = !assignedAgentId;
+  // Viewers are read-only in the thread (Task 11 parity with the status /
+  // assign controls above): they can see reactions but not add or toggle
+  // them — reactions.set/remove require requireRole("agent"). Threaded into
+  // the message toolbar (hides the add-reaction button) and the pills
+  // (rendered non-interactive) so a viewer never gets a control that would
+  // only fail server-side.
+  const canReact = accountRole !== "viewer";
 
   return (
     // `min-w-0` is load-bearing: the page already puts min-w-0 on the
@@ -616,7 +700,7 @@ export function MessageThread({
       {/* Header — solid card surface sits on top of the doodle so the
           name/avatar/dropdowns stay legible. */}
       <div className="flex items-center justify-between gap-2 border-b border-border bg-card px-3 py-3 sm:px-4">
-        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
           {/* Back-to-list button — mobile only. Hidden on lg+ where the
               conversation list is always visible next to the thread. */}
           {onBack && (
@@ -662,9 +746,59 @@ export function MessageThread({
             <Clock className="h-3 w-3" />
             {sessionInfo.remaining}
           </Badge>
+          {conversation.ad_referral && (
+            <Badge
+              variant="outline"
+              className="ml-1 hidden gap-1 border-primary/40 text-[10px] text-primary sm:inline-flex sm:ml-2"
+            >
+              <Megaphone className="h-3 w-3" />
+              {t("adLeadBadge")}
+            </Badge>
+          )}
+          {headerChips.visible.map((tag) => (
+            <span
+              key={tag.id}
+              className="hidden shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium sm:inline-flex"
+              style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
+            >
+              {tag.name}
+            </span>
+          ))}
+          {headerChips.overflow > 0 && (
+            <span className="hidden shrink-0 items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground sm:inline-flex">
+              +{headerChips.overflow}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
+          {accountRole !== "viewer" && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
+                  funnelState?.currentStage ? "text-primary" : "text-muted-foreground",
+                )}
+              >
+                {funnelState?.currentStage
+                  ? tFunnel(`stage.${funnelState.currentStage}`)
+                  : tFunnel("label")}
+                <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="border-border bg-popover">
+                {UI_FUNNEL_STAGES.map((s) => (
+                  <DropdownMenuItem
+                    key={s.key}
+                    onClick={() => handleStageSelect(s.key)}
+                    className="text-sm"
+                  >
+                    {tFunnel(`stage.${s.key}`)}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
           {/* Status dropdown — hidden for viewers, same as the assign
               dropdown and AiThreadBanner below. Changing a
               conversation's status is an agent-class write
@@ -864,6 +998,7 @@ export function MessageThread({
                       <MessageActions
                         key={msg.id}
                         message={msg}
+                        canReact={canReact}
                         onReply={() => handleStartReply(msg)}
                         onReact={(emoji) => {
                           if (emoji) void postReaction(msg.id, emoji);
@@ -875,6 +1010,7 @@ export function MessageThread({
                           reactions={msgReactions}
                           currentUserId={user?.id}
                           onToggleReaction={handlePillToggle}
+                          canReact={canReact}
                         />
                       </MessageActions>
                     );
@@ -934,6 +1070,7 @@ export function MessageThread({
           onOpenTemplates={handleOpenTemplates}
           replyTo={replyTo}
           onClearReply={() => setReplyTo(null)}
+          adFreeWindowLabel={sessionInfo.expired ? adFreeWindowLabel : null}
         />
       )}
 
@@ -942,6 +1079,38 @@ export function MessageThread({
         onOpenChange={setTemplateModalOpen}
         onSelect={handleSendTemplate}
       />
+
+      <Dialog open={purchaseOpen} onOpenChange={setPurchaseOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{tFunnel("saleAmountTitle")}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <label className="text-xs text-muted-foreground">{tFunnel("saleAmountLabel")}</label>
+            <Input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              value={purchaseAmount}
+              onChange={(e) => setPurchaseAmount(e.target.value)}
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={() => {
+                const v = Number(purchaseAmount);
+                if (!Number.isFinite(v) || v <= 0) return;
+                setPurchaseOpen(false);
+                void applyStage("purchased", v);
+              }}
+              disabled={!(Number(purchaseAmount) > 0)}
+            >
+              {tFunnel("saleAmountConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

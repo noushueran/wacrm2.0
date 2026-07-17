@@ -563,6 +563,25 @@ export const assignTag = accountMutation({
       throw new ConvexError({ code: "NOT_FOUND", entity: "tag" });
     }
 
+    // Single-select displacement: if this tag's group is single-select,
+    // remove any other tag the contact holds from the SAME group first.
+    if (tag.groupId) {
+      const group = await ctx.db.get(tag.groupId);
+      if (group?.selectionMode === "single") {
+        const links = await ctx.db
+          .query("contactTags")
+          .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+          .collect();
+        for (const link of links) {
+          if (link.tagId === args.tagId) continue;
+          const other = await ctx.db.get(link.tagId);
+          if (other?.groupId === tag.groupId) {
+            await ctx.db.delete(link._id);
+          }
+        }
+      }
+    }
+
     const existing = await ctx.db
       .query("contactTags")
       .withIndex("by_contact_tag", (q) =>

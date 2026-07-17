@@ -10,6 +10,18 @@ export interface MetricDelta {
 export interface MetricsBundle {
   activeConversations: MetricDelta
   newContactsToday: MetricDelta
+  /**
+   * Today's + yesterday's new leads split into Click-to-WhatsApp ad leads vs
+   * "direct" (everything else). Optional: a client shipped before the matching
+   * `convex deploy` reads `undefined` here and shows the total without a split
+   * rather than crashing.
+   */
+  newLeadsBySource?: {
+    adToday: number
+    directToday: number
+    adYesterday: number
+    directYesterday: number
+  }
   openDealsValue: number
   openDealsCount: number
   messagesSentToday: MetricDelta

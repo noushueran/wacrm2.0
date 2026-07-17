@@ -1139,37 +1139,23 @@ test("processInbound resolves an inbound voice note's media into storage and att
 });
 
 // ============================================================
-// Attribution signal (Task B4) — processInbound's LAST fan-out step,
-// outside every flowConsumed guard (like webhookDelivery.dispatch just
-// above it): detect our HY- ref code (in the message text) or Meta's
-// ctwa_clid (ad referral), record an account-scoped signal once per
-// (accountId, identifier) via attribution.recordSignal, and — only on a
-// fresh insert (fire-once) — schedule attribution.sendSignal to POST it
-// to Platform A. Scaffold mirrors the minimal
-// "account + aiConfig + webhook endpoint" processInbound tests above
-// (e.g. the "automations phase matching zero automations" test) — no
-// flows/automations needed, since attribution doesn't interact with
-// either.
+// Conversion funnel: first-touch new_lead (formerly "Attribution
+// signal", Task B4) — processInbound's LAST fan-out step, outside
+// every flowConsumed guard (like webhookDelivery.dispatch just above
+// it): detect our HY- ref code (in the message text) or Meta's
+// ctwa_clid (ad referral), classify the lane, and seed the ONE
+// `new_lead` conversionEvents row for that lane via
+// conversionEvents.seedNewLead — only on a fresh insert (fire-once) —
+// scheduling conversionEvents.deliverConversionEvent to dispatch it
+// (`code` lane → Platform A, `ctwa` lane → direct CAPI; replaces the
+// old attribution.recordSignal/sendSignal double-fire — see
+// convex/ingest.ts's own comment on the step). Scaffold mirrors the
+// minimal "account + aiConfig + webhook endpoint" processInbound tests
+// above (e.g. the "automations phase matching zero automations" test)
+// — no flows/automations needed.
 // ============================================================
 
-// Scans (not `.withIndex`) — a helper parameter typed as the bare
-// `ReturnType<typeof convexTest>` loses this suite's concrete index
-// names (see this file's own `tagLink`/`messagesFor` for the identical,
-// already-documented gotcha).
-/** All attributionSignals rows for an account. */
-async function attributionSignalsFor(
-  t: ReturnType<typeof convexTest>,
-  accountId: Id<"accounts">,
-) {
-  return await t.run((ctx) =>
-    ctx.db
-      .query("attributionSignals")
-      .filter((q) => q.eq(q.field("accountId"), accountId))
-      .collect(),
-  );
-}
-
-test("processInbound records a code-lane attribution signal when the inbound text carries an HY- ref code", async () => {
+test("processInbound seeds a code-lane new_lead conversionEvent from an HY- code, and NO attributionSignals row", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -1178,34 +1164,50 @@ test("processInbound records a code-lane attribution signal when the inbound tex
   await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
 
   await t.action(internal.ingest.processInbound, {
-    accountId,
-    from: "15551234567",
-    message: {
-      type: "text",
-      text: "hi," + hidden("ABCDEF") + " please",
-      wamid: "wamid.CODE1",
-    },
+    accountId, from: "15551234567",
+    message: { type: "text", text: "hi," + hidden("ABCDEF") + " please", wamid: "wamid.CODE1" },
   });
 
-  const contact = await t.run((ctx) =>
-    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
-  );
-  const conversation = await t.run((ctx) =>
-    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
-  );
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
+  expect(events[0].lane).toBe("code");
+  expect(events[0].backend).toBe("platformA");
+  expect(events[0].eventName).toBe("Lead");
+  expect(events[0].stage).toBe("new_lead");
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.identifier).toBe("ABCDEF");
-  expect(signals[0]!.lane).toBe("code");
-  expect(signals[0]!.phone).toBe("15551234567");
-  expect(signals[0]!.landingResult).toBe("pending");
-  expect(signals[0]!.attempts).toBe(0);
-  expect(signals[0]!.contactId).toBe(contact!._id);
-  expect(signals[0]!.conversationId).toBe(conversation!._id);
+  const signals = await t.run((ctx) =>
+    ctx.db.query("attributionSignals").withIndex("by_account_result", (q) => q.eq("accountId", accountId)).collect());
+  expect(signals).toHaveLength(0); // old path no longer writes
 });
 
-test("processInbound records a ctwa-lane attribution signal from a Meta ad-referral ctwaClid", async () => {
+test("processInbound seeds a ctwa-lane new_lead conversionEvent (backend capi) from a ctwaClid", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
+
+  await t.action(internal.ingest.processInbound, {
+    accountId, from: "15551234567",
+    message: { type: "text", text: "hello", wamid: "wamid.CTWA1", ctwaClid: "clid-xyz789" },
+  });
+
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
+  expect(events[0].lane).toBe("ctwa");
+  expect(events[0].backend).toBe("capi");
+  expect(events[0].eventName).toBe("LeadSubmitted");
+  expect(events[0].identifier).toBe("clid-xyz789");
+});
+
+test("processInbound captures an adReferrals row from an inbound ad referral", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -1218,16 +1220,23 @@ test("processInbound records a ctwa-lane attribution signal from a Meta ad-refer
     from: "15551234567",
     message: {
       type: "text",
-      text: "hello",
-      wamid: "wamid.CTWA1",
+      text: "hi",
+      wamid: "wamid.AD1",
       ctwaClid: "clid-xyz789",
+      referral: { sourceType: "ad", sourceId: "AD1", headline: "Maldives" },
     },
   });
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.identifier).toBe("clid-xyz789");
-  expect(signals[0]!.lane).toBe("ctwa");
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("adReferrals")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0].ctwaClid).toBe("clid-xyz789");
+  expect(rows[0].adId).toBe("AD1");
+  expect(rows[0].isFirstTouch).toBe(true);
 });
 
 test("processInbound: an HY- code in the text wins over a ctwaClid also present on the same message", async () => {
@@ -1249,10 +1258,13 @@ test("processInbound: an HY- code in the text wins over a ctwaClid also present 
     },
   });
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.lane).toBe("code");
-  expect(signals[0]!.identifier).toBe("ABCDEF");
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
+  expect(events[0]!.lane).toBe("code");
+  expect(events[0]!.identifier).toBe("ABCDEF");
 });
 
 test("processInbound creates no attribution signal when the message carries neither an HY- code nor a ctwaClid", async () => {
@@ -1269,10 +1281,14 @@ test("processInbound creates no attribution signal when the message carries neit
     message: { type: "text", text: "just saying hello", wamid: "wamid.NONE" },
   });
 
-  expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(0);
 });
 
-test("processInbound does not create a second attribution signal when the SAME code message is redelivered (duplicate wamid)", async () => {
+test("processInbound does not create a second new_lead conversionEvent when the SAME code message is redelivered (duplicate wamid)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -1300,61 +1316,24 @@ test("processInbound does not create a second attribution signal when the SAME c
   });
   expect(second.duplicate).toBe(true);
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-});
-
-test("processInbound schedules attribution.sendSignal on a fresh signal; draining it with LANDING_CONVERSION_URL unset advances the row from 'pending' to 'error'", async () => {
-  process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.CONVEX_AI_DRY_RUN = "1";
-  // Deterministic dormant-sendSignal branch (see attribution.ts's own
-  // sendSignal comment) — defensively unset even though the suite-level
-  // afterEach already deletes it, so this test's intent reads standalone.
-  delete process.env.LANDING_CONVERSION_URL;
-  vi.useFakeTimers();
-  const t = convexTest(schema, modules);
-  const accountId = await seedAccount(t, "Acme");
-  await seedAiConfig(t, accountId);
-  await seedWebhookEndpoint(t, { accountId, events: ["message.received"] });
-
-  await t.action(internal.ingest.processInbound, {
-    accountId,
-    from: "15551234567",
-    message: {
-      type: "text",
-      text: "hi," + hidden("ABCDEF") + " please",
-      wamid: "wamid.SCHED1",
-    },
-  });
-
-  // Not yet run — convex-test does not auto-run scheduled functions, so
-  // the row `recordSignal` just inserted is still "pending".
-  let signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.landingResult).toBe("pending");
-
-  // Proves the schedule happened: draining the scheduler queue is the
-  // only way this row could move off "pending" at all.
-  await t.finishAllScheduledFunctions(vi.runAllTimers);
-
-  signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.landingResult).toBe("error");
-  expect(signals[0]!.attempts).toBe(1);
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
 });
 
 // ============================================================
 // Task B8 — offline integration test for the SEAM no existing test
 // covers. webhookParse.test.ts proves `flattenInboundMessage` extracts
-// `ctwaClid` from a raw `referral` in isolation; the attribution tests
-// just above prove `processInbound` consumes an ALREADY-flattened
-// `message.ctwaClid`/HY- text and records a signal — but nothing
+// `ctwaClid` from a raw `referral` in isolation; the tests above prove
+// `processInbound` consumes an ALREADY-flattened `message.ctwaClid`/HY-
+// text and seeds a `new_lead` conversionEvents row — but nothing
 // proves the two compose end-to-end: a RAW `MetaWebhookMessage`,
 // flattened by the SAME `flattenInboundMessage` convex/http.ts's
 // `processChange` calls, fed into `processInbound` exactly as
 // `processChange` does it (`{ accountId, from: rawMessage.from, name,
-// message: flattened }`), actually produces an `attributionSignals`
-// row.
+// message: flattened }`), actually produces a `conversionEvents` row.
 //
 // httpActions themselves can't be invoked under convex-test (see
 // webhookParse.ts's own header comment), so the literal HTTP POST to
@@ -1362,15 +1341,14 @@ test("processInbound schedules attribution.sendSignal on a fresh signal; drainin
 // docs/attribution-verified-conversion.md) — this offline test is the
 // stand-in, replicating exactly what `processChange` does between the
 // HTTP layer and the engine. Reuses this file's own
-// `seedAccount`/`seedAiConfig`/`seedWebhookEndpoint`/
-// `attributionSignalsFor` scaffolding and DRY-RUN env, same as every
-// processInbound test above. Each test asserts immediately after
-// `processInbound` returns — before any scheduled fn runs — so every
-// row here is still `"pending"` (mirrors the "schedules
-// attribution.sendSignal" test's own comment just above).
+// `seedAccount`/`seedAiConfig`/`seedWebhookEndpoint` scaffolding and
+// DRY-RUN env, same as every processInbound test above (the negative
+// case below asserts that no conversionEvents are created). Each test
+// asserts immediately after `processInbound` returns — before any
+// scheduled fn runs — so every conversionEvents row here is still `"pending"`.
 // ============================================================
 
-test("integration seam: a RAW Meta message with referral.ctwa_clid flattens via flattenInboundMessage and ingests via processInbound into a ctwa-lane signal", async () => {
+test("integration seam: a RAW Meta message with referral.ctwa_clid flattens via flattenInboundMessage and ingests via processInbound into a ctwa-lane new_lead conversionEvent", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -1405,14 +1383,18 @@ test("integration seam: a RAW Meta message with referral.ctwa_clid flattens via 
     message: flattened,
   });
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.lane).toBe("ctwa");
-  expect(signals[0]!.identifier).toBe("clid-int-1");
-  expect(signals[0]!.landingResult).toBe("pending");
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
+  expect(events[0]!.lane).toBe("ctwa");
+  expect(events[0]!.backend).toBe("capi");
+  expect(events[0]!.identifier).toBe("clid-int-1");
+  expect(events[0]!.status).toBe("pending");
 });
 
-test("integration seam: a RAW Meta message with an HY- code in the text flattens via flattenInboundMessage and ingests via processInbound into a code-lane signal", async () => {
+test("integration seam: a RAW Meta message with an HY- code in the text flattens via flattenInboundMessage and ingests via processInbound into a code-lane new_lead conversionEvent", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
@@ -1440,11 +1422,15 @@ test("integration seam: a RAW Meta message with an HY- code in the text flattens
     message: flattened,
   });
 
-  const signals = await attributionSignalsFor(t, accountId);
-  expect(signals).toHaveLength(1);
-  expect(signals[0]!.lane).toBe("code");
-  expect(signals[0]!.identifier).toBe("ABCDEF");
-  expect(signals[0]!.landingResult).toBe("pending");
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(1);
+  expect(events[0]!.lane).toBe("code");
+  expect(events[0]!.backend).toBe("platformA");
+  expect(events[0]!.identifier).toBe("ABCDEF");
+  expect(events[0]!.status).toBe("pending");
 });
 
 test("integration seam: a RAW Meta message with neither a code nor a referral flattens via flattenInboundMessage and ingests via processInbound with NO attribution signal", async () => {
@@ -1474,7 +1460,274 @@ test("integration seam: a RAW Meta message with neither a code nor a referral fl
     message: flattened,
   });
 
-  expect(await attributionSignalsFor(t, accountId)).toHaveLength(0);
+  const conv = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first());
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conv!._id)).collect());
+  expect(events).toHaveLength(0);
+});
+
+test("processInbound persists the ad referral on the message, denorms it onto the conversation, and marks the contact acquired via ad", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551230000",
+    message: {
+      type: "text",
+      text: "Hello, how can I get more info?",
+      wamid: "wamid.ADLEAD1",
+      ctwaClid: "clid-1",
+      referral: {
+        sourceType: "ad",
+        sourceId: "120210000",
+        sourceUrl: "https://fb.me/ad123",
+        headline: "Dubai 5N/6D Package",
+        body: "Starting AED 1,499",
+        mediaType: "image",
+        imageUrl: "https://scontent.example/ad.jpg",
+      },
+    },
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADLEAD1"))
+      .first(),
+  );
+  expect(message!.referral?.headline).toBe("Dubai 5N/6D Package");
+  expect(message!.referral?.sourceType).toBe("ad");
+
+  const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
+  expect(conversation!.adReferral?.headline).toBe("Dubai 5N/6D Package");
+  expect(typeof conversation!.adReferral?.startedAt).toBe("number");
+
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionSource).toBe("ad");
+  expect(contact!.acquisitionAd?.sourceId).toBe("120210000");
+});
+
+test("processInbound does NOT overwrite an existing conversation adReferral or contact acquisition on a later ad message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  const send = (wamid: string, headline: string) =>
+    t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551230000",
+      message: {
+        type: "text",
+        text: "hi",
+        wamid,
+        referral: { sourceType: "ad", sourceId: "AD-" + headline, headline },
+      },
+    });
+  await send("wamid.FIRST", "First Ad");
+  await send("wamid.SECOND", "Second Ad");
+
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  expect(conversation!.adReferral?.headline).toBe("First Ad");
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionAd?.sourceId).toBe("AD-First Ad");
+});
+
+test("processInbound sets no ad fields for a plain (non-ad) inbound message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551239999",
+    message: { type: "text", text: "just browsing", wamid: "wamid.PLAIN1" },
+  });
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  expect(conversation!.adReferral).toBeUndefined();
+  const contact = await t.run((ctx) => ctx.db.get(conversation!.contactId));
+  expect(contact!.acquisitionSource).toBeUndefined();
+});
+
+test("processInbound downloads the ad image into storage and attaches storedImageUrl to the message + conversation", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  const imgBytes = new TextEncoder().encode("jpeg-ad-banner-bytes");
+  const fetchMock = vi.fn(async () =>
+    ({ ok: true, status: 200, blob: async () => new Blob([imgBytes], { type: "image/jpeg" }) }) as unknown as Response,
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551230000",
+    message: {
+      type: "text",
+      text: "info?",
+      wamid: "wamid.ADIMG1",
+      referral: { sourceType: "ad", headline: "Pkg", imageUrl: "https://scontent.example/ad.jpg" },
+    },
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADIMG1")).first(),
+  );
+  expect(message!.referral?.storedImageUrl).toBeTruthy();
+  const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
+  expect(conversation!.adReferral?.storedImageUrl).toBeTruthy();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("processInbound pins the conversation adReferral image to the FIRST ad — a later DIFFERENT ad updates only its own message, not the conversation denorm", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  // Distinct bytes per ad creative (adA vs adB) — convex-test's
+  // `ctx.storage.store` is content-addressed, so identical bytes would
+  // collapse to the same storage id (hence the same getUrl) and mask a
+  // conversation-level overwrite. Different bytes → different stored URLs,
+  // so an overwrite of the conversation denorm is observable as a URL flip.
+  const fetchMock = vi.fn(async (url: string | URL) => {
+    const bytes = new TextEncoder().encode(
+      String(url).includes("adB") ? "jpeg-ad-B-bytes" : "jpeg-ad-A-bytes",
+    );
+    return {
+      ok: true,
+      status: 200,
+      blob: async () => new Blob([bytes], { type: "image/jpeg" }),
+    } as unknown as Response;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const sendAd = (wamid: string, headline: string, imageUrl: string) =>
+    t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551230000",
+      message: {
+        type: "text",
+        text: "info?",
+        wamid,
+        referral: { sourceType: "ad", headline, imageUrl },
+      },
+    });
+
+  // ---- Ad A: the FIRST ad on this (new) conversation ----
+  await sendAd("wamid.ADA", "Ad A", "https://scontent.example/adA.jpg");
+  const msgA = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADA")).first(),
+  );
+  const convAfterA = await t.run((ctx) => ctx.db.get(msgA!.conversationId));
+  // The conversation denorm is filled from the first ad's own stored image.
+  expect(convAfterA!.adReferral?.storedImageUrl).toBeTruthy();
+  expect(convAfterA!.adReferral?.storedImageUrl).toBe(msgA!.referral?.storedImageUrl);
+  const pinnedUrl = convAfterA!.adReferral!.storedImageUrl;
+
+  // ---- Ad B: a returning contact clicks a DIFFERENT ad; the SAME
+  // conversation is reused (by_contact lookup), and its `adReferral` is
+  // set-once so it still holds Ad A's headline/imageUrl. ----
+  await sendAd("wamid.ADB", "Ad B", "https://scontent.example/adB.jpg");
+  const msgB = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADB")).first(),
+  );
+  const convAfterB = await t.run((ctx) => ctx.db.get(msgB!.conversationId));
+
+  // Msg B recorded its OWN stored image (message-scoped — always correct)...
+  expect(msgB!.referral?.storedImageUrl).toBeTruthy();
+  expect(msgB!.referral?.storedImageUrl).not.toBe(pinnedUrl);
+  // ...but the conversation denorm stays PINNED to Ad A's image (set-once),
+  // so it never desyncs from the Ad A headline/imageUrl it holds. Without
+  // the guard, this flips to Ad B's URL and the assertion fails.
+  expect(convAfterB!.adReferral?.storedImageUrl).toBe(pinnedUrl);
+});
+
+// ============================================================
+// Inbound reply linkage — the customer's `context.id` (the wamid of the
+// message they replied to) resolves to the parent's internal id so the
+// inbox renders the quote.
+// ============================================================
+
+test("ingestInbound links a reply to its parent via contextWamid", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  // Pre-seed the contact + conversation + our outbound message (the one the
+  // customer replies to) so ingestInbound reuses that conversation.
+  const { conversationId, parentId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "15559990000",
+      phoneNormalized: "15559990000",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    });
+    const parentId = await ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "agent" as const,
+      contentType: "text" as const,
+      contentText: "Here is your quote",
+      messageId: "wamid.OURS",
+      status: "sent" as const,
+    });
+    return { conversationId, parentId };
+  });
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15559990000",
+    name: "Cust",
+    message: {
+      type: "text",
+      text: "thanks!",
+      wamid: "wamid.THEIRS",
+      contextWamid: "wamid.OURS",
+    },
+  });
+
+  expect(res.conversationId).toBe(conversationId);
+  const stored = await t.run((ctx) => ctx.db.get(res.messageId));
+  expect(stored!.replyToMessageId).toBe(parentId);
+});
+
+test("ingestInbound leaves replyToMessageId undefined when contextWamid matches nothing", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15559990001",
+    name: "Cust",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.NEW",
+      contextWamid: "wamid.MISSING",
+    },
+  });
+
+  const stored = await t.run((ctx) => ctx.db.get(res.messageId));
+  expect(stored!.replyToMessageId).toBeUndefined();
 });
 
 // ============================================================

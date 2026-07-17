@@ -117,6 +117,10 @@ export const sendText = internalAction({
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
     senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    // Internal id of the message being replied to (WhatsApp quoted reply).
+    // Persisted on the outbound row so the inbox renders the quote — Meta
+    // itself is told via `contextMessageId` (the wamid), resolved upstream.
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -141,6 +145,7 @@ export const sendText = internalAction({
       accountId: args.accountId,
       conversationId: args.conversationId,
       senderType: args.senderType ?? "bot",
+      replyToMessageId: args.replyToMessageId,
       contentType: "text",
       contentText: args.text,
       messageId: whatsappMessageId,
@@ -171,6 +176,10 @@ export const sendTemplate = internalAction({
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
     senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    // Internal id of the message being replied to (WhatsApp quoted reply).
+    // Persisted on the outbound row so the inbox renders the quote — Meta
+    // itself is told via `contextMessageId` (the wamid), resolved upstream.
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -197,6 +206,7 @@ export const sendTemplate = internalAction({
       accountId: args.accountId,
       conversationId: args.conversationId,
       senderType: args.senderType ?? "bot",
+      replyToMessageId: args.replyToMessageId,
       contentType: "template",
       contentText: args.contentText,
       templateName: args.templateName,
@@ -218,6 +228,10 @@ export const sendInteractive = internalAction({
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
     senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    // Internal id of the message being replied to (WhatsApp quoted reply).
+    // Persisted on the outbound row so the inbox renders the quote — Meta
+    // itself is told via `contextMessageId` (the wamid), resolved upstream.
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     // Validate before send (dry-run or not) so a misconfigured
@@ -270,6 +284,7 @@ export const sendInteractive = internalAction({
       accountId: args.accountId,
       conversationId: args.conversationId,
       senderType: args.senderType ?? "bot",
+      replyToMessageId: args.replyToMessageId,
       contentType: "interactive",
       contentText: payload.body,
       interactivePayload: payload,
@@ -299,6 +314,10 @@ export const sendMedia = internalAction({
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
     senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    // Internal id of the message being replied to (WhatsApp quoted reply).
+    // Persisted on the outbound row so the inbox renders the quote — Meta
+    // itself is told via `contextMessageId` (the wamid), resolved upstream.
+    replyToMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -326,6 +345,7 @@ export const sendMedia = internalAction({
       accountId: args.accountId,
       conversationId: args.conversationId,
       senderType: args.senderType ?? "bot",
+      replyToMessageId: args.replyToMessageId,
       // `MediaKind` ("image"/"video"/"document"/"audio") is a strict
       // subset of `messages.contentType` — every value maps straight
       // across with no translation.

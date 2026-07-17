@@ -78,10 +78,22 @@ export interface MetaWebhookMessage {
     list_reply?: { id: string; title?: string; description?: string };
   };
   context?: { id: string };
-  // Present when the message originated from a click-to-WhatsApp ad.
-  // `source_id` mirrors Meta's payload for fidelity even though only
-  // `ctwa_clid` is surfaced downstream (see `FlattenedInboundMessage`).
-  referral?: { ctwa_clid?: string; source_id?: string };
+  // Present when the message originated from a click-to-WhatsApp ad. The
+  // full creative is lifted into `FlattenedInboundMessage.referral` for the
+  // inbox ad-preview card; `ctwa_clid` continues to surface separately for
+  // attribution (`FlattenedInboundMessage.ctwaClid`).
+  referral?: {
+    ctwa_clid?: string;
+    source_id?: string;
+    source_type?: "ad" | "post";
+    source_url?: string;
+    headline?: string;
+    body?: string;
+    media_type?: "image" | "video";
+    image_url?: string;
+    video_url?: string;
+    thumbnail_url?: string;
+  };
 }
 
 export interface MetaWebhookStatus {
@@ -240,6 +252,20 @@ export function resolveContactName(
 // silent drop.
 // ============================================================
 
+/** Click-to-WhatsApp ad creative, lifted from the inbound `referral`
+ *  object. The camelCase counterpart of Meta's snake_case payload. */
+export interface AdReferral {
+  sourceType?: "ad" | "post";
+  sourceId?: string;
+  sourceUrl?: string;
+  headline?: string;
+  body?: string;
+  mediaType?: "image" | "video";
+  imageUrl?: string;
+  videoUrl?: string;
+  thumbnailUrl?: string;
+}
+
 export interface FlattenedInboundMessage {
   type:
     | "text"
@@ -254,22 +280,60 @@ export interface FlattenedInboundMessage {
   wamid: string;
   interactiveReplyId?: string;
   ctwaClid?: string;
+  /** wamid of the message this one replies to (Meta `context.id`), so the
+   *  inbox can render the customer's reply as a quote of our message. */
+  contextWamid?: string;
+  referral?: AdReferral;
 }
 
 /**
  * Public entry point: flattens by type, then merges the click-to-WhatsApp
- * ad click id (if any) onto the result. Kept separate from `flattenByType`
- * so the referral merge lives in exactly one place instead of being
- * appended to every `case` below — a `reaction` (or other `null` result)
- * stays `null`; a referral does not resurrect a skipped message.
+ * ad click id (if any) AND the full ad referral creative (`AdReferral`,
+ * when previewable content is present) onto the result. Kept separate from
+ * `flattenByType` so the referral merge lives in exactly one place instead
+ * of being appended to every `case` below — a `reaction` (or other `null`
+ * result) stays `null`; a referral does not resurrect a skipped message.
  */
 export function flattenInboundMessage(
   message: MetaWebhookMessage,
 ): FlattenedInboundMessage | null {
   const base = flattenByType(message);
   if (!base) return null;
-  const ctwaClid = message.referral?.ctwa_clid || undefined;
-  return ctwaClid ? { ...base, ctwaClid } : base;
+  const r = message.referral;
+  const ctwaClid = r?.ctwa_clid || undefined;
+  // Only attach a `referral` when there's previewable creative/link — a
+  // referral carrying just ctwa_clid/source_id has nothing to render.
+  const hasCreative =
+    !!r &&
+    !!(
+      r.headline ||
+      r.body ||
+      r.source_url ||
+      r.source_type ||
+      r.image_url ||
+      r.video_url ||
+      r.thumbnail_url
+    );
+  const referral: AdReferral | undefined = hasCreative
+    ? {
+        sourceType: r!.source_type,
+        sourceId: r!.source_id,
+        sourceUrl: r!.source_url,
+        headline: r!.headline,
+        body: r!.body,
+        mediaType: r!.media_type,
+        imageUrl: r!.image_url,
+        videoUrl: r!.video_url,
+        thumbnailUrl: r!.thumbnail_url,
+      }
+    : undefined;
+  const contextWamid = message.context?.id || undefined;
+  return {
+    ...base,
+    ...(ctwaClid ? { ctwaClid } : {}),
+    ...(contextWamid ? { contextWamid } : {}),
+    ...(referral ? { referral } : {}),
+  };
 }
 
 function flattenByType(

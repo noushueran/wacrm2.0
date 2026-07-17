@@ -7,6 +7,9 @@ import type { Id } from "../../../convex/_generated/dataModel";
 import { toUiContactNote, toUiDeal } from "@/lib/convex/adapters";
 import type { Contact } from "@/types";
 import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
+import { LabelPicker } from "./label-picker";
+import { TagSuggestionBanner } from "./tag-suggestion-banner";
+import { ContactCustomFields } from "./contact-custom-fields";
 import {
   Phone,
   Smartphone,
@@ -21,15 +24,22 @@ import {
   MapPin,
   Plane,
   Info,
+  Megaphone,
+  ExternalLink,
+  ListChecks,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { format } from "date-fns";
 import { useTranslations } from "next-intl";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import { buildFunnelSteps } from "@/lib/inbox/funnelView";
 
 interface ContactSidebarProps {
   contact: Contact | null;
+  conversationId?: string;
 }
 
 type EditForm = {
@@ -60,9 +70,12 @@ function formToState(c: Contact): EditForm {
   };
 }
 
-export function ContactSidebar({ contact }: ContactSidebarProps) {
+export function ContactSidebar({ contact, conversationId }: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
+  const tFunnel = useTranslations("Inbox.funnel");
+  const tLabels = useTranslations("Inbox.labels");
+  const tCustom = useTranslations("Inbox.customFields");
 
   const [copied, setCopied] = useState(false);
   const [newNote, setNewNote] = useState("");
@@ -93,6 +106,11 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     contactId ? { contactId } : "skip",
   );
   const notes = (noteDocs ?? []).map(toUiContactNote);
+
+  const funnelState = useQuery(
+    api.funnel.getState,
+    conversationId ? { conversationId: conversationId as Id<"conversations"> } : "skip",
+  );
 
   const tags = contact?.tags ?? [];
 
@@ -298,6 +316,76 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
             />
           </Section>
 
+          {contact.acquisition_source === "ad" && (
+            <Section icon={Megaphone} label={tSidebar("sectionAcquisition")}>
+              <div className="px-3 py-2">
+                <p className="text-xs text-muted-foreground">
+                  {tSidebar("acquiredViaAd")}
+                </p>
+                {contact.acquisition_ad?.headline && (
+                  <p className="mt-0.5 text-sm text-foreground">
+                    {contact.acquisition_ad.headline}
+                  </p>
+                )}
+                {contact.acquisition_ad?.source_url && (
+                  <a
+                    href={contact.acquisition_ad.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-0.5 inline-flex items-center gap-0.5 text-xs text-primary hover:underline"
+                  >
+                    {tSidebar("viewAd")}
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
+              </div>
+            </Section>
+          )}
+
+          {conversationId && funnelState && (
+            <Section icon={ListChecks} label={tFunnel("label")}>
+              <div className="px-3 py-2 space-y-1.5">
+                {!funnelState.attributed && (
+                  <p className="text-xs text-muted-foreground">{tFunnel("crmOnly")}</p>
+                )}
+                {buildFunnelSteps(funnelState).map((step) => (
+                  <div key={step.key} className="flex items-center justify-between gap-2">
+                    <span
+                      className={cn(
+                        "text-sm",
+                        step.current
+                          ? "font-medium text-primary"
+                          : step.done
+                            ? "text-foreground"
+                            : "text-muted-foreground",
+                      )}
+                    >
+                      {step.done ? "✓ " : step.current ? "• " : "○ "}
+                      {tFunnel(`stage.${step.key}`)}
+                    </span>
+                    {step.reportsToMeta && (step.done || step.current) && (
+                      <span
+                        className="text-[10px] text-muted-foreground"
+                        title={
+                          step.metaStatus === "sent"
+                            ? tFunnel("reportedToMeta")
+                            : tFunnel("notReportedYet")
+                        }
+                      >
+                        {step.metaStatus === "sent" ? "✓ Meta" : "– Meta"}
+                      </span>
+                    )}
+                  </div>
+                ))}
+                {funnelState.saleValue !== undefined && (
+                  <p className="pt-1 text-sm text-foreground">
+                    {funnelState.saleCurrency} {funnelState.saleValue}
+                  </p>
+                )}
+              </div>
+            </Section>
+          )}
+
           {/* Section: Location */}
           <Section icon={MapPin} label={tSidebar("sectionLocation")}>
             <Field
@@ -374,29 +462,34 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
 
           <Divider />
 
-          {/* Tags */}
+          {/* AI tag suggestion banner — conversationId-scoped (a pending
+              classification is keyed by conversation, not contact), so
+              only rendered once a conversation is actually selected,
+              same `conversationId &&` guard the funnel Section above
+              uses. */}
+          {conversationId && (
+            <TagSuggestionBanner contactId={contact.id} conversationId={conversationId} />
+          )}
+
+          {/* Labels */}
           <div>
-            <SectionLabel icon={TagIcon} label={tSidebar("tags")} />
-            <div className="mt-2 flex flex-wrap gap-1">
-              {tags.length === 0 ? (
-                <p className="px-1 text-xs text-muted-foreground">
-                  {tSidebar("noTags")}
-                </p>
-              ) : (
-                tags.map((tag) => (
-                  <span
-                    key={tag.id}
-                    className="rounded-full px-2 py-0.5 text-[10px] font-medium"
-                    style={{
-                      backgroundColor: `${tag.color}20`,
-                      color: tag.color,
-                    }}
-                  >
-                    {tag.name}
-                  </span>
-                ))
-              )}
-            </div>
+            <SectionLabel icon={TagIcon} label={tLabels("title")} />
+            <LabelPicker contactId={contact.id} tags={tags} />
+          </div>
+
+          <Divider />
+
+          {/* Custom fields — keyed on contact.id so the section fully
+              remounts on contact switch. ContactSidebar itself never
+              unmounts across contacts (it lives inside the always-mounted
+              ContactPanelDrawer), and FieldInput's text/date/number
+              inputs are uncontrolled (defaultValue) for a smooth typing
+              experience, so without this key they'd keep showing the
+              previous contact's stale value — and silently resave it —
+              until the user actually edited that field. */}
+          <div>
+            <SectionLabel icon={SlidersHorizontal} label={tCustom("title")} />
+            <ContactCustomFields key={contact.id} contactId={contact.id} />
           </div>
 
           <Divider />

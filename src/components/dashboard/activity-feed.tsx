@@ -13,6 +13,7 @@ import {
 import type { ComponentType } from 'react'
 import type { ActivityItem, ActivityKind } from '@/lib/dashboard/types'
 import { cn } from '@/lib/utils'
+import { softBadge } from '@/lib/ui/soft-badge'
 import { EmptyState } from './empty-state'
 import { Skeleton } from './skeleton'
 
@@ -30,12 +31,14 @@ interface KindTheme {
   badge: string
 }
 
+// Mode-aware tone per activity kind (see soft-badge.ts). The old badges
+// used dark-only `text-*-400` stops that washed out in light mode.
 const KIND_THEME: Record<ActivityKind, KindTheme> = {
-  message: { icon: MessageSquare, badge: 'bg-blue-500/10 text-blue-400' },
-  contact: { icon: UserPlus, badge: 'bg-primary/10 text-primary' },
-  deal: { icon: Briefcase, badge: 'bg-primary/10 text-primary' },
-  broadcast: { icon: Radio, badge: 'bg-amber-500/10 text-amber-400' },
-  automation: { icon: Zap, badge: 'bg-rose-500/10 text-rose-400' },
+  message: { icon: MessageSquare, badge: softBadge('info') },
+  contact: { icon: UserPlus, badge: softBadge('accent') },
+  deal: { icon: Briefcase, badge: softBadge('accent') },
+  broadcast: { icon: Radio, badge: softBadge('amber') },
+  automation: { icon: Zap, badge: softBadge('danger') },
 }
 
 import { useTranslations } from 'next-intl'

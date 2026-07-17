@@ -25,6 +25,7 @@
     "automations": "Automations",
     "flows": "Flows",
     "aiAgents": "AI Agents",
+    "campaigns": "Campaigns",
     "settings": "Settings",
     "beta": "Beta",
     "unreadConversations": "{count} unread {count, plural, =1 {conversation} other {conversations}}",
@@ -37,6 +38,8 @@
     "closeMenu": "Close menu",
     "collapseMenu": "Collapse menu",
     "expandMenu": "Expand menu",
+    "pinSidebar": "Pin sidebar",
+    "unpinSidebar": "Unpin sidebar",
     "defaultUser": "User",
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
@@ -44,6 +47,7 @@
     "menuSignOut": "Sign out"
   },
   "Header": {
+    "brand": "Holidayys WA CRM",
     "dashboard": "Dashboard",
     "inbox": "Inbox",
     "notifications": "Notifications",
@@ -58,7 +62,12 @@
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
     "menuSettings": "Settings",
-    "menuSignOut": "Sign out"
+    "menuSignOut": "Sign out",
+    "notificationsUnread": "{count} unread",
+    "notificationsMarkAllRead": "Mark all as read",
+    "notificationsViewAll": "View all notifications",
+    "notificationsEmpty": "No notifications yet",
+    "notificationsEmptyHint": "You'll see an alert here when someone assigns you a conversation."
   },
   "ModeToggle": {
     "switchMode": "Switch to {mode} mode"
@@ -74,7 +83,10 @@
       "newTodayVsYesterday": "new today vs yesterday",
       "vsYesterday": "vs yesterday",
       "openDeals": "{count} open {count, plural, =1 {deal} other {deals}}",
-      "noChange": "No change {suffix}"
+      "noChange": "No change {suffix}",
+      "waitingOnReply": "Waiting on Reply",
+      "awaitingReply": "awaiting a reply",
+      "leadsSplit": "{ad} ads · {direct} direct"
     },
     "quickActions": {
       "newContact": "New Contact",
@@ -136,6 +148,25 @@
       "spent": "Spent",
       "yourSpend": "You've spent {amount} on {count} leads",
       "empty": "No lead spend yet"
+    },
+    "needsAttention": {
+      "title": "Needs Attention",
+      "tabAll": "All",
+      "tabMine": "Mine",
+      "tabUnassigned": "Unassigned",
+      "allCaught": "You're all caught up",
+      "allCaughtHint": "No conversations are waiting on a reply.",
+      "unknown": "Unknown",
+      "adLead": "Ad lead",
+      "noPreview": "No message preview"
+    },
+    "responsePerformance": {
+      "title": "Response Performance",
+      "thisWeek": "This week",
+      "lastWeek": "Last week",
+      "target": "under {minutes}m target",
+      "over": "over {minutes}m target",
+      "noData": "No replies recorded yet"
     }
   },
   "Inbox": {
@@ -194,17 +225,21 @@
       "selectConversation": "Select a conversation",
       "selectConversationHint": "Choose a conversation from the left to start messaging",
       "today": "Today",
-      "yesterday": "Yesterday"
+      "yesterday": "Yesterday",
+      "adLeadBadge": "Ad lead"
     },
     "sessionTimer": {
       "expired": "Expired",
       "xhRemaining": "{hours}h remaining",
       "xmRemaining": "{minutes}m remaining",
-      "noCustomerMessages": "No customer messages"
+      "noCustomerMessages": "No customer messages",
+      "adFreeXhRemaining": "{hours}h",
+      "adFreeXmRemaining": "{minutes}m"
     },
     "composer": {
       "draftHint": "Tap the ✨ to draft a reply with AI — you can edit it before sending",
       "sessionExpiredHint": "24-hour session expired. Use a template to re-engage.",
+      "adFreeWindowHint": "Ad lead — templates are free for {remaining}",
       "templates": "Templates",
       "readOnlyPlaceholder": "Read-only — viewers can browse but not reply",
       "sessionExpiredPlaceholder": "Session expired - use a template",
@@ -244,7 +279,9 @@
       "interactiveReply": "[Interactive reply]",
       "unsupported": "[Unsupported message type]",
       "aiBadge": "AI",
-      "aiBadgeTitle": "Sent automatically by the AI assistant"
+      "aiBadgeTitle": "Sent automatically by the AI assistant",
+      "fromAd": "From an ad",
+      "viewAd": "View ad"
     },
     "actions": {
       "reply": "Reply",
@@ -311,7 +348,30 @@
       "nationality": "Nationality",
       "preferredDestination": "Preferred destination",
       "aboutPlaceholder": "Add notes about this contact…",
-      "notFilled": "—"
+      "notFilled": "—",
+      "sectionAcquisition": "Acquisition",
+      "acquiredViaAd": "Acquired via a Click-to-WhatsApp ad",
+      "viewAd": "View ad"
+    },
+    "labels": {
+      "title": "Labels",
+      "add": "Add label",
+      "none": "No labels yet",
+      "ungrouped": "Other",
+      "failed": "Couldn’t update labels"
+    },
+    "tagSuggestions": {
+      "title": "AI suggestion",
+      "suggestCta": "Suggest tags",
+      "accept": "Accept",
+      "dismiss": "Dismiss",
+      "accepted": "Labels applied",
+      "errorGeneric": "Couldn’t get a suggestion",
+      "error_ai_not_configured": "Set up the AI assistant in Settings first",
+      "error_forbidden": "You don’t have access",
+      "error_not_found": "Conversation not found",
+      "error_no_account": "No account",
+      "error_no_tags": "No matching tags found for this conversation"
     },
     "aiBanner": {
       "pausedTitle": "AI assistant is paused here",
@@ -322,6 +382,32 @@
       "resumed": "AI resumed.",
       "updateError": "Couldn’t update the AI assistant.",
       "networkError": "Couldn’t reach the server."
+    },
+    "funnel": {
+      "label": "Stage",
+      "crmOnly": "CRM only — not from an ad or tracked link, so not reported to Meta.",
+      "reportedToMeta": "Reported to Meta",
+      "notReportedYet": "Not reported yet",
+      "saleAmountTitle": "Record the sale",
+      "saleAmountLabel": "Sale amount",
+      "saleAmountConfirm": "Mark purchased",
+      "updateError": "Couldn't update the stage.",
+      "stage": {
+        "new_lead": "New lead",
+        "qualified": "Qualified lead",
+        "price_quoted": "Price quoted",
+        "itinerary_created": "Itinerary created",
+        "itinerary_sent": "Itinerary sent",
+        "invoice_sent": "Invoice sent",
+        "purchased": "Purchased"
+      }
+    },
+    "customFields": {
+      "title": "Details",
+      "none": "No fields configured",
+      "saved": "Saved",
+      "failed": "Couldn’t save",
+      "selectPlaceholder": "—"
     }
   },
   "Contacts": {
@@ -530,7 +616,18 @@
       "toastCreated": "Created \"{name}\".",
       "toastRenameFailed": "Could not rename field.",
       "toastDeleteFailed": "Could not delete field.",
-      "toastDeleted": "Deleted \"{name}\"."
+      "toastDeleted": "Deleted \"{name}\".",
+      "type": "Type",
+      "typeText": "Text",
+      "typeSelect": "Dropdown",
+      "typeMultiselect": "Multi-select",
+      "typeDate": "Date",
+      "typeNumber": "Number",
+      "options": "Options (comma-separated)",
+      "optionsPlaceholder": "UAE Visa, Global Visa, Packages",
+      "saveOptions": "Save options",
+      "toastUpdated": "Field updated",
+      "toastOptionsFailed": "Could not save options."
     }
   },
   "Pipelines": {
@@ -827,6 +924,25 @@
         "progressDesc": "Processing {current} of {total} recipients...",
         "toastFailedPreview": "Failed to load preview data"
       }
+    }
+  },
+  "Campaigns": {
+    "title": "Campaigns",
+    "subtitle": "Funnel performance and Meta conversion reporting.",
+    "newLeads": "New leads",
+    "qualified": "Qualified",
+    "purchases": "Purchases",
+    "purchaseValue": "Purchase value",
+    "window": "Last {days} days",
+    "funnelTitle": "Funnel by stage",
+    "metaTitle": "Meta delivery",
+    "meta": {
+      "sent": "Sent",
+      "pending": "Pending",
+      "unmatched": "Unmatched",
+      "error": "Error",
+      "abandoned": "Abandoned",
+      "total": "Total"
     }
   },
   "Automations": {
@@ -1374,6 +1490,26 @@
         "pink": "Pink"
       }
     },
+    "tagGroups": {
+      "title": "Tag groups",
+      "desc": "Organise labels into dimensions (Product, Destination, Priority…). Single-select groups allow one tag per chat; multi-select allow several.",
+      "newGroupName": "New group name",
+      "single": "Single-select",
+      "multi": "Multi-select",
+      "addGroup": "Add group",
+      "addTag": "Add tag",
+      "tagName": "Tag name",
+      "ungrouped": "Ungrouped",
+      "deleteGroup": "Delete group",
+      "deleteGroupConfirm": "Delete “{name}”? Its tags become ungrouped (they are not deleted).",
+      "deleteTag": "Delete tag",
+      "deleteTagConfirm": "Delete “{name}”? It is removed from every chat.",
+      "created": "Created",
+      "deleted": "Deleted",
+      "failed": "Something went wrong",
+      "nameRequired": "Enter a name",
+      "tagColor": "Tag colour"
+    },
     "templates": {
       "title": "Message templates",
       "description": "Create templates and submit them to Meta for approval. Use \"Sync from Meta\" to pull templates approved elsewhere.",
@@ -1756,6 +1892,11 @@
       "reindex": "Reindex",
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
+    }
+  },
+  "Agents": {
+    "usage": {
+      "classifyLabel": "Tagging"
     }
   }
 }

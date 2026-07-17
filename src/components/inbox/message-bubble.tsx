@@ -18,6 +18,7 @@ import {
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
 import { MessageReactions } from "./message-reactions";
+import { AdReferralCard } from "./ad-referral-card";
 import { InteractivePreview } from "@/components/interactive/interactive-preview";
 import { useTranslations } from "next-intl";
 
@@ -28,6 +29,10 @@ interface MessageBubbleProps {
   reactions?: MessageReaction[];
   currentUserId?: string;
   onToggleReaction?: (emoji: string) => void;
+  /** When false (viewer role), reaction pills render read-only (still
+   *  shown, not clickable) — passed through to <MessageReactions>.
+   *  Defaults to true. */
+  canReact?: boolean;
 }
 
 function StatusIcon({ status }: { status: Message["status"] }) {
@@ -120,6 +125,17 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
 }
 
 function MessageContent({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
+  const body = <MessageContentBody message={message} t={t} isAgent={isAgent} />;
+  if (!message.referral) return body;
+  return (
+    <>
+      <AdReferralCard referral={message.referral} />
+      {body}
+    </>
+  );
+}
+
+function MessageContentBody({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
   switch (message.content_type) {
     case "text":
       return (
@@ -276,6 +292,7 @@ export function MessageBubble({
   reactions,
   currentUserId,
   onToggleReaction,
+  canReact = true,
 }: MessageBubbleProps) {
   const t = useTranslations("Inbox.bubble");
 
@@ -346,6 +363,7 @@ export function MessageBubble({
           reactions={reactions}
           currentUserId={currentUserId}
           onToggle={onToggleReaction}
+          canReact={canReact}
         />
       )}
     </div>
