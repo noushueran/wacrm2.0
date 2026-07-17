@@ -173,13 +173,19 @@ export const filterByTags = accountQuery({
     const { tagIds, search, limit, offset } = args;
 
     // OR across tags: union every matching contactId (Set dedupes a
-    // contact that matches more than one selected tag).
+    // contact that matches more than one selected tag). The per-tag
+    // lookups are independent, so they go out in one wave rather than
+    // one round-trip per selected tag.
+    const linksPerTag = await Promise.all(
+      tagIds.map((tagId) =>
+        ctx.db
+          .query("contactTags")
+          .withIndex("by_tag", (q) => q.eq("tagId", tagId))
+          .collect(),
+      ),
+    );
     const contactIds = new Set<Id<"contacts">>();
-    for (const tagId of tagIds) {
-      const links = await ctx.db
-        .query("contactTags")
-        .withIndex("by_tag", (q) => q.eq("tagId", tagId))
-        .collect();
+    for (const links of linksPerTag) {
       for (const link of links) contactIds.add(link.contactId);
     }
 
