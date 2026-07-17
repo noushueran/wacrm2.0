@@ -378,3 +378,53 @@ export const analyzeInbound = internalAction({
     }
   },
 });
+
+/**
+ * Steering input for the assistant (spec §7): what's collected (never
+ * re-ask) and the ONE next question. Null when the feature is dormant
+ * or the session isn't collecting — `aiReply.dispatchInbound` then
+ * builds its prompt exactly as before this feature existed.
+ * `nextQuestion` prefers the analysis pass's `pendingQuestion`; before
+ * the first analysis lands it falls back to the first unanswered
+ * required basic field's first phrasing, so the assistant steers
+ * usefully from the very first reply.
+ */
+export const getObjectives = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    collected: { label: string; value: string }[];
+    nextQuestion: string | null;
+  } | null> => {
+    const config = await loadEnabledConfig(ctx, args.accountId);
+    if (!config) return null;
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .unique();
+    if (!session || session.status !== "collecting") return null;
+    if (session.accountId !== args.accountId) return null;
+
+    const collected = session.fields
+      .filter((f) => f.confidence !== "low")
+      .map((f) => ({ label: f.label ?? f.key, value: f.value }));
+
+    let nextQuestion: string | null = session.pendingQuestion?.text ?? null;
+    if (!nextQuestion) {
+      const answered = new Set(
+        session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
+      );
+      const missing = config.basicFields.find(
+        (f) => f.required && !answered.has(f.key),
+      );
+      nextQuestion = missing?.phrasings[0] ?? null;
+    }
+
+    return { collected, nextQuestion };
+  },
+});

@@ -284,3 +284,52 @@ test("analyzeInbound is a no-op without an active AI config or on terminal sessi
   rows = await sessionsFor(t, second.conversationId);
   expect(rows[0].fields).toHaveLength(0);
 });
+
+test("getObjectives returns collected + next question for a collecting session, null when dormant", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "collecting", origin: "inbound",
+      fields: [
+        { key: "destination", label: "Destination", value: "Bali", confidence: "high", updatedAt: 1 },
+        { key: "budget", value: "5000", confidence: "low", updatedAt: 1 },
+      ],
+      expectedCount: 4, answeredCount: 1,
+      pendingQuestion: { key: "travel_dates", text: "When are you planning to travel?", alternates: [] },
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const objectives = await t.query(internal.qualificationEngine.getObjectives, {
+    accountId, conversationId,
+  });
+  expect(objectives?.collected).toEqual([{ label: "Destination", value: "Bali" }]);
+  expect(objectives?.nextQuestion).toBe("When are you planning to travel?");
+
+  const off = await seed(t, { enabled: false });
+  expect(
+    await t.query(internal.qualificationEngine.getObjectives, {
+      accountId: off.accountId, conversationId: off.conversationId,
+    }),
+  ).toBeNull();
+});
+
+test("getObjectives falls back to the first unanswered required basic field when no pendingQuestion", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "collecting", origin: "inbound",
+      fields: [
+        { key: "looking_for", value: "Bali package", confidence: "high", updatedAt: 1 },
+      ],
+      expectedCount: 4, answeredCount: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const objectives = await t.query(internal.qualificationEngine.getObjectives, {
+    accountId, conversationId,
+  });
+  // looking_for is answered → next required basic field is travel_dates
+  expect(objectives?.nextQuestion).toContain("travel");
+});

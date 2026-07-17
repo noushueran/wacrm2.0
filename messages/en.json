@@ -1938,7 +1938,8 @@
   },
   "Agents": {
     "usage": {
-      "classifyLabel": "Tagging"
+      "classifyLabel": "Tagging",
+      "qualifyLabel": "Qualification"
     }
   }
 }

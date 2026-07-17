@@ -648,6 +648,26 @@ export const processInbound = internalAction({
       flowConsumed = flowResult.consumed;
     });
 
+    const inboundText = message.text ?? "";
+
+    // ---- Qualification ANALYSIS (P1 — spec §7). After Flows (so a
+    // scripted reply is never delayed by an LLM call), BEFORE the AI
+    // reply below (so the assistant's prompt sees freshly-extracted
+    // state). Awaited + best-effort; runs even when a flow consumed the
+    // message or a human owns the thread — extraction is passive
+    // tracking, not replying. Text-only: media/interactive taps carry
+    // nothing to extract (their activity bump already happened in
+    // `qualificationEngine.onInbound` above).
+    if (inboundText.trim() && !message.interactiveReplyId) {
+      await runBestEffort("qualificationEngine.analyzeInbound", () =>
+        ctx.runAction(internal.qualificationEngine.analyzeInbound, {
+          accountId,
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+        }),
+      );
+    }
+
     // ---- Automations (route.ts:756-797). Every trigger in the set
     // dispatches independently and best-effort — one failing (or
     // matching zero automations) must never affect the others.
@@ -657,7 +677,6 @@ export const processInbound = internalAction({
       isFirstInboundMessage: res.isFirstInboundMessage,
       interactiveReplyId: message.interactiveReplyId,
     });
-    const inboundText = message.text ?? "";
     await Promise.all(
       automationTriggers.map((triggerType) =>
         runBestEffort(`automationsEngine.runForTrigger(${triggerType})`, () =>

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from 'convex/react';
-import { BarChart3, Bot, PencilLine, Tag } from 'lucide-react';
+import { BarChart3, Bot, ClipboardCheck, PencilLine, Tag } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 import {
@@ -41,6 +41,7 @@ interface UsageResponse {
     auto_reply: { calls: number; tokens: number };
     draft: { calls: number; tokens: number };
     classify: { calls: number; tokens: number };
+    qualify: { calls: number; tokens: number };
   };
   by_model: {
     model: string;
@@ -96,6 +97,7 @@ export function AiUsageCard() {
       auto_reply: { calls: 0, tokens: 0 },
       draft: { calls: 0, tokens: 0 },
       classify: { calls: 0, tokens: 0 },
+      qualify: { calls: 0, tokens: 0 },
     };
     const modelMap = new Map<
       string,
@@ -211,6 +213,11 @@ export function AiUsageCard() {
                 label={t('classifyLabel')}
                 value={formatCompactNumber(data.by_mode.classify.tokens)}
                 icon={Tag}
+              />
+              <Stat
+                label={t('qualifyLabel')}
+                value={formatCompactNumber(data.by_mode.qualify.tokens)}
+                icon={ClipboardCheck}
               />
             </div>
 

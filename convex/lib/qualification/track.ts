@@ -1,5 +1,5 @@
 import type { Doc, Id } from "../../_generated/dataModel";
-import type { MutationCtx } from "../../_generated/server";
+import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { normalizePhone } from "../phone";
 
 // ============================================================
@@ -15,9 +15,13 @@ import { normalizePhone } from "../phone";
 // ============================================================
 
 type DbCtx = { db: MutationCtx["db"] };
+// Reader-typed ctx for the read-only gate below, so `internalQuery`
+// handlers (whose `db` has no write methods) can call it too — a
+// MutationCtx's db is a strict superset, so both call sites typecheck.
+type DbReadCtx = { db: QueryCtx["db"] };
 
 export async function loadEnabledConfig(
-  ctx: DbCtx,
+  ctx: DbReadCtx,
   accountId: Id<"accounts">,
 ): Promise<Doc<"qualificationConfigs"> | null> {
   const config = await ctx.db

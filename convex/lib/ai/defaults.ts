@@ -54,8 +54,16 @@ export function buildSystemPrompt(args: {
   mode: "draft" | "auto_reply";
   /** Knowledge-base excerpts retrieved for the current question. */
   knowledge?: string[];
+  /** Lead-qualification steering (spec §7) — collected answers the bot
+   *  must never re-ask, plus the ONE next question to weave in. Only
+   *  rendered in auto_reply mode; supplied by
+   *  `qualificationEngine.getObjectives` when a session is collecting. */
+  qualification?: {
+    collected: { label: string; value: string }[];
+    nextQuestion: string | null;
+  };
 }): string {
-  const { userPrompt, mode, knowledge } = args;
+  const { userPrompt, mode, knowledge, qualification } = args;
   const parts: string[] = [
     "You are a customer-messaging assistant for a business that uses a WhatsApp CRM. " +
       "You are shown the recent WhatsApp conversation between the business (assistant) and a customer (user). " +
@@ -74,6 +82,28 @@ export function buildSystemPrompt(args: {
 
   if (userPrompt && userPrompt.trim()) {
     parts.push(`Business context and instructions:\n${userPrompt.trim()}`);
+  }
+
+  if (mode === "auto_reply" && qualification) {
+    const lines: string[] = [
+      "Lead qualification objective: collect the customer's trip details naturally — " +
+        "ONE question per reply, conversational, never a form or checklist. " +
+        "Answer whatever the customer asked first, then weave in your question.",
+    ];
+    if (qualification.collected.length > 0) {
+      lines.push(
+        "Already provided (never re-ask any of these):\n" +
+          qualification.collected.map((c) => `- ${c.label}: ${c.value}`).join("\n"),
+      );
+    }
+    if (qualification.nextQuestion) {
+      lines.push(
+        `In this reply, weave in exactly ONE question asking: "${qualification.nextQuestion}" — ` +
+          "in your own words, matching the customer's language. If their latest message " +
+          "already answers it, acknowledge it instead of re-asking.",
+      );
+    }
+    parts.push(lines.join("\n\n"));
   }
 
   if (knowledge && knowledge.length > 0) {
