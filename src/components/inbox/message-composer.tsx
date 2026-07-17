@@ -30,6 +30,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -546,7 +547,7 @@ export function MessageComposer({
   // ---- Render --------------------------------------------------------
 
   return (
-    <div className="border-t border-border bg-card p-3">
+    <div className="border-t border-border bg-card p-3 pb-safe-bar">
       {replyTo && (
         <div className="mb-2">
           <ReplyQuote
@@ -641,9 +642,10 @@ export function MessageComposer({
           </Button>
         </div>
       ) : (
-        <div className="flex items-end gap-2">
-          {/* Attach menu — photo / video / document. Voice moved to the
-              first-class Mic button in the send slot (below). */}
+        <div className="flex items-end gap-1.5 sm:gap-2">
+          {/* Attach menu — photo / video / document. Desktop-only: on phones
+              these fold into the single ➕ actions menu below so the row
+              isn't crowded. Voice lives on the Mic button in the send slot. */}
           <DropdownMenu>
             <DropdownMenuTrigger
               disabled={inputsDisabled || busy}
@@ -654,7 +656,7 @@ export function MessageComposer({
                     ? undefined
                     : t("attachMedia")
               }
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:inline-flex"
             >
               {busy ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -678,8 +680,10 @@ export function MessageComposer({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* + menu — interactive messages + quick replies. Gated on the
-              24h window like free-form text (interactive requires it). */}
+          {/* Actions menu (➕) — always visible. On phones it also carries the
+              media + template items (each `sm:hidden`) so the separate desktop
+              buttons collapse into one tap target. Gated on the 24h window like
+              free-form text (interactive requires it). */}
           <DropdownMenu>
             <DropdownMenuTrigger
               disabled={inputsDisabled}
@@ -690,11 +694,43 @@ export function MessageComposer({
                     ? undefined
                     : t("moreActions")
               }
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
             >
-              <Plus className="h-4 w-4" />
+              <Plus className="h-5 w-5 sm:h-4 sm:w-4" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="border-border bg-popover">
+              {/* Mobile-only — desktop surfaces these as dedicated buttons.
+                  Media stays busy-gated; Template mirrors the desktop button
+                  (available whenever you can send). */}
+              <DropdownMenuItem
+                className="sm:hidden"
+                disabled={busy}
+                onClick={() => imageInputRef.current?.click()}
+              >
+                <ImageIcon className="mr-2 h-4 w-4" />
+                {t("photo")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="sm:hidden"
+                disabled={busy}
+                onClick={() => videoInputRef.current?.click()}
+              >
+                <Video className="mr-2 h-4 w-4" />
+                {t("video")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="sm:hidden"
+                disabled={busy}
+                onClick={() => documentInputRef.current?.click()}
+              >
+                <FileText className="mr-2 h-4 w-4" />
+                {t("document")}
+              </DropdownMenuItem>
+              <DropdownMenuItem className="sm:hidden" onClick={onOpenTemplates}>
+                <LayoutTemplate className="mr-2 h-4 w-4" />
+                {t("sendTemplate")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator className="sm:hidden" />
               <DropdownMenuItem onClick={() => openInteractiveBuilder()}>
                 <MessageSquareDashed className="mr-2 h-4 w-4" />
                 {t("interactiveMessage")}
@@ -706,18 +742,24 @@ export function MessageComposer({
             </DropdownMenuContent>
           </DropdownMenu>
 
+          {/* Template — desktop-only button; on phones it lives in the ➕ menu
+              (and in the amber banner when the session is expired). */}
           <GatedButton
             variant="ghost"
             size="sm"
             canAct={!readOnly}
             gateReason="send messages"
             title={readOnly ? undefined : t("sendTemplate")}
-            className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+            className="hidden h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground sm:inline-flex"
             onClick={onOpenTemplates}
           >
             <LayoutTemplate className="h-4 w-4" />
           </GatedButton>
 
+          {/* AI draft — kept first-class on every screen (tinted so it reads
+              as the "magic" action) instead of being buried in the ➕ menu.
+              This is the primary way agents draft a reply, so it stays a
+              one-tap, always-visible control on mobile. */}
           <GatedButton
             variant="ghost"
             size="sm"
@@ -725,13 +767,17 @@ export function MessageComposer({
             gateReason="send messages"
             disabled={drafting}
             title={readOnly ? undefined : t("draftWithAI")}
-            className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-primary"
+            aria-label={t("draftWithAI")}
+            // Mobile: tinted (text-primary) so the AI action reads as the
+            // "magic" button and stays obvious. Desktop (sm+): restored to the
+            // original muted icon with hover→primary, unchanged.
+            className="h-10 w-10 shrink-0 p-0 text-primary sm:h-9 sm:w-9 sm:text-muted-foreground sm:hover:text-primary"
             onClick={handleDraft}
           >
             {drafting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Loader2 className="h-5 w-5 animate-spin sm:h-4 sm:w-4" />
             ) : (
-              <Sparkles className="h-4 w-4" />
+              <Sparkles className="h-5 w-5 sm:h-4 sm:w-4" />
             )}
           </GatedButton>
 
@@ -770,9 +816,9 @@ export function MessageComposer({
               gateReason="send messages"
               disabled={sessionExpired || sending}
               onClick={handleSend}
-              className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
+              className="h-10 w-10 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40 sm:h-9 sm:w-9"
             >
-              <Send className="h-4 w-4" />
+              <Send className="h-5 w-5 sm:h-4 sm:w-4" />
             </GatedButton>
           ) : (
             <GatedButton
@@ -783,9 +829,9 @@ export function MessageComposer({
               title={readOnly ? undefined : t("voiceNote")}
               aria-label={t("voiceNote")}
               onClick={() => void startRecording()}
-              className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
+              className="h-10 w-10 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40 sm:h-9 sm:w-9"
             >
-              <Mic className="h-4 w-4" />
+              <Mic className="h-5 w-5 sm:h-4 sm:w-4" />
             </GatedButton>
           )}
         </div>
@@ -794,8 +840,10 @@ export function MessageComposer({
       {/* Hint sits outside the flex row so its height doesn't push
           `items-end` buttons below the textarea. Indented to line up
           under the textarea left edge. */}
+      {/* Desktop-only hint. On mobile it's dropped — vertical space is scarce
+          and the tinted ✨ button is self-evident. */}
       {!draft && !recording && (
-        <p className="mt-1 pl-[5.5rem] text-[10px] text-muted-foreground">
+        <p className="mt-1 hidden pl-[5.5rem] text-[10px] text-muted-foreground sm:block">
           {t("draftHint")}
         </p>
       )}

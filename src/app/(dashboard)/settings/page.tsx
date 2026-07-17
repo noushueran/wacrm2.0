@@ -11,6 +11,7 @@ import { SettingsRail } from '@/components/settings/settings-rail';
 import { SettingsOverview } from '@/components/settings/settings-overview';
 import { ProfileForm } from '@/components/settings/profile-form';
 import { AppearancePanel } from '@/components/settings/appearance-panel';
+import { NotificationsPanel } from '@/components/settings/notifications-panel';
 import { WhatsAppConfig } from '@/components/settings/whatsapp-config';
 import { TemplateManager } from '@/components/settings/template-manager';
 import { QuickRepliesManager } from '@/components/settings/quick-replies-manager';
@@ -72,6 +73,7 @@ export default function SettingsPage() {
     overview: <SettingsOverview onSelect={go} />,
     profile: <ProfileForm />,
     appearance: <AppearancePanel />,
+    notifications: <NotificationsPanel />,
     whatsapp: <WhatsAppConfig />,
     templates: <TemplateManager />,
     'quick-replies': <QuickRepliesManager />,

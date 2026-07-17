@@ -83,12 +83,16 @@ export default function BroadcastsPage() {
   return (
     <div className="space-y-6">
       {/* Top indeterminate progress bar: only visible while a broadcast
-          is mid-send. Pure CSS animation so no extra deps. */}
+          is mid-send. Pure CSS animation so no extra deps.
+          Offset by the safe-area inset rather than a literal top-0: this is
+          `fixed`, so in the installed PWA a bare top-0 puts this 2px bar
+          underneath the iOS status bar, silently hiding the only
+          send-in-progress indicator. Resolves to top-0 on desktop. */}
       {anySending && (
         <div
           role="progressbar"
           aria-label="Broadcast in progress"
-          className="broadcast-indeterminate fixed inset-x-0 top-0 z-40 h-0.5 overflow-hidden bg-muted"
+          className="broadcast-indeterminate fixed inset-x-0 top-[var(--safe-top)] z-40 h-0.5 overflow-hidden bg-muted"
         >
           <div className="broadcast-indeterminate-bar h-0.5 bg-primary" />
           <style jsx>{`

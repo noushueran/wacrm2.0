@@ -706,6 +706,19 @@ export const processInbound = internalAction({
       }),
     );
 
+    // ---- Web Push (PWA) — OUTSIDE every guard above, best-effort.
+    // Notifies the assigned agent (else owner/admin/supervisor) on their
+    // installed devices. A push failure never blocks ingestion.
+    await runBestEffort("pushSend.deliverForMessage", () =>
+      ctx.runAction(internal.pushSend.deliverForMessage, {
+        accountId,
+        conversationId: res.conversationId,
+        contentType: message.type,
+        text: message.text,
+        flowConsumed,
+      }),
+    );
+
     // ---- Conversion funnel: first-touch (new_lead) — OUTSIDE every guard
     // above, best-effort. Classify the lead source from the inbound
     // identifiers (our HY- zero-width code → website/code lane, else Meta's

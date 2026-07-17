@@ -213,7 +213,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
       <aside
         className={cn(
           // Mobile: fixed drawer that slides in from the left.
-          "group fixed inset-y-0 left-0 z-40 flex h-full w-64 flex-col overflow-hidden whitespace-nowrap border-r border-border bg-card",
+          // `pt-safe`: this is `fixed`, so it is positioned against the
+          // viewport and does NOT inherit the shell's `pt-safe` — without its
+          // own the brand/pin row (and the first nav items) render under the
+          // iOS status bar in the installed PWA. Inset is 0 on desktop.
+          "group fixed inset-y-0 left-0 z-40 flex h-full w-64 flex-col overflow-hidden whitespace-nowrap border-r border-border bg-card pt-safe",
           "transition-[transform,width,box-shadow] duration-200 ease-out will-change-transform",
           open ? "translate-x-0" : "-translate-x-full",
           // Desktop: always visible. Collapsed rail expands over content on
@@ -227,17 +231,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
       >
         {/* Logo + pin row. */}
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-          <Link href="/dashboard" className="flex items-center gap-2">
+          {/* Mark only — the wordmark lives in the header. aria-label carries
+              the name the removed text used to provide. */}
+          <Link href="/dashboard" aria-label={t("title")} className="flex items-center">
             <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <MessageSquare className="h-4 w-4" />
-            </span>
-            <span
-              className={cn(
-                "text-sm font-semibold text-foreground",
-                revealOnExpand,
-              )}
-            >
-              {t("title")}
             </span>
           </Link>
           <div className="flex items-center gap-1">

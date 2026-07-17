@@ -12,6 +12,7 @@ export default defineSchema({
     defaultCurrency: v.string(), // ISO-4217, default "USD"
     ownerUserId: v.id("users"),
     leadValue: v.optional(v.number()), // flat per-lead charge; unset/<=0 = feature OFF
+    suppressBotHandledPush: v.optional(v.boolean()), // opt-in: skip push when a flow fully handled the inbound message
   }).index("by_owner", ["ownerUserId"]),
 
   // Append-only spend ledger — one row = one agent charged once for one
@@ -689,6 +690,32 @@ export default defineSchema({
   })
     .index("by_account", ["accountId"])
     .index("by_user", ["userId"]),
+
+  // One Web Push subscription = one browser/device for one user. A user
+  // may have several (phone + laptop). `by_endpoint` is the upsert/prune
+  // key; `by_user` loads a recipient's devices when sending.
+  pushSubscriptions: defineTable({
+    accountId: v.id("accounts"),
+    userId: v.id("users"),
+    endpoint: v.string(),
+    p256dh: v.string(),
+    auth: v.string(),
+    userAgent: v.optional(v.string()),
+    createdAt: v.number(),
+    lastSeenAt: v.number(),
+  })
+    .index("by_endpoint", ["endpoint"])
+    .index("by_user", ["userId"])
+    .index("by_account", ["accountId"]),
+
+  // Per-user, per-account notification preferences. An absent row means
+  // defaults (push enabled, message preview shown).
+  notificationPreferences: defineTable({
+    accountId: v.id("accounts"),
+    userId: v.id("users"),
+    pushEnabled: v.boolean(),
+    hidePreview: v.boolean(),
+  }).index("by_user_account", ["userId", "accountId"]),
 
   // Lightweight online/away heartbeat, one row per user. Postgres's
   // primary key WAS `user_id` (a genuine one-row-per-user constraint);
