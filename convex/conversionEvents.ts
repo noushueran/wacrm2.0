@@ -11,6 +11,9 @@ import { resolveEventName, backendForLane } from "./lib/funnel";
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
 
+/** Rows per pass of `migrateDormantOutOfAbandoned`'s cursor walk. */
+const MIGRATE_BATCH = 512;
+
 /**
  * Delay between each `deliverConversionEvent` the retry cron schedules. The
  * cron pulls up to 100 rows every 15 minutes and every one of them is an
@@ -214,9 +217,54 @@ export const retireDormant = internalMutation({
     const row = await ctx.db.get(args.conversionEventId);
     if (!row) return;
     await ctx.db.patch(args.conversionEventId, {
-      status: "abandoned",
+      status: "dormant",
       lastError: `dormant: ${args.reason}`,
     });
+  },
+});
+
+/**
+ * One-off: reclassifies rows the PREVIOUS release retired as `"abandoned"`
+ * with `attempts < MAX_DELIVER_ATTEMPTS` into the `"dormant"` partition the
+ * sweep now reads. Without it those rows are stranded — `getDormantToSweep`
+ * no longer looks at `"abandoned"`, so they would never deliver once their
+ * backend is configured, silently. Production carried 19 of them, all real
+ * undelivered CTWA conversions.
+ *
+ * `attempts` is what identifies them, and it is exact rather than heuristic:
+ * `patchStatus`'s give-up path can only ever land on `attempts >= MAX`, so a
+ * sub-MAX `"abandoned"` row can only have come from `retireDormant`.
+ *
+ * Walks the `"abandoned"` partition on a `_creationTime` cursor (the implicit
+ * trailing key of `by_status`) rather than filtering it, so each pass reads a
+ * bounded window and never re-reads a row it has already stepped over. Safe to
+ * re-run: a second pass finds nothing left below MAX.
+ */
+export const migrateDormantOutOfAbandoned = internalMutation({
+  args: { cursorMs: v.optional(v.number()) },
+  handler: async (ctx, args): Promise<void> => {
+    const cursorMs = args.cursorMs ?? 0;
+    const page = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_status", (q) =>
+        q.eq("status", "abandoned").gt("_creationTime", cursorMs),
+      )
+      .take(MIGRATE_BATCH);
+    if (page.length === 0) return;
+
+    for (const row of page) {
+      if (row.attempts < MAX_DELIVER_ATTEMPTS) {
+        await ctx.db.patch(row._id, { status: "dormant" });
+      }
+    }
+
+    if (page.length === MIGRATE_BATCH) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.conversionEvents.migrateDormantOutOfAbandoned,
+        { cursorMs: page[page.length - 1]!._creationTime },
+      );
+    }
   },
 });
 
@@ -411,15 +459,19 @@ export const getPendingToRetry = internalQuery({
  * `attempts < MAX_DELIVER_ATTEMPTS` excludes rows that reached `"abandoned"`
  * the honest way, through `patchStatus`'s give-up.
  *
- * Dormant-retired and genuinely-given-up rows share the `"abandoned"`
- * partition, so that `attempts` bound is a post-index `.filter()` rather than
- * a partition of its own. It would be cleaner as a distinct `"dormant"` status
- * (its own `by_status` range, no scanning past dead rows to reach live ones —
- * the principle `getPendingToRetry` above is built on), but that needs a new
- * literal in `conversionEvents.status` in `convex/schema.ts`. The two only mix
- * when an account both fails deliveries permanently AND has undeliverable
- * rows, which needs the env configured and unconfigured at once, so the scan
- * stays short in practice.
+ * Dormant now has its own status, so this carries NO `.filter()`: one
+ * `by_status_backend` range per configured backend, each bounded by its own
+ * `.take()`. It previously ranged `"abandoned"` and filtered on both
+ * `attempts < MAX` and the backend list — a scan across a partition that
+ * genuinely-given-up rows never leave, so it walked further every time one
+ * accumulated. That comment argued the two "only mix when an account both
+ * fails deliveries permanently AND has undeliverable rows"; the real
+ * production state is simpler and worse, since capi-dormant rows pile up
+ * indefinitely while only platformA is configured.
+ *
+ * Per-backend rather than one range over `"dormant"` with a backend filter,
+ * for the same reason: a filter over the whole dormant set would scan past
+ * every capi row to find platformA's.
  */
 export const getDormantToSweep = internalQuery({
   args: {
@@ -427,16 +479,17 @@ export const getDormantToSweep = internalQuery({
   },
   handler: async (ctx, args): Promise<Doc<"conversionEvents">[]> => {
     if (args.backends.length === 0) return [];
-    return await ctx.db
-      .query("conversionEvents")
-      .withIndex("by_status", (q) => q.eq("status", "abandoned"))
-      .filter((q) =>
-        q.and(
-          q.lt(q.field("attempts"), MAX_DELIVER_ATTEMPTS),
-          q.or(...args.backends.map((b) => q.eq(q.field("backend"), b))),
-        ),
-      )
-      .take(100);
+    const perBackend = await Promise.all(
+      args.backends.map((backend) =>
+        ctx.db
+          .query("conversionEvents")
+          .withIndex("by_status_backend", (q) =>
+            q.eq("status", "dormant").eq("backend", backend),
+          )
+          .take(100),
+      ),
+    );
+    return perBackend.flat().slice(0, 100);
   },
 });
 

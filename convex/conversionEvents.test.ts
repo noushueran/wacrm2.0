@@ -3,6 +3,7 @@ import { expect, test, afterEach, vi } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
+import { MAX_DELIVER_ATTEMPTS } from "./conversionEvents";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -81,9 +82,10 @@ test("capi: dormant without env retires the row out of the retry partitions (no 
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
   const row = await t.run((ctx) => ctx.db.get(id));
-  // Terminal, but `attempts` untouched — that pair is what distinguishes a
-  // dormant-retired row (re-sweepable) from a genuinely given-up one.
-  expect(row?.status).toBe("abandoned");
+  // Its own status, not `"abandoned"` with an `attempts` tiebreak: dormant is
+  // re-sweepable and given-up is not, so they get separate partitions rather
+  // than a `.filter()` to tell them apart.
+  expect(row?.status).toBe("dormant");
   expect(row?.attempts).toBe(0);
   expect(row?.lastError).toContain("dormant");
 });
@@ -100,7 +102,7 @@ test("capi: an account with no wabaId is dormant-retired, not left pending", asy
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
   const row = await t.run((ctx) => ctx.db.get(id));
-  expect(row?.status).toBe("abandoned");
+  expect(row?.status).toBe("dormant");
   expect(row?.attempts).toBe(0);
 });
 
@@ -115,7 +117,7 @@ test("platformA: dormant without env retires the row (no attempt bump)", async (
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
   const row = await t.run((ctx) => ctx.db.get(id));
-  expect(row?.status).toBe("abandoned");
+  expect(row?.status).toBe("dormant");
   expect(row?.attempts).toBe(0);
 });
 
@@ -392,6 +394,71 @@ test("retryConversionEvents staggers its fan-out instead of firing 100 Graph POS
   }
 });
 
+/**
+ * `getDormantToSweep` reads `by_status_backend` with BOTH keys bound, so it
+ * has no `.filter()` left: one range per configured backend. Previously it
+ * ranged `"abandoned"` and filtered on `attempts < MAX` plus the backend list —
+ * a scan across a partition that genuinely-given-up rows never leave, so it
+ * walked further every time one accumulated. This asserts the three things
+ * that separation buys: the other backend's dormant rows are not swept, a
+ * given-up row is not swept, and a live pending row is not swept.
+ */
+test("getDormantToSweep returns only dormant rows for the configured backend", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  const capiDormant = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", stage: "new_lead", status: "dormant", attempts: 0,
+  });
+  await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "platformA", stage: "qualified", status: "dormant", attempts: 0,
+  });
+  await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", stage: "purchased", status: "abandoned", attempts: 5,
+  });
+  await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", stage: "invoice_sent", status: "pending", attempts: 0,
+  });
+
+  const swept = await t.run(() =>
+    t.query(internal.conversionEvents.getDormantToSweep, { backends: ["capi"] }),
+  );
+
+  expect(swept.map((r) => r._id)).toEqual([capiDormant]);
+});
+
+/**
+ * Rows retired by the PREVIOUS release are sitting at `"abandoned"` with
+ * `attempts < MAX`, which the new sweep no longer reads. Production has 19 of
+ * them — real undelivered CTWA conversions — so without this migration they
+ * would never deliver once CAPI is configured, silently. `attempts` is what
+ * identifies them: the give-up path can only ever land on `>= MAX`.
+ */
+test("migrateDormantOutOfAbandoned reclassifies legacy rows and leaves genuine give-ups alone", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const accountId = await seedAccount(t);
+    const { contactId, conversationId } = await seedConversation(t, accountId);
+
+    const legacyDormant = await seedEvent(t, accountId, conversationId, contactId, {
+      backend: "capi", stage: "new_lead", status: "abandoned", attempts: 0,
+    });
+    const gaveUp = await seedEvent(t, accountId, conversationId, contactId, {
+      backend: "capi", stage: "purchased", status: "abandoned", attempts: MAX_DELIVER_ATTEMPTS,
+    });
+
+    await t.mutation(internal.conversionEvents.migrateDormantOutOfAbandoned, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    expect((await t.run((ctx) => ctx.db.get(legacyDormant)))?.status).toBe("dormant");
+    expect((await t.run((ctx) => ctx.db.get(gaveUp)))?.status).toBe("abandoned");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("retryConversionEvents leaves dormant rows alone while their backend is unconfigured, and re-sweeps them once it is", async () => {
   delete process.env.META_CAPI_DATASET_ID;
   delete process.env.META_CAPI_ACCESS_TOKEN;
@@ -401,7 +468,7 @@ test("retryConversionEvents leaves dormant rows alone while their backend is unc
   await seedWaba(t, accountId);
   const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa" });
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
-  expect((await t.run((ctx) => ctx.db.get(id)))?.status).toBe("abandoned");
+  expect((await t.run((ctx) => ctx.db.get(id)))?.status).toBe("dormant");
 
   // Env still unset: sweeping it would only churn the scheduler.
   await t.action(internal.conversionEvents.retryConversionEvents, {});

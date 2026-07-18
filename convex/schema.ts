@@ -1391,12 +1391,21 @@ export default defineSchema({
     waMessageId: v.string(),
     firstMessageAt: v.number(),
     eventId: v.string(), // `${conversationId}:${stage}` — dedup
+    // "abandoned" is terminal: the row gave up after MAX_DELIVER_ATTEMPTS.
+    // "dormant" is terminal-for-now: the backend had no env configured, so
+    // nothing could be attempted and no attempt was spent;
+    // `getDormantToSweep` brings it back once that backend exists. These were
+    // one status separated by `attempts < MAX` in a post-index `.filter()`,
+    // which meant the sweep scanned across given-up rows — and those never
+    // leave their partition, so it walked further every time one accumulated.
+    // Mirrors `campaignAds.resolveStatus`.
     status: v.union(
       v.literal("pending"),
       v.literal("sent"),
       v.literal("unmatched"),
       v.literal("error"),
       v.literal("abandoned"),
+      v.literal("dormant"),
     ),
     attempts: v.number(),
     lastError: v.optional(v.string()),
@@ -1407,6 +1416,13 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     .index("by_event_id", ["eventId"])
     .index("by_status", ["status"])
+    // `getDormantToSweep` wants one backend's dormant rows. Binding BOTH keys
+    // leaves it with no `.filter()` at all — one bounded range per configured
+    // backend. Ranging `status` alone would still have to filter `backend`,
+    // and capi-dormant rows pile up indefinitely while only platformA is
+    // configured (exactly today's production state), so that filter would
+    // scan past a growing set to reach the rows it wants.
+    .index("by_status_backend", ["status", "backend"])
     // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
     // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
     .index("by_account", ["accountId"]),
