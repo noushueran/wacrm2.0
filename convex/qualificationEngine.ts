@@ -31,6 +31,7 @@ import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import type { AccountRole } from "./lib/roles";
 import { normalizePhone } from "./lib/phone";
+import { allocateContactCode } from "./contacts";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -83,10 +84,14 @@ export const onInbound = internalMutation({
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
       .unique();
     if (session && session.status === "collecting") {
-      const at = computeNextFollowUpAt(config, session.followUpsSent, now);
-      if (at !== null) {
-        await ctx.db.patch(session._id, { nextFollowUpAt: at });
-      }
+      // Past the nudge cap the ladder returns null — fall back to the
+      // expiry revisit so the 72h clock still fires (review fix: without
+      // this, a reply AFTER the final nudge orphaned the session in
+      // "collecting" forever — the sweep only visits armed rows).
+      const at =
+        computeNextFollowUpAt(config, session.followUpsSent, now) ??
+        now + config.sessionWindowHours * 3_600_000 + 60_000;
+      await ctx.db.patch(session._id, { nextFollowUpAt: at });
     }
   },
 });
@@ -173,6 +178,13 @@ export const loadAnalysisContext = internalQuery({
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return null;
     if (conversation.status === "closed") return null;
+    // Loop guard (spec §9, review fix): the analysis path must skip the
+    // admin-alert channel just like `onInbound` does — an admin REPLYING
+    // to a lead alert must never trigger paid analysis, let alone a
+    // session (the alert text itself contains qualifying answers, so
+    // the model could "qualify" the staff thread and echo fresh alerts).
+    const contact = await ctx.db.get(conversation.contactId);
+    if (contact && isAdminAlertNumber(config, contact.phoneNormalized)) return null;
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
@@ -245,6 +257,13 @@ export const applyAnalysis = internalMutation({
     const none = { wantsHuman: false, readyToComplete: false };
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return none;
+    // Belt-and-braces admin-channel guard (loadAnalysisContext already
+    // filters, but this mutation creates sessions and is independently
+    // callable — it must never open one on the alert channel).
+    const guardContact = await ctx.db.get(args.contactId);
+    if (guardContact && isAdminAlertNumber(config, guardContact.phoneNormalized)) {
+      return none;
+    }
     const now = Date.now();
     const sessionId = await ensureSession(ctx, {
       accountId: args.accountId,
@@ -697,11 +716,15 @@ export const ensureAdminConversation = internalMutation({
       )
       .unique();
     if (!contact) {
+      // Every contact insert path allocates a sequential HC- code — this
+      // one included (review fix; see contacts.ts's allocator comment).
+      const contactCode = await allocateContactCode(ctx.db, args.accountId);
       const contactId = await ctx.db.insert("contacts", {
         accountId: args.accountId,
         phone: args.phone,
         phoneNormalized,
         name: "Lead alerts (staff)",
+        contactCode,
       });
       contact = (await ctx.db.get(contactId))!;
     }
@@ -938,26 +961,34 @@ export const setNextFollowUpAt = internalMutation({
   },
 });
 
-/** Books the slot AFTER a successful send: attempt count, phrasing
- *  rotation, next rung of the ladder (or the expiry revisit when the
- *  ladder/cap is exhausted). */
-export const recordFollowUpSent = internalMutation({
+/**
+ * CLAIMS the slot BEFORE the send (review fix — the codebase's
+ * `aiReply.claimReplySlot` pattern): advances the attempt count, the
+ * phrasing rotation, and the next rung of the ladder (or the expiry
+ * revisit once the ladder/cap is exhausted) in one OCC-serialized
+ * mutation. Returns false when the slot is no longer claimable (state
+ * changed, or a concurrent sender already claimed it — its patch moved
+ * `nextFollowUpAt` into the future), so a duplicate follow-up can never
+ * reach the customer. The tradeoff is at-most-once: a transient Meta
+ * failure after a claim costs that one nudge (the next rung is already
+ * booked) rather than ever risking a double text.
+ */
+export const claimFollowUpSlot = internalMutation({
   args: {
     sessionId: v.id("qualificationSessions"),
     nextCursor: v.optional(v.number()),
   },
-  handler: async (ctx, args): Promise<void> => {
+  handler: async (ctx, args): Promise<boolean> => {
     const session = await ctx.db.get(args.sessionId);
-    if (!session || session.status !== "collecting") return;
-    const config = await loadEnabledConfig(ctx, session.accountId);
+    if (!session || session.status !== "collecting") return false;
     const now = Date.now();
+    if (!session.nextFollowUpAt || session.nextFollowUpAt > now) return false;
+    const config = await loadEnabledConfig(ctx, session.accountId);
+    if (!config) return false;
     const sent = session.followUpsSent + 1;
-    let next: number | null = null;
-    if (config) {
-      next = computeNextFollowUpAt(config, sent, now);
-      if (next === null && session.lastCustomerMessageAt) {
-        next = session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
-      }
+    let next = computeNextFollowUpAt(config, sent, now);
+    if (next === null && session.lastCustomerMessageAt) {
+      next = session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
     }
     await ctx.db.patch(args.sessionId, {
       followUpsSent: sent,
@@ -965,39 +996,7 @@ export const recordFollowUpSent = internalMutation({
       ...(args.nextCursor !== undefined ? { phrasingCursor: args.nextCursor } : {}),
       nextFollowUpAt: next ?? undefined,
     });
-  },
-});
-
-/** Bounded send-failure retry: +30min, three strikes skips the slot
- *  (mirrors the outbox's attempts cap). */
-export const recordFollowUpError = internalMutation({
-  args: { sessionId: v.id("qualificationSessions") },
-  handler: async (ctx, args): Promise<void> => {
-    const session = await ctx.db.get(args.sessionId);
-    if (!session || session.status !== "collecting") return;
-    const errors = session.sendAttemptErrors + 1;
-    if (errors >= 3) {
-      const config = await loadEnabledConfig(ctx, session.accountId);
-      const now = Date.now();
-      const sent = session.followUpsSent + 1; // slot consumed
-      let next: number | null = null;
-      if (config) {
-        next = computeNextFollowUpAt(config, sent, now);
-        if (next === null && session.lastCustomerMessageAt) {
-          next = session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
-        }
-      }
-      await ctx.db.patch(args.sessionId, {
-        followUpsSent: sent,
-        sendAttemptErrors: 0,
-        nextFollowUpAt: next ?? undefined,
-      });
-      return;
-    }
-    await ctx.db.patch(args.sessionId, {
-      sendAttemptErrors: errors,
-      nextFollowUpAt: Date.now() + 30 * 60_000,
-    });
+    return true;
   },
 });
 
@@ -1036,6 +1035,16 @@ export const sendFollowUp = internalAction({
             sessionId: args.sessionId,
           });
           if (!meta) return;
+          // Claim BEFORE the send (see claimFollowUpSlot): losing the
+          // claim means another sender (or a state change) got here
+          // first — never send twice.
+          const claimed = await ctx.runMutation(
+            internal.qualificationEngine.claimFollowUpSlot,
+            verdict.kind === "sendText"
+              ? { ...session, nextCursor: verdict.nextCursor }
+              : session,
+          );
+          if (!claimed) return;
           try {
             if (verdict.kind === "sendText") {
               await ctx.runAction(internal.metaSend.sendText, {
@@ -1043,10 +1052,6 @@ export const sendFollowUp = internalAction({
                 conversationId: meta.conversationId,
                 to: verdict.to,
                 text: verdict.text,
-              });
-              await ctx.runMutation(internal.qualificationEngine.recordFollowUpSent, {
-                ...session,
-                nextCursor: verdict.nextCursor,
               });
             } else {
               await ctx.runAction(internal.metaSend.sendTemplate, {
@@ -1058,11 +1063,12 @@ export const sendFollowUp = internalAction({
                 params: verdict.params,
                 contentText: verdict.contentText,
               });
-              await ctx.runMutation(internal.qualificationEngine.recordFollowUpSent, session);
             }
           } catch (err) {
+            // At-most-once by design: the slot is spent, the next rung is
+            // already booked — a transient failure skips one nudge, it
+            // never duplicates one.
             console.error("[qualification] follow-up send failed:", err);
-            await ctx.runMutation(internal.qualificationEngine.recordFollowUpError, session);
           }
           return;
         }

@@ -2,7 +2,11 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { holidayysDefaultConfig } from "./lib/qualification/defaults";
-import { validateConfigPatch, type QualificationConfigPatch } from "./lib/qualification/validate";
+import {
+  validateConfigPatch,
+  CONFIG_PATCH_KEYS,
+  type QualificationConfigPatch,
+} from "./lib/qualification/validate";
 
 // ============================================================
 // Lead-qualification config CRUD (P0 — spec §11/§12). Admin-gated on
@@ -39,14 +43,16 @@ export const updateConfig = accountMutation({
   args: { patch: v.any() },
   handler: async (ctx, args) => {
     ctx.requireRole("admin");
-    const raw = { ...((args.patch ?? {}) as Record<string, unknown>) };
-    delete raw._id;
-    delete raw._creationTime;
-    delete raw.accountId;
-    delete raw.isPersisted;
-    const patch = raw as QualificationConfigPatch;
+    // Whitelist (review fix): only known config keys survive, so a stray
+    // client field fails HERE as a clean no-op instead of surfacing as a
+    // raw schema-validation error from db.insert/patch.
+    const raw = (args.patch ?? {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const key of CONFIG_PATCH_KEYS) {
+      if (raw[key] !== undefined) patch[key] = raw[key];
+    }
 
-    const error = validateConfigPatch(patch);
+    const error = validateConfigPatch(patch as QualificationConfigPatch);
     if (error) throw new ConvexError({ code: "BAD_REQUEST", reason: error });
 
     const existing = await ctx.db

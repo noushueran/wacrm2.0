@@ -131,6 +131,7 @@ export async function recordOutboundSend(
 ): Promise<void> {
   const conversation = await ctx.db.get(args.conversationId);
   if (!conversation || conversation.accountId !== args.accountId) return;
+  if (conversation.status === "closed") return; // mirror onInbound (review fix)
   const contact = await ctx.db.get(conversation.contactId);
   if (contact && isAdminAlertNumber(args.config, contact.phoneNormalized)) {
     return; // loop guard (spec §9)

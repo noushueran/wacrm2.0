@@ -467,6 +467,7 @@ test("sendAdminAlerts creates a silenced internal conversation, sends the alert,
       .withIndex("by_contact", (q) => q.eq("contactId", adminContact!._id))
       .unique());
   expect(adminConversation?.aiAutoreplyDisabled).toBe(true);
+  expect(adminContact?.contactCode).toMatch(/^HC-/); // review fix: allocator invariant
   const alertMessages = await t.run((ctx) =>
     ctx.db.query("messages")
       .withIndex("by_conversation", (q) => q.eq("conversationId", adminConversation!._id))
@@ -618,7 +619,103 @@ test("getDueSessions picks only due collecting sessions", async () => {
   await seedDueSession(t, other, { nextFollowUpAt: Date.now() + 3_600_000 }); // future
   const third = await seedAllHours(t);
   await seedDueSession(t, third, { status: "expired", nextFollowUpAt: Date.now() - 500 }); // terminal
+  const fourth = await seedAllHours(t);
+  await seedDueSession(t, fourth, { nextFollowUpAt: undefined }); // never armed — must NOT leak into the range
   const due = await t.query(internal.qualificationEngine.getDueSessions, {});
   expect(due).toHaveLength(1);
   expect(due[0].conversationId).toBe(base.conversationId);
+});
+
+test("sendFollowUp at the nudge cap sends nothing and waits out the expiry clock", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base, { followUpsSent: 4 }); // cap (default maxFollowUps=4)
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(4);
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  expect(s.status).toBe("collecting");
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now()); // expiry revisit booked
+});
+
+// ---- Review fixes (independent review of PR #18) ----
+
+test("REVIEW-1: the analysis path never opens a session on the admin-alert channel", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 50 000 0001"] });
+  await configureAi(base.asUser);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "field:a=1;field:b=2;field:c=3; [[COMPLETE]] score:90");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(0);
+});
+
+test("REVIEW-2: a customer reply after the nudge cap re-arms toward the expiry revisit", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await seedDueSession(t, base, { followUpsSent: 4, nextFollowUpAt: undefined });
+  await t.mutation(internal.qualificationEngine.onInbound, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    contactId: base.contactId, phoneNormalized: "971500000001",
+  });
+  const [s] = await sessionsFor(t, base.conversationId);
+  // expiry revisit ≈ now + 72h — the sweep can still expire the session
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now() + 71 * 3_600_000);
+});
+
+test("REVIEW-3: outbound sends into a closed conversation open no session", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, conversationId } = await seed(t);
+  await t.run((ctx) => ctx.db.patch(conversationId, { status: "closed" }));
+  await t.mutation(internal.messages.appendInternal, {
+    accountId, conversationId, senderType: "bot",
+    contentType: "text", contentText: "note into closed thread",
+  });
+  expect(await sessionsFor(t, conversationId)).toHaveLength(0);
+});
+
+test("REVIEW-4: the follow-up slot is claimed before sending — a second claim loses", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  const first = await t.mutation(internal.qualificationEngine.claimFollowUpSlot, {
+    sessionId, nextCursor: 1,
+  });
+  const second = await t.mutation(internal.qualificationEngine.claimFollowUpSlot, {
+    sessionId, nextCursor: 2,
+  });
+  expect(first).toBe(true);
+  expect(second).toBe(false); // slot already claimed — no duplicate send possible
+  // and sequential sendFollowUp cannot double-send either
+  const other = await seedAllHours(t);
+  await seedDueSession(t, other);
+  await t.action(internal.qualificationEngine.sendFollowUp, {
+    sessionId: (await sessionsFor(t, other.conversationId))[0]._id,
+  });
+  await t.action(internal.qualificationEngine.sendFollowUp, {
+    sessionId: (await sessionsFor(t, other.conversationId))[0]._id,
+  });
+  expect(await messagesFor(t, other.conversationId)).toHaveLength(1);
+});
+
+test("REVIEW-6: updateConfig rejects wrong-typed and invalid values cleanly, and ignores unknown keys", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seed(t);
+  await expect(
+    asUser.mutation(api.qualification.updateConfig, { patch: { workDays: 5 } }),
+  ).rejects.toThrow();
+  await expect(
+    asUser.mutation(api.qualification.updateConfig, {
+      patch: { adminAlertPhones: ["not-a-phone"] },
+    }),
+  ).rejects.toThrow();
+  // unknown keys are stripped, not stored and not a server error
+  await asUser.mutation(api.qualification.updateConfig, {
+    patch: { enabled: true, bogusKey: 123 },
+  });
+  const config = await asUser.query(api.qualification.getConfig, {});
+  expect(config.enabled).toBe(true);
+  expect((config as Record<string, unknown>).bogusKey).toBeUndefined();
 });
