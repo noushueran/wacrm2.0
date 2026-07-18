@@ -233,12 +233,19 @@ export const ingestInbound = internalMutation({
     // outbound template) before the customer ever replies, so
     // "conversation is new" and "no customer message yet" aren't
     // actually the same condition.
+    // Ranged on `by_conversation_sender` (NOT `by_conversation` + a
+    // post-scan `.filter()`): a conversation that only ever carried
+    // outbound bot/agent messages — a staff-alert channel gets them daily
+    // — was otherwise walked end-to-end here, and past Convex's read limit
+    // this mutation ITSELF would fail and the customer's message be lost.
+    // The current inbound is not inserted until step (4) below, so this
+    // still sees only PRIOR customer messages; `.first()` on the customer
+    // partition is the oldest one (or null), identical to the old filter.
     const priorCustomerMessage = await ctx.db
       .query("messages")
-      .withIndex("by_conversation", (q) =>
-        q.eq("conversationId", conversationId),
+      .withIndex("by_conversation_sender", (q) =>
+        q.eq("conversationId", conversationId).eq("senderType", "customer"),
       )
-      .filter((q) => q.eq(q.field("senderType"), "customer"))
       .first();
     const isFirstInboundMessage = priorCustomerMessage === null;
 

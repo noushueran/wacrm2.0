@@ -337,6 +337,12 @@ export default defineSchema({
     ),
   })
     .index("by_conversation", ["conversationId"])
+    // Per-conversation, per-senderType lookups: `ingest.ingestInbound`'s
+    // first-CUSTOMER-message detection (the webhook path — an outbound-only
+    // thread must not be scanned end-to-end) and `qualificationEngine`'s
+    // last-customer-message check. Ranging `senderType` in the index bounds
+    // both to the customer partition instead of a post-scan `.filter()`.
+    .index("by_conversation_sender", ["conversationId", "senderType"])
     .index("by_message_id", ["messageId"])
     .index("by_account", ["accountId"])
     // `dashboard.activity`'s "newest N customer messages" feed. Ranging
