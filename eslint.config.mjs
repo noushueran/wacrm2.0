@@ -19,6 +19,10 @@ const eslintConfig = defineConfig([
     // multi-MB chunks across every stale worktree under here, which is
     // what pushes a bare `npm run lint` past its runtime budget.
     ".claude/**",
+    // Convex codegen output — hand-maintained to stay byte-identical to
+    // what `convex dev`/`deploy` regenerates (see convex-codegen notes),
+    // so it must never be edited to satisfy lint. Don't lint it at all.
+    "convex/_generated/**",
   ]),
 ]);
 

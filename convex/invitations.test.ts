@@ -596,7 +596,7 @@ test("a foreign/unknown token reveals nothing through peek or redeem", async () 
 test("admin can invite a supervisor", async () => {
   const t = convexTest(schema, modules);
   const adminId = await t.run((ctx) => ctx.db.insert("users", { name: "Ad", email: "ad@x.com" }));
-  const accountId = await t.run(async (ctx) => {
+  await t.run(async (ctx) => {
     const id = await ctx.db.insert("accounts", { name: "Acme", defaultCurrency: "USD", ownerUserId: adminId });
     await ctx.db.insert("memberships", { userId: adminId, accountId: id, role: "admin" });
     return id;

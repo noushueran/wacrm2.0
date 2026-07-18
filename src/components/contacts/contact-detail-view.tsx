@@ -161,7 +161,6 @@ export function ContactDetailView({
         const uiValue = toUiContactCustomValue(value);
         map[uiValue.custom_field_id] = uiValue.value ?? '';
       });
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing local editable form state from a reactive Convex read, same pattern as the original imperative fetch this replaces
       setCustomValues(map);
     }
   }, [customValuesResult]);

@@ -111,7 +111,6 @@ export function ContactForm({
       setSelectedTagIds((contact?.tags ?? []).map((tag) => tag.id));
       setDupContactId(null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, contact]);
 
   function toggleTag(tagId: string) {

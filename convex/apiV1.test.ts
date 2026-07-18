@@ -249,7 +249,7 @@ test("getContact returns the embedded contact for this account, and null for a m
     email: "alice@example.com",
     role: "agent",
   });
-  const { accountId: bobAccount, asUser: asBob } = await seedAccountMember(t, {
+  const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
     role: "agent",
