@@ -275,3 +275,60 @@ test("P6: memberTags.setForTag replaces routing links, admin-gated", async () =>
     agent.as.mutation(api.memberTags.setForTag, { tagId, userIds: [] }),
   ).rejects.toThrow();
 });
+
+test("leadsBoard carries funnel stage + checklist payload per lead (null when absent)", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const { withId, withoutId } = await t.run(async (ctx) => {
+    const mk = async (phone: string) => {
+      const contactId = await ctx.db.insert("contacts", {
+        accountId: admin.accountId, phone, phoneNormalized: phone.replace(/\D/g, ""), name: `N${phone.slice(-2)}`,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        accountId: admin.accountId, contactId, status: "open", unreadCount: 0,
+      });
+      const sessionId = await ctx.db.insert("qualificationSessions", {
+        accountId: admin.accountId, conversationId, contactId, status: "qualified", origin: "inbound",
+        fields: [], expectedCount: 4, answeredCount: 4, score: 80, qualifiedAt: 5,
+        followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0, serviceName: "Packages",
+      });
+      return { contactId, conversationId, sessionId };
+    };
+    const a = await mk("+971500000021");
+    await ctx.db.patch(a.conversationId, {
+      funnel: { stage: "price_quoted", stageUpdatedAt: 7, saleValue: 1234, saleCurrency: "AED" },
+    });
+    await ctx.db.insert("salesChecklists", {
+      accountId: admin.accountId, sessionId: a.sessionId, conversationId: a.conversationId,
+      contactId: a.contactId, source: "default",
+      items: [
+        { key: "call", title: "Call the lead", done: true, doneAt: 9, doneByUserId: admin.userId, note: "Spoke, wants March" },
+        { key: "pitch", title: "Give a proper pitch", description: "Right package", done: false },
+      ],
+      generatedAt: 1,
+    });
+    const b = await mk("+971500000022");
+    return { withId: a.sessionId, withoutId: b.sessionId };
+  });
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {});
+  const withChecklist = board.leads.find((l) => l.sessionId === withId)!;
+  expect(withChecklist.funnelStage).toBe("price_quoted");
+  expect(withChecklist.saleValue).toBe(1234);
+  expect(withChecklist.saleCurrency).toBe("AED");
+  expect(withChecklist.checklist).not.toBeNull();
+  expect(withChecklist.checklist!.doneCount).toBe(1);
+  expect(withChecklist.checklist!.total).toBe(2);
+  expect(withChecklist.checklist!.source).toBe("default");
+  expect(withChecklist.checklist!.outcome).toBeNull();
+  expect(withChecklist.checklist!.items[0]).toMatchObject({
+    key: "call", done: true, doneByName: "admin", note: "Spoke, wants March",
+  });
+  expect(withChecklist.checklist!.items[1]).toMatchObject({
+    key: "pitch", done: false, description: "Right package", doneByName: null, note: null,
+  });
+
+  const bare = board.leads.find((l) => l.sessionId === withoutId)!;
+  expect(bare.funnelStage).toBeNull();
+  expect(bare.checklist).toBeNull();
+});

@@ -202,6 +202,30 @@ export const leadsBoard = accountQuery({
         lastFeedback: string | null;
         lastFeedbackAt: number | null;
       };
+      funnelStage: string | null;
+      saleValue: number | null;
+      saleCurrency: string | null;
+      checklist: {
+        checklistId: string;
+        source: "kb" | "default";
+        doneCount: number;
+        total: number;
+        outcome: {
+          result: "won" | "lost";
+          lossCategory: string | null;
+          lossDetail: string | null;
+          at: number;
+        } | null;
+        items: {
+          key: string;
+          title: string;
+          description: string | null;
+          done: boolean;
+          doneAt: number | null;
+          doneByName: string | null;
+          note: string | null;
+        }[];
+      } | null;
     }[] = [];
 
     for (const status of LEAD_STATUSES) {
@@ -233,6 +257,12 @@ export const leadsBoard = accountQuery({
         const accepted = offers
           .filter((o) => o.status === "accepted")
           .sort((a, b) => (b.respondedAt ?? 0) - (a.respondedAt ?? 0))[0];
+        // The lead's sales checklist (pipeline discipline) — one indexed
+        // point read per rendered session.
+        const checklistRow = await ctx.db
+          .query("salesChecklists")
+          .withIndex("by_session", (q) => q.eq("sessionId", s._id))
+          .unique();
         leads.push({
           sessionId: s._id,
           conversationId: s.conversationId,
@@ -272,6 +302,36 @@ export const leadsBoard = accountQuery({
             lastFeedback: accepted?.feedback ?? null,
             lastFeedbackAt: accepted?.feedbackAt ?? null,
           },
+          funnelStage: conversation.funnel?.stage ?? null,
+          saleValue: conversation.funnel?.saleValue ?? null,
+          saleCurrency: conversation.funnel?.saleCurrency ?? null,
+          checklist: checklistRow
+            ? {
+                checklistId: checklistRow._id,
+                source: checklistRow.source,
+                doneCount: checklistRow.items.filter((i) => i.done).length,
+                total: checklistRow.items.length,
+                outcome: checklistRow.outcome
+                  ? {
+                      result: checklistRow.outcome.result,
+                      lossCategory: checklistRow.outcome.lossCategory ?? null,
+                      lossDetail: checklistRow.outcome.lossDetail ?? null,
+                      at: checklistRow.outcome.at,
+                    }
+                  : null,
+                items: checklistRow.items.map((i) => ({
+                  key: i.key,
+                  title: i.title,
+                  description: i.description ?? null,
+                  done: i.done,
+                  doneAt: i.doneAt ?? null,
+                  doneByName: i.doneByUserId
+                    ? (memberName.get(i.doneByUserId) ?? null)
+                    : null,
+                  note: i.note ?? null,
+                })),
+              }
+            : null,
         });
       }
     }
