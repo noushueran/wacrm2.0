@@ -93,6 +93,27 @@ test("overview counts DISTINCT conversations per stage (repeat transitions dedup
   expect(byStage.qualified).toBe(1);
 });
 
+// Post-rebase integration: main gave conversionEvents a 6th status
+// ("dormant" — backend env unconfigured, parked until credentials exist).
+// overview's meta buckets must carry it too, or dormant rows count toward
+// `total` while landing in no named bucket and the /campaigns delivery grid
+// stops summing.
+test("meta buckets include dormant and always sum to total", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asAdmin } = await seedAdmin(t);
+  const { conversationId, contactId } = await seedConv(t, accountId, "new_lead");
+  await seedEvent(t, accountId, conversationId, contactId, { stage: "new_lead", status: "sent" });
+  await seedEvent(t, accountId, conversationId, contactId, { stage: "qualified", status: "dormant" });
+  await seedEvent(t, accountId, conversationId, contactId, { stage: "price_quoted", status: "pending" });
+
+  const o = await asAdmin.query(api.campaigns.overview, {});
+  expect(o.meta.dormant).toBe(1);
+  expect(o.meta.total).toBe(3);
+  expect(
+    o.meta.sent + o.meta.pending + o.meta.dormant + o.meta.unmatched + o.meta.error + o.meta.abandoned,
+  ).toBe(o.meta.total);
+});
+
 test("purchase totalValue sums ALL purchased events regardless of Meta delivery status", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asAdmin } = await seedAdmin(t);

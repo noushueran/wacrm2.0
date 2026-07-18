@@ -1,6 +1,6 @@
 import { accountQuery } from "./lib/auth";
 import { FUNNEL_STAGE_KEYS } from "./lib/funnel";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 
 // Rolling window for the funnel-analytics rollup. `overview` scans the
 // account's `funnelTransitions` + `conversionEvents`; bounding both to a
@@ -75,9 +75,17 @@ export const overview = accountQuery({
     const purchaseCount = convosByStage.get("purchased")?.size ?? 0;
 
     // Meta delivery status counts (events-derived; unrelated to value).
-    const meta: Record<string, number> = { sent: 0, pending: 0, unmatched: 0, error: 0, abandoned: 0, total: 0 };
+    // Exhaustive over `conversionEvents.status` (not `Record<string, ...>`),
+    // so adding a literal to the schema union is a compile error here rather
+    // than a row that counts toward `total` while landing in no named bucket
+    // — exactly how the 6th member (`"dormant"`, the backend-env-unconfigured
+    // parking state) briefly behaved when it landed. Every event lands in
+    // exactly one named bucket, so the buckets always sum to `total`.
+    const meta: Record<Doc<"conversionEvents">["status"] | "total", number> = {
+      sent: 0, pending: 0, dormant: 0, unmatched: 0, error: 0, abandoned: 0, total: 0,
+    };
     for (const ev of events) {
-      if (ev.status in meta) meta[ev.status] += 1;
+      meta[ev.status] += 1;
       meta.total += 1;
     }
 
@@ -102,8 +110,9 @@ export const overview = accountQuery({
       funnel,
       purchase: { count: purchaseCount, totalValue, currency },
       meta: {
-        sent: meta.sent, pending: meta.pending, unmatched: meta.unmatched,
-        error: meta.error, abandoned: meta.abandoned, total: meta.total,
+        sent: meta.sent, pending: meta.pending, dormant: meta.dormant,
+        unmatched: meta.unmatched, error: meta.error, abandoned: meta.abandoned,
+        total: meta.total,
       },
       windowDays: WINDOW_DAYS,
     };
