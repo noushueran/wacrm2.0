@@ -8,7 +8,11 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
 import { buildHandoffSummary } from "./lib/ai/handoff";
-import { toChatMessages, type HistoryMessage } from "./lib/ai/context";
+import {
+  AI_VISIBLE_MEDIA_TYPES,
+  toChatMessages,
+  type HistoryMessage,
+} from "./lib/ai/context";
 import { generateReply, parseGeneration } from "./lib/ai/generate";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
@@ -172,13 +176,16 @@ export const getConversationForAccount = internalQuery({
 });
 
 /**
- * The last `limit` TEXT messages of a conversation, oldest → newest,
- * re-asserting `accountId` on every row even though `by_conversation`
- * alone would already scope correctly in practice (belt-and-braces,
- * same discipline as `aiKnowledge.ts`'s `getChunksByIds` — see that
- * file's header for why isolation here is layered, not single-point).
- * Convex port of `src/lib/ai/context.ts`'s DB half; `toChatMessages`
- * (called by `dispatchInbound`, not here) is the pure other half.
+ * The last `limit` conversation messages the AI can "see" (text + the
+ * customer-content media types — see `context.ts`'s
+ * `AI_VISIBLE_MEDIA_TYPES`), oldest → newest, re-asserting `accountId`
+ * on every row even though `by_conversation` alone would already scope
+ * correctly in practice (belt-and-braces, same discipline as
+ * `aiKnowledge.ts`'s `getChunksByIds` — see that file's header for why
+ * isolation here is layered, not single-point). Convex port of
+ * `src/lib/ai/context.ts`'s DB half; `toChatMessages` (called by
+ * `dispatchInbound`, not here) is the pure other half — it renders the
+ * media rows as placeholders.
  */
 export const recentMessages = internalQuery({
   args: {
@@ -194,7 +201,10 @@ export const recentMessages = internalQuery({
       .filter((q) =>
         q.and(
           q.eq(q.field("accountId"), args.accountId),
-          q.eq(q.field("contentType"), "text"),
+          q.or(
+            q.eq(q.field("contentType"), "text"),
+            ...AI_VISIBLE_MEDIA_TYPES.map((t) => q.eq(q.field("contentType"), t)),
+          ),
         ),
       )
       .take(args.limit);
@@ -206,6 +216,7 @@ export const recentMessages = internalQuery({
     return rows.reverse().map((m) => ({
       senderType: m.senderType,
       contentText: m.contentText,
+      contentType: m.contentType,
       createdAt: m._creationTime,
     }));
   },

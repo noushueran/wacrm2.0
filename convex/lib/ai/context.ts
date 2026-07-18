@@ -16,15 +16,44 @@ import type { ChatMessage } from "./types";
 // ============================================================
 
 /**
+ * Media content types the AI transcript can "see" — rendered as
+ * placeholders (below) so the model can acknowledge a voice note or an
+ * image instead of the row being invisible (which previously meant a
+ * media-only inbound produced NO reply at all). Also the set
+ * `convex/ingest.ts`'s `shouldDispatchAiReply` treats as reply-worthy
+ * without any text. Deliberately excludes `template`/`interactive`
+ * (outbound machinery, not customer content).
+ */
+export const AI_VISIBLE_MEDIA_TYPES = [
+  "image",
+  "document",
+  "audio",
+  "video",
+  "location",
+] as const;
+
+/** What each media row reads as in the transcript. The model is taught
+ *  (see `defaults.ts`'s attachment guidance) that it cannot open these —
+ *  acknowledge, never pretend to have seen/heard the content. */
+const MEDIA_PLACEHOLDER: Record<string, string> = {
+  image: "[image]",
+  video: "[video]",
+  audio: "[voice note]",
+  document: "[document]",
+  location: "[location shared]",
+};
+
+/**
  * One row of conversation history as read off `messages` — the exact
- * fields `recentMessages` selects, already restricted to `contentType
- * === "text"` by that query (mirrors the source's own `.eq('content_type',
- * 'text')` filter, so this function never has to consider media/template/
- * interactive rows).
+ * fields `recentMessages` selects (text + the media types above; that
+ * query's filter is the DB half of this contract). `contentType` is
+ * optional so plain text callers/tests stay untouched: absent means
+ * `"text"`.
  */
 export interface HistoryMessage {
   senderType: "customer" | "agent" | "bot";
   contentText?: string;
+  contentType?: string;
 }
 
 /**
@@ -32,13 +61,24 @@ export interface HistoryMessage {
  * (`recentMessages` reverses its newest-first index scan before
  * returning) — to the provider-neutral chat shape. Customer messages
  * become `user`; agent and bot messages become `assistant`, exactly
- * like the source. Blank/whitespace-only text is dropped.
+ * like the source. Text rows keep their (trimmed) text; media rows
+ * render as a placeholder followed by any caption; rows with neither
+ * text nor a known placeholder are dropped.
  */
 export function toChatMessages(rows: HistoryMessage[]): ChatMessage[] {
-  return rows
-    .filter((m) => m.contentText && m.contentText.trim())
-    .map((m) => ({
-      role: m.senderType === "customer" ? "user" : ("assistant" as const),
-      content: m.contentText!.trim(),
-    }));
+  return rows.flatMap((m) => {
+    const placeholder =
+      m.contentType && m.contentType !== "text"
+        ? (MEDIA_PLACEHOLDER[m.contentType] ?? null)
+        : null;
+    const text = (m.contentText ?? "").trim();
+    const content = placeholder ? (text ? `${placeholder} ${text}` : placeholder) : text;
+    if (!content) return [];
+    return [
+      {
+        role: m.senderType === "customer" ? ("user" as const) : ("assistant" as const),
+        content,
+      },
+    ];
+  });
 }

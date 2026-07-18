@@ -342,6 +342,49 @@ test("the cap-reached handoff assigns the configured handoff agent", async () =>
 });
 
 // ============================================================
+// Media-only inbound — a voice note (or image/video/document) with no
+// text previously produced NO reply at all: `recentMessages` filtered
+// to text rows, so the model saw an empty transcript and dispatch
+// bailed. The transcript now renders media placeholders instead.
+// ============================================================
+
+test("replies to a voice-note-only message instead of ignoring it", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const, // voice note: no contentText at all
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0]!.aiGenerated).toBe(true);
+}, 20_000);
+
+// ============================================================
 // Transient-failure retry — `[[FAIL]]` in the triggering message makes
 // DRY-RUN's `syntheticGeneration` throw, exactly where a real provider/
 // network failure would surface (same steering convention as the

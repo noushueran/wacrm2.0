@@ -687,6 +687,7 @@ test("shouldDispatchAiReply: dispatches when nothing stands in the way", () => {
       flowConsumed: false,
       inboundText: "hi there",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(true);
 });
@@ -697,6 +698,7 @@ test("shouldDispatchAiReply: stands down when a flow consumed the message", () =
       flowConsumed: true,
       inboundText: "hi there",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(false);
 });
@@ -708,6 +710,7 @@ test("shouldDispatchAiReply: stands down for an interactive reply", () => {
       interactiveReplyId: "btn_yes",
       inboundText: "Yes please",
       hasActiveAutoResponder: false,
+      contentType: "interactive",
     }),
   ).toBe(false);
 });
@@ -718,6 +721,7 @@ test("shouldDispatchAiReply: stands down for empty/whitespace-only text", () => 
       flowConsumed: false,
       inboundText: "   ",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(false);
 });
@@ -728,6 +732,37 @@ test("shouldDispatchAiReply: stands down when the account has an active auto-res
       flowConsumed: false,
       inboundText: "hi there",
       hasActiveAutoResponder: true,
+      contentType: "text",
+    }),
+  ).toBe(false);
+});
+
+test("shouldDispatchAiReply: dispatches for a media-only message (voice note, no text)", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "",
+      hasActiveAutoResponder: false,
+      contentType: "audio",
+    }),
+  ).toBe(true);
+});
+
+test("shouldDispatchAiReply: a media message still respects the flow/auto-responder precedence", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: true,
+      inboundText: "",
+      hasActiveAutoResponder: false,
+      contentType: "image",
+    }),
+  ).toBe(false);
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "",
+      hasActiveAutoResponder: true,
+      contentType: "image",
     }),
   ).toBe(false);
 });

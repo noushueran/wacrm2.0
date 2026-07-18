@@ -2,6 +2,7 @@ import { internalAction, internalMutation } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
+import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
 import { allocateContactCode } from "./contacts";
 import {
   insertMessageAndUpdateConversation,
@@ -469,12 +470,17 @@ export function shouldDispatchAiReply(input: {
   interactiveReplyId?: string;
   inboundText: string;
   hasActiveAutoResponder: boolean;
+  contentType: string;
 }): boolean {
   if (input.flowConsumed) return false;
   if (input.interactiveReplyId) return false;
-  if (!input.inboundText.trim()) return false;
   if (input.hasActiveAutoResponder) return false;
-  return true;
+  if (input.inboundText.trim()) return true;
+  // No text: a customer-content attachment (voice note, image, …) still
+  // deserves a reply — the transcript renders it as a placeholder the
+  // model can acknowledge (`lib/ai/context.ts`). Anything else textless
+  // (empty text row, unsupported type) stays a no-op.
+  return (AI_VISIBLE_MEDIA_TYPES as readonly string[]).includes(input.contentType);
 }
 
 /**
@@ -713,8 +719,15 @@ export const processInbound = internalAction({
     // this file's previously-flagged gap — see the header comment
     // above) the AI stands down when the account has an active
     // new_message_received/keyword_match automation, avoiding a
-    // double-text with that automation's own reply.
-    if (!flowConsumed && !message.interactiveReplyId && inboundText.trim()) {
+    // double-text with that automation's own reply. Text OR
+    // customer-content media (voice note, image, …) qualifies — a
+    // media-only inbound previously got no reply at all.
+    if (
+      !flowConsumed &&
+      !message.interactiveReplyId &&
+      (inboundText.trim() ||
+        (AI_VISIBLE_MEDIA_TYPES as readonly string[]).includes(message.type))
+    ) {
       await runBestEffort("aiReply.dispatchInbound", async () => {
         const hasActiveAutoResponder: boolean = await ctx.runQuery(
           internal.automationsEngine.hasActiveAutoResponder,
@@ -726,6 +739,7 @@ export const processInbound = internalAction({
             interactiveReplyId: message.interactiveReplyId,
             inboundText,
             hasActiveAutoResponder,
+            contentType: message.type,
           })
         ) {
           return;
