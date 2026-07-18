@@ -1085,3 +1085,42 @@ test("V4: cleanupDuplicateLeads retires same-service qualified duplicates within
   expect(sessions.filter((s) => s.status === "qualified")).toHaveLength(2);
   expect(sessions.filter((s) => s.closedReason === "duplicate")).toHaveLength(2);
 });
+
+// ---- P6: staff channel generalization + contact card ----
+
+test("P6: a MEMBER's own number is staff — no sessions open on it (inbound or outbound)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t); // contact phone +971500000001
+  await t.run(async (ctx) => {
+    // make the seeded contact's number a MEMBER phone (agent's own)
+    const uid = await ctx.db.insert("users", { name: "Agent P", email: "ap@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId: base.accountId, role: "agent",
+      fullName: "Agent P", email: "ap@example.com", phone: "+971 50 000 0001",
+    });
+  });
+  await t.mutation(internal.qualificationEngine.onInbound, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    contactId: base.contactId, phoneNormalized: "971500000001",
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(0);
+  await t.mutation(internal.messages.appendInternal, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    senderType: "bot", contentType: "text", contentText: "offer msg",
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(0);
+});
+
+test("P6: sendContactCard persists a readable card row (dry-run)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await t.action(internal.metaSend.sendContactCard, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    to: "+971500000001", cardName: "Agent P", cardPhone: "+971 55 123 4567",
+  });
+  const msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].senderType).toBe("bot");
+  expect(msgs[0].contentText).toContain("Agent P");
+  expect(msgs[0].contentText).toContain("+971 55 123 4567");
+});

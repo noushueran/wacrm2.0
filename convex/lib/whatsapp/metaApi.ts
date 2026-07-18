@@ -418,6 +418,55 @@ export async function sendTextMessage(
   return { messageId: data.messages[0].id };
 }
 
+export interface SendContactsMessageArgs {
+  phoneNumberId: string;
+  accessToken: string;
+  to: string;
+  contactName: string;
+  contactPhone: string;
+}
+
+/**
+ * Send a WhatsApp CONTACT CARD (Cloud API `type: "contacts"`) — the
+ * recipient can tap-to-save the number. Phase 6: used to hand the
+ * customer their assigned agent's contact.
+ */
+export async function sendContactsMessage(
+  args: SendContactsMessageArgs,
+): Promise<MetaSendResult> {
+  const { phoneNumberId, accessToken, to, contactName, contactPhone } = args;
+  const url = `${META_API_BASE}/${phoneNumberId}/messages`;
+  const waId = contactPhone.replace(/\D/g, "");
+  const body: Record<string, unknown> = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to,
+    type: "contacts",
+    contacts: [
+      {
+        name: {
+          formatted_name: contactName,
+          first_name: contactName.split(" ")[0] || contactName,
+        },
+        phones: [{ phone: contactPhone, type: "CELL", wa_id: waId }],
+      },
+    ],
+  };
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = await response.json();
+  return { messageId: data.messages[0].id };
+}
+
 export type MediaKind = "image" | "video" | "document" | "audio";
 
 export interface SendMediaMessageArgs {

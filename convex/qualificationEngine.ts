@@ -4,6 +4,8 @@ import { v } from "convex/values";
 import {
   loadEnabledConfig,
   isAdminAlertNumber,
+  loadStaffPhoneSet,
+  isStaffNumber,
   recordInboundActivity,
   ensureSession,
 } from "./lib/qualification/track";
@@ -63,7 +65,8 @@ export const onInbound = internalMutation({
   handler: async (ctx, args): Promise<void> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return; // dormant
-    if (isAdminAlertNumber(config, args.phoneNormalized)) return; // loop guard
+    const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+    if (isStaffNumber(staff, args.phoneNormalized)) return; // loop guard (P6: all staff)
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
     if (conversation.status === "closed") return;
@@ -192,7 +195,10 @@ export const loadAnalysisContext = internalQuery({
     // session (the alert text itself contains qualifying answers, so
     // the model could "qualify" the staff thread and echo fresh alerts).
     const contact = await ctx.db.get(conversation.contactId);
-    if (contact && isAdminAlertNumber(config, contact.phoneNormalized)) return null;
+    if (contact) {
+      const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+      if (isStaffNumber(staff, contact.phoneNormalized)) return null;
+    }
     // v3 multi-lead: the LATEST session is the live one; older terminal
     // rows are history. A terminal latest no longer bails — the analysis
     // decides whether this message starts a NEW inquiry.
@@ -295,8 +301,9 @@ export const applyAnalysis = internalMutation({
     // filters, but this mutation creates sessions and is independently
     // callable — it must never open one on the alert channel).
     const guardContact = await ctx.db.get(args.contactId);
-    if (guardContact && isAdminAlertNumber(config, guardContact.phoneNormalized)) {
-      return none;
+    if (guardContact) {
+      const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+      if (isStaffNumber(staff, guardContact.phoneNormalized)) return none;
     }
     const now = Date.now();
     const analysis = args.analysis as AnalysisResult;
