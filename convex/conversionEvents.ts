@@ -13,6 +13,28 @@ import { accountQuery } from "./lib/auth";
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
 
+/**
+ * The transient lane's own budget + backoff. A transient failure (429/5xx/
+ * network) doesn't spend `attempts` — but "free" retries with no gate were the
+ * livelock: a persistently-5xx row was re-selected every 15-minute tick
+ * forever, and 100 of them filled the oldest-first error window so no pending
+ * row was ever reached again. Now each transient failure bumps its OWN
+ * counter and pushes `nextAttemptAt` out exponentially; the budget's worst
+ * case (4 doubling steps + 16 capped waits ≈ 4.4 days) still fits inside
+ * Meta CAPI's 7-day `event_time` acceptance window, so a row that survives
+ * a long outage is still worth delivering when it finally sends.
+ */
+export const MAX_TRANSIENT_DELIVER_ATTEMPTS = 20;
+const TRANSIENT_BACKOFF_BASE_MS = 15 * 60 * 1000; // one cron tick
+const TRANSIENT_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
+
+function transientBackoffMs(transientAttempts: number): number {
+  return Math.min(
+    TRANSIENT_BACKOFF_BASE_MS * 2 ** (transientAttempts - 1),
+    TRANSIENT_BACKOFF_CAP_MS,
+  );
+}
+
 /** Rows per pass of `migrateDormantOutOfAbandoned`'s cursor walk. */
 const MIGRATE_BATCH = 512;
 
@@ -37,9 +59,13 @@ const DELIVER_STAGGER_MS = 100;
 class TransientDeliveryError extends Error {}
 
 /**
- * Everything that isn't a 429/5xx (4xx, a malformed body, a network failure)
- * is treated as the row's own fault: it bumps `attempts` and can legitimately
- * exhaust the budget and give up.
+ * Everything else with an HTTP status (a 4xx, a malformed body) is the row's
+ * own fault: it bumps `attempts` and can legitimately exhaust the budget and
+ * give up. A failure with NO status (reset/timeout — the fetch itself threw)
+ * is wrapped as transient at the call site: it's the failure mode most likely
+ * to be self-inflicted by our own send burst, and burning the permanent
+ * budget on it let 5 connection resets destroy a conversion a 503 would have
+ * survived.
  */
 function deliveryError(status: number, message: string): Error {
   return status === 429 || status >= 500
@@ -47,20 +73,32 @@ function deliveryError(status: number, message: string): Error {
     : new Error(message);
 }
 
+/** The fetch call itself threw — no HTTP status to classify on. Transient. */
+function networkError(err: unknown): TransientDeliveryError {
+  return new TransientDeliveryError(
+    `network: ${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
 /**
  * The `patchStatus` args a failed delivery attempt should write. Transient
- * failures re-queue as `"error"` WITHOUT a bump, so they stay selectable by
- * `getPendingToRetry` indefinitely and can never reach `MAX_DELIVER_ATTEMPTS`.
+ * failures re-queue as `"error"` without spending `attempts`; they spend
+ * `transientAttempts` instead and back off via `nextAttemptAt` (see
+ * `patchStatus`), so they neither retire a live conversion NOR occupy a
+ * retry slot on every tick forever.
  */
 function errorPatchFor(err: unknown): {
   status: "error";
   lastError: string;
   bumpAttempts: boolean;
+  transient: boolean;
 } {
+  const transient = err instanceof TransientDeliveryError;
   return {
     status: "error",
     lastError: err instanceof Error ? err.message : String(err),
-    bumpAttempts: !(err instanceof TransientDeliveryError),
+    bumpAttempts: !transient,
+    transient,
   };
 }
 
@@ -184,11 +222,17 @@ export const seedNewLead = internalMutation({
  * Advances a conversionEvents row after a delivery attempt. Conditional
  * spread (a field is only patched when supplied). `attempts` bumps only on
  * an explicit `bumpAttempts === true` — a transient failure passes `false`
- * (see `errorPatchFor`) so it re-queues without spending budget. An
+ * (see `errorPatchFor`) so it re-queues without spending that budget. An
  * `"error"` bump that reaches `MAX_DELIVER_ATTEMPTS` is retired to the
- * terminal `"abandoned"` state — the single give-up point for a row that
- * keeps failing on its own merits (mirrors `attribution.patchResult`).
+ * terminal `"abandoned"` state — the give-up point for a row that keeps
+ * failing on its own merits (mirrors `attribution.patchResult`).
  * A row that can't be attempted at all is retired by `retireDormant` instead.
+ *
+ * The transient lane is symmetric, just on its own ledger: `transient: true`
+ * bumps `transientAttempts`, gates the next try via `nextAttemptAt`
+ * (exponential, capped), and gives up at `MAX_TRANSIENT_DELIVER_ATTEMPTS` —
+ * so "the backend is down" retries generously but never forever. A permanent
+ * failure clears any stale gate: it's immediately retryable on its own budget.
  */
 export const patchStatus = internalMutation({
   args: {
@@ -202,22 +246,37 @@ export const patchStatus = internalMutation({
     matchResult: v.optional(v.string()),
     lastError: v.optional(v.string()),
     bumpAttempts: v.optional(v.boolean()),
+    transient: v.optional(v.boolean()),
   },
   handler: async (ctx, args): Promise<void> => {
     const row = await ctx.db.get(args.conversionEventId);
     if (!row) return;
     const bumping = args.bumpAttempts === true;
+    const transient = args.transient === true && args.status === "error";
     const nextAttempts = row.attempts + 1;
+    const nextTransientAttempts = (row.transientAttempts ?? 0) + 1;
     const status =
       bumping && args.status === "error" && nextAttempts >= MAX_DELIVER_ATTEMPTS
         ? ("abandoned" as const)
-        : args.status;
+        : transient && nextTransientAttempts >= MAX_TRANSIENT_DELIVER_ATTEMPTS
+          ? ("abandoned" as const)
+          : args.status;
     const patch: Record<string, unknown> = { status };
     if (args.fbTraceId !== undefined) patch.fbTraceId = args.fbTraceId;
     if (args.matchResult !== undefined) patch.matchResult = args.matchResult;
     if (args.lastError !== undefined) patch.lastError = args.lastError;
     if (args.status === "sent") patch.sentAt = Date.now();
-    if (bumping) patch.attempts = nextAttempts;
+    if (bumping) {
+      patch.attempts = nextAttempts;
+      if (row.nextAttemptAt !== undefined) patch.nextAttemptAt = undefined;
+    }
+    if (transient) {
+      patch.transientAttempts = nextTransientAttempts;
+      if (status === "error") {
+        patch.nextAttemptAt =
+          Date.now() + transientBackoffMs(nextTransientAttempts);
+      }
+    }
     await ctx.db.patch(args.conversionEventId, patch);
   },
 });
@@ -359,11 +418,16 @@ export const deliverConversionEvent = internalAction({
         const url = `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(
           datasetId,
         )}/events?access_token=${encodeURIComponent(token)}`;
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
+        let res: Response;
+        try {
+          res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+        } catch (err) {
+          throw networkError(err);
+        }
         if (!res.ok) {
           const text = await res.text();
           throw deliveryError(
@@ -409,14 +473,19 @@ export const deliverConversionEvent = internalAction({
       };
       if (row.value !== undefined) body.value = row.value;
       if (row.currency !== undefined) body.currency = row.currency;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${secret}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${secret}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        throw networkError(err);
+      }
       if (!res.ok) {
         throw deliveryError(res.status, `Platform A responded ${res.status}`);
       }
@@ -452,17 +521,30 @@ export const deliverConversionEvent = internalAction({
  * 100 total. Queried through `by_status` (never a full scan), each `.take(100)`,
  * combined and re-capped. Mirrors `attribution.getPendingToRetry`.
  *
- * Both partitions drain: an `error` row either succeeds or bumps its way to
- * `"abandoned"`, and a `pending` row is delivered the moment it's seeded. A row
+ * Both partitions drain: an `error` row succeeds, bumps its way to
+ * `"abandoned"` on the permanent budget, or exhausts the transient budget and
+ * abandons there; a `pending` row is delivered the moment it's seeded. A row
  * whose backend isn't configured never got either treatment and so used to sit
  * in `pending` permanently — since this window is oldest-first, that backlog
  * starved every newer row behind it. Those rows are now retired by
  * `retireDormant` to a status neither partition reads, and come back through
  * `getDormantToSweep` instead.
+ *
+ * The `nextAttemptAt` backoff gate is applied in JS over the already-bounded
+ * window — NOT as a query `.filter()`, which would not narrow the scan and
+ * would walk the partition end-to-end whenever due rows are rare (the
+ * `.filter().take()` trap that took down the cron-settings page). The cost of
+ * doing it here is that backing-off rows inside the window shrink the batch
+ * below 100 even when due rows exist beyond it — acceptable, because every
+ * gated row's gate expires (capped backoff) and its lane's budget is finite,
+ * so the front of the window always drains and the window advances. The win
+ * is the livelock fix: a backing-off row no longer occupies a slot, so
+ * `pending` rows behind 100 sick `error` rows still deliver.
  */
 export const getPendingToRetry = internalQuery({
   args: {},
   handler: async (ctx): Promise<Doc<"conversionEvents">[]> => {
+    const now = Date.now();
     const errored = await ctx.db
       .query("conversionEvents")
       .withIndex("by_status", (q) => q.eq("status", "error"))
@@ -473,7 +555,9 @@ export const getPendingToRetry = internalQuery({
       .withIndex("by_status", (q) => q.eq("status", "pending"))
       .filter((q) => q.lt(q.field("attempts"), MAX_DELIVER_ATTEMPTS))
       .take(100);
-    return [...errored, ...pending].slice(0, 100);
+    return [...errored, ...pending]
+      .filter((row) => (row.nextAttemptAt ?? 0) <= now)
+      .slice(0, 100);
   },
 });
 

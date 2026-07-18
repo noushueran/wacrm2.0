@@ -1429,6 +1429,15 @@ export default defineSchema({
       v.literal("dormant"),
     ),
     attempts: v.number(),
+    // Transient-failure lane (429/5xx/network): its own budget + a backoff
+    // gate, separate from `attempts`. `transientAttempts` counts them and
+    // gives up at MAX_TRANSIENT_DELIVER_ATTEMPTS; `nextAttemptAt` is the
+    // earliest next try — `getPendingToRetry` skips rows still inside it (in
+    // JS over the bounded window, never a `.filter()`), so a backing-off row
+    // can't pin the front of the retry window every tick. See
+    // `conversionEvents.errorPatchFor`. Mirrors `campaignAds`.
+    transientAttempts: v.optional(v.number()),
+    nextAttemptAt: v.optional(v.number()),
     lastError: v.optional(v.string()),
     sentAt: v.optional(v.number()),
     fbTraceId: v.optional(v.string()),
@@ -1572,6 +1581,11 @@ export default defineSchema({
       v.literal("dormant"),
     ),
     attempts: v.number(),
+    // Transient-failure lane (429/5xx/network) — same design as
+    // `conversionEvents`: own budget (MAX_TRANSIENT_RESOLVE_ATTEMPTS) +
+    // `nextAttemptAt` backoff gate applied in JS by `getResolvable`.
+    transientAttempts: v.optional(v.number()),
+    nextAttemptAt: v.optional(v.number()),
     lastError: v.optional(v.string()),
     resolvedAt: v.optional(v.number()),
   })
