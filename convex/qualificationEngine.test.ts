@@ -1184,7 +1184,7 @@ test("P6: qualification offers the lead to a matching agent; YES assigns, announ
   const staffConversation = await t.run((ctx) =>
     ctx.db.query("conversations").withIndex("by_contact", (q) =>
       q.eq("contactId", staffContact!._id)).first());
-  let staffMsgs = await messagesFor(t, staffConversation!._id);
+  const staffMsgs = await messagesFor(t, staffConversation!._id);
   expect(staffMsgs.some((m) => m.contentText?.includes("Reply YES"))).toBe(true);
 
   // the agent replies YES
