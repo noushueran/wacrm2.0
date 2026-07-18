@@ -1,16 +1,35 @@
 'use client';
 
 import { useState } from 'react';
+import dynamic from 'next/dynamic';
 import { useQuery } from '@/lib/convex/cached';
-import { Bot, Sparkles, Settings2, BarChart3 } from 'lucide-react';
+import { Bot, Sparkles, Settings2, BarChart3, Loader2 } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { AiPlayground } from '@/components/agents/ai-playground';
-import { AiUsageCard } from '@/components/agents/ai-usage';
 import { AiConfig } from '@/components/settings/ai-config';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 
 import { api } from '../../../../convex/_generated/api';
+
+/**
+ * The usage chart pulls in `recharts` (via the vendored Tremor bar chart)
+ * — 107 KB gzip, the largest chunk in the app. It renders only on the
+ * "usage" tab, which is not the default AND requires the settings role,
+ * so eagerly importing it made every visit to this page download a chart
+ * most callers never open. Loaded on demand instead.
+ */
+const AiUsageCard = dynamic(
+  () => import('@/components/agents/ai-usage').then((m) => m.AiUsageCard),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-64 items-center justify-center">
+        <Loader2 className="h-5 w-5 animate-spin text-primary" />
+      </div>
+    ),
+  },
+);
 
 type Tab = 'playground' | 'setup' | 'usage';
 

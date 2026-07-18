@@ -3,6 +3,23 @@ import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
 
+/**
+ * Ceiling on `unreadCount`'s read. Must stay >= 10 so the client's
+ * `formatUnreadBadge` (`src/lib/notifications/shared.ts`) can still tell
+ * "exactly 9" from "more than 9" — it renders 1-9 verbatim and anything
+ * above as "9+", so a count that saturates at 10 is indistinguishable to
+ * the UI from an exact one, at a bounded cost.
+ */
+const UNREAD_BADGE_CAP = 10;
+
+/**
+ * Hard ceiling on `listRecent`'s page. The bell only ever asks for a
+ * handful, but `limit` is client-supplied and reaches `.take()`, which
+ * throws on a negative value and is unbounded on a large one — so clamp
+ * it to `[0, LIST_RECENT_CAP]` before the read.
+ */
+const LIST_RECENT_CAP = 50;
+
 // ============================================================
 // Notifications — in-app alerts for one agent (`convex/schema.ts`'s
 // `notifications`). Convex counterpart to migration 027_notifications.sql:
@@ -94,25 +111,72 @@ export const create = accountMutation({
 });
 
 /**
- * The caller's own notifications, newest-first. Scoped to `ctx.userId`
- * (the recipient) via `by_user`, then re-filtered in plain JS to
- * `ctx.accountId` (mirrors `contacts.filterByTags`'s own "collect, then
- * filter in memory" style for a query with no dedicated composite
- * index) — defense-in-depth against a stale row surviving an account
- * switch: `invitations.redeem` moves a user's `memberships.accountId` in
- * place, which would otherwise leave an old notification from their
- * PREVIOUS account visible under their new one.
+ * The caller's own notifications, newest-first — the `/notifications`
+ * page's full history. Binds `(userId, accountId)` on
+ * `by_user_account` rather than scanning `by_user` and re-filtering the
+ * account in JS. That still gives the same defense-in-depth the JS
+ * filter was there for — a stale row surviving an account switch, since
+ * `invitations.redeem` moves a user's `memberships.accountId` in place —
+ * except the excluded rows are now never read at all.
+ *
+ * Deliberately unbounded: this is a history view, and it is only
+ * subscribed while the page is open. The header bell, which mounts on
+ * every authenticated page, must use `listRecent`/`unreadCount` below.
  */
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
-    const mine = await ctx.db
+    return await ctx.db
       .query("notifications")
-      .withIndex("by_user", (q) => q.eq("userId", ctx.userId))
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", ctx.userId).eq("accountId", ctx.accountId),
+      )
       .order("desc")
       .collect();
+  },
+});
 
-    return mine.filter((notification) => notification.accountId === ctx.accountId);
+/**
+ * The newest `limit` notifications for the caller — the header bell's
+ * popover rows. Same range as `list`, stopped at `limit`.
+ */
+export const listRecent = accountQuery({
+  args: { limit: v.number() },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("notifications")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", ctx.userId).eq("accountId", ctx.accountId),
+      )
+      .order("desc")
+      .take(Math.min(Math.max(0, Math.floor(args.limit)), LIST_RECENT_CAP));
+  },
+});
+
+/**
+ * How many unread notifications the caller has, saturating at
+ * `UNREAD_BADGE_CAP`. The bell's `formatUnreadBadge` only needs exact
+ * values 1-9 and renders anything above that as "9+", so stopping the
+ * read at the cap costs the UI nothing and makes this query O(cap)
+ * instead of O(the caller's entire notification history) — which matters
+ * because the bell subscribes to it on every authenticated page.
+ *
+ * `readAt: undefined` is a real indexed value in Convex, so the unread
+ * set is an index range here, not a post-scan filter.
+ */
+export const unreadCount = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    const unread = await ctx.db
+      .query("notifications")
+      .withIndex("by_user_account_read", (q) =>
+        q
+          .eq("userId", ctx.userId)
+          .eq("accountId", ctx.accountId)
+          .eq("readAt", undefined),
+      )
+      .take(UNREAD_BADGE_CAP);
+    return unread.length;
   },
 });
 
@@ -153,16 +217,18 @@ export const markRead = accountMutation({
 export const markAllRead = accountMutation({
   args: {},
   handler: async (ctx) => {
-    const mine = await ctx.db
+    // Ranges the unread set on `by_user_account_read` rather than
+    // collecting the caller's whole cross-account history and narrowing
+    // it in JS: the rows this patches are exactly the rows it now reads.
+    const unread = await ctx.db
       .query("notifications")
-      .withIndex("by_user", (q) => q.eq("userId", ctx.userId))
+      .withIndex("by_user_account_read", (q) =>
+        q
+          .eq("userId", ctx.userId)
+          .eq("accountId", ctx.accountId)
+          .eq("readAt", undefined),
+      )
       .collect();
-
-    const unread = mine.filter(
-      (notification) =>
-        notification.accountId === ctx.accountId &&
-        notification.readAt === undefined,
-    );
 
     const now = Date.now();
     await Promise.all(
