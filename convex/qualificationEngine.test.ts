@@ -905,3 +905,183 @@ test("V3-C: post-qualification chit-chat does NOT open a new lead", async () => 
   });
   expect(await sessionsFor(t, base.conversationId)).toHaveLength(1);
 });
+
+// ---- v4: duplicate-lead bug fixes ----
+
+test("V4-BUG: contact details / greetings after completion NEVER reopen — even if the model claims newInquiry without evidence", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 90, qualifiedAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  // [[NEW]] but NO fields → no evidence → blocked
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "[[NEW]] hello again");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(1);
+});
+
+test("V4-BUG: the SAME service cannot reopen within 48h of completing (the Italy-duplicate case)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  // synthetic analysis always says service "UAE visa" — make the terminal
+  // session the SAME service, finished just now
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 90, qualifiedAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[NEW]] field:nationality=Indian;field:visa_type=60-day;field:email=x@y.com; [[COMPLETE]] score:95");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(1); // no duplicate
+
+  // …but the same service CAN reopen after 48h (months-later re-booking)
+  await t.run(async (ctx) => {
+    const [s] = await ctx.db.query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .collect();
+    await ctx.db.patch(s._id, { qualifiedAt: Date.now() - 49 * 3_600_000 });
+  });
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(2);
+});
+
+test("V4-BUG: analysis after completion only sees messages SINCE completion (no re-extraction from history)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  // history full of qualifying markers from the FINISHED inquiry
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[NEW]] field:destination=Italy;field:travelers=2; [[COMPLETE]] score:95");
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "Packages",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 95, qualifiedAt: Date.now() + 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  // the ONLY post-completion message is harmless — the old marker-laden
+  // history must NOT leak into the analysis (latest visible = "thanks!")
+  await new Promise((r) => setTimeout(r, 5));
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "thanks!");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(1);
+});
+
+test("V4-BUG: the assistant stays silent on the completion turn (closing message is the reply) and keeps the never-re-ask list afterwards", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [{ key: "email", label: "Email", value: "ravi@x.com", confidence: "high", updatedAt: 1 }],
+      expectedCount: 4, answeredCount: 4, score: 90, qualifiedAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "great thanks");
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  // fresh completion (< 90s) → no extra assistant reply
+  expect((await messagesFor(t, base.conversationId)).filter((m) => m.senderType === "bot")).toHaveLength(1 - 1);
+
+  // after the suppression window, objectives STILL list collected fields
+  await t.run(async (ctx) => {
+    const [s] = await ctx.db.query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .collect();
+    await ctx.db.patch(s._id, { qualifiedAt: Date.now() - 10 * 60_000 });
+  });
+  const objectives = await t.query(internal.qualificationEngine.getObjectives, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+  expect(objectives?.collected).toEqual([{ label: "Email", value: "ravi@x.com" }]);
+  expect(objectives?.nextQuestion).toBeNull();
+});
+
+// ---- v4: mandatory auto-tag + cleanup ----
+
+test("V4: qualification auto-tags the contact with the service; a second lead stacks a second tag", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  let links = await t.run(async (ctx) => {
+    const rows = await ctx.db.query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", base.contactId)).collect();
+    return await Promise.all(rows.map(async (r) => ({
+      source: r.source, name: (await ctx.db.get(r.tagId))?.name,
+    })));
+  });
+  expect(links).toHaveLength(1);
+  expect(links[0].name).toBe("UAE visa"); // synthetic service
+  expect(links[0].source).toBe("ai");
+
+  // second lead for a DIFFERENT service → a second tag stacks
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "collecting", origin: "inbound", serviceName: "Italy package",
+      fields: [], expectedCount: 4, answeredCount: 3,
+      checklistSatisfiedAt: Date.now(), lastCustomerMessageAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  await t.mutation(internal.qualificationEngine.completeQualification, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+  links = await t.run(async (ctx) => {
+    const rows = await ctx.db.query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", base.contactId)).collect();
+    return await Promise.all(rows.map(async (r) => ({
+      source: r.source, name: (await ctx.db.get(r.tagId))?.name,
+    })));
+  });
+  expect(links.map((l) => l.name).sort()).toEqual(["Italy package", "UAE visa"]);
+});
+
+test("V4: cleanupDuplicateLeads retires same-service qualified duplicates within 48h, keeps distinct services", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  const mk = (serviceName: string, qualifiedAt: number) =>
+    t.run((ctx) =>
+      ctx.db.insert("qualificationSessions", {
+        accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+        status: "qualified", origin: "inbound", serviceName,
+        fields: [], expectedCount: 4, answeredCount: 4, score: 90, qualifiedAt,
+        followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+      }));
+  const now = Date.now();
+  await mk("Italy package", now - 3_600_000);      // keep (first)
+  await mk("Italy package", now - 3_000_000);      // duplicate
+  await mk("Italy package", now - 2_000_000);      // duplicate
+  await mk("UAE visa", now - 1_000_000);           // distinct service — keep
+  const { removed } = await t.mutation(internal.qualificationEngine.cleanupDuplicateLeads, {
+    accountId: base.accountId,
+  });
+  expect(removed).toBe(2);
+  const sessions = await sessionsFor(t, base.conversationId);
+  expect(sessions.filter((s) => s.status === "qualified")).toHaveLength(2);
+  expect(sessions.filter((s) => s.closedReason === "duplicate")).toHaveLength(2);
+});

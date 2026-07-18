@@ -187,9 +187,12 @@ export const recentMessages = internalQuery({
 
     // Newest-first off the index — reverse for the chronological
     // transcript the provider APIs expect (oldest message first).
+    // `createdAt` rides along for callers that need a transcript
+    // boundary (qualification v4); `toChatMessages` ignores it.
     return rows.reverse().map((m) => ({
       senderType: m.senderType,
       contentText: m.contentText,
+      createdAt: m._creationTime,
     }));
   },
 });
@@ -393,6 +396,10 @@ export const dispatchInbound = internalAction({
         internal.qualificationEngine.getObjectives,
         { accountId: args.accountId, conversationId: args.conversationId },
       );
+      // v4: on the turn a lead just qualified, the closing message IS
+      // the reply — a second assistant message here double-texted and
+      // could re-ask already-given details.
+      if (qualification?.suppressReply) return;
 
       // Ask-admin relay (v3): team answers that haven't reached the
       // customer yet are injected as knowledge so THIS reply can deliver
