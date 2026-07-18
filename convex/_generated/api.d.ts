@@ -97,6 +97,7 @@ import type * as qualification from "../qualification.js";
 import type * as qualificationEngine from "../qualificationEngine.js";
 import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
+import type * as salesChecklists from "../salesChecklists.js";
 import type * as send from "../send.js";
 import type * as tagGroups from "../tagGroups.js";
 import type * as tags from "../tags.js";
@@ -201,6 +202,7 @@ declare const fullApi: ApiFromModules<{
   qualificationEngine: typeof qualificationEngine;
   quickReplies: typeof quickReplies;
   reactions: typeof reactions;
+  salesChecklists: typeof salesChecklists;
   send: typeof send;
   tagGroups: typeof tagGroups;
   tags: typeof tags;

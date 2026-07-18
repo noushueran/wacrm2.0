@@ -143,3 +143,26 @@ export function parseChecklistGeneration(
 export function allItemsDone(items: { done: boolean }[]): boolean {
   return items.length > 0 && items.every((i) => i.done);
 }
+
+/** System prompt for turning the KB's SALES CHECKLIST excerpts into the
+ *  per-lead task list. Deterministic; the strict-JSON contract matches
+ *  `parseChecklistGeneration`. */
+export function buildChecklistPrompt(args: {
+  excerpts: string[];
+  serviceName: string | null;
+}): string {
+  const excerpts = args.excerpts
+    .map((c, i) => `[${i + 1}] ${c}`)
+    .join("\n\n---\n\n");
+  return [
+    "You turn a travel company's sales-process documentation into the working checklist a salesperson must complete for one newly qualified lead.",
+    args.serviceName ? `The lead's service: ${args.serviceName}.` : "",
+    "Documentation excerpts (SALES CHECKLIST section):",
+    excerpts,
+    "",
+    'Reply with ONLY a JSON array of tasks, ordered: [{"title": "…", "description": "…"}]',
+    "Rules: 3–12 tasks; imperative titles under 120 characters; description is one concrete sentence; no markdown, no commentary outside the JSON.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
