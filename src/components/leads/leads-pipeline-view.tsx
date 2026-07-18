@@ -47,6 +47,9 @@ import { cn } from '@/lib/utils';
 export interface PipelineLead {
   sessionId: string;
   conversationId: string;
+  /** Session creation time — the collapse key that picks the one live
+   *  card per conversation (see groupLeadsByStage). */
+  startedAt: number;
   status: string;
   score: number | null;
   serviceName: string | null;
