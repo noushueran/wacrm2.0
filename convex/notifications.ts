@@ -33,7 +33,7 @@ export async function insertNotification(
   args: {
     accountId: Id<"accounts">;
     userId: Id<"users">;
-    type: "conversation_assigned" | "lead_qualified";
+    type: "conversation_assigned" | "lead_qualified" | "sla_alert";
     conversationId?: Id<"conversations">;
     contactId?: Id<"contacts">;
     actorUserId?: Id<"users">;

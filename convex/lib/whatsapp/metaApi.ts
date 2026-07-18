@@ -658,6 +658,59 @@ export async function sendReactionMessage(
   return { messageId: data.messages[0].id };
 }
 
+export interface MarkMessageReadArgs {
+  phoneNumberId: string;
+  accessToken: string;
+  /** Meta's message_id (wamid) of the INBOUND message to mark read. */
+  messageId: string;
+  /** Also show "typing…" to the customer — Meta auto-dismisses it after
+   *  ~25 seconds or as soon as the next message is sent. */
+  typingIndicator?: boolean;
+}
+
+/**
+ * The wire payload for Meta's mark-as-read call (same `/messages`
+ * endpoint as the senders above, but `status: "read"` instead of a
+ * `type`). Extracted as a pure builder so the exact shape is unit-
+ * testable without a fetch — see `metaApi.test.ts`.
+ */
+export function buildMarkReadPayload(args: {
+  messageId: string;
+  typingIndicator?: boolean;
+}): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    messaging_product: "whatsapp",
+    status: "read",
+    message_id: args.messageId,
+  };
+  if (args.typingIndicator) {
+    payload.typing_indicator = { type: "text" };
+  }
+  return payload;
+}
+
+/**
+ * Mark an inbound message as read (blue ticks), optionally showing the
+ * typing indicator. Purely customer-facing polish: Meta answers
+ * `{"success": true}` rather than a message id, so unlike every sender
+ * above there is nothing to return or persist.
+ */
+export async function markMessageRead(args: MarkMessageReadArgs): Promise<void> {
+  const { phoneNumberId, accessToken, messageId, typingIndicator } = args;
+  const url = `${META_API_BASE}/${phoneNumberId}/messages`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(buildMarkReadPayload({ messageId, typingIndicator })),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+}
+
 // ============================================================
 // Interactive (button replies + list messages)
 // ============================================================

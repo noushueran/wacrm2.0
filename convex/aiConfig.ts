@@ -107,7 +107,9 @@ export const upsert = accountMutation({
     systemPrompt: v.optional(v.string()),
     isActive: v.boolean(),
     autoReplyEnabled: v.boolean(),
-    autoReplyMaxPerConversation: v.number(),
+    // DEPRECATED — no reply cap anymore (see schema.ts). Still accepted
+    // so an older client bundle mid-deploy can't hit a validator error.
+    autoReplyMaxPerConversation: v.optional(v.number()),
     handoffAgentId: v.optional(v.id("users")),
     apiKey: v.optional(v.string()),
     embeddingsApiKey: v.optional(v.string()),

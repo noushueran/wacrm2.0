@@ -46,7 +46,7 @@ import type * as lib_ai_context from "../lib/ai/context.js";
 import type * as lib_ai_defaults from "../lib/ai/defaults.js";
 import type * as lib_ai_embeddings from "../lib/ai/embeddings.js";
 import type * as lib_ai_generate from "../lib/ai/generate.js";
-import type * as lib_ai_handoff from "../lib/ai/handoff.js";
+import type * as lib_ai_media from "../lib/ai/media.js";
 import type * as lib_ai_providers_anthropic from "../lib/ai/providers/anthropic.js";
 import type * as lib_ai_providers_openai from "../lib/ai/providers/openai.js";
 import type * as lib_ai_providers_shared from "../lib/ai/providers/shared.js";
@@ -150,7 +150,7 @@ declare const fullApi: ApiFromModules<{
   "lib/ai/defaults": typeof lib_ai_defaults;
   "lib/ai/embeddings": typeof lib_ai_embeddings;
   "lib/ai/generate": typeof lib_ai_generate;
-  "lib/ai/handoff": typeof lib_ai_handoff;
+  "lib/ai/media": typeof lib_ai_media;
   "lib/ai/providers/anthropic": typeof lib_ai_providers_anthropic;
   "lib/ai/providers/openai": typeof lib_ai_providers_openai;
   "lib/ai/providers/shared": typeof lib_ai_providers_shared;

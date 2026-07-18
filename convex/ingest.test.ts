@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { afterEach, expect, test, vi } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
@@ -687,6 +687,7 @@ test("shouldDispatchAiReply: dispatches when nothing stands in the way", () => {
       flowConsumed: false,
       inboundText: "hi there",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(true);
 });
@@ -697,6 +698,7 @@ test("shouldDispatchAiReply: stands down when a flow consumed the message", () =
       flowConsumed: true,
       inboundText: "hi there",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(false);
 });
@@ -708,6 +710,7 @@ test("shouldDispatchAiReply: stands down for an interactive reply", () => {
       interactiveReplyId: "btn_yes",
       inboundText: "Yes please",
       hasActiveAutoResponder: false,
+      contentType: "interactive",
     }),
   ).toBe(false);
 });
@@ -718,6 +721,7 @@ test("shouldDispatchAiReply: stands down for empty/whitespace-only text", () => 
       flowConsumed: false,
       inboundText: "   ",
       hasActiveAutoResponder: false,
+      contentType: "text",
     }),
   ).toBe(false);
 });
@@ -728,6 +732,37 @@ test("shouldDispatchAiReply: stands down when the account has an active auto-res
       flowConsumed: false,
       inboundText: "hi there",
       hasActiveAutoResponder: true,
+      contentType: "text",
+    }),
+  ).toBe(false);
+});
+
+test("shouldDispatchAiReply: dispatches for a media-only message (voice note, no text)", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "",
+      hasActiveAutoResponder: false,
+      contentType: "audio",
+    }),
+  ).toBe(true);
+});
+
+test("shouldDispatchAiReply: a media message still respects the flow/auto-responder precedence", () => {
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: true,
+      inboundText: "",
+      hasActiveAutoResponder: false,
+      contentType: "image",
+    }),
+  ).toBe(false);
+  expect(
+    shouldDispatchAiReply({
+      flowConsumed: false,
+      inboundText: "",
+      hasActiveAutoResponder: true,
+      contentType: "image",
     }),
   ).toBe(false);
 });
@@ -906,9 +941,42 @@ test("processInbound: AI reply stands down for an active keyword_match automatio
   expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
 });
 
+test("a rapid burst of inbound texts gets ONE debounced AI reply, not one per message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  // WhatsApp users fragment one thought across quick messages — each is
+  // its own webhook. Only the LAST message's debounced dispatch may
+  // reply, covering the whole burst.
+  for (const [i, text] of ["Hi", "I want a Baku package", "for August"].entries()) {
+    await t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551234567",
+      message: { type: "text", text, wamid: `wamid.BURST${i}` },
+    });
+  }
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "customer")).toHaveLength(3);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(1);
+}, 20_000);
+
 test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers(); // the AI reply is debounced (scheduled) — drained below
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
 
@@ -923,6 +991,7 @@ test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry
     message: { type: "text", text: "hello there", wamid: "wamid.DUPETEST" },
   });
   expect(first.duplicate).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // debounced AI reply lands
 
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
@@ -942,6 +1011,7 @@ test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry
   });
   expect(second.duplicate).toBe(true);
   expect(second.flowConsumed).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // a duplicate schedules nothing
 
   // No SECOND automation run, AI reply, or webhook delivery attempt —
   // every observable side effect is identical to right after the FIRST
@@ -1063,6 +1133,7 @@ test("processInbound: an automations phase matching zero automations (nothing to
   // failure mode isn't reachable through real engine behavior here.)
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers(); // the AI reply is debounced (scheduled) — drained below
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
@@ -1075,6 +1146,7 @@ test("processInbound: an automations phase matching zero automations (nothing to
   });
 
   expect(result.duplicate).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // debounced AI reply lands
 
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
@@ -1780,3 +1852,194 @@ test("ingestInbound assigns a contact code when it creates a new contact", async
   const contact = await t.run((ctx) => ctx.db.get(res.contactId));
   expect(contact!.contactCode).toBe("HC-000001");
 });
+
+// ============================================================
+// Agent-reply SLA — an ASSIGNED chat where the customer keeps waiting
+// escalates to supervisors (bell + staff WhatsApp), and again if the
+// agent stays silent. Bot-owned threads never escalate (the bot always
+// replies); a newer customer message hands the cycle to its own check.
+// ============================================================
+
+async function seedSlaTeam(t: TestConvex<typeof schema>, accountId: Id<"accounts">) {
+  return await t.run(async (ctx) => {
+    const agentUserId = await ctx.db.insert("users", { name: "Aisha", email: "aisha@x.com" });
+    await ctx.db.insert("memberships", {
+      userId: agentUserId, accountId, role: "agent", fullName: "Aisha", email: "aisha@x.com",
+    });
+    const supervisorUserId = await ctx.db.insert("users", { name: "Sam", email: "sam@x.com" });
+    await ctx.db.insert("memberships", {
+      userId: supervisorUserId, accountId, role: "supervisor", fullName: "Sam",
+      email: "sam@x.com", phone: "+971 55 111 2222",
+    });
+    return { agentUserId, supervisorUserId };
+  });
+}
+
+async function notificationsFor(t: TestConvex<typeof schema>, accountId: Id<"accounts">) {
+  return await t.run((ctx) =>
+    ctx.db
+      .query("notifications")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+}
+
+test("an assigned agent staying silent escalates to the supervisor — bell + staff WhatsApp, then again", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId, supervisorUserId } = await seedSlaTeam(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "is my quote ready?", wamid: "wamid.SLA1" },
+  });
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  // The agent takes the chat from the dashboard… and goes silent.
+  await t.run((ctx) => ctx.db.patch(conversation!._id, { assignedToUserId: agentUserId }));
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const notifications = await notificationsFor(t, accountId);
+  const supervisorBells = notifications.filter(
+    (n) => n.userId === supervisorUserId && n.type === "sla_alert",
+  );
+  expect(supervisorBells).toHaveLength(2); // first alert + still-silent repeat
+  expect(supervisorBells[0]!.conversationId).toBe(conversation!._id);
+  // The silent agent is never the escalation target.
+  expect(notifications.filter((n) => n.userId === agentUserId)).toHaveLength(0);
+  // Staff WhatsApp alert went out (dry-run persists it as a bot message
+  // in the supervisor's staff conversation).
+  const allMessages = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_account", (q) => q.eq("accountId", accountId)).collect(),
+  );
+  expect(allMessages.some((m) => (m.contentText ?? "").includes("hasn't replied"))).toBe(true);
+}, 30_000);
+
+test("an assigned agent who replied in time never escalates", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId } = await seedSlaTeam(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "is my quote ready?", wamid: "wamid.SLA2" },
+  });
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversation!._id, { assignedToUserId: agentUserId });
+    await ctx.db.insert("messages", {
+      accountId,
+      conversationId: conversation!._id,
+      senderType: "agent",
+      contentType: "text",
+      contentText: "Yes! Sending it over now.",
+      status: "sent",
+    });
+  });
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+}, 30_000);
+
+test("checkAgentReplySla anchors on the OLDEST unanswered message — rapid pings never reset the clock", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId, supervisorUserId } = await seedSlaTeam(t, accountId);
+  const { conversationId, firstMessageId, secondMessageId } = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId, phone: "+15551234567", phoneNormalized: "15551234567",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+    });
+    const firstMessageId = await ctx.db.insert("messages", {
+      accountId, conversationId, senderType: "customer",
+      contentType: "text", contentText: "first", status: "sent",
+    });
+    const secondMessageId = await ctx.db.insert("messages", {
+      accountId, conversationId, senderType: "customer",
+      contentType: "text", contentText: "second (still ignored!)", status: "sent",
+    });
+    return { conversationId, firstMessageId, secondMessageId };
+  });
+
+  // Unassigned: the bot owns the thread (it always replies) — no alert.
+  await t.mutation(internal.ingest.checkAgentReplySla, {
+    accountId, conversationId, inboundMessageId: firstMessageId, stage: 1,
+  });
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+
+  await t.run((ctx) => ctx.db.patch(conversationId, { assignedToUserId: agentUserId }));
+
+  // The NEWER message's check stands down — the oldest unanswered
+  // message anchors the cycle (otherwise every rapid ping would push
+  // the alert forever while the customer waits).
+  await t.mutation(internal.ingest.checkAgentReplySla, {
+    accountId, conversationId, inboundMessageId: secondMessageId, stage: 1,
+  });
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+
+  // The anchor's own check FIRES even though newer pings exist.
+  await t.mutation(internal.ingest.checkAgentReplySla, {
+    accountId, conversationId, inboundMessageId: firstMessageId, stage: 1,
+  });
+  const bells = await notificationsFor(t, accountId);
+  expect(bells.filter((n) => n.userId === supervisorUserId)).toHaveLength(1);
+});
+
+test("a bot reply before takeover satisfies the SLA — no false alarm after assignment", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId } = await seedSlaTeam(t, accountId);
+  await seedAiConfig(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello!", wamid: "wamid.SLA3" },
+  });
+  // Let ONLY the debounced bot reply land (not the 10-min SLA check yet).
+  vi.advanceTimersByTime(15_000);
+  await t.finishInProgressScheduledFunctions();
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const botReplies = (await messagesFor(t, conversation!._id)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botReplies).toHaveLength(1); // the customer WAS answered (by the bot)
+
+  // Routine takeover a few minutes later — then the SLA check fires.
+  await t.run((ctx) => ctx.db.patch(conversation!._id, { assignedToUserId: agentUserId }));
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  // The customer isn't waiting: the bot already replied to their last
+  // message. No supervisor alarm may fire.
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+}, 30_000);

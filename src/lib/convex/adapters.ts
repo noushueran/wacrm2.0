@@ -698,7 +698,6 @@ export interface AiConfigView {
   systemPrompt: string | null;
   isActive: boolean;
   autoReplyEnabled: boolean;
-  autoReplyMaxPerConversation: number;
   handoffAgentId: string | null;
   hasKey: boolean;
   hasEmbeddingsKey: boolean;
@@ -710,7 +709,7 @@ export function toUiAiConfig(config: {
   systemPrompt: string | undefined;
   isActive: boolean;
   autoReplyEnabled: boolean;
-  autoReplyMaxPerConversation: number;
+  autoReplyMaxPerConversation: number | undefined;
   handoffAgentId: Id<"users"> | undefined;
   hasKey: boolean;
   hasEmbeddingsKey: boolean;
@@ -721,7 +720,6 @@ export function toUiAiConfig(config: {
     systemPrompt: config.systemPrompt ?? null,
     isActive: config.isActive,
     autoReplyEnabled: config.autoReplyEnabled,
-    autoReplyMaxPerConversation: config.autoReplyMaxPerConversation,
     handoffAgentId: config.handoffAgentId ?? null,
     hasKey: config.hasKey,
     hasEmbeddingsKey: config.hasEmbeddingsKey,

@@ -511,3 +511,40 @@ test("sendReaction is account-scoped: rejects a conversation belonging to a diff
 
   delete process.env.CONVEX_META_DRY_RUN;
 });
+
+// ============================================================
+// markRead — read receipt + typing indicator (no persistence)
+// ============================================================
+
+test("markRead in DRY-RUN resolves without calling Meta and persists nothing", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  try {
+    const t = convexTest(schema, modules);
+    const { accountId, asUser } = await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+    const contactId = await asUser.mutation(api.contacts.create, {
+      phone: "15551234567",
+    });
+    const conversationId = await seedConversation(t, { accountId, contactId });
+
+    await t.action(internal.metaSend.markRead, {
+      accountId,
+      whatsappMessageId: "wamid.inbound123",
+      typingIndicator: true,
+    });
+
+    // A read receipt is not a message — nothing may be persisted.
+    const rows = await t.run((ctx) =>
+      ctx.db
+        .query("messages")
+        .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+        .collect(),
+    );
+    expect(rows).toHaveLength(0);
+  } finally {
+    delete process.env.CONVEX_META_DRY_RUN;
+  }
+});

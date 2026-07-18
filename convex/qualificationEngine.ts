@@ -283,7 +283,7 @@ const analysisValidator = v.object({
  * checklistSatisfied AND score >= threshold AND >= 3 answers.
  * Intents: opt_out/disqualified close the session here (opt-out also
  * silences the bot entirely); wants_human is returned to the action,
- * which routes through `aiReply.markHandoff`.
+ * which routes through `aiReply.flagForHuman` (surface, never silence).
  */
 export const applyAnalysis = internalMutation({
   args: {
@@ -538,10 +538,12 @@ export const analyzeInbound = internalAction({
           conversationId: args.conversationId,
         });
       } else if (wantsHuman) {
-        await ctx.runMutation(internal.aiReply.markHandoff, {
+        // Surface it for the team (pending + summary) — the bot keeps
+        // replying and reassuring; takeover is a manual dashboard
+        // action only (owner decision 2026-07-18).
+        await ctx.runMutation(internal.aiReply.flagForHuman, {
           accountId: args.accountId,
           conversationId: args.conversationId,
-          handoffAgentId: aiCfg.handoffAgentId ?? undefined,
           summary:
             "🤖 Customer asked for a human during qualification." +
             (analysis.summary ? ` ${analysis.summary}` : ""),
@@ -1039,6 +1041,10 @@ export const followUpContext = internalQuery({
     const expiryRevisit =
       session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
     if (conversation.aiAutoreplyDisabled) return { kind: "reschedule", at: expiryRevisit };
+    // Assignment IS the takeover signal (owner strategy 2026-07-18):
+    // once a human owns the thread, scheduled nudges yield exactly like
+    // a pause — the human decides the cadence now.
+    if (conversation.assignedToUserId) return { kind: "reschedule", at: expiryRevisit };
     if (
       session.humanTouchedAt &&
       session.humanTouchedAt > session.lastCustomerMessageAt
@@ -1285,6 +1291,37 @@ export const pendingAnswers = internalQuery({
   },
 });
 
+/**
+ * Compare-and-set claim for `relayAnswerToCustomer`: flips exactly one
+ * `answered` inquiry to `delivered` BEFORE the send, so two concurrent
+ * relays (e.g. the scheduled one and a manual retry) can never both
+ * text the customer — Convex OCC serializes the two patches and the
+ * loser sees `delivered`. Same claim-before-send discipline as
+ * `claimFollowUpSlot`.
+ */
+export const claimAnswerDelivery = internalMutation({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args): Promise<boolean> => {
+    const row = await ctx.db.get(args.inquiryId);
+    if (!row || row.status !== "answered") return false;
+    await ctx.db.patch(args.inquiryId, { status: "delivered" });
+    return true;
+  },
+});
+
+/** Reverts a failed relay's claim (`delivered` → `answered`) so the
+ *  `pendingAnswers` injection path can still carry the answer into the
+ *  bot's next reply — an answered question must never be silently lost
+ *  to one bad Meta call. */
+export const unclaimAnswerDelivery = internalMutation({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args): Promise<void> => {
+    const row = await ctx.db.get(args.inquiryId);
+    if (!row || row.status !== "delivered") return;
+    await ctx.db.patch(args.inquiryId, { status: "answered" });
+  },
+});
+
 export const markAnswersDelivered = internalMutation({
   args: { inquiryIds: v.array(v.id("adminInquiries")) },
   handler: async (ctx, args): Promise<void> => {
@@ -1344,7 +1381,8 @@ export const relayContext = internalQuery({
  * Sends the assistant's question to every admin number (plain text; see
  * the section header on why no template). Without configured admin
  * numbers the question falls back to the in-app human queue
- * (`markHandoff`) so it is never silently dropped.
+ * (`flagForHuman` — pending + summary, bot stays on) so it is never
+ * silently dropped.
  */
 export const relayQuestionToAdmin = internalAction({
   args: {
@@ -1360,7 +1398,11 @@ export const relayQuestionToAdmin = internalAction({
         contactId: args.contactId,
       });
       if (!context) {
-        await ctx.runMutation(internal.aiReply.markHandoff, {
+        // No admin numbers configured — nobody to ask over WhatsApp.
+        // Surface the thread (pending + the open question) WITHOUT
+        // silencing the bot: it keeps answering what it can from the KB
+        // while the team picks the question up from the dashboard.
+        await ctx.runMutation(internal.aiReply.flagForHuman, {
           accountId: args.accountId,
           conversationId: args.conversationId,
           summary: `🤖 Needs an answer for the customer: ${args.question}`,
@@ -1623,10 +1665,12 @@ export const answerContext = internalQuery({
 
 /**
  * Relays the admin's answer to the waiting customer as a warm assistant
- * reply (LLM-composed; deterministic in DRY-RUN). Best-effort: if the
- * immediate send can't happen (human took over, cap, window closed),
- * the answer stays `answered` and reaches the customer through the
- * `pendingAnswers` knowledge injection on their next message.
+ * reply (LLM-composed; deterministic in DRY-RUN). Best-effort with no
+ * loss: if the immediate send can't happen (human took over, window
+ * closed, Meta failure — the claim is reverted on a failed send), the
+ * answer stays `answered` and reaches the customer through the
+ * `pendingAnswers` knowledge injection on their next message. The
+ * claim-before-send only guards against two relays double-texting.
  */
 export const relayAnswerToCustomer = internalAction({
   args: { inquiryId: v.id("adminInquiries") },
@@ -1669,26 +1713,42 @@ export const relayAnswerToCustomer = internalAction({
         text = gen.text || `Update on your question: ${context.answer}`;
       }
 
-      const claimed = await ctx.runMutation(internal.aiReply.claimReplySlot, {
-        accountId: context.accountId,
-        conversationId: context.conversationId,
-        maxReplies: aiCfg.autoReplyMaxPerConversation,
-      });
-      if (!claimed) return; // cap reached — pendingAnswers injection remains
+      // CLAIM the inquiry before sending (compare-and-set answered →
+      // delivered, the `claimFollowUpSlot` pattern): two concurrent
+      // relays for the same answer must never double-text the customer.
+      // At-most-once by design — a send failure after the claim falls
+      // back to nothing rather than ever risking a duplicate. No reply
+      // cap (owner decision): the count is bumped purely as a metric.
+      const claimed = await ctx.runMutation(
+        internal.qualificationEngine.claimAnswerDelivery,
+        { inquiryId: args.inquiryId },
+      );
+      if (!claimed) return; // another relay already delivered this answer
 
-      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
-        accountId: context.accountId,
-        conversationId: context.conversationId,
-        to: context.to,
-        text,
-      });
-      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
-        accountId: context.accountId,
-        whatsappMessageId: sendResult.whatsappMessageId,
-      });
-      await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
-        inquiryIds: [args.inquiryId],
-      });
+      try {
+        const sendResult = await ctx.runAction(internal.metaSend.sendText, {
+          accountId: context.accountId,
+          conversationId: context.conversationId,
+          to: context.to,
+          text,
+        });
+        await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
+          accountId: context.accountId,
+          whatsappMessageId: sendResult.whatsappMessageId,
+        });
+        await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+          accountId: context.accountId,
+          conversationId: context.conversationId,
+        });
+      } catch (err) {
+        // Send failed AFTER the claim — un-claim so the answer stays
+        // "answered" and reaches the customer through the pendingAnswers
+        // injection on their next message. Nothing is lost.
+        console.error("[qualification] relay send failed — un-claiming:", err);
+        await ctx.runMutation(internal.qualificationEngine.unclaimAnswerDelivery, {
+          inquiryId: args.inquiryId,
+        });
+      }
     } catch (err) {
       console.error("[qualification] relayAnswerToCustomer failed:", err);
     }

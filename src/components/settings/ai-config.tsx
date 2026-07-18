@@ -28,22 +28,12 @@ import { SettingsPanelHead } from './settings-panel-head';
 import { AiKnowledgeCard } from './ai-knowledge';
 import { AI_PROVIDER_DEFAULT_MODEL } from '@/lib/ai/defaults';
 import type { AiProvider } from '@/lib/ai/types';
-import {
-  toUiAiConfig,
-  toUiMemberProfile,
-  isConvexErrorCode,
-} from '@/lib/convex/adapters';
+import { toUiAiConfig, isConvexErrorCode } from '@/lib/convex/adapters';
 import { useTranslations } from 'next-intl';
 
 import { api } from '../../../convex/_generated/api';
-import type { Id } from '../../../convex/_generated/dataModel';
 
 const MASKED_KEY = '••••••••••••••••';
-
-// Radix Select can't use an empty-string item value, so the "leave
-// unassigned" choice gets a sentinel that maps to `undefined` in the
-// mutation payload.
-const HANDOFF_QUEUE = '__queue__';
 
 const PROVIDER_LABEL: Record<AiProvider, string> = {
   openai: 'OpenAI',
@@ -91,16 +81,6 @@ export function AiConfig() {
   const upsertConfig = useMutation(api.aiConfig.upsert);
   const testConnection = useAction(api.aiConfig.testConnection);
 
-  // The handoff-target picker's teammate list, via reactive
-  // `api.members.list` (any member may read it) mapped through the
-  // shared `toUiMemberProfile` adapter — same pattern as the inbox
-  // assign dropdown (`message-thread.tsx`).
-  const memberDocs = useQuery(api.members.list);
-  const members = useMemo(
-    () => (memberDocs ?? []).map(toUiMemberProfile),
-    [memberDocs],
-  );
-
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
@@ -114,9 +94,6 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
-  const [maxPerConversation, setMaxPerConversation] = useState(3);
-  // Empty string = leave unassigned (shared queue).
-  const [handoffAgentId, setHandoffAgentId] = useState('');
 
   const hasStoredKey = config?.hasKey ?? false;
   const hasStoredEmbeddingsKey = config?.hasEmbeddingsKey ?? false;
@@ -138,8 +115,6 @@ export function AiConfig() {
       setSystemPrompt(config.systemPrompt ?? '');
       setIsActive(config.isActive);
       setAutoReplyEnabled(config.autoReplyEnabled);
-      setMaxPerConversation(config.autoReplyMaxPerConversation ?? 3);
-      setHandoffAgentId(config.handoffAgentId ?? '');
       setApiKey(config.hasKey ? MASKED_KEY : '');
       setEmbeddingsKey(config.hasEmbeddingsKey ? MASKED_KEY : '');
     }
@@ -202,10 +177,6 @@ export function AiConfig() {
         systemPrompt: systemPrompt.trim() || undefined,
         isActive,
         autoReplyEnabled,
-        autoReplyMaxPerConversation: maxPerConversation,
-        handoffAgentId: handoffAgentId
-          ? (handoffAgentId as Id<'users'>)
-          : undefined,
         apiKey: keyPayload(),
         embeddingsApiKey: embeddingsKeyPayload(),
       });
@@ -437,56 +408,6 @@ export function AiConfig() {
               />
             </div>
 
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <Label htmlFor="ai-max">{t('maxAutoReplies')}</Label>
-                <p className="text-xs text-muted-foreground">
-                  {t('maxAutoRepliesDesc')}
-                </p>
-              </div>
-              <Input
-                id="ai-max"
-                type="number"
-                min={1}
-                max={20}
-                value={maxPerConversation}
-                onChange={(e) =>
-                  setMaxPerConversation(
-                    Math.min(20, Math.max(1, Number(e.target.value) || 1)),
-                  )
-                }
-                disabled={disabled || !autoReplyEnabled}
-                className="w-20"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="ai-handoff">{t('handoffTo')}</Label>
-              <p className="text-xs text-muted-foreground">
-                {t('handoffToDesc')}
-              </p>
-              <Select
-                value={handoffAgentId || HANDOFF_QUEUE}
-                onValueChange={(v) =>
-                  setHandoffAgentId(!v || v === HANDOFF_QUEUE ? '' : v)
-                }
-                disabled={disabled || !autoReplyEnabled}
-              >
-                <SelectTrigger id="ai-handoff">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={HANDOFF_QUEUE}>
-                    {t('handoffQueue')}
-                  </SelectItem>
-                  {members.map((m) => (
-                    <SelectItem key={m.user_id} value={m.user_id}>
-                      {m.full_name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
           </CardContent>
         </Card>
 
