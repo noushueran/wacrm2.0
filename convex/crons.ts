@@ -34,4 +34,13 @@ crons.interval(
   {},
 );
 
+// P6: expire lead offers past their consent window (default 10 min) and
+// move to the next eligible agent. No-op with no offered rows.
+crons.interval(
+  "qualification-lead-offers",
+  { minutes: 5 },
+  internal.qualificationEngine.sweepLeadOffers,
+  {},
+);
+
 export default crons;
