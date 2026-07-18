@@ -691,6 +691,9 @@ export default defineSchema({
     type: v.union(
       v.literal("conversation_assigned"),
       v.literal("lead_qualified"),
+      // Assigned-agent reply-SLA breach (customer waiting on a taken
+      // chat) — targets supervisors+.
+      v.literal("sla_alert"),
     ),
     conversationId: v.optional(v.id("conversations")),
     contactId: v.optional(v.id("contacts")),

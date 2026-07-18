@@ -4,6 +4,8 @@ import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
 import { aiReplyDebounceMs } from "./lib/ai/defaults";
+import { hasMinRole } from "./lib/roles";
+import { insertNotification } from "./notifications";
 import { allocateContactCode } from "./contacts";
 import {
   insertMessageAndUpdateConversation,
@@ -797,6 +799,23 @@ export const processInbound = internalAction({
       }),
     );
 
+    // ---- Agent-reply SLA (owner requirement 2026-07-18): if a HUMAN
+    // has taken this chat and leaves this customer message unanswered,
+    // supervisors get escalated. Stateless scheduled check, same
+    // pattern as the AI-reply debounce: every inbound books a check; at
+    // fire time it no-ops for bot-owned threads (the bot always
+    // replies), stands down when a newer customer message exists (its
+    // own check owns the cycle), and otherwise notifies + books one
+    // repeat.
+    await runBestEffort("ingest.checkAgentReplySla", () =>
+      ctx.scheduler.runAfter(agentReplySlaMs(), internal.ingest.checkAgentReplySla, {
+        accountId,
+        conversationId: res.conversationId,
+        inboundMessageId: res.messageId,
+        stage: 1,
+      }),
+    );
+
     // ---- Conversion funnel: first-touch (new_lead) — OUTSIDE every guard
     // above, best-effort. Classify the lead source from the inbound
     // identifiers (our HY- zero-width code → website/code lane, else Meta's
@@ -851,5 +870,115 @@ export const processInbound = internalAction({
     }
 
     return { duplicate: false, flowConsumed };
+  },
+});
+
+// ============================================================
+// Agent-reply SLA (owner requirement 2026-07-18): "if the agent has
+// taken the chat and is not replying, notify the supervisor; if the
+// agent still has not replied, notify again."
+// ============================================================
+
+const DEFAULT_AGENT_REPLY_SLA_MS = 10 * 60_000;
+const DEFAULT_AGENT_REPLY_SLA_REPEAT_MS = 20 * 60_000;
+
+/** How long an ASSIGNED chat may leave a customer message unanswered
+ *  before supervisors are alerted. Override with `AGENT_REPLY_SLA_MS`. */
+export function agentReplySlaMs(): number {
+  const raw = Number(process.env.AGENT_REPLY_SLA_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_AGENT_REPLY_SLA_MS;
+}
+
+/** Delay before the still-silent repeat alert (measured from the first
+ *  alert). Override with `AGENT_REPLY_SLA_REPEAT_MS`. */
+export function agentReplySlaRepeatMs(): number {
+  const raw = Number(process.env.AGENT_REPLY_SLA_REPEAT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_AGENT_REPLY_SLA_REPEAT_MS;
+}
+
+/**
+ * Fires `agentReplySlaMs()` after every inbound (booked by
+ * `processInbound`'s fan-out). Stands down unless ALL of:
+ *   - a human owns the thread (`assignedToUserId` — bot threads always
+ *     get a bot reply, so they never escalate),
+ *   - the conversation is still open/pending,
+ *   - the checked inbound is still the NEWEST customer message (a newer
+ *     one's own check owns the cycle — the debounce-staleness pattern),
+ *   - no agent message was sent after it.
+ * Then: one `sla_alert` bell per supervisor+ member (never the silent
+ * assignee), a staff-WhatsApp nudge to those with a phone on file, and
+ * — on stage 1 — one booked repeat check.
+ */
+export const checkAgentReplySla = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    inboundMessageId: v.id("messages"),
+    stage: v.number(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) return;
+    if (!conversation.assignedToUserId) return; // bot-owned — bot always replies
+    if (conversation.status === "closed") return;
+    const inbound = await ctx.db.get(args.inboundMessageId);
+    if (!inbound || inbound.conversationId !== args.conversationId) return;
+
+    const recent = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .take(30);
+    const latestCustomer = recent.find((m) => m.senderType === "customer");
+    if (latestCustomer && latestCustomer._id !== args.inboundMessageId) return; // stale
+    const agentReplied = recent.some(
+      (m) => m.senderType === "agent" && m._creationTime > inbound._creationTime,
+    );
+    if (agentReplied) return;
+
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    const assignee = memberships.find((m) => m.userId === conversation.assignedToUserId);
+    const assigneeName = assignee?.fullName ?? assignee?.email ?? "the assigned agent";
+    const contact = await ctx.db.get(conversation.contactId);
+    const customerName = contact?.name?.trim() || contact?.phone || "A customer";
+    const waitedMin = Math.max(1, Math.round((Date.now() - inbound._creationTime) / 60_000));
+
+    const title =
+      args.stage === 1
+        ? "Customer waiting on an assigned chat"
+        : "Still waiting: assigned chat unanswered";
+    const body = `${customerName} messaged ${waitedMin} min ago and ${assigneeName} hasn't replied yet.`;
+
+    for (const member of memberships) {
+      if (!hasMinRole(member.role, "supervisor")) continue;
+      if (member.userId === conversation.assignedToUserId) continue; // never the silent assignee
+      await insertNotification(ctx, {
+        accountId: args.accountId,
+        userId: member.userId,
+        type: "sla_alert",
+        conversationId: args.conversationId,
+        contactId: conversation.contactId,
+        title,
+        body,
+      });
+      if (member.phone) {
+        await ctx.scheduler.runAfter(0, internal.qualificationEngine.notifyStaffText, {
+          accountId: args.accountId,
+          phone: member.phone,
+          text: `⚠️ ${body} Please check the inbox.`,
+        });
+      }
+    }
+
+    if (args.stage === 1) {
+      await ctx.scheduler.runAfter(
+        agentReplySlaRepeatMs(),
+        internal.ingest.checkAgentReplySla,
+        { ...args, stage: 2 },
+      );
+    }
   },
 });
