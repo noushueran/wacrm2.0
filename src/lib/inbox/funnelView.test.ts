@@ -23,3 +23,17 @@ test("an organic funnel reports no stage as reporting to Meta", () => {
   const steps = buildFunnelSteps({ ...base, attributed: false, lane: null, currentStage: "qualified", reachedAt: { qualified: 5 } });
   expect(steps.every((s) => s.reportsToMeta === false)).toBe(true);
 });
+
+test("the terminal lost stage is hidden until reached, shown when current", () => {
+  // Unreached → not a step (losing is an exit, not a milestone to chase).
+  const unreached = buildFunnelSteps({ ...base, currentStage: "price_quoted", reachedAt: { price_quoted: 5 } });
+  expect(unreached.some((s) => s.key === "lost")).toBe(false);
+
+  // Current → shown, marked current.
+  const lost = buildFunnelSteps({ ...base, currentStage: "lost", reachedAt: { price_quoted: 5, lost: 9 } });
+  const lostStep = lost.find((s) => s.key === "lost");
+  expect(lostStep?.current).toBe(true);
+  // Reached earlier but reopened since → still visible as done history.
+  const reopened = buildFunnelSteps({ ...base, currentStage: "price_quoted", reachedAt: { price_quoted: 5, lost: 9 } });
+  expect(reopened.find((s) => s.key === "lost")?.done).toBe(true);
+});
