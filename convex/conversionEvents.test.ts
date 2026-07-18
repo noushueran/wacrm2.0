@@ -1,5 +1,5 @@
 import { convexTest } from "convex-test";
-import { expect, test, afterEach } from "vitest";
+import { expect, test, afterEach, vi } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
@@ -69,7 +69,7 @@ afterEach(() => {
   globalThis.fetch = origFetch;
 });
 
-test("capi: dormant without env leaves the row pending (no attempt bump)", async () => {
+test("capi: dormant without env retires the row out of the retry partitions (no attempt bump)", async () => {
   delete process.env.META_CAPI_DATASET_ID;
   delete process.env.META_CAPI_ACCESS_TOKEN;
   const t = convexTest(schema, modules);
@@ -81,8 +81,102 @@ test("capi: dormant without env leaves the row pending (no attempt bump)", async
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
   const row = await t.run((ctx) => ctx.db.get(id));
-  expect(row?.status).toBe("pending");
+  // Terminal, but `attempts` untouched — that pair is what distinguishes a
+  // dormant-retired row (re-sweepable) from a genuinely given-up one.
+  expect(row?.status).toBe("abandoned");
   expect(row?.attempts).toBe(0);
+  expect(row?.lastError).toContain("dormant");
+});
+
+test("capi: an account with no wabaId is dormant-retired, not left pending", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  // No seedWaba — the account has no WABA configured.
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa" });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("abandoned");
+  expect(row?.attempts).toBe(0);
+});
+
+test("platformA: dormant without env retires the row (no attempt bump)", async () => {
+  delete process.env.LANDING_CONVERSION_URL;
+  delete process.env.WA_CONVERSION_SHARED_SECRET;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "platformA", lane: "code" });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("abandoned");
+  expect(row?.attempts).toBe(0);
+});
+
+// ------------------------------------------------------------
+// Transient (429/5xx) vs permanent errors — the retry budget must only
+// ever be spent on errors that are actually the row's fault.
+// ------------------------------------------------------------
+
+test("capi: a 429 re-queues as error WITHOUT bumping attempts — rate limiting can never retire a live conversion", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => new Response("rate limited", { status: 429 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  // One bump away from the give-up cap: a 429 here used to abandon the row
+  // and lose the conversion permanently.
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa", attempts: 4 });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(4);
+  // Still selectable by the cron — the whole point.
+  const batch = await t.query(internal.conversionEvents.getPendingToRetry, {});
+  expect(batch.map((r) => r._id)).toContain(id);
+});
+
+test("capi: a 5xx re-queues as error WITHOUT bumping attempts", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => new Response("upstream down", { status: 503 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa", attempts: 4 });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(4);
+});
+
+test("platformA: a 429 re-queues as error WITHOUT bumping attempts", async () => {
+  process.env.LANDING_CONVERSION_URL = "https://a.example/whatsapp-conversion";
+  process.env.WA_CONVERSION_SHARED_SECRET = "secret";
+  globalThis.fetch = (async () => new Response("slow down", { status: 429 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "platformA", lane: "code", attempts: 4 });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(4);
 });
 
 test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", async () => {
@@ -187,10 +281,12 @@ test("platformA: a malformed 200 body is a retryable error, not terminal unmatch
   expect(row?.attempts).toBe(1);
 });
 
-test("error path bumps attempts; the bump that reaches MAX retires to abandoned", async () => {
+test("a permanent (4xx) error bumps attempts; the bump that reaches MAX retires to abandoned", async () => {
   process.env.META_CAPI_DATASET_ID = "DS1";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";
-  globalThis.fetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
+  // 400, not 429/5xx: a genuinely bad request is the row's own fault and
+  // must still be able to exhaust the budget and give up.
+  globalThis.fetch = (async () => new Response("bad payload", { status: 400 })) as typeof fetch;
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t);
   const { contactId, conversationId } = await seedConversation(t, accountId);
@@ -202,6 +298,131 @@ test("error path bumps attempts; the bump that reaches MAX retires to abandoned"
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("abandoned");
   expect(row?.attempts).toBe(5);
+});
+
+test("a network failure (no HTTP status) bumps attempts — still terminal after MAX", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => { throw new Error("ECONNREFUSED"); }) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa", attempts: 4 });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("abandoned");
+  expect(row?.attempts).toBe(5);
+});
+
+// ------------------------------------------------------------
+// getPendingToRetry / retryConversionEvents — window saturation + fan-out.
+// ------------------------------------------------------------
+
+test("dormant rows never saturate the retry window: a newer pending row is still reachable behind 100 of them", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+
+  // Exactly the prod shape: CAPI env unset, so every CTWA ad lead seeds a row
+  // that delivery can do nothing with. 100 of them = the cron's whole
+  // oldest-first `.take(100)` budget.
+  for (let i = 0; i < 100; i++) {
+    const id = await t.run((ctx) =>
+      ctx.db.insert("conversionEvents", {
+        accountId, conversationId, contactId,
+        stage: "new_lead", lane: "ctwa", backend: "capi",
+        eventName: "LeadSubmitted", identifier: `clid-${i}`,
+        phone: "+15551230000", waMessageId: `wamid.${i}`, firstMessageAt: 1_000_000,
+        eventId: `${conversationId}:dormant-${i}`, status: "pending", attempts: 0,
+      }),
+    );
+    await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+  }
+
+  // A fresh lead arrives *after* that backlog.
+  const fresh = await t.run((ctx) =>
+    ctx.db.insert("conversionEvents", {
+      accountId, conversationId, contactId,
+      stage: "new_lead", lane: "code", backend: "platformA",
+      eventName: "Lead", identifier: "ABCDEF",
+      phone: "+15551230000", waMessageId: "wamid.fresh", firstMessageAt: 2_000_000,
+      eventId: `${conversationId}:fresh`, status: "pending", attempts: 0,
+    }),
+  );
+
+  const batch = await t.query(internal.conversionEvents.getPendingToRetry, {});
+  expect(batch.map((r) => r._id)).toContain(fresh);
+});
+
+test("retryConversionEvents staggers its fan-out instead of firing 100 Graph POSTs at once", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  for (let i = 0; i < 5; i++) {
+    await t.run((ctx) =>
+      ctx.db.insert("conversionEvents", {
+        accountId, conversationId, contactId,
+        stage: "new_lead", lane: "ctwa", backend: "capi",
+        eventName: "LeadSubmitted", identifier: `clid-${i}`,
+        phone: "+15551230000", waMessageId: `wamid.${i}`, firstMessageAt: 1_000_000,
+        eventId: `${conversationId}:stagger-${i}`, status: "pending", attempts: 0,
+      }),
+    );
+  }
+
+  await t.action(internal.conversionEvents.retryConversionEvents, {});
+
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect());
+  expect(scheduled).toHaveLength(5);
+  const times = scheduled.map((s) => s.scheduledTime).sort((a, b) => a - b);
+  // Each successive delivery is at least one stagger step later than the
+  // last; `runAfter(0)` for all 5 would leave these within a millisecond.
+  for (let i = 1; i < times.length; i++) {
+    expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(100);
+  }
+});
+
+test("retryConversionEvents leaves dormant rows alone while their backend is unconfigured, and re-sweeps them once it is", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, { backend: "capi", lane: "ctwa" });
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+  expect((await t.run((ctx) => ctx.db.get(id)))?.status).toBe("abandoned");
+
+  // Env still unset: sweeping it would only churn the scheduler.
+  await t.action(internal.conversionEvents.retryConversionEvents, {});
+  expect(await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect())).toHaveLength(0);
+
+  // Env now configured — the row must come back and deliver.
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => new Response(JSON.stringify({ fbtrace_id: "trace-1" }), { status: 200 })) as typeof fetch;
+
+  vi.useFakeTimers();
+  try {
+    await t.action(internal.conversionEvents.retryConversionEvents, {});
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+  } finally {
+    vi.useRealTimers();
+  }
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("sent");
+  expect(row?.fbTraceId).toBe("trace-1");
 });
 
 test("already-sent row is a no-op (idempotent)", async () => {
