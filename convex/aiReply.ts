@@ -332,8 +332,11 @@ export const markMessageAiGenerated = internalMutation({
  *   - `conversationId`/`contactId` don't resolve to THIS account
  *   - a human (or a prior handoff) already owns the thread (`assignedToUserId`)
  *   - auto-reply was disabled on this conversation (prior handoff)
- *   - the per-conversation reply cap is already reached
  *   - there's no text history to ground a reply in
+ *
+ * The per-conversation reply cap is NOT a silent gate: a capped thread
+ * with a customer still writing into it hands off to a human instead
+ * (see the cap branch below) — silence would strand the customer.
  */
 export const dispatchInbound = internalAction({
   args: {
@@ -360,9 +363,29 @@ export const dispatchInbound = internalAction({
       if (conversation.assignedToUserId) return; // a human owns this thread
       if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
       const replyCountSoFar = conversation.aiReplyCount ?? 0;
-      // Cheap early-out; `claimReplySlot` below is the authoritative,
-      // race-proof check at the point a reply is actually sent.
-      if (replyCountSoFar >= config.autoReplyMaxPerConversation) return;
+      // Reply budget spent: the customer is still writing, so going
+      // silent would strand them — hand the thread to a human instead
+      // (markHandoff sets `aiAutoreplyDisabled`, so this fires once).
+      // `claimReplySlot` below stays the authoritative, race-proof check
+      // at the point a reply is actually sent.
+      if (replyCountSoFar >= config.autoReplyMaxPerConversation) {
+        const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          limit: aiContextMessageLimit(),
+        });
+        await ctx.runMutation(internal.aiReply.markHandoff, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          handoffAgentId: config.handoffAgentId,
+          summary: buildHandoffSummary({
+            messages: toChatMessages(historyRows),
+            replyCount: replyCountSoFar,
+            reason: "cap",
+          }),
+        });
+        return;
+      }
 
       const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
         accountId: args.accountId,

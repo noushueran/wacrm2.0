@@ -284,13 +284,13 @@ test("early-exits without sending when a human already owns the conversation", a
   expect(await messagesFor(t, conversationId)).toHaveLength(1);
 });
 
-test("hitting autoReplyMaxPerConversation early-exits with no send and leaves the count unchanged", async () => {
+test("hitting autoReplyMaxPerConversation hands off to a human instead of going silent", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
-  await configureAi(asUser, { autoReplyMaxPerConversation: 3 });
+  await configureAi(asUser, { autoReplyMaxPerConversation: 3 }); // no handoffAgentId
   const { contactId, conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
@@ -300,8 +300,44 @@ test("hitting autoReplyMaxPerConversation early-exits with no send and leaves th
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
 
+  // No reply (the budget is spent) — but the thread must land in the
+  // human queue rather than stranding the customer in silence.
   expect(await messagesFor(t, conversationId)).toHaveLength(1); // no bot reply added
-  expect((await getConversation(t, conversationId))!.aiReplyCount).toBe(3); // unchanged
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.aiReplyCount).toBe(3); // unchanged
+  expect(conversation!.aiAutoreplyDisabled).toBe(true);
+  expect(conversation!.status).toBe("pending");
+  expect(conversation!.aiHandoffSummary).toContain("reply limit");
+  expect(conversation!.aiHandoffSummary).toContain("“Hello?”");
+  // No handoff target configured — left unassigned (shared queue).
+  expect(conversation!.assignedToUserId).toBeUndefined();
+});
+
+test("the cap-reached handoff assigns the configured handoff agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const handoffAgentId = await seedTeammate(t, {
+    accountId,
+    name: "Hank (handoff agent)",
+    email: "hank@example.com",
+  });
+  await configureAi(asUser, { autoReplyMaxPerConversation: 3, handoffAgentId });
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hello?",
+  });
+  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 3 }));
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
+  expect(conversation!.status).toBe("pending");
+  expect(conversation!.aiAutoreplyDisabled).toBe(true);
 });
 
 // ============================================================
