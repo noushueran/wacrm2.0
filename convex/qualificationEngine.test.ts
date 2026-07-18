@@ -1463,3 +1463,64 @@ test("completing qualification posts the sales checklist on the lead", async () 
     vi.useRealTimers();
   }
 });
+
+// ============================================================
+// staffCheckinsDue — last-inbound derived from the newest CUSTOMER
+// message (read-bound via by_conversation_sender)
+// ============================================================
+
+test("staffCheckinsDue keys a staff member's last inbound off their newest CUSTOMER message, ignoring newer outbound noise", async () => {
+  // The seeded contact's own phone doubles as the configured staff number,
+  // so `staffCheckinsDue` walks THIS conversation. A stale (>20h) customer
+  // message with fresh bot chatter on top must still read as "stale" — the
+  // lookup ranges the customer partition, so a newer bot message can't make
+  // the member look freshly-active and silently drop their check-in. (If
+  // the scan picked the newest message of ANY type, `now - lastInbound` <
+  // CHECKIN_EVERY_MS would exclude this member and the assertion fails.)
+  const t = convexTest(schema, modules);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const NOW = Date.parse("2026-07-09T12:00:00.000Z");
+    const OLD = NOW - 30 * 3_600_000; // 30h ago — older than CHECKIN_EVERY_MS (20h)
+
+    vi.setSystemTime(OLD);
+    const { accountId, conversationId } = await seed(t, {
+      enabled: true,
+      adminPhones: ["+971500000001"],
+    });
+    await t.run((ctx) =>
+      ctx.db.insert("messages", {
+        accountId,
+        conversationId,
+        senderType: "customer",
+        contentType: "text",
+        contentText: "hello (30h ago)",
+        status: "sent",
+      }),
+    );
+
+    // Newer bot message right now — must NOT be treated as the last inbound.
+    vi.setSystemTime(NOW);
+    await t.run((ctx) =>
+      ctx.db.insert("messages", {
+        accountId,
+        conversationId,
+        senderType: "bot",
+        contentType: "text",
+        contentText: "auto-nudge (just now)",
+        status: "sent",
+      }),
+    );
+
+    const due = await t.query(
+      internal.qualificationEngine.staffCheckinsDue,
+      {},
+    );
+    const entry = due.find((d) => d.phoneNormalized === "971500000001");
+    expect(entry).toBeDefined();
+    // 30h since the last CUSTOMER inbound → outside the 24h WhatsApp window.
+    expect(entry!.windowOpen).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
+});

@@ -2272,13 +2272,17 @@ export const staffCheckinsDue = internalQuery({
             .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
             .first();
           if (conversation) {
+            // Ranged on `by_conversation_sender` so this reads only the
+            // customer partition: this runs inside a loop over EVERY
+            // account's staff, so each conversation's scan sums toward one
+            // 4096-read budget — a post-scan `.filter()` down a long
+            // outbound-heavy staff thread could blow it for the whole sweep.
             const lastMsg = await ctx.db
               .query("messages")
-              .withIndex("by_conversation", (q) =>
-                q.eq("conversationId", conversation._id),
+              .withIndex("by_conversation_sender", (q) =>
+                q.eq("conversationId", conversation._id).eq("senderType", "customer"),
               )
               .order("desc")
-              .filter((q) => q.eq(q.field("senderType"), "customer"))
               .first();
             lastInbound = lastMsg?._creationTime ?? 0;
           }
