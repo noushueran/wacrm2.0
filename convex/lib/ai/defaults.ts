@@ -35,6 +35,20 @@ export function aiContextMessageLimit(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONTEXT_MESSAGE_LIMIT;
 }
 
+const DEFAULT_REPLY_DEBOUNCE_MS = 12_000;
+
+/**
+ * How long the auto-reply waits after an inbound before generating, so
+ * a burst of quick messages ("Hi" / "I want a package" / "for August")
+ * gets ONE reply to the whole thought instead of one racy reply each —
+ * and the bot stops answering at inhuman speed. Override with
+ * `AI_REPLY_DEBOUNCE_MS` (`0` restores immediate dispatch).
+ */
+export function aiReplyDebounceMs(): number {
+  const raw = Number(process.env.AI_REPLY_DEBOUNCE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_REPLY_DEBOUNCE_MS;
+}
+
 /**
  * Build the system prompt for the auto-reply bot. The account's own
  * `systemPrompt` (business context / persona / tone) is appended to a

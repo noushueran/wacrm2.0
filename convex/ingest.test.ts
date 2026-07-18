@@ -941,9 +941,42 @@ test("processInbound: AI reply stands down for an active keyword_match automatio
   expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
 });
 
+test("a rapid burst of inbound texts gets ONE debounced AI reply, not one per message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  // WhatsApp users fragment one thought across quick messages — each is
+  // its own webhook. Only the LAST message's debounced dispatch may
+  // reply, covering the whole burst.
+  for (const [i, text] of ["Hi", "I want a Baku package", "for August"].entries()) {
+    await t.action(internal.ingest.processInbound, {
+      accountId,
+      from: "15551234567",
+      message: { type: "text", text, wamid: `wamid.BURST${i}` },
+    });
+  }
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+  expect(messages.filter((m) => m.senderType === "customer")).toHaveLength(3);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(1);
+}, 20_000);
+
 test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers(); // the AI reply is debounced (scheduled) — drained below
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
 
@@ -958,6 +991,7 @@ test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry
     message: { type: "text", text: "hello there", wamid: "wamid.DUPETEST" },
   });
   expect(first.duplicate).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // debounced AI reply lands
 
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
@@ -977,6 +1011,7 @@ test("processInbound SKIPS the entire fan-out on a duplicate wamid (a Meta retry
   });
   expect(second.duplicate).toBe(true);
   expect(second.flowConsumed).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // a duplicate schedules nothing
 
   // No SECOND automation run, AI reply, or webhook delivery attempt —
   // every observable side effect is identical to right after the FIRST
@@ -1098,6 +1133,7 @@ test("processInbound: an automations phase matching zero automations (nothing to
   // failure mode isn't reachable through real engine behavior here.)
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers(); // the AI reply is debounced (scheduled) — drained below
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
@@ -1110,6 +1146,7 @@ test("processInbound: an automations phase matching zero automations (nothing to
   });
 
   expect(result.duplicate).toBe(false);
+  await t.finishAllScheduledFunctions(vi.runAllTimers); // debounced AI reply lands
 
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),

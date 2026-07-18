@@ -3,6 +3,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
+import { aiReplyDebounceMs } from "./lib/ai/defaults";
 import { allocateContactCode } from "./contacts";
 import {
   insertMessageAndUpdateConversation,
@@ -744,14 +745,26 @@ export const processInbound = internalAction({
         ) {
           return;
         }
-        await ctx.runAction(internal.aiReply.dispatchInbound, {
-          accountId,
-          conversationId: res.conversationId,
-          contactId: res.contactId,
-          // Lets the bot blue-tick the customer's message + show
-          // "typing…" while the reply generates.
-          triggerWamid: message.wamid,
-        });
+        // Debounced, not inline: WhatsApp users fragment one thought
+        // across quick messages, and one racy dispatch per fragment
+        // used to produce multiple partial replies. Each inbound
+        // schedules a delayed dispatch carrying its own message id;
+        // at fire time only the dispatch whose trigger is still the
+        // NEWEST customer message replies (see `dispatchInbound`'s
+        // debounce gate) — one reply per burst, at human pace.
+        await ctx.scheduler.runAfter(
+          aiReplyDebounceMs(),
+          internal.aiReply.dispatchInbound,
+          {
+            accountId,
+            conversationId: res.conversationId,
+            contactId: res.contactId,
+            triggerMessageId: res.messageId,
+            // Lets the bot blue-tick the customer's message + show
+            // "typing…" while the reply generates.
+            triggerWamid: message.wamid,
+          },
+        );
       });
     }
 

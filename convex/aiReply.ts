@@ -223,6 +223,30 @@ export const recentMessages = internalQuery({
 });
 
 /**
+ * Newest CUSTOMER message in a conversation — the debounce token
+ * `dispatchInbound` compares its `triggerMessageId` against: when they
+ * differ, a newer inbound arrived after this dispatch was scheduled and
+ * that message's own dispatch owns the reply to the whole burst.
+ */
+export const latestInboundMessageId = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args): Promise<Id<"messages"> | null> => {
+    const row = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .filter((q) =>
+        q.and(
+          q.eq(q.field("accountId"), args.accountId),
+          q.eq(q.field("senderType"), "customer"),
+        ),
+      )
+      .first();
+    return row?._id ?? null;
+  },
+});
+
+/**
  * Cheap existence check on the account's knowledge chunks — lets
  * `dispatchInbound` skip the `aiKnowledge.retrieve` action call (its own
  * config load + potential embedding call) entirely when there's nothing
@@ -375,6 +399,13 @@ export const dispatchInbound = internalAction({
     // lets the bot mark it read (blue ticks) + show "typing…" while the
     // reply generates. Optional: older callers simply skip the receipt.
     triggerWamid: v.optional(v.string()),
+    // Row id of that same inbound message — the debounce token. The
+    // ingest layer schedules dispatch `aiReplyDebounceMs()` after each
+    // inbound; at fire time only the dispatch whose trigger is still
+    // the newest customer message replies, so a burst of quick
+    // fragments gets ONE reply. Optional: direct callers (tests, a
+    // future manual trigger) skip the staleness check.
+    triggerMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<void> => {
     // Flipped right after the Meta send succeeds: a failure AFTER this
@@ -398,6 +429,19 @@ export const dispatchInbound = internalAction({
 
       if (conversation.assignedToUserId) return; // a human owns this thread
       if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
+
+      // Debounce gate (burst aggregation): a newer customer message
+      // means ITS scheduled dispatch owns the reply to the whole burst —
+      // this one stands down without sending, marking, or claiming
+      // anything.
+      if (args.triggerMessageId) {
+        const latestInbound = await ctx.runQuery(
+          internal.aiReply.latestInboundMessageId,
+          { accountId: args.accountId, conversationId: args.conversationId },
+        );
+        if (latestInbound && latestInbound !== args.triggerMessageId) return;
+      }
+
       const replyCountSoFar = conversation.aiReplyCount ?? 0;
       // Reply budget spent: the customer is still writing, so going
       // silent would strand them — hand the thread to a human instead
@@ -601,6 +645,9 @@ export const dispatchInbound = internalAction({
               contactId: args.contactId,
               attempt: attempt + 1,
               triggerWamid: args.triggerWamid,
+              // Keeps the debounce gate honest on the retry too: if a
+              // newer inbound arrived meanwhile, its dispatch replies.
+              triggerMessageId: args.triggerMessageId,
             },
           );
         } catch (schedErr) {
