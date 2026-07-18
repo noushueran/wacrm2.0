@@ -2,7 +2,7 @@ import { action, internalAction, internalMutation, internalQuery } from "./_gene
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
-import { hasMinRole } from "./lib/roles";
+import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
@@ -917,6 +917,23 @@ export const draft = action({
       conversationId: args.conversationId,
     });
     if (!conversation) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
+    }
+    // Per-conversation RBAC: the account check above is NOT sufficient — an
+    // agent could otherwise draft a reply grounded in a COLLEAGUE'S thread
+    // that `messages.listByConversation` would refuse to show them. Same
+    // "view" policy + NOT_FOUND conflation as `reactions.reactToMeta`;
+    // supervisor+ keep full access, the assignee and the unassigned pool work.
+    if (
+      !canAccessConversation(
+        context.role,
+        {
+          isMine: conversation.assignedToUserId === userId,
+          isUnassigned: conversation.assignedToUserId === undefined,
+        },
+        "view",
+      )
+    ) {
       throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
     }
 

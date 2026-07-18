@@ -4,7 +4,7 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import type { Id, Doc } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
-import { hasMinRole } from "./lib/roles";
+import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { accountMutation, accountQuery } from "./lib/auth";
 import { toChatMessages } from "./lib/ai/context";
 import { aiContextMessageLimit } from "./lib/ai/defaults";
@@ -224,6 +224,22 @@ export const suggest = action({
       conversationId: args.conversationId,
     });
     if (!conversation) {
+      return { error: "Conversation not found", code: "not_found" };
+    }
+    // Per-conversation RBAC: the account check above lets an agent classify a
+    // COLLEAGUE'S thread grounded in history `messages.listByConversation`
+    // would deny them. Same "view" policy as `reactions.reactToMeta`, surfaced
+    // as this action's own `{error, code:"not_found"}` shape (it never throws).
+    if (
+      !canAccessConversation(
+        role,
+        {
+          isMine: conversation.assignedToUserId === userId,
+          isUnassigned: conversation.assignedToUserId === undefined,
+        },
+        "view",
+      )
+    ) {
       return { error: "Conversation not found", code: "not_found" };
     }
 
