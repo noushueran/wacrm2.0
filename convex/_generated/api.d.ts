@@ -28,6 +28,7 @@ import type * as contactNotes from "../contactNotes.js";
 import type * as contacts from "../contacts.js";
 import type * as conversations from "../conversations.js";
 import type * as conversionEvents from "../conversionEvents.js";
+import type * as cronSchedules from "../cronSchedules.js";
 import type * as crons from "../crons.js";
 import type * as customFields from "../customFields.js";
 import type * as dashboard from "../dashboard.js";
@@ -58,6 +59,7 @@ import type * as lib_automations_stepsTree from "../lib/automations/stepsTree.js
 import type * as lib_automations_validate from "../lib/automations/validate.js";
 import type * as lib_contactSearch from "../lib/contactSearch.js";
 import type * as lib_conversationAccess from "../lib/conversationAccess.js";
+import type * as lib_cronSummary from "../lib/cronSummary.js";
 import type * as lib_dashboardDate from "../lib/dashboardDate.js";
 import type * as lib_flows_edges from "../lib/flows/edges.js";
 import type * as lib_flows_fallback from "../lib/flows/fallback.js";
@@ -132,6 +134,7 @@ declare const fullApi: ApiFromModules<{
   contacts: typeof contacts;
   conversations: typeof conversations;
   conversionEvents: typeof conversionEvents;
+  cronSchedules: typeof cronSchedules;
   crons: typeof crons;
   customFields: typeof customFields;
   dashboard: typeof dashboard;
@@ -162,6 +165,7 @@ declare const fullApi: ApiFromModules<{
   "lib/automations/validate": typeof lib_automations_validate;
   "lib/contactSearch": typeof lib_contactSearch;
   "lib/conversationAccess": typeof lib_conversationAccess;
+  "lib/cronSummary": typeof lib_cronSummary;
   "lib/dashboardDate": typeof lib_dashboardDate;
   "lib/flows/edges": typeof lib_flows_edges;
   "lib/flows/fallback": typeof lib_flows_fallback;
