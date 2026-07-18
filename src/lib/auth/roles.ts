@@ -188,7 +188,8 @@ export type SettingsSectionKey =
   | "members"
   | "api"
   | "conversions"
-  | "qualification";
+  | "qualification"
+  | "cron";
 
 const PERSONAL_SECTIONS: SettingsSectionKey[] = [
   "overview",
@@ -200,7 +201,7 @@ const PERSONAL_SECTIONS: SettingsSectionKey[] = [
 // itself `ctx.requireRole("admin")`-gated (it exposes raw lead phone
 // numbers) — same threshold as `whatsapp`/`api`/`members`, so it joins
 // them here rather than being reachable by a supervisor.
-const CRITICAL_SECTIONS: SettingsSectionKey[] = ["whatsapp", "api", "members", "conversions", "qualification"];
+const CRITICAL_SECTIONS: SettingsSectionKey[] = ["whatsapp", "api", "members", "conversions", "qualification", "cron"];
 
 export function canAccessSettingsSection(
   role: AccountRole,
