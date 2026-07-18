@@ -939,37 +939,6 @@ export default defineSchema({
     // `automationId` still yields nothing.
     .index("by_account_automation", ["accountId", "automationId"]),
 
-  // A queued resume point created when a running automation hits a
-  // `wait` step. The cron endpoint (`/api/automations/cron`) drains
-  // rows where `status === "pending"` and `runAt <= now`, via the
-  // `by_status_runat` index below — this is the row this Phase 1 plan
-  // explicitly foreshadows for `ctx.scheduler` in a later
-  // function-phase. `runAt` is `NOT NULL` with no default in Postgres
-  // (the engine always supplies it when scheduling the wait), so
-  // unlike most other domain timestamps in this file it's a required
-  // `v.number()`, not optional — same treatment Task 2 gave
-  // `accountInvitations.expiresAt`.
-  automationPendingExecutions: defineTable({
-    accountId: v.id("accounts"),
-    createdByUserId: v.optional(v.id("users")),
-    automationId: v.id("automations"),
-    contactId: v.optional(v.id("contacts")),
-    logId: v.optional(v.id("automationLogs")),
-    parentStepId: v.optional(v.id("automationSteps")),
-    branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
-    nextStepPosition: v.number(),
-    context: v.optional(v.any()),
-    status: v.union(
-      v.literal("pending"),
-      v.literal("running"),
-      v.literal("done"),
-      v.literal("failed"),
-    ),
-    runAt: v.number(),
-  })
-    .index("by_account", ["accountId"])
-    .index("by_status_runat", ["status", "runAt"]),
-
   // The definition envelope for one conversational flow (bot). Mirrors
   // `automations` above but for the graph-based engine. `entryNodeId`
   // references `flowNodes.nodeKey` (a stable string the migration's
@@ -1170,17 +1139,24 @@ export default defineSchema({
     systemPrompt: v.optional(v.string()),
     isActive: v.boolean(),
     autoReplyEnabled: v.boolean(),
-    // DEPRECATED (owner decision 2026-07-18): there is NO reply cap —
-    // the bot answers every message until a human takes the chat from
-    // the dashboard. Optional so existing rows stay valid; nothing
-    // reads it anymore.
+    // legacy, unread (owner decision 2026-07-18; plumbing removed Task
+    // B7) — there is NO reply cap anymore, the bot answers every message
+    // until a human takes the chat from the dashboard. Kept optional
+    // in-schema only because dropping a field with data present fails
+    // deploy validation; old rows may still carry a value here, but
+    // `aiConfig.ts` no longer reads or writes it.
     autoReplyMaxPerConversation: v.optional(v.number()),
     // Migration 030: optional OpenAI-compatible embeddings key —
     // encrypted like `apiKey`; its presence turns on semantic KB
     // retrieval (else lexical-only).
     embeddingsApiKey: v.optional(v.string()),
-    // Migration 033: where auto-reply hands a conversation off when the
-    // model bails. Unset/null leaves it unassigned (shared queue).
+    // legacy, unread (Migration 033; plumbing removed Task B7) — used to
+    // be where auto-reply would hand a conversation off when the model
+    // bailed; nothing enforces/reads it anymore (v3 kept the assistant on
+    // the conversation instead — see qualificationEngine.ts's
+    // completeQualification comment). Kept optional in-schema only
+    // because dropping a field with data present fails deploy
+    // validation; old rows may still carry a value here.
     handoffAgentId: v.optional(v.id("users")),
     updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),

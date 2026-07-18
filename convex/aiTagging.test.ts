@@ -62,7 +62,6 @@ const BASE_AI_CONFIG_ARGS = {
   model: "gpt-4o-mini",
   isActive: true,
   autoReplyEnabled: true,
-  autoReplyMaxPerConversation: 3,
 };
 
 /**

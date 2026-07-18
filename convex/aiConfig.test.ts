@@ -76,16 +76,17 @@ async function seedTeammate(
   });
 }
 
-// Minimal valid upsert payload — every REQUIRED arg (per the brief:
-// provider/model/isActive/autoReplyEnabled/autoReplyMaxPerConversation
-// are required on every call; systemPrompt/handoffAgentId/apiKey/
-// embeddingsApiKey are optional).
+// Minimal valid upsert payload — every REQUIRED arg (provider/model/
+// isActive/autoReplyEnabled are required on every call; systemPrompt/
+// apiKey/embeddingsApiKey are optional). autoReplyMaxPerConversation/
+// handoffAgentId are NOT accepted anymore (Task B7 removed the
+// deprecated reply-cap/handoff plumbing) — see aiConfig.ts's own upsert
+// docstring.
 const BASE_ARGS = {
   provider: "openai" as const,
   model: "gpt-4o-mini",
   isActive: true,
   autoReplyEnabled: false,
-  autoReplyMaxPerConversation: 3,
 };
 
 // ============================================================
@@ -128,7 +129,6 @@ test("get never returns apiKey/embeddingsApiKey, and reports hasKey/hasEmbedding
   expect(config!.model).toBe("gpt-4o-mini");
   expect(config!.isActive).toBe(true);
   expect(config!.autoReplyEnabled).toBe(false);
-  expect(config!.autoReplyMaxPerConversation).toBe(3);
 });
 
 test("get reports hasEmbeddingsKey false when no embeddings key was ever set", async () => {
@@ -326,6 +326,36 @@ test("upsert reuses the existing encrypted embeddingsApiKey when omitted on a la
 
 test("upsert patches only the optional fields supplied, leaving the rest untouched", async () => {
   const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const configId = await asUser.mutation(api.aiConfig.upsert, {
+    ...BASE_ARGS,
+    systemPrompt: "Be nice",
+    apiKey: "sk-plaintext-chat-key",
+  });
+
+  // Omit systemPrompt this time — it must survive.
+  await asUser.mutation(api.aiConfig.upsert, {
+    ...BASE_ARGS,
+    model: "gpt-4o",
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(configId));
+  expect(row!.model).toBe("gpt-4o");
+  expect(row!.systemPrompt).toBe("Be nice");
+});
+
+// B7: autoReplyMaxPerConversation/handoffAgentId are no longer in
+// upsert's args at all, so a value already stored on a row (e.g. an old
+// pre-B7 row) is never touched by ANY upsert call — not because upsert
+// "preserves" it deliberately, but because the field simply never
+// appears in the patch object anymore.
+test("upsert never touches a legacy handoffAgentId already stored on the row", async () => {
+  const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
@@ -340,21 +370,17 @@ test("upsert patches only the optional fields supplied, leaving the rest untouch
 
   const configId = await asUser.mutation(api.aiConfig.upsert, {
     ...BASE_ARGS,
-    systemPrompt: "Be nice",
-    handoffAgentId: agentId,
     apiKey: "sk-plaintext-chat-key",
   });
+  // Simulate a pre-B7 row that already carries a legacy value — direct
+  // db patch, since upsert itself can no longer write this field.
+  await t.run((ctx) => ctx.db.patch(configId, { handoffAgentId: agentId }));
 
-  // Omit systemPrompt/handoffAgentId this time — both must survive.
-  await asUser.mutation(api.aiConfig.upsert, {
-    ...BASE_ARGS,
-    model: "gpt-4o",
-  });
+  await asUser.mutation(api.aiConfig.upsert, { ...BASE_ARGS, model: "gpt-4o" });
 
   const row = await t.run((ctx) => ctx.db.get(configId));
   expect(row!.model).toBe("gpt-4o");
-  expect(row!.systemPrompt).toBe("Be nice");
-  expect(row!.handoffAgentId).toBe(agentId);
+  expect(row!.handoffAgentId).toBe(agentId); // untouched legacy value
 });
 
 // ============================================================
@@ -396,7 +422,6 @@ test("loadDecrypted returns the decrypted apiKey and embeddingsApiKey", async ()
   expect(result!.embeddingsApiKey).toBe("sk-plaintext-embeddings-key");
   expect(result!.provider).toBe("openai");
   expect(result!.isActive).toBe(true);
-  expect(result!.autoReplyMaxPerConversation).toBe(3);
 });
 
 test("loadDecrypted swallows an embeddings-decrypt failure to null, without affecting apiKey", async () => {
