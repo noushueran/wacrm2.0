@@ -47,6 +47,10 @@ export default defineSchema({
     fullName: v.optional(v.string()),
     email: v.optional(v.string()),
     avatarUrl: v.optional(v.string()),
+    // v4 (qualification): the member's own WhatsApp number — the channel
+    // the AI uses to reach agents (lead offers, questions) when they're
+    // away from the desktop. Set by admin+ in Settings → Team members.
+    phone: v.optional(v.string()),
   })
     .index("by_user", ["userId"])
     .index("by_account", ["accountId"])

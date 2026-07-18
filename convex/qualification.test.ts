@@ -186,6 +186,50 @@ test("leadsBoard: supervisor+ gets summary + score-sorted leads; agents are deni
   expect(board.leads[0].contactName).toBe("C90");
   expect(board.leads[0].fields[0].value).toBe("Bali");
 
+  // v4: agents are ALLOWED but see only their own assigned leads —
+  // this agent has none, so the board is empty (viewers still rejected).
   const agent = await seedMember(t, "agent");
-  await expect(agent.as.query(api.qualification.leadsBoard, {})).rejects.toThrow();
+  const agentBoard = await agent.as.query(api.qualification.leadsBoard, {});
+  expect(agentBoard.leads).toHaveLength(0);
+  const viewer = await seedMember(t, "viewer");
+  await expect(viewer.as.query(api.qualification.leadsBoard, {})).rejects.toThrow();
+});
+
+test("V4 RBAC: agents see ONLY their own assigned leads; supervisors see all with assignee", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const agentUserId = await t.run(async (ctx) => {
+    const uid = await ctx.db.insert("users", { name: "Agent A", email: "aa@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId: admin.accountId, role: "agent", fullName: "Agent A", email: "aa@example.com",
+    });
+    return uid;
+  });
+  const mk = async (phone: string, assigned: boolean) =>
+    t.run(async (ctx) => {
+      const contactId = await ctx.db.insert("contacts", {
+        accountId: admin.accountId, phone, phoneNormalized: phone.replace(/\D/g, ""),
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        accountId: admin.accountId, contactId, status: "open", unreadCount: 0,
+        ...(assigned ? { assignedToUserId: agentUserId } : {}),
+      });
+      await ctx.db.insert("qualificationSessions", {
+        accountId: admin.accountId, conversationId, contactId,
+        status: "qualified", origin: "inbound", serviceName: "UAE visa",
+        fields: [], expectedCount: 4, answeredCount: 4, score: 70, qualifiedAt: 1,
+        followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+      });
+    });
+  await mk("+971500000021", true);   // agent's own
+  await mk("+971500000022", false);  // unassigned
+
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|s3` });
+  const agentBoard = await asAgent.query(api.qualification.leadsBoard, {});
+  expect(agentBoard.leads).toHaveLength(1);
+  expect(agentBoard.summary.qualified).toBe(1);
+
+  const adminBoard = await admin.as.query(api.qualification.leadsBoard, {});
+  expect(adminBoard.leads).toHaveLength(2);
+  expect(adminBoard.leads.some((l) => l.assigneeName === "Agent A")).toBe(true);
 });

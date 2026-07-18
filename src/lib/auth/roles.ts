@@ -146,7 +146,7 @@ export function canAssignToOthers(role: AccountRole): boolean {
 
 // ── Section access (nav + settings rail) ────────────────────────────
 /** Top-level nav hrefs. */
-export const AGENT_NAV = ["/inbox", "/notifications"] as const;
+export const AGENT_NAV = ["/inbox", "/notifications", "/leads"] as const;
 export const VIEWER_NAV = ["/inbox"] as const;
 
 /** Sections gated to admin+ even though supervisors otherwise see all nav. */

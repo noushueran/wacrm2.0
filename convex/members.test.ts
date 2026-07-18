@@ -441,3 +441,32 @@ test("supervisor cannot change roles", async () => {
     asSup.mutation(api.members.setRole, { userId: targetId, role: "viewer" }),
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
+
+test("setPhone (v4): admin sets/clears a member's WhatsApp number; bad numbers rejected", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedOwner(t, { name: "Owner", email: "o@example.com" });
+  const teammate = await addMember(t, owner.accountId, {
+    name: "Agent", email: "ag@example.com", role: "agent",
+  });
+  await owner.asUser.mutation(api.members.setPhone, {
+    userId: teammate.userId, phone: "+971 55 111 2233",
+  });
+  let row = await t.run((ctx) =>
+    ctx.db.query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", teammate.userId).eq("accountId", owner.accountId))
+      .first());
+  expect(row?.phone).toBe("+971 55 111 2233");
+
+  await expect(
+    owner.asUser.mutation(api.members.setPhone, { userId: teammate.userId, phone: "abc" }),
+  ).rejects.toThrow();
+
+  await owner.asUser.mutation(api.members.setPhone, { userId: teammate.userId, phone: "" });
+  row = await t.run((ctx) =>
+    ctx.db.query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", teammate.userId).eq("accountId", owner.accountId))
+      .first());
+  expect(row?.phone).toBeUndefined();
+});

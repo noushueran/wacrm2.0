@@ -75,6 +75,9 @@ export interface AccountMember {
   avatar_url: string | null;
   role: AccountRole;
   joined_at: string;
+  /** The member's own WhatsApp number (qualification v4) — the channel
+   *  the AI uses to reach them when they're off the desktop. */
+  phone: string | null;
 }
 
 /**
