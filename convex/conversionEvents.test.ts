@@ -657,3 +657,75 @@ test("seedNewLead NEVER downgrades a conversation already past new_lead", async 
   const conv = await t.run((ctx) => ctx.db.get(conversationId));
   expect(conv?.funnel?.stage).toBe("qualified"); // untouched by seeding
 });
+
+// B4: Settings → Conversions repointed off the dead attributionSignals
+// table (no remaining writers) onto this bounded, account-scoped query over
+// the live conversionEvents pipeline.
+test("listRecent is admin-gated", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const agentId = await t.run((ctx) => ctx.db.insert("users", { name: "Ag", email: "ag@example.com" }));
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", { userId: agentId, accountId, role: "agent", fullName: "Ag", email: "ag@example.com" }),
+  );
+  const asAgent = t.withIdentity({ subject: `${agentId}|s-Ag` });
+  await expect(asAgent.query(api.conversionEvents.listRecent, {})).rejects.toThrow();
+});
+
+test("listRecent returns account-scoped rows newest-first with the documented shape", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const otherAccountId = await seedAccount(t);
+  const { asOwner } = await seedOwner(t, accountId);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await t.run((ctx) => ctx.db.patch(contactId, { name: "Priya Singh" }));
+
+  await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "new_lead", lane: "ctwa", eventName: "LeadSubmitted", status: "sent", attempts: 1,
+  });
+  const purchaseId = await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "purchased", lane: "ctwa", eventName: "Purchase", status: "pending", value: 4200, currency: "AED", attempts: 2,
+  });
+
+  // A different account's row must never surface.
+  const { contactId: otherContactId, conversationId: otherConversationId } = await seedConversation(t, otherAccountId);
+  await seedEvent(t, otherAccountId, otherConversationId, otherContactId, { stage: "new_lead" });
+
+  const rows = await asOwner.query(api.conversionEvents.listRecent, {});
+  expect(rows).toHaveLength(2); // the other account's row never surfaces
+  // Newest-first: the purchased row (inserted second) comes first.
+  expect(rows[0].id).toBe(purchaseId);
+  expect(rows[0]).toMatchObject({
+    lane: "ctwa",
+    stage: "purchased",
+    eventName: "Purchase",
+    status: "pending",
+    attempts: 2,
+    value: 4200,
+    currency: "AED",
+    contactName: "Priya Singh",
+    phone: "+15551230000",
+  });
+  expect(typeof rows[0].createdAt).toBe("number");
+});
+
+test("listRecent clamps to the ≤100 cap even when more rows exist", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { asOwner } = await seedOwner(t, accountId);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 105; i++) {
+      await ctx.db.insert("conversionEvents", {
+        accountId, conversationId, contactId,
+        stage: "new_lead", lane: "ctwa", backend: "capi",
+        eventName: "LeadSubmitted", identifier: `clid-${i}`,
+        phone: "+15551230000", waMessageId: `wamid.${i}`, firstMessageAt: 1_000_000 + i,
+        eventId: `${conversationId}:new_lead:${i}`, status: "pending", attempts: 0,
+      });
+    }
+  });
+
+  const rows = await asOwner.query(api.conversionEvents.listRecent, { limit: 500 });
+  expect(rows.length).toBe(100); // clamped even though the caller asked for 500 and 105 exist
+});
