@@ -1403,10 +1403,19 @@ export default defineSchema({
     adSetName: v.optional(v.string()),
     campaignId: v.optional(v.string()),
     campaignName: v.optional(v.string()),
+    // "abandoned" is terminal: the give-up state for a row that exhausted
+    // MAX_RESOLVE_ATTEMPTS. It exists so dead rows LEAVE the "error"
+    // partition — `getResolvable` reads that partition through `by_status`
+    // and `.filter()`s on `attempts`, and a Convex `.filter()` does not
+    // narrow what is read. Rows that gave up while still tagged "error"
+    // would accumulate there forever, matching nothing, growing the cron's
+    // scan without bound. Mirrors conversionEvents.status and
+    // attributionSignals.landingResult, which retire the same way.
     resolveStatus: v.union(
       v.literal("pending"),
       v.literal("resolved"),
       v.literal("error"),
+      v.literal("abandoned"),
     ),
     attempts: v.number(),
     lastError: v.optional(v.string()),
