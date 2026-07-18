@@ -136,3 +136,58 @@ test("overview excludes transitions and events older than the window", async () 
     vi.useRealTimers();
   }
 });
+
+// B2: conversionEvents rows exist ONLY for attributed (ad/website)
+// conversations, but funnelTransitions exist for every conversation, incl.
+// organic. totalValue must therefore be read off funnelTransitions (Task
+// B1's saleValue field), not conversionEvents — else an organic purchase
+// counts toward purchase.count but contributes 0 to purchase.totalValue.
+test("organic purchases (no conversionEvents row at all) contribute their value via funnelTransitions", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asAdmin } = await seedAdmin(t);
+  await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+9715", phoneNormalized: "9715" });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+      funnel: { stage: "purchased", stageUpdatedAt: 1, saleValue: 750, saleCurrency: "AED" },
+    });
+    // Organic: a real applyStageTransition writes saleValue directly onto
+    // the transition row (Task B1); NO conversionEvents row is ever
+    // created for an organic conversation.
+    await ctx.db.insert("funnelTransitions", {
+      accountId, conversationId, contactId, stage: "purchased", auto: false,
+      saleValue: 750, saleCurrency: "AED",
+    });
+  });
+
+  const o = await asAdmin.query(api.campaigns.overview, {});
+  expect(o.purchase.count).toBe(1);
+  expect(o.purchase.totalValue).toBe(750); // previously 0: no conversionEvents row exists for organic
+  expect(o.meta.total).toBe(0); // confirms no Meta/conversionEvents rows are involved at all
+});
+
+test("totalValue sums an organic purchase (transition-only value) AND an attributed legacy purchase (event-fallback value)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asAdmin } = await seedAdmin(t);
+
+  // Attributed, pre-B1-shaped row: value lives only on the conversionEvents
+  // row (seedConv's transition carries no saleValue) — the fallback path.
+  const { conversationId: attrConvId, contactId: attrContactId } = await seedConv(t, accountId, "purchased", 4200);
+  await seedEvent(t, accountId, attrConvId, attrContactId, { stage: "purchased", status: "sent", value: 4200 });
+
+  // Organic, post-B1-shaped row: value lives only on funnelTransitions.
+  await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+9716", phoneNormalized: "9716" });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+      funnel: { stage: "purchased", stageUpdatedAt: 1, saleValue: 300, saleCurrency: "AED" },
+    });
+    await ctx.db.insert("funnelTransitions", {
+      accountId, conversationId, contactId, stage: "purchased", auto: false, saleValue: 300, saleCurrency: "AED",
+    });
+  });
+
+  const o = await asAdmin.query(api.campaigns.overview, {});
+  expect(o.purchase.count).toBe(2);
+  expect(o.purchase.totalValue).toBe(4500); // 4200 (attributed, event-fallback) + 300 (organic, transition value)
+});
