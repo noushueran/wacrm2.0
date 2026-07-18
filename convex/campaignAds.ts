@@ -20,8 +20,15 @@ export const getById = internalQuery({
  * Advances a campaignAds row after a `resolveAd` attempt. Only patches the
  * name fields the caller supplied (conditional spread, like
  * attribution.patchResult). `attempts` bumps only on an explicit
- * `bumpAttempts === true` (the error branch). Give-up is implicit: a row at
- * `attempts >= MAX_RESOLVE_ATTEMPTS` simply drops out of `getResolvable`.
+ * `bumpAttempts === true` (the error branch). An `"error"` bump that reaches
+ * `MAX_RESOLVE_ATTEMPTS` is retired to the terminal `"abandoned"` state — the
+ * single give-up point — so dead rows leave the retry cron's partition
+ * (mirrors `conversionEvents.patchStatus` and `attribution.patchResult`).
+ *
+ * Giving up by letting the row sit at `attempts >= MAX_RESOLVE_ATTEMPTS` while
+ * still tagged `"error"` would be silently unbounded: `getResolvable` reads the
+ * whole `"error"` partition and filters on `attempts` afterwards, so every
+ * abandoned-but-still-"error" row is re-read on every cron run, forever.
  */
 export const patchResolution = internalMutation({
   args: {
@@ -38,9 +45,15 @@ export const patchResolution = internalMutation({
   handler: async (ctx, args): Promise<void> => {
     const row = await ctx.db.get(args.campaignAdId);
     if (!row) return;
-    const patch: Record<string, unknown> = {
-      resolveStatus: args.resolveStatus,
-    };
+    const bumping = args.bumpAttempts === true;
+    const nextAttempts = row.attempts + 1;
+    const resolveStatus =
+      bumping &&
+      args.resolveStatus === "error" &&
+      nextAttempts >= MAX_RESOLVE_ATTEMPTS
+        ? ("abandoned" as const)
+        : args.resolveStatus;
+    const patch: Record<string, unknown> = { resolveStatus };
     if (args.adName !== undefined) patch.adName = args.adName;
     if (args.adSetId !== undefined) patch.adSetId = args.adSetId;
     if (args.adSetName !== undefined) patch.adSetName = args.adSetName;
@@ -48,7 +61,7 @@ export const patchResolution = internalMutation({
     if (args.campaignName !== undefined) patch.campaignName = args.campaignName;
     if (args.lastError !== undefined) patch.lastError = args.lastError;
     if (args.resolveStatus === "resolved") patch.resolvedAt = Date.now();
-    if (args.bumpAttempts === true) patch.attempts = row.attempts + 1;
+    if (bumping) patch.attempts = nextAttempts;
     await ctx.db.patch(args.campaignAdId, patch);
   },
 });
@@ -113,8 +126,17 @@ export const resolveAd = internalAction({
  * Retry candidates for the cron: `pending` OR `error` rows with
  * `attempts < MAX_RESOLVE_ATTEMPTS`, capped at 100. `pending` covers both
  * never-attempted rows and dormant ones skipped for lack of a token — so
- * once a token is configured, the cron picks them up. Each status is
- * queried through the `by_status` index (never a full scan).
+ * once a token is configured, the cron picks them up.
+ *
+ * `by_status` bounds each read to one status partition, but the
+ * `attempts` test below is a `.filter()`, which does NOT narrow what
+ * Convex reads — `.take(100)` stops after 100 *matches*, so a partition
+ * full of non-matching rows is walked end to end. What keeps these reads
+ * bounded is that both partitions drain: a row that exhausts its attempts
+ * is retired to `"abandoned"` by `patchResolution` (see `MAX_RESOLVE_
+ * ATTEMPTS`) and so leaves the set scanned here, keeping matches common
+ * and `.take(100)` satisfied early. Without that terminal state this query
+ * would degrade exactly the way `cronSchedules.listSystemTasks` did.
  */
 export const getResolvable = internalQuery({
   args: {},

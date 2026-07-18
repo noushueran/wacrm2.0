@@ -3,6 +3,7 @@ import { expect, test, afterEach } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
+import { MAX_RESOLVE_ATTEMPTS } from "./campaignAds";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -107,4 +108,44 @@ test("getResolvable returns pending + error rows under MAX_RESOLVE_ATTEMPTS", as
   );
   expect(rows).toHaveLength(1);
   expect(rows[0].resolveStatus).toBe("pending");
+});
+
+test("the error bump that reaches MAX_RESOLVE_ATTEMPTS retires the row to abandoned", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () =>
+    new Response("nope", { status: 400 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS - 1, "error");
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const row = await t.run((ctx) => ctx.db.get(adId));
+  expect(row?.resolveStatus).toBe("abandoned");
+  expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS);
+});
+
+// The point of the terminal state is the *scan*, not the label: `getResolvable`
+// reads the `by_status` "error" partition and `.filter()`s on `attempts`, which
+// does not narrow what Convex reads. A row that gives up while still tagged
+// "error" therefore stays in that partition forever, matching nothing — so the
+// cron re-scans a monotonically growing set of dead rows on every run. Retiring
+// to "abandoned" is what actually drains it.
+test("an abandoned row leaves the error partition getResolvable scans", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () =>
+    new Response("nope", { status: 400 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS - 1, "error");
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const stillErrored = await t.run((ctx) =>
+    ctx.db
+      .query("campaignAds")
+      .withIndex("by_status", (q) => q.eq("resolveStatus", "error"))
+      .collect(),
+  );
+  expect(stillErrored).toHaveLength(0);
 });

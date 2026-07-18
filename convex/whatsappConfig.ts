@@ -395,26 +395,42 @@ export const accountByPhoneNumberId = internalQuery({
  * pre-existing question for `upsert`, not something this read-only
  * lookup can fix — see this task's own report.)
  *
- * There's no index to look this up by (the plaintext token is only
- * known at verification time, never stored elsewhere), so this is a
- * full table scan, mirroring the source's own unfiltered `SELECT id,
- * verify_token FROM whatsapp_config`. A config with no `verifyToken` set
- * is skipped. Returns the matched config's `accountId`, or `null` for no
- * match. Does NOT port the source's opportunistic legacy-format-to-GCM
- * token upgrade (a write, and moot besides — there is no encrypted
- * format here to upgrade FROM).
+ * Looked up through `by_verify_token` rather than scanned. This used to
+ * be a full table scan justified as "there's no index to look this up by
+ * (the plaintext token is only known at verification time, never stored
+ * elsewhere)" — but that is exactly backwards: the token IS stored, in
+ * plain text, as this docblock says two paragraphs up. Only an ENCRYPTED
+ * column would be unindexable by its plaintext. So the handshake no
+ * longer reads every tenant's config on every webhook GET. (The source's
+ * own unfiltered `SELECT id, verify_token FROM whatsapp_config` had the
+ * same shape, but there it was forced: that column really is encrypted.)
+ *
+ * The empty token is guarded explicitly rather than left to the index. A
+ * stored `""` is falsy — so the old scan's `if (!config.verifyToken)
+ * continue` skipped it — but `""` is a perfectly matchable index key, and
+ * without the guard a caller supplying no token at all would be handed an
+ * accountId. Configs with no `verifyToken` at all need no guard: Convex
+ * sorts a missing field before every present value, so it can never be
+ * the `.eq` match for a non-empty string.
+ *
+ * Where two configs share a token, `.first()` returns the oldest, which
+ * is what the scan's creation-order walk did — the index key is
+ * (verifyToken, _creationTime). Returns the matched config's `accountId`,
+ * or `null` for no match. Does NOT port the source's opportunistic
+ * legacy-format-to-GCM token upgrade (a write, and moot besides — there
+ * is no encrypted format here to upgrade FROM).
  */
 export const matchVerifyToken = internalQuery({
   args: { verifyToken: v.string() },
   handler: async (ctx, args): Promise<Id<"accounts"> | null> => {
-    const configs = await ctx.db.query("whatsappConfig").collect();
-    for (const config of configs) {
-      if (!config.verifyToken) continue;
-      if (config.verifyToken === args.verifyToken) {
-        return config.accountId;
-      }
-    }
-    return null;
+    if (!args.verifyToken) return null;
+    const config = await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_verify_token", (q) =>
+        q.eq("verifyToken", args.verifyToken),
+      )
+      .first();
+    return config?.accountId ?? null;
   },
 });
 

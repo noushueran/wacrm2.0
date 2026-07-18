@@ -664,6 +664,86 @@ test("matchVerifyToken scans past non-matching rows (incl. one with no verifyTok
   expect(matched).toBe(healthyAccountId);
 });
 
+/**
+ * The empty token is the one seam where "skip falsy stored tokens" and "look
+ * the token up by equality" disagree: a stored `""` is falsy (so the scan form
+ * skips it) but is a perfectly matchable index key. An unguarded lookup would
+ * hand an accountId to a caller who supplied no token at all. Seeded directly
+ * because `upsert` would not normally write an empty token.
+ */
+test("matchVerifyToken never matches an empty verify token, even against a config that stored one", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await t.run((ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId,
+      phoneNumberId: "1000000000",
+      accessToken: "alice-token",
+      verifyToken: "",
+      status: "connected",
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const matched = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "",
+  });
+
+  expect(matched).toBeNull();
+});
+
+/**
+ * Two accounts holding the same verify token is a misconfiguration rather than
+ * a supported state, but it resolves to *something* and which one it resolves
+ * to decides whose account a webhook is attributed to. Pinning "oldest wins"
+ * keeps that tie-break from silently flipping — a scan walks creation order,
+ * and so does the index, whose key is (verifyToken, _creationTime).
+ */
+test("matchVerifyToken resolves a duplicated verify token to the oldest config", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: firstAccountId } = await seedAccountMember(t, {
+    name: "First",
+    email: "first@example.com",
+    role: "admin",
+  });
+  const { accountId: secondAccountId } = await seedAccountMember(t, {
+    name: "Second",
+    email: "second@example.com",
+    role: "admin",
+  });
+  await t.run((ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId: firstAccountId,
+      phoneNumberId: "1000000000",
+      accessToken: "first-token",
+      verifyToken: "shared-verify-token",
+      status: "connected",
+      updatedAt: Date.now(),
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("whatsappConfig", {
+      accountId: secondAccountId,
+      phoneNumberId: "2000000000",
+      accessToken: "second-token",
+      verifyToken: "shared-verify-token",
+      status: "connected",
+      updatedAt: Date.now(),
+    }),
+  );
+
+  const matched = await t.query(internal.whatsappConfig.matchVerifyToken, {
+    verifyToken: "shared-verify-token",
+  });
+
+  expect(matched).toBe(firstAccountId);
+  expect(matched).not.toBe(secondAccountId);
+});
+
 // ============================================================
 // verifyRegistration — admin-gated diagnostic action (transitive-
 // Supabase gap-fill task). Convex port of `GET /api/whatsapp/config/

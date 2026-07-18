@@ -358,10 +358,17 @@ export const byCustomFieldValue = accountQuery({
     value: v.string(),
   },
   handler: async (ctx, args) => {
+    // Ranged on `by_account_field`, not a `by_account` scan with a
+    // `customFieldId` `.filter()` — a Convex `.filter()` runs after the
+    // index scan, so the old form read every custom value in the account
+    // (contacts × fields) to answer a question about one field. The
+    // operator matching below stays in JS: `contains` is a substring test
+    // and `is_not` a negation, neither of which an index range expresses.
     const rows = await ctx.db
       .query("contactCustomValues")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("customFieldId"), args.customFieldId))
+      .withIndex("by_account_field", (q) =>
+        q.eq("accountId", ctx.accountId).eq("customFieldId", args.customFieldId),
+      )
       .collect();
 
     const needle = args.value.toLowerCase();
@@ -517,19 +524,18 @@ export const remove = accountMutation({
     // Explicit SET NULL: migration 004 gave `broadcast_recipients.
     // contact_id` the same ON DELETE SET NULL treatment as `deals`
     // above, so a broadcast's send history survives too.
-    // `broadcastRecipients` has no `by_contact` index (see schema.ts —
-    // only `by_broadcast`/`by_account`/`by_wamid`), so this scopes
-    // through the account's own `by_account` index and filters down to
-    // this contact in memory instead — the same pattern
-    // `customFields.remove`'s cascade uses onto `contactCustomValues`
-    // for the identical reason (no index on the column being filtered).
-    // A dedicated `by_contact` index would speed this up, but adding
-    // one is a schema change beyond this cascade fix — worth revisiting
-    // if broadcast recipient volume ever makes this scan a hot path.
+    // Ranged on `by_account_contact` rather than filtering the account's
+    // `by_account` scan: `.filter()` applies after the index scan, so the
+    // old form read every recipient row the account had ever accumulated
+    // to find this contact's. (That index is the "revisit if broadcast
+    // recipient volume makes this a hot path" this comment used to defer;
+    // `customFields.remove`'s cascade, cited here as sharing the problem,
+    // is fixed the same way in the same change.)
     const recipients = await ctx.db
       .query("broadcastRecipients")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("contactId"), args.contactId))
+      .withIndex("by_account_contact", (q) =>
+        q.eq("accountId", ctx.accountId).eq("contactId", args.contactId),
+      )
       .collect();
     for (const recipient of recipients) {
       await ctx.db.patch(recipient._id, { contactId: undefined });

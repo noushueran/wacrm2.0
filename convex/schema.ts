@@ -246,7 +246,22 @@ export default defineSchema({
     // Convex sorts a missing field before every present value, so in
     // `.order("desc")` those rows deterministically fall to the end of
     // the page rather than scattering randomly or erroring.
-    .index("by_account_last_message", ["accountId", "lastMessageAt"]),
+    .index("by_account_last_message", ["accountId", "lastMessageAt"])
+    // `unreadTotal` (the app-wide sidebar badge) counts this account's
+    // conversations with `unreadCount > 0`. Ranging that test on the
+    // index instead of filtering in JS bounds both the read set and —
+    // because a Convex subscription re-runs when any document it read
+    // changes — the invalidation set: without it, the `lastMessageAt`
+    // patch every message writes re-runs a full-account scan for every
+    // connected client. Deliberately NOT a prefix of `by_account`:
+    // Convex appends `_creationTime` to each index, so `by_account` is
+    // `["accountId", "_creationTime"]` and cannot express this range.
+    .index("by_account_unread", ["accountId", "unreadCount"])
+    // `dashboard.metrics` counts the account's OPEN conversations. Same
+    // reasoning as `deals.by_account_status`: the open set tracks current
+    // workload, the closed set grows forever, and a `status` `.filter()`
+    // after a `by_account` scan read both.
+    .index("by_account_status", ["accountId", "status"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -400,7 +415,22 @@ export default defineSchema({
     .index("by_account", ["accountId"])
     .index("by_pipeline", ["pipelineId"])
     .index("by_stage", ["stageId"])
-    .index("by_contact", ["contactId"]),
+    .index("by_contact", ["contactId"])
+    // `dashboard.metrics` and `dashboard.pipelineDonut` both want the
+    // account's OPEN deals. Filtering `status` after a `by_account` scan
+    // read every deal the account had ever closed to find the ones still
+    // live. The open set tracks current workload and is roughly
+    // steady-state; the closed set only ever grows — so ranging `status`
+    // converts a read that grows forever into one that does not.
+    .index("by_account_status", ["accountId", "status"])
+    // `dashboard.activity` wants the 10 most-recently-UPDATED deals (any
+    // status — a deal opened long ago but just moved to "Won" must
+    // surface). `_creationTime`, the implicit trailing key on every other
+    // index here, cannot express that. NOTE: `updatedAt` is optional, and
+    // Convex sorts a missing field before every present value, so
+    // descending it sorts LAST — see `activity`'s comment and the test
+    // that pins it.
+    .index("by_account_updated", ["accountId", "updatedAt"]),
 
   // A custom field definition (e.g. "Birthday") an account can attach
   // values of to any contact via `contactCustomValues`.
@@ -423,7 +453,16 @@ export default defineSchema({
   })
     .index("by_contact_field", ["contactId", "customFieldId"])
     .index("by_contact", ["contactId"])
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    // `contacts.byCustomFieldValue` (the broadcast composer's audience
+    // filter) and `customFields.remove`'s cascade both want one field's
+    // value rows across every contact. `by_contact_field` cannot serve that
+    // — its prefix is `contactId`, so it can only answer "this contact's
+    // value for this field", not "every contact's value for this field".
+    // On `by_account` the `customFieldId` test was a `.filter()`, i.e. a
+    // scan of every custom value in the account. Grows with contacts ×
+    // fields.
+    .index("by_account_field", ["accountId", "customFieldId"]),
 
   // A free-text note an account member left on a contact.
   contactNotes: defineTable({
@@ -582,7 +621,25 @@ export default defineSchema({
     whatsappMessageId: v.optional(v.string()), // Meta wamid (migration 003)
   })
     .index("by_broadcast", ["broadcastId"])
+    // `maybeFinalizeBroadcast` runs once per delivered recipient and asks
+    // "is any recipient still pending?". `.filter()` runs *after* the
+    // index scan, so on `by_broadcast` alone each probe walked past the
+    // already-resolved recipients piling up at the front of the range —
+    // O(N^2) reads to finalize an N-recipient broadcast. Binding `status`
+    // makes that probe O(1); `startSendingInternal`'s pending set uses
+    // the same range.
+    .index("by_broadcast_status", ["broadcastId", "status"])
     .index("by_account", ["accountId"])
+    // `contacts.remove`'s SET NULL cascade wants one contact's recipient
+    // rows. On `by_account` alone that read the account's ENTIRE broadcast
+    // history and narrowed it with a `.filter()`, which does not narrow what
+    // Convex reads. This table is the spikiest in the schema — one send
+    // inserts a row per recipient at once — so the scan a single contact
+    // deletion pays grows with total broadcast volume, not with that
+    // contact's. `contactId` is optional (this cascade is what clears it);
+    // Convex sorts missing values before all present ones, so a `.eq` range
+    // on a present id is unaffected.
+    .index("by_account_contact", ["accountId", "contactId"])
     .index("by_wamid", ["whatsappMessageId"]),
 
   // A reusable inbox-composer snippet — either plain text or a saved
@@ -626,7 +683,18 @@ export default defineSchema({
     updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
-    .index("by_phone_number_id", ["phoneNumberId"]),
+    .index("by_phone_number_id", ["phoneNumberId"])
+    // `matchVerifyToken` runs on every Meta webhook GET handshake and used
+    // to scan this whole table. Indexable precisely BECAUSE `verifyToken` is
+    // stored as plain text (see `upsert` — only `accessToken` is encrypted),
+    // so the value arriving in `hub.verify_token` is the stored key itself.
+    // The index therefore holds no secret the document did not already hold
+    // in the clear. If `verifyToken` is ever encrypted to match
+    // `accessToken` — the open question `matchVerifyToken`'s own comment
+    // raises — this index stops working and the lookup has to move to a
+    // stored hash of the token, not ciphertext (which is per-row salted and
+    // so not equality-comparable).
+    .index("by_verify_token", ["verifyToken"]),
 
   // One outstanding invite link. `tokenHash` is a SHA-256 digest, never
   // the plaintext token (same pattern as `apiKeys.keyHash` below).
@@ -858,7 +926,18 @@ export default defineSchema({
       v.literal("failed"),
     ),
     errorMessage: v.optional(v.string()),
-  }).index("by_account", ["accountId"]),
+  })
+    .index("by_account", ["accountId"])
+    // `logs` (filtered by automation) and `remove`'s cascade both want one
+    // automation's rows. On `by_account` alone that is a scan of the
+    // account's ENTIRE log history with an `automationId` `.filter()`
+    // applied afterwards — and a Convex `.filter()` does not narrow what is
+    // read. This table grows with every automation execution, so it is the
+    // fastest-growing per-account table once automations see real use.
+    // Keeping `accountId` as the prefix leaves tenancy enforced by the index
+    // itself rather than by a post-scan predicate, so a foreign
+    // `automationId` still yields nothing.
+    .index("by_account_automation", ["accountId", "automationId"]),
 
   // A queued resume point created when a running automation hits a
   // `wait` step. The cron endpoint (`/api/automations/cron`) drains
@@ -1403,10 +1482,19 @@ export default defineSchema({
     adSetName: v.optional(v.string()),
     campaignId: v.optional(v.string()),
     campaignName: v.optional(v.string()),
+    // "abandoned" is terminal: the give-up state for a row that exhausted
+    // MAX_RESOLVE_ATTEMPTS. It exists so dead rows LEAVE the "error"
+    // partition — `getResolvable` reads that partition through `by_status`
+    // and `.filter()`s on `attempts`, and a Convex `.filter()` does not
+    // narrow what is read. Rows that gave up while still tagged "error"
+    // would accumulate there forever, matching nothing, growing the cron's
+    // scan without bound. Mirrors conversionEvents.status and
+    // attributionSignals.landingResult, which retire the same way.
     resolveStatus: v.union(
       v.literal("pending"),
       v.literal("resolved"),
       v.literal("error"),
+      v.literal("abandoned"),
     ),
     attempts: v.number(),
     lastError: v.optional(v.string()),

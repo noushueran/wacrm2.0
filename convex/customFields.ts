@@ -210,15 +210,18 @@ export const remove = accountMutation({
     // field_id ... REFERENCES custom_fields(id) ON DELETE CASCADE`;
     // Convex has no ON DELETE, so every value row referencing this
     // field is deleted first (same pattern as `contacts.remove`'s
-    // explicit `contactTags` cascade). Scoped through the account's
-    // own `by_account` index (rather than an unindexed full-table
-    // scan) and filtered down to this field — `requireOwnCustomField`
+    // explicit `contactTags` cascade). Ranged on `by_account_field`
+    // rather than scanning the account's `by_account` range and
+    // filtering down to this field: `.filter()` applies after the index
+    // scan, so the old form read every custom value in the account
+    // (contacts × fields) to delete one field's. `requireOwnCustomField`
     // above already proves `fieldId` is this account's own, so every
     // matching row is guaranteed to belong to it too.
     const values = await ctx.db
       .query("contactCustomValues")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("customFieldId"), args.fieldId))
+      .withIndex("by_account_field", (q) =>
+        q.eq("accountId", ctx.accountId).eq("customFieldId", args.fieldId),
+      )
       .collect();
     for (const value of values) {
       await ctx.db.delete(value._id);
