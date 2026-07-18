@@ -35,9 +35,19 @@ import {
 // account-scoped table this file touches that lacks one), matching how
 // `src/lib/dashboard/queries.ts`'s own header comment describes the
 // original: "Perf is acceptable for the current scale (low thousands of
-// messages)". Several of these scans are genuinely unbounded by table
-// size (not just by a time window) — each is called out with a comment
-// at its call site, and summarized in the Phase 3 Task 3 report.
+// messages)".
+//
+// Every read here is now bounded by something that does not grow
+// forever — a time window (`contacts`, `messages`), a fixed take
+// (`activity`'s sources), or a status range (`metrics`/`pipelineDonut`'s
+// open conversations and deals). None of them still scan a whole
+// account partition. The status-ranged collects remain unbounded in the
+// size of the OPEN set, which tracks current workload rather than
+// accumulated history; bounding those further would need a denormalised
+// counter, since a count cannot be taken from a window.
+//
+// `pipelineStages` is collected per account without a range, which is
+// fine and deliberate: a handful of structural rows per pipeline.
 // ============================================================
 
 // --- 1. Metric cards ----------------------------------------------------
@@ -56,13 +66,15 @@ export const metrics = accountQuery({
     // "previous" shown is the delta of NEW open conversations
     // today-vs-yesterday, not yesterday's open count). All three are
     // derived from one collected array rather than three separate
-    // scans. UNBOUNDED: this reads every currently-open conversation in
-    // the account, with no time window — there's no `(accountId,
-    // status)` index today to narrow it further (see report).
+    // scans. Ranged on `by_account_status` — the `(accountId, status)`
+    // index this comment used to say did not exist. Still unbounded in
+    // the number of OPEN conversations, but no longer in the number of
+    // closed ones, which is the half that grows without limit.
     const openConversations = await ctx.db
       .query("conversations")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
     const newOpenToday = openConversations.filter(
       (c) => c._creationTime >= todayStartMs,
@@ -110,13 +122,16 @@ export const metrics = accountQuery({
       directYesterday: yesterdayContacts.filter((c) => !isAdLead(c)).length,
     };
 
-    // Deals: value-sum + count of every open deal, no time bound.
-    // UNBOUNDED: same shape as `openConversations` above — grows with
-    // total open deals in the account, not with a time window.
+    // Deals: value-sum + count of every open deal, no time bound. Same
+    // shape as `openConversations` above, and now the same fix — grows
+    // with the account's OPEN deals rather than with every deal it has
+    // ever closed. The sum needs the rows themselves, so this stays a
+    // collect; only its range narrows.
     const openDeals = await ctx.db
       .query("deals")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
     const openDealsValue = openDeals.reduce((sum, d) => sum + d.value, 0);
 
@@ -215,14 +230,15 @@ export const pipelineDonut = accountQuery({
       .collect();
     stages.sort((a, b) => a.position - b.position);
 
-    // UNBOUNDED: every open deal in the account, no time bound — same
-    // shape/cost as `metrics`'s `openDeals` above (in fact the same
-    // underlying rows; each caller re-reads independently since there's
-    // no cross-request cache in Convex).
+    // Every open deal in the account — same range as `metrics`'s
+    // `openDeals` above (in fact the same underlying rows; each caller
+    // re-reads independently since there's no cross-request cache in
+    // Convex), and bounded the same way by `by_account_status`.
     const openDeals = await ctx.db
       .query("deals")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("status"), "open"))
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "open"),
+      )
       .collect();
 
     const byStage = new Map<Id<"pipelineStages">, { count: number; total: number }>();
@@ -436,23 +452,29 @@ export const activity = accountQuery({
 
     // Deals, most-recently-*updated* 10 (any status — mirrors
     // `loadActivity` exactly, which does NOT filter to open deals the
-    // way `loadMetrics`/`loadPipelineDonut` do). UNBOUNDED, and unlike
-    // every other source in this function, not fixable with `.take()`:
-    // there is no `(accountId, updatedAt)` index (see schema.ts), and
-    // sorting by `updatedAt` instead of `_creationTime` is the whole
+    // way `loadMetrics`/`loadPipelineDonut` do). This was the one source
+    // here that read every deal in the account; `by_account_updated` is
+    // the `(accountId, updatedAt)` index the old comment said did not
+    // exist, so it is now a bounded 10-row take like every other source.
+    // Sorting by `updatedAt` rather than `_creationTime` is the whole
     // point — a deal opened long ago but just moved to "Won" must still
-    // surface here. So this reads every deal in the account. Flagged in
-    // the report as the one call site that would most benefit from a
-    // new index if deal volume grows (mirrors why `conversations` has
-    // its own `by_account_last_message` index today).
-    const allDeals = await ctx.db
+    // surface.
+    //
+    // THE ONE BEHAVIOUR CHANGE in this file: membership of the fetched
+    // 10 is now Convex's index order, and Convex sorts a MISSING field
+    // before every present value — so descending, a deal with no
+    // `updatedAt` sorts last and falls out of the window, where the old
+    // JS sort promoted it on its `_creationTime` fallback. Unreachable
+    // through the app (every `deals` insert sets `updatedAt`), needs >10
+    // deals to manifest at all, and pinned by its own test. The `??`
+    // fallback below stays: it still decides where a fetched row ranks
+    // in the final interleaved feed.
+    const recentDeals = await ctx.db
       .query("deals")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .collect();
-    allDeals.sort(
-      (a, b) => (b.updatedAt ?? b._creationTime) - (a.updatedAt ?? a._creationTime),
-    );
-    for (const deal of allDeals.slice(0, 10)) {
+      .withIndex("by_account_updated", (q) => q.eq("accountId", ctx.accountId))
+      .order("desc")
+      .take(10);
+    for (const deal of recentDeals) {
       const stage = await ctx.db.get(deal.stageId);
       items.push({
         id: `deal-${deal._id}`,

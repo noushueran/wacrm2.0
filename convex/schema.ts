@@ -256,7 +256,12 @@ export default defineSchema({
     // connected client. Deliberately NOT a prefix of `by_account`:
     // Convex appends `_creationTime` to each index, so `by_account` is
     // `["accountId", "_creationTime"]` and cannot express this range.
-    .index("by_account_unread", ["accountId", "unreadCount"]),
+    .index("by_account_unread", ["accountId", "unreadCount"])
+    // `dashboard.metrics` counts the account's OPEN conversations. Same
+    // reasoning as `deals.by_account_status`: the open set tracks current
+    // workload, the closed set grows forever, and a `status` `.filter()`
+    // after a `by_account` scan read both.
+    .index("by_account_status", ["accountId", "status"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -410,7 +415,22 @@ export default defineSchema({
     .index("by_account", ["accountId"])
     .index("by_pipeline", ["pipelineId"])
     .index("by_stage", ["stageId"])
-    .index("by_contact", ["contactId"]),
+    .index("by_contact", ["contactId"])
+    // `dashboard.metrics` and `dashboard.pipelineDonut` both want the
+    // account's OPEN deals. Filtering `status` after a `by_account` scan
+    // read every deal the account had ever closed to find the ones still
+    // live. The open set tracks current workload and is roughly
+    // steady-state; the closed set only ever grows — so ranging `status`
+    // converts a read that grows forever into one that does not.
+    .index("by_account_status", ["accountId", "status"])
+    // `dashboard.activity` wants the 10 most-recently-UPDATED deals (any
+    // status — a deal opened long ago but just moved to "Won" must
+    // surface). `_creationTime`, the implicit trailing key on every other
+    // index here, cannot express that. NOTE: `updatedAt` is optional, and
+    // Convex sorts a missing field before every present value, so
+    // descending it sorts LAST — see `activity`'s comment and the test
+    // that pins it.
+    .index("by_account_updated", ["accountId", "updatedAt"]),
 
   // A custom field definition (e.g. "Birthday") an account can attach
   // values of to any contact via `contactCustomValues`.

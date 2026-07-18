@@ -823,6 +823,70 @@ test("activity interleaves messages/contacts/deals/broadcasts/automation logs by
   ]);
 });
 
+/**
+ * The one place `by_account_updated` changes behaviour rather than preserving
+ * it. `activity` fetches the 10 most-recently-updated deals; ranging that on
+ * the index means Convex's ordering decides membership, and Convex sorts a
+ * MISSING field before every present value — so descending, a deal with no
+ * `updatedAt` sorts last and drops out of the fetched 10. The old full scan
+ * sorted in JS on `updatedAt ?? _creationTime`, which promoted such a row to
+ * the front on the strength of its creation time alone.
+ *
+ * This is unreachable through the app: every `deals` insert sets `updatedAt`
+ * (`deals.create` and `automationsEngine`'s deal step both do), and both
+ * production rows carry it — `v.optional` here is defensive, not a real state.
+ * It needs >10 deals to show at all, since below that the anomaly is fetched
+ * anyway and its `atMs` fallback still ranks it. Pinned so the trade-off is
+ * asserted rather than assumed.
+ */
+test("activity drops a deal with no updatedAt from the fetched window rather than ranking it by creation time", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser: asAlice, accountId: aliceId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { pipelineId, stageIds } = await seedPipelineWithStages(t, {
+    accountId: aliceId,
+    stages: [{ name: "New Lead", color: "#3b82f6" }],
+  });
+
+  const BASE = Date.parse("2026-07-01T00:00:00.000Z");
+  clock(BASE);
+  for (let i = 0; i < 10; i++) {
+    await seedDeal(t, {
+      accountId: aliceId,
+      pipelineId,
+      stageId: stageIds[0]!,
+      title: `Deal ${i}`,
+      value: 1,
+      status: "open",
+      updatedAt: BASE + i,
+    });
+  }
+
+  // Created well AFTER all ten, but carrying no `updatedAt` at all. On the
+  // old JS sort its creation time put it first; on the index it sorts last.
+  clock(BASE + 1_000_000);
+  const noUpdatedAt = await seedDeal(t, {
+    accountId: aliceId,
+    pipelineId,
+    stageId: stageIds[0]!,
+    title: "No updatedAt",
+    value: 1,
+    status: "open",
+  });
+
+  const items = await asAlice.query(api.dashboard.activity, { limit: 50 });
+
+  expect(items.some((i) => i.id === `deal-${noUpdatedAt}`)).toBe(false);
+  // The ten that do carry `updatedAt` are all present, so the window is full
+  // rather than merely empty.
+  expect(items.filter((i) => i.kind === "deal")).toHaveLength(10);
+});
+
 // ============================================================
 // cross-cutting denial — every dashboard query requires an identity
 // ============================================================
