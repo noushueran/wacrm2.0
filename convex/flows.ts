@@ -3,6 +3,7 @@ import { v, ConvexError } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 import { validateFlowForActivation, type ValidationIssue } from "./lib/flows/validate";
+import { clampLimit } from "./lib/cronSummary";
 
 // ============================================================
 // Flows config CRUD — the account-scoped builder-facing counterpart to
@@ -564,7 +565,9 @@ export const runs = accountQuery({
   args: { flowId: v.id("flows"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const flow = await requireOwnFlow(ctx, args.flowId);
-    const limit = args.limit ?? 50;
+    // Clamp the caller-supplied limit: a negative throws in `.take()` and a
+    // huge value makes it an unbounded read.
+    const limit = clampLimit(args.limit, 50, 200);
 
     const runRows = await ctx.db
       .query("flowRuns")

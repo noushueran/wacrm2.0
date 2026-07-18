@@ -557,6 +557,19 @@ test("runs respects the limit argument", async () => {
   expect(result.runs).toHaveLength(2);
 });
 
+test("runs clamps a non-positive limit up to 1 instead of returning nothing", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
+  const flowId = await asUser.mutation(api.flows.create, { name: "F" });
+  await seedFlowRun(t, { accountId, flowId });
+  await seedFlowRun(t, { accountId, flowId });
+
+  // Pre-fix `args.limit ?? 50` passed 0 straight into `.take(0)` → []. The
+  // clamp floors it at 1 (and caps the other end at 200).
+  const result = await asUser.query(api.flows.runs, { flowId, limit: 0 });
+  expect(result.runs).toHaveLength(1);
+});
+
 test("runs throws NOT_FOUND for another account's flow", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAlice } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });

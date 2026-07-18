@@ -495,6 +495,41 @@ test("listMessages paginates newest-first via Convex's native cursor, and 404s (
   ).toBeNull();
 });
 
+test("listMessages clamps an oversized limit to 100 instead of paginating the whole conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { keyHash } = await seedApiKey(t, { accountId, scopes: ["messages:read"] });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15550000014" });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 101; i++) {
+      await ctx.db.insert("messages", {
+        accountId,
+        conversationId,
+        senderType: "agent",
+        contentType: "text",
+        contentText: `m${i}`,
+        status: "sent",
+      });
+    }
+  });
+
+  // A caller-supplied limit above the REST layer's [1,100] cap is clamped,
+  // so a single page can't be coerced into reading the whole conversation.
+  const page = await t.query(api.apiV1.listMessages, {
+    keyHash,
+    conversationId,
+    limit: 100_000,
+  });
+  if (!page) throw new Error("expected a page, got null");
+  expect(page.items).toHaveLength(100);
+  expect(page.nextCursor).not.toBeNull();
+});
+
 test("sendMessage (text, DRY-RUN) resolves-or-creates the contact+conversation and persists the sent message", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
