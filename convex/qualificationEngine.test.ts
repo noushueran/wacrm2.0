@@ -1293,3 +1293,76 @@ test("P6: agent feedback on an accepted lead lands as a contact note and resets 
   expect(notes).toHaveLength(1);
   expect(notes[0].noteText).toContain("Sara");
 });
+
+// ---- P6: staff loops (reminders + keepalive) ----
+
+test("P6: a silent assigned lead gets a reminder after 4 working-hours; the second quiet-day escalates to supervisors", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t); // 24/7 hours so the test never skips
+  const agent = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971551110004", tagName: "UAE visa",
+  });
+  const sessionId = await t.run(async (ctx) => {
+    await ctx.db.patch(base.conversationId, { assignedToUserId: agent.userId });
+    return await ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const offerId = await t.run((ctx) =>
+    ctx.db.insert("leadOffers", {
+      accountId: base.accountId, sessionId, conversationId: base.conversationId,
+      contactId: base.contactId, agentUserId: agent.userId, agentPhone: "+971551110004",
+      status: "accepted", offeredAt: Date.now() - 50 * 3_600_000,
+      respondedAt: Date.now() - 49 * 3_600_000, // quiet for 49h → escalation due
+    }));
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  const offer = await t.run((ctx) => ctx.db.get(offerId));
+  expect(offer?.remindersSent).toBe(1);
+  expect(offer?.escalatedAt).toBeGreaterThan(0);
+  // supervisor pool (the seeded admin) got the escalation bell
+  const bells = await t.run((ctx) =>
+    ctx.db.query("notifications")
+      .withIndex("by_user", (q) => q.eq("userId", base.userId)).collect());
+  expect(bells.some((n) => n.title.includes("needs attention"))).toBe(true);
+  // the agent got the WhatsApp reminder
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971551110004")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  const msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs.some((m) => m.contentText?.includes("Quick reminder"))).toBe(true);
+
+  // running again immediately does NOT double-remind (daily repeat)
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  expect((await t.run((ctx) => ctx.db.get(offerId)))?.remindersSent).toBe(1);
+});
+
+test("P6: staff keepalive — closed window gets the template, and never twice in 20h", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971551110005", tagName: "UAE visa",
+  });
+  // no prior inbound from Sara at all → window closed → template path
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971551110005")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  let msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].contentType).toBe("template");
+  expect(msgs[0].templateName).toBe("staff_checkin");
+
+  // second run within 20h → no repeat
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs).toHaveLength(1);
+});

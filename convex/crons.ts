@@ -43,4 +43,14 @@ crons.interval(
   {},
 );
 
+// P6: hourly staff loops — assigned-lead feedback reminders (4h → daily,
+// supervisor escalation after 2 quiet days) + daily staff window
+// keepalive (plain nudge in-window, staff_checkin template once closed).
+crons.interval(
+  "qualification-staff-loops",
+  { minutes: 60 },
+  internal.qualificationEngine.runStaffLoops,
+  {},
+);
+
 export default crons;

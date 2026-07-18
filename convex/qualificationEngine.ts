@@ -2062,3 +2062,269 @@ export const getExpiredOffers = internalQuery({
     return out;
   },
 });
+
+// ============================================================
+// P6 — staff loops cron (hourly): (a) feedback reminders for assigned
+// leads that haven't moved (first nudge 4 working-hours after accept,
+// then daily, supervisor escalation after 48 quiet hours); (b) daily
+// window keepalive for every staff number (plain reminder while the
+// 24h window is open, the approved staff_checkin template once closed).
+// ============================================================
+
+const REMINDER_FIRST_MS = 4 * 3_600_000;
+const REMINDER_REPEAT_MS = 24 * 3_600_000;
+const ESCALATE_AFTER_MS = 48 * 3_600_000;
+const CHECKIN_EVERY_MS = 20 * 3_600_000;
+
+export const staffLoopsDue = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const reminders: {
+      offerId: Id<"leadOffers">;
+      accountId: Id<"accounts">;
+      agentPhone: string;
+      customerName: string;
+      escalate: boolean;
+    }[] = [];
+    const accepted = await ctx.db
+      .query("leadOffers")
+      .withIndex("by_status_offered", (q) => q.eq("status", "accepted"))
+      .take(200);
+    for (const offer of accepted) {
+      const config = await ctx.db
+        .query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+        .unique();
+      if (!config?.enabled) continue;
+      // outside working hours → skip this pass (the hourly cron retries)
+      if (clampToWorkingHours(now, config) !== now) continue;
+      const conversation = await ctx.db.get(offer.conversationId);
+      if (!conversation) continue;
+      if (conversation.assignedToUserId !== offer.agentUserId) continue; // re-assigned
+      if (conversation.status === "closed") continue; // done
+      if (conversation.funnel?.stage && conversation.funnel.stage !== "qualified") {
+        continue; // the agent moved the funnel — no nagging
+      }
+      const anchor = Math.max(
+        offer.respondedAt ?? 0,
+        offer.feedbackAt ?? 0,
+        offer.lastReminderAt ?? 0,
+      );
+      const firstReminder = !offer.lastReminderAt && !offer.feedbackAt;
+      const wait = firstReminder ? REMINDER_FIRST_MS : REMINDER_REPEAT_MS;
+      if (now - anchor < wait) continue;
+      const contact = await ctx.db.get(offer.contactId);
+      const quietSince = Math.max(offer.respondedAt ?? 0, offer.feedbackAt ?? 0);
+      reminders.push({
+        offerId: offer._id,
+        accountId: offer.accountId,
+        agentPhone: offer.agentPhone,
+        customerName: contact?.name?.trim() || contact?.phone || "the customer",
+        escalate: !offer.escalatedAt && now - quietSince > ESCALATE_AFTER_MS,
+      });
+    }
+    return reminders;
+  },
+});
+
+export const recordReminderSent = internalMutation({
+  args: { offerId: v.id("leadOffers"), escalated: v.boolean() },
+  handler: async (ctx, args): Promise<void> => {
+    const offer = await ctx.db.get(args.offerId);
+    if (!offer) return;
+    const now = Date.now();
+    await ctx.db.patch(args.offerId, {
+      lastReminderAt: now,
+      remindersSent: (offer.remindersSent ?? 0) + 1,
+      ...(args.escalated ? { escalatedAt: now } : {}),
+    });
+    if (args.escalated) {
+      const members = await ctx.db
+        .query("memberships")
+        .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+        .collect();
+      const recipients = recipientsForInbound({
+        assignedToUserId: null, // escalation goes to the whole supervisor pool
+        members: members.map((m) => ({ userId: m.userId, role: m.role as AccountRole })),
+      });
+      const agent = members.find((m) => m.userId === offer.agentUserId);
+      for (const userId of recipients) {
+        await insertNotification(ctx, {
+          accountId: offer.accountId,
+          userId,
+          type: "lead_qualified",
+          conversationId: offer.conversationId,
+          contactId: offer.contactId,
+          title: "Assigned lead needs attention",
+          body: `${agent?.fullName ?? "An agent"} hasn't updated this lead in 2 days.`,
+        });
+      }
+    }
+  },
+});
+
+export const staffCheckinsDue = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const out: {
+      accountId: Id<"accounts">;
+      phone: string;
+      phoneNormalized: string;
+      windowOpen: boolean;
+      templateName: string | null;
+      templateLanguage: string | null;
+    }[] = [];
+    // every enabled config = one account's staff set
+    const configs = await ctx.db.query("qualificationConfigs").collect();
+    for (const config of configs) {
+      if (!config.enabled) continue;
+      const staff = await loadStaffPhoneSet(ctx, config.accountId, config);
+      for (const phoneNormalized of staff) {
+        const checkin = await ctx.db
+          .query("staffCheckins")
+          .withIndex("by_account_phone", (q) =>
+            q.eq("accountId", config.accountId).eq("phoneNormalized", phoneNormalized),
+          )
+          .unique();
+        if (checkin && now - checkin.lastCheckinSentAt < CHECKIN_EVERY_MS) continue;
+        // last inbound FROM this staff number = their staff conversation's
+        // latest customer-sender message
+        const contact = await ctx.db
+          .query("contacts")
+          .withIndex("by_account_phone", (q) =>
+            q.eq("accountId", config.accountId).eq("phoneNormalized", phoneNormalized),
+          )
+          .unique();
+        let lastInbound = 0;
+        let phone = "+" + phoneNormalized;
+        if (contact) {
+          phone = contact.phone;
+          const conversation = await ctx.db
+            .query("conversations")
+            .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+            .first();
+          if (conversation) {
+            const lastMsg = await ctx.db
+              .query("messages")
+              .withIndex("by_conversation", (q) =>
+                q.eq("conversationId", conversation._id),
+              )
+              .order("desc")
+              .filter((q) => q.eq(q.field("senderType"), "customer"))
+              .first();
+            lastInbound = lastMsg?._creationTime ?? 0;
+          }
+        }
+        // fresh chatter (<20h) needs nothing today
+        if (now - lastInbound < CHECKIN_EVERY_MS) continue;
+        out.push({
+          accountId: config.accountId,
+          phone,
+          phoneNormalized,
+          windowOpen: now - lastInbound < 24 * 3_600_000 && lastInbound > 0,
+          templateName: config.staffCheckinTemplateName ?? null,
+          templateLanguage: config.staffCheckinTemplateLanguage ?? null,
+        });
+      }
+    }
+    return out;
+  },
+});
+
+export const recordCheckinSent = internalMutation({
+  args: { accountId: v.id("accounts"), phoneNormalized: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    const existing = await ctx.db
+      .query("staffCheckins")
+      .withIndex("by_account_phone", (q) =>
+        q.eq("accountId", args.accountId).eq("phoneNormalized", args.phoneNormalized),
+      )
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, { lastCheckinSentAt: Date.now() });
+    } else {
+      await ctx.db.insert("staffCheckins", {
+        accountId: args.accountId,
+        phoneNormalized: args.phoneNormalized,
+        lastCheckinSentAt: Date.now(),
+      });
+    }
+  },
+});
+
+export const runStaffLoops = internalAction({
+  args: {},
+  handler: async (ctx): Promise<void> => {
+    // (a) assigned-lead feedback reminders
+    try {
+      const reminders = await ctx.runQuery(internal.qualificationEngine.staffLoopsDue, {});
+      for (const r of reminders) {
+        try {
+          const target = await ctx.runMutation(
+            internal.qualificationEngine.ensureAdminConversation,
+            { accountId: r.accountId, phone: r.agentPhone },
+          );
+          await ctx.runAction(internal.metaSend.sendText, {
+            accountId: r.accountId,
+            conversationId: target.conversationId,
+            to: target.to,
+            text:
+              `⏰ Quick reminder about your lead ${r.customerName} — any progress? ` +
+              "Reply here with an update (I'll log it), and please keep the CRM lead status current.",
+          });
+          await ctx.runMutation(internal.qualificationEngine.recordReminderSent, {
+            offerId: r.offerId,
+            escalated: r.escalate,
+          });
+        } catch (err) {
+          console.error("[qualification] reminder failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] reminders sweep failed:", err);
+    }
+    // (b) staff window keepalive
+    try {
+      const checkins = await ctx.runQuery(internal.qualificationEngine.staffCheckinsDue, {});
+      for (const c of checkins) {
+        try {
+          const target = await ctx.runMutation(
+            internal.qualificationEngine.ensureAdminConversation,
+            { accountId: c.accountId, phone: c.phone },
+          );
+          if (c.windowOpen || !c.templateName) {
+            await ctx.runAction(internal.metaSend.sendText, {
+              accountId: c.accountId,
+              conversationId: target.conversationId,
+              to: target.to,
+              text:
+                "👋 Daily check-in! Reply anything to this message once a day so our chat window stays open — " +
+                "that way I can reach you instantly with new leads and customer questions.",
+            });
+          } else {
+            await ctx.runAction(internal.metaSend.sendTemplate, {
+              accountId: c.accountId,
+              conversationId: target.conversationId,
+              to: c.phone,
+              templateName: c.templateName,
+              language: c.templateLanguage ?? undefined,
+              params: [],
+              contentText:
+                "👋 Our chat window closed — please reply to this message so I can reach you again with leads and updates.",
+            });
+          }
+          await ctx.runMutation(internal.qualificationEngine.recordCheckinSent, {
+            accountId: c.accountId,
+            phoneNormalized: c.phoneNormalized,
+          });
+        } catch (err) {
+          console.error("[qualification] checkin failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] checkin sweep failed:", err);
+    }
+  },
+});
