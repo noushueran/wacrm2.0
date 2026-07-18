@@ -416,9 +416,10 @@ export default defineSchema({
     .index("by_pipeline", ["pipelineId"])
     .index("by_stage", ["stageId"])
     .index("by_contact", ["contactId"])
-    // `dashboard.metrics` and `dashboard.pipelineDonut` both want the
-    // account's OPEN deals. Filtering `status` after a `by_account` scan
-    // read every deal the account had ever closed to find the ones still
+    // `dashboard.metrics` wants the account's OPEN deals (its former
+    // sibling reader, `dashboard.pipelineDonut`, was deleted as orphaned
+    // in Task B6). Filtering `status` after a `by_account` scan read
+    // every deal the account had ever closed to find the ones still
     // live. The open set tracks current workload and is roughly
     // steady-state; the closed set only ever grows — so ranging `status`
     // converts a read that grows forever into one that does not.
@@ -825,15 +826,16 @@ export default defineSchema({
   // 1/2's own precedent of late migrations touching tables outside
   // their named source list. Two real findings from that sweep:
   //   - Migration 017 added `account_id` (NOT NULL) to `automations`,
-  //     `automationLogs`, `automationPendingExecutions`, `flows`, and
-  //     `flowRuns` — but NOT to `automationSteps`, `flowNodes`, or
-  //     `flowRunEvents` in Postgres, which stayed tenant-scoped only
-  //     transitively via their parent FK (same pattern as
-  //     `pipelineStages`/`contactCustomValues` in Task 1). The Phase 1
-  //     final review denormalizes `accountId` onto all five of those
-  //     tables in Convex anyway (see each table below), matching the
-  //     direct-index treatment already given to `messages`/`contactTags`/
-  //     `broadcastRecipients`. Migration 017 also swapped `flowRuns`'s
+  //     `automationLogs`, `flows`, `flowRuns`, and the pending-execution
+  //     queue table (whose Convex counterpart, `automationPendingExecutions`,
+  //     was never written by any code path and was dropped in Task B7) —
+  //     but NOT to `automationSteps`, `flowNodes`, or `flowRunEvents` in
+  //     Postgres, which stayed tenant-scoped only transitively via their
+  //     parent FK (same pattern as `pipelineStages`/`contactCustomValues`
+  //     in Task 1). The Phase 1 final review denormalizes `accountId` onto
+  //     the surviving tables of that set in Convex (see each table below),
+  //     matching the direct-index treatment already given to `messages`/
+  //     `contactTags`/`broadcastRecipients`. Migration 017 also swapped `flowRuns`'s
   //     "one active run per contact" partial unique index from
   //     `(user_id, contact_id)` to `(account_id, contact_id)`.
   //   - Migration 016 widened `flow_nodes.node_type`'s CHECK to add

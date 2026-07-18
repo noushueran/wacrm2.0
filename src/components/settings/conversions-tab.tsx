@@ -22,6 +22,7 @@ import { formatCurrency } from '@/lib/currency';
 import { SettingsPanelHead } from './settings-panel-head';
 
 import { api } from '../../../convex/_generated/api';
+import type { Doc } from '../../../convex/_generated/dataModel';
 
 // ============================================================
 // ConversionsTab — Settings → Conversions (Task B4)
@@ -54,12 +55,18 @@ const LANE_BADGE_CLASS: Record<'code' | 'ctwa', string> = {
   ctwa: 'border-primary/40 bg-primary/10 text-primary',
 };
 
-const STATUS_BADGE_CLASS: Record<string, string> = {
+// Exhaustive over `conversionEvents.status` (not `Record<string, ...>`), so
+// adding a literal to the schema union is a compile error here rather than a
+// blank badge — exactly how the 6th member (`"dormant"`, the backend-env-
+// unconfigured parking state) was caught when it landed.
+type ConversionEventStatus = Doc<'conversionEvents'>['status'];
+const STATUS_BADGE_CLASS: Record<ConversionEventStatus, string> = {
   sent: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400',
   pending: 'border-amber-500/40 bg-amber-500/10 text-amber-400',
   unmatched: 'border-slate-500/40 bg-slate-500/10 text-slate-400',
   error: 'border-destructive/40 bg-destructive/10 text-destructive',
   abandoned: 'border-muted-foreground/30 bg-muted text-muted-foreground',
+  dormant: 'border-indigo-500/40 bg-indigo-500/10 text-indigo-400',
 };
 
 function fmtDateTime(ms: number): string {
