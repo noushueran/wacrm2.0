@@ -203,3 +203,30 @@ export const setPhone = accountMutation({
     return membership._id;
   },
 });
+
+/**
+ * Sets a teammate's job title — shown on the WhatsApp contact card the
+ * customer receives when this member accepts a lead. Admin+ only, same
+ * shape as `setPhone` above; empty string clears it.
+ */
+export const setJobTitle = accountMutation({
+  args: { userId: v.id("users"), jobTitle: v.string() },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", args.userId).eq("accountId", ctx.accountId),
+      )
+      .first();
+    if (!membership) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "member" });
+    }
+    const trimmed = args.jobTitle.trim();
+    if (trimmed.length > 80) {
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "job title too long (80 max)" });
+    }
+    await ctx.db.patch(membership._id, { jobTitle: trimmed || undefined });
+    return membership._id;
+  },
+});

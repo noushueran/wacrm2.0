@@ -77,6 +77,13 @@ export interface MetaWebhookMessage {
     button_reply?: { id: string; title?: string };
     list_reply?: { id: string; title?: string; description?: string };
   };
+  // Present when the customer shares contact card(s) (`type: "contacts"`)
+  // — vCard data flattened to Meta's JSON shape. Only the fields the
+  // readable summary needs are typed here.
+  contacts?: {
+    name?: { formatted_name?: string; first_name?: string };
+    phones?: { phone?: string; wa_id?: string; type?: string }[];
+  }[];
   context?: { id: string };
   // Present when the message originated from a click-to-WhatsApp ad. The
   // full creative is lifted into `FlattenedInboundMessage.referral` for the
@@ -416,6 +423,26 @@ function flattenByType(
       // if Meta ever omits the body.
       const body = message.system?.body?.trim();
       return { type: "text", text: body || "[System message]", wamid };
+    }
+
+    case "contacts": {
+      // The customer shared contact card(s). Structured inbound card
+      // storage is out of scope (rare, and `ingestInbound`'s validator
+      // stays untouched) — but a readable "who + number" summary beats
+      // the raw "[Unsupported message type: contacts]" placeholder, same
+      // trade as `system` above.
+      const lines = (message.contacts ?? [])
+        .map((c) => {
+          const name = c.name?.formatted_name?.trim() || c.name?.first_name?.trim();
+          const phone = c.phones?.map((p) => p.phone?.trim()).find(Boolean);
+          return [name, phone].filter(Boolean).join(" — ");
+        })
+        .filter(Boolean);
+      return {
+        type: "text",
+        text: lines.length > 0 ? `📇 Shared contact: ${lines.join("\n📇 ")}` : "📇 Shared contact",
+        wamid,
+      };
     }
 
     case "reaction":

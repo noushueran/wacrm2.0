@@ -32,6 +32,24 @@ export const CONFIG_PATCH_KEYS = [
   "staffCheckinTemplateName",
   "staffCheckinTemplateLanguage",
   "outboundNudgesEnabled",
+  "contactCard",
+] as const;
+
+/** The company-side fields of the customer-facing contact card — must
+ *  match the `contactCard` object in schema.ts exactly (the whitelist
+ *  below strips anything else so a stray client field never reaches the
+ *  schema validator as a raw server error, same as the top-level keys). */
+export const CONTACT_CARD_KEYS = [
+  "companyName",
+  "website",
+  "email",
+  "phone",
+  "street",
+  "city",
+  "state",
+  "zip",
+  "country",
+  "countryCode",
 ] as const;
 
 function isNumber(x: unknown): x is number {
@@ -146,6 +164,32 @@ export function validateConfigPatch(patch: QualificationConfigPatch): string | n
       if (!/^[1-9]\d{6,14}$/.test(digits)) {
         return `adminAlertPhones: "${phone}" is not a valid phone number`;
       }
+    }
+  }
+  if (p.contactCard !== undefined) {
+    if (!p.contactCard || typeof p.contactCard !== "object" || Array.isArray(p.contactCard)) {
+      return "contactCard must be an object";
+    }
+    const card = p.contactCard as Record<string, unknown>;
+    for (const key of Object.keys(card)) {
+      if (!(CONTACT_CARD_KEYS as readonly string[]).includes(key)) {
+        return `contactCard: unknown field "${key}"`;
+      }
+      if (card[key] !== undefined && typeof card[key] !== "string") {
+        return `contactCard.${key} must be a string`;
+      }
+    }
+    const phone = card.phone as string | undefined;
+    if (phone && phone.trim()) {
+      // Same plausibility rule as adminAlertPhones — this number lands on
+      // the card the customer taps to call.
+      if (!/^[1-9]\d{6,14}$/.test(normalizePhone(phone))) {
+        return `contactCard.phone: "${phone}" is not a valid phone number`;
+      }
+    }
+    const email = card.email as string | undefined;
+    if (email && email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return "contactCard.email is not a valid email address";
     }
   }
   return null;

@@ -83,12 +83,16 @@ export interface AppendMessageArgs {
     | "video"
     | "location"
     | "template"
-    | "interactive";
+    | "interactive"
+    | "contacts";
   contentText?: string;
   mediaUrl?: string;
   templateName?: string;
   messageId?: string;
   interactivePayload?: unknown;
+  /** Outbound contact cards (`contentType === "contacts"`): the Cloud API
+   *  `contacts` array we sent, rendered by the inbox as a card bubble. */
+  contactsPayload?: unknown;
   // Inbound-only in practice (the customer's reply to a `interactive`
   // message we sent) — schema.ts's `interactiveReplyId` column existed
   // since Task 1 but neither `append` nor `appendInternal` ever
@@ -124,6 +128,7 @@ export async function insertMessageAndUpdateConversation(
     templateName,
     messageId,
     interactivePayload,
+    contactsPayload,
     interactiveReplyId,
     aiGenerated,
     referral,
@@ -140,6 +145,7 @@ export async function insertMessageAndUpdateConversation(
     templateName,
     messageId,
     interactivePayload,
+    contactsPayload,
     interactiveReplyId,
     aiGenerated,
     referral,
@@ -210,12 +216,14 @@ export const append = accountMutation({
       v.literal("location"),
       v.literal("template"),
       v.literal("interactive"),
+      v.literal("contacts"),
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
+    contactsPayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
     replyToMessageId: v.optional(v.id("messages")),
@@ -272,12 +280,14 @@ export const appendInternal = internalMutation({
       v.literal("location"),
       v.literal("template"),
       v.literal("interactive"),
+      v.literal("contacts"),
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
+    contactsPayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     aiGenerated: v.optional(v.boolean()),
     replyToMessageId: v.optional(v.id("messages")),

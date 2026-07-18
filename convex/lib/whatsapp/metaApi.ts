@@ -418,39 +418,129 @@ export async function sendTextMessage(
   return { messageId: data.messages[0].id };
 }
 
+/**
+ * Everything a customer-facing contact card can carry. The person half
+ * (name/phone/jobTitle) comes from the accepting agent's membership; the
+ * company half from the qualification config's `contactCard` settings.
+ * Every field but `name` and `phone` is optional — the builder prunes
+ * blanks so a half-configured card still produces a valid payload.
+ */
+export interface ContactCard {
+  /** Full display name (vCard `formatted_name`) — required by Meta. */
+  name: string;
+  /** e.g. "Senior Travel Consultant" (vCard org.title). */
+  jobTitle?: string;
+  /** Company name (vCard org.company). */
+  company?: string;
+  /** The person's direct WhatsApp number — sent with `wa_id` so the card
+   *  is tap-to-chat, not just tap-to-save. */
+  phone: string;
+  /** Company/office line (plain WORK entry — no `wa_id`: unlike the
+   *  agent's own number, nothing guarantees it is a WhatsApp account). */
+  companyPhone?: string;
+  email?: string;
+  website?: string;
+  address?: {
+    street?: string;
+    city?: string;
+    state?: string;
+    zip?: string;
+    country?: string;
+    countryCode?: string;
+  };
+}
+
+const clean = (s: string | undefined): string | undefined => {
+  const t = s?.trim();
+  return t ? t : undefined;
+};
+
+/**
+ * Pure builder for one element of the Cloud API `contacts` array —
+ * exported for unit tests and persisted on the message row so the inbox
+ * can render the card exactly as the customer received it.
+ */
+export function buildContactsPayload(card: ContactCard): Record<string, unknown> {
+  const name = card.name.trim();
+  const [firstName, ...rest] = name.split(/\s+/);
+  const contact: Record<string, unknown> = {
+    name: {
+      formatted_name: name,
+      first_name: firstName || name,
+      ...(rest.length > 0 ? { last_name: rest.join(" ") } : {}),
+    },
+  };
+
+  const company = clean(card.company);
+  const jobTitle = clean(card.jobTitle);
+  if (company || jobTitle) {
+    contact.org = {
+      ...(company ? { company } : {}),
+      ...(jobTitle ? { title: jobTitle } : {}),
+    };
+  }
+
+  const phones: Record<string, unknown>[] = [];
+  const directPhone = clean(card.phone);
+  if (directPhone) {
+    const waId = directPhone.replace(/\D/g, "");
+    phones.push({ phone: directPhone, type: "CELL", ...(waId ? { wa_id: waId } : {}) });
+  }
+  const companyPhone = clean(card.companyPhone);
+  // Skip a company line that duplicates the direct number — two identical
+  // entries on the saved contact read as a mistake.
+  if (companyPhone && companyPhone.replace(/\D/g, "") !== directPhone?.replace(/\D/g, "")) {
+    phones.push({ phone: companyPhone, type: "WORK" });
+  }
+  if (phones.length > 0) contact.phones = phones;
+
+  const email = clean(card.email);
+  if (email) contact.emails = [{ email, type: "WORK" }];
+
+  const website = clean(card.website);
+  if (website) contact.urls = [{ url: website, type: "WORK" }];
+
+  const a = card.address;
+  if (a) {
+    const address: Record<string, unknown> = {
+      ...(clean(a.street) ? { street: clean(a.street) } : {}),
+      ...(clean(a.city) ? { city: clean(a.city) } : {}),
+      ...(clean(a.state) ? { state: clean(a.state) } : {}),
+      ...(clean(a.zip) ? { zip: clean(a.zip) } : {}),
+      ...(clean(a.country) ? { country: clean(a.country) } : {}),
+      ...(clean(a.countryCode) ? { country_code: clean(a.countryCode) } : {}),
+    };
+    if (Object.keys(address).length > 0) {
+      contact.addresses = [{ ...address, type: "WORK" }];
+    }
+  }
+
+  return contact;
+}
+
 export interface SendContactsMessageArgs {
   phoneNumberId: string;
   accessToken: string;
   to: string;
-  contactName: string;
-  contactPhone: string;
+  card: ContactCard;
 }
 
 /**
  * Send a WhatsApp CONTACT CARD (Cloud API `type: "contacts"`) — the
- * recipient can tap-to-save the number. Phase 6: used to hand the
- * customer their assigned agent's contact.
+ * recipient gets the native tap-to-save card (WhatsApp's vCard). Used to
+ * hand the customer their assigned agent's full contact details.
  */
 export async function sendContactsMessage(
   args: SendContactsMessageArgs,
 ): Promise<MetaSendResult> {
-  const { phoneNumberId, accessToken, to, contactName, contactPhone } = args;
+  const { phoneNumberId, accessToken, to, card } = args;
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
-  const waId = contactPhone.replace(/\D/g, "");
   const body: Record<string, unknown> = {
     messaging_product: "whatsapp",
     recipient_type: "individual",
     to,
     type: "contacts",
-    contacts: [
-      {
-        name: {
-          formatted_name: contactName,
-          first_name: contactName.split(" ")[0] || contactName,
-        },
-        phones: [{ phone: contactPhone, type: "CELL", wa_id: waId }],
-      },
-    ],
+    contacts: [buildContactsPayload(card)],
   };
   const response = await fetch(url, {
     method: "POST",

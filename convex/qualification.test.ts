@@ -391,3 +391,45 @@ test("leadsBoard carries funnel stage + checklist payload per lead (null when ab
   expect(bare.funnelStage).toBeNull();
   expect(bare.checklist).toBeNull();
 });
+
+test("updateConfig contactCard: valid card persists (and round-trips via getConfig); bad phone/email/unknown field rejected", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await admin.as.mutation(api.qualification.updateConfig, {
+    patch: {
+      contactCard: {
+        companyName: "Holidayys Tours LLC",
+        website: "https://holidayys.co",
+        email: "hello@holidayys.co",
+        phone: "+971 4 000 0000",
+        city: "Dubai",
+        countryCode: "AE",
+      },
+    },
+  });
+  const after = await admin.as.query(api.qualification.getConfig, {});
+  expect(after.contactCard).toMatchObject({
+    companyName: "Holidayys Tours LLC",
+    website: "https://holidayys.co",
+    email: "hello@holidayys.co",
+    phone: "+971 4 000 0000",
+    city: "Dubai",
+    countryCode: "AE",
+  });
+
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { contactCard: { phone: "not-a-phone" } },
+    }),
+  ).rejects.toThrow();
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { contactCard: { email: "not-an-email" } },
+    }),
+  ).rejects.toThrow();
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { contactCard: { logoUrl: "https://x.example/logo.png" } },
+    }),
+  ).rejects.toThrow(); // unknown field — whitelist, not silently dropped
+});

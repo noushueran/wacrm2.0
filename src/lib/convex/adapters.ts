@@ -13,6 +13,7 @@ import type {
   Contact,
   ContactCustomValue,
   ContactNote,
+  ContactsPayloadEntry,
   Conversation,
   CustomField,
   Deal,
@@ -234,6 +235,7 @@ export function toUiMember(
     role: doc.role,
     joined_at: new Date(doc._creationTime).toISOString(),
     phone: doc.phone ?? null,
+    job_title: doc.jobTitle ?? null,
   };
 }
 
@@ -356,6 +358,9 @@ export function toUiMessage(doc: Doc<"messages">): Message {
     interactive_reply_id: doc.interactiveReplyId,
     interactive_payload: doc.interactivePayload as
       | InteractiveMessagePayload
+      | undefined,
+    contacts_payload: doc.contactsPayload as
+      | ContactsPayloadEntry[]
       | undefined,
     ai_generated: doc.aiGenerated,
     referral: doc.referral

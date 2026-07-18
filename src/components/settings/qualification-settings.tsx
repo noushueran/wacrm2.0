@@ -66,6 +66,23 @@ export function QualificationSettings() {
   const [autoAssign, setAutoAssign] = useState(true);
   const [reengagementName, setReengagementName] = useState('');
   const [alertTemplateName, setAlertTemplateName] = useState('');
+  // Contact-card (company half) form state — the card the customer
+  // receives when an agent accepts a lead. Same hydrate-once pattern.
+  const [card, setCard] = useState({
+    companyName: '',
+    website: '',
+    email: '',
+    phone: '',
+    street: '',
+    city: '',
+    state: '',
+    zip: '',
+    country: '',
+    countryCode: '',
+  });
+  const [cardSaving, setCardSaving] = useState(false);
+  const [cardError, setCardError] = useState<string | null>(null);
+  const [cardSaved, setCardSaved] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
     if (!config || hydrated) return;
@@ -74,6 +91,19 @@ export function QualificationSettings() {
     setAutoAssign(config.autoAssignEnabled !== false);
     setReengagementName(config.reengagementTemplateName ?? '');
     setAlertTemplateName(config.adminAlertTemplateName ?? '');
+    const cc = config.contactCard;
+    setCard({
+      companyName: cc?.companyName ?? '',
+      website: cc?.website ?? '',
+      email: cc?.email ?? '',
+      phone: cc?.phone ?? '',
+      street: cc?.street ?? '',
+      city: cc?.city ?? '',
+      state: cc?.state ?? '',
+      zip: cc?.zip ?? '',
+      country: cc?.country ?? '',
+      countryCode: cc?.countryCode ?? '',
+    });
     setHydrated(true);
   }, [config, hydrated]);
 
@@ -120,6 +150,31 @@ export function QualificationSettings() {
       setAlertsSaving(false);
     }
   };
+
+  const onSaveCard = async () => {
+    setCardSaving(true);
+    setCardError(null);
+    setCardSaved(false);
+    try {
+      // Trim everything; omit blanks so the stored object only carries
+      // real values (the send path treats missing as "not configured").
+      const contactCard = Object.fromEntries(
+        Object.entries(card)
+          .map(([k, v]) => [k, v.trim()])
+          .filter(([, v]) => v !== ''),
+      );
+      await updateConfig({ patch: { contactCard } });
+      setCardSaved(true);
+    } catch (err) {
+      const data = (err as { data?: { reason?: string } })?.data;
+      setCardError(data?.reason ?? t('contactCard.saveError'));
+    } finally {
+      setCardSaving(false);
+    }
+  };
+
+  const setCardField = (key: keyof typeof card) => (value: string) =>
+    setCard((prev) => ({ ...prev, [key]: value }));
 
   const templateOptions = (templates ?? []).filter((row) =>
     ['APPROVED', 'PENDING'].includes(row.status ?? ''),
@@ -215,6 +270,111 @@ export function QualificationSettings() {
                   ) : null}
                   {alertsError ? (
                     <span className="text-xs text-red-400">{alertsError}</span>
+                  ) : null}
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="space-y-4 pt-6 text-sm">
+                <p className="font-medium text-foreground">{t('contactCard.title')}</p>
+                <p className="text-muted-foreground">{t('contactCard.desc')}</p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.companyName')}</p>
+                    <Input
+                      value={card.companyName}
+                      onChange={(e) => setCardField('companyName')(e.target.value)}
+                      placeholder="Holidayys Tours LLC"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.website')}</p>
+                    <Input
+                      value={card.website}
+                      onChange={(e) => setCardField('website')(e.target.value)}
+                      placeholder="https://holidayys.co"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.email')}</p>
+                    <Input
+                      type="email"
+                      value={card.email}
+                      onChange={(e) => setCardField('email')(e.target.value)}
+                      placeholder="hello@holidayys.co"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.phone')}</p>
+                    <Input
+                      value={card.phone}
+                      onChange={(e) => setCardField('phone')(e.target.value)}
+                      placeholder="+971 4 000 0000"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.street')}</p>
+                    <Input
+                      value={card.street}
+                      onChange={(e) => setCardField('street')(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.city')}</p>
+                    <Input
+                      value={card.city}
+                      onChange={(e) => setCardField('city')(e.target.value)}
+                      placeholder="Dubai"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('contactCard.state')}</p>
+                    <Input
+                      value={card.state}
+                      onChange={(e) => setCardField('state')(e.target.value)}
+                    />
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="space-y-1.5">
+                      <p className="text-muted-foreground">{t('contactCard.zip')}</p>
+                      <Input
+                        value={card.zip}
+                        onChange={(e) => setCardField('zip')(e.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-muted-foreground">{t('contactCard.country')}</p>
+                      <Input
+                        value={card.country}
+                        onChange={(e) => setCardField('country')(e.target.value)}
+                        placeholder="UAE"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-muted-foreground">{t('contactCard.countryCode')}</p>
+                      <Input
+                        value={card.countryCode}
+                        onChange={(e) => setCardField('countryCode')(e.target.value)}
+                        placeholder="AE"
+                      />
+                    </div>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">{t('contactCard.hint')}</p>
+                <div className="flex items-center gap-3">
+                  <Button size="sm" onClick={onSaveCard} disabled={cardSaving}>
+                    {cardSaving ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    {t('contactCard.save')}
+                  </Button>
+                  {cardSaved ? (
+                    <span className="text-xs text-emerald-500">{t('contactCard.saved')}</span>
+                  ) : null}
+                  {cardError ? (
+                    <span className="text-xs text-red-400">{cardError}</span>
                   ) : null}
                 </div>
               </CardContent>
