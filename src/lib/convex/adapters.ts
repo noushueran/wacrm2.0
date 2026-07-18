@@ -233,6 +233,7 @@ export function toUiMember(
     avatar_url: doc.avatarUrl ?? null,
     role: doc.role,
     joined_at: new Date(doc._creationTime).toISOString(),
+    phone: doc.phone ?? null,
   };
 }
 

@@ -102,10 +102,10 @@ export function buildAnalysisPrompt(args: {
       known,
     ...(previousInquiry
       ? [
-          `IMPORTANT — the customer's previous inquiry${previousInquiry.serviceName ? ` (${previousInquiry.serviceName})` : ""} is already FINISHED. ` +
-            "Decide: is this message starting a NEW request (any service, even the same one again)? " +
-            "If YES: set newInquiry true and extract for the new request only. " +
-            "If they are merely chatting about or thanking us for the finished inquiry: set newInquiry false, service null, and no fields.\n" +
+          `IMPORTANT — the customer's previous inquiry${previousInquiry.serviceName ? ` (${previousInquiry.serviceName})` : ""} is already FINISHED and with the sales team. ` +
+            "Everything discussed for it is HISTORY: never re-extract it and never treat it as a new request. " +
+            "Set newInquiry true ONLY when the customer's latest messages clearly start a DIFFERENT request — a different service, or an explicitly separate additional booking. " +
+            "Greetings, thanks, contact details, confirmations, or any follow-up about the finished inquiry ⇒ newInquiry false, service null, no fields, score 0.\n" +
             (previousInquiry.carried.length > 0
               ? "Known profile details from the previous inquiry (already pre-filled at medium confidence — the assistant will reconfirm them casually; only re-extract if the customer states a DIFFERENT value):\n" +
                 previousInquiry.carried.map((c) => `- ${c.key}: ${c.value}`).join("\n")

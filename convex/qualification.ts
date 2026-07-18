@@ -152,7 +152,11 @@ const LEAD_STATUSES = [
 export const leadsBoard = accountQuery({
   args: {},
   handler: async (ctx) => {
-    ctx.requireRole("supervisor");
+    // v4 RBAC (owner rule): agents work ONLY their own assigned leads;
+    // supervisor+ see everything (with assignee details). Viewers have
+    // no lead queue.
+    ctx.requireRole("agent");
+    const ownOnly = ctx.role === "agent";
 
     const caps: Record<(typeof LEAD_STATUSES)[number], number> = {
       collecting: 200,
@@ -202,12 +206,12 @@ export const leadsBoard = accountQuery({
         )
         .order("desc")
         .take(caps[status]);
-      summary[status] = rows.length;
 
       for (const s of rows) {
         const contact = await ctx.db.get(s.contactId);
         const conversation = await ctx.db.get(s.conversationId);
         if (!contact || !conversation) continue;
+        if (ownOnly && conversation.assignedToUserId !== ctx.userId) continue;
         const source: "ad" | "website" | "organic" =
           conversation.attribution?.lane === "ctwa" || conversation.adReferral
             ? "ad"
@@ -267,6 +271,10 @@ export const leadsBoard = accountQuery({
       if (score !== 0) return score;
       return b.startedAt - a.startedAt;
     });
+
+    for (const status of LEAD_STATUSES) {
+      summary[status] = leads.filter((l) => l.status === status).length;
+    }
 
     const qualifiedScores = leads
       .filter((l) => l.status === "qualified" && l.score !== null)

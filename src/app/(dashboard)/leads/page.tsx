@@ -39,7 +39,10 @@ type Lead = Board['leads'][number];
 function useLeadsBoard() {
   const { accountRole } = useAuth();
   const canView =
-    accountRole === 'supervisor' || accountRole === 'admin' || accountRole === 'owner';
+    accountRole === 'agent' ||
+    accountRole === 'supervisor' ||
+    accountRole === 'admin' ||
+    accountRole === 'owner';
   return useQuery(api.qualification.leadsBoard, canView ? {} : 'skip');
 }
 

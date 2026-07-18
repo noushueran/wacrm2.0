@@ -84,6 +84,9 @@ export const list = accountQuery({
     return members.map((member) => ({
       ...member,
       email: canSeeEmail ? member.email : null,
+      // v4: the member's WhatsApp number follows the same visibility
+      // rule as email (admin+ only — it's staff PII).
+      phone: canSeeEmail ? member.phone : undefined,
     }));
   },
 });
@@ -165,5 +168,38 @@ export const remove = accountMutation({
     });
 
     return newAccountId;
+  },
+});
+
+/**
+ * v4 (qualification): sets a teammate's own WhatsApp number — the
+ * channel the AI uses to reach them (lead offers, team questions) when
+ * they're off the desktop. Admin+ only; validated as a plausible E.164
+ * (7–15 digits, no leading zero); empty string clears it.
+ */
+export const setPhone = accountMutation({
+  args: { userId: v.id("users"), phone: v.string() },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", args.userId).eq("accountId", ctx.accountId),
+      )
+      .first();
+    if (!membership) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "member" });
+    }
+    const trimmed = args.phone.trim();
+    if (!trimmed) {
+      await ctx.db.patch(membership._id, { phone: undefined });
+      return membership._id;
+    }
+    const digits = trimmed.replace(/\D/g, "");
+    if (!/^[1-9]\d{6,14}$/.test(digits)) {
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "invalid phone number" });
+    }
+    await ctx.db.patch(membership._id, { phone: trimmed });
+    return membership._id;
   },
 });

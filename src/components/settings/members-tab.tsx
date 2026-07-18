@@ -153,6 +153,9 @@ export function MembersTab() {
   );
 
   const setMemberRole = useMutation(api.members.setRole);
+  const setMemberPhone = useMutation(api.members.setPhone);
+  const [phoneEditing, setPhoneEditing] = useState<string | null>(null);
+  const [phoneDraft, setPhoneDraft] = useState('');
   const removeMember = useMutation(api.members.remove);
   const revokeInvitation = useMutation(api.invitations.revoke);
 
@@ -326,6 +329,64 @@ export function MembersTab() {
                       {member.email && (
                         <p className="truncate text-xs text-muted-foreground">
                           {member.email}
+                        </p>
+                      )}
+                      {/* v4: the member's own WhatsApp number — the AI's
+                          channel to reach them off-desktop. Admin+ edits
+                          inline; others just see it. */}
+                      {phoneEditing === member.user_id ? (
+                        <form
+                          className="mt-1 flex items-center gap-1.5"
+                          onSubmit={async (e) => {
+                            e.preventDefault();
+                            try {
+                              await setMemberPhone({
+                                userId: member.user_id as Id<'users'>,
+                                phone: phoneDraft,
+                              });
+                              setPhoneEditing(null);
+                            } catch (err) {
+                              console.error('[MembersTab] phone save error:', err);
+                              toast.error(t('phoneInvalid'));
+                            }
+                          }}
+                        >
+                          <input
+                            value={phoneDraft}
+                            onChange={(e) => setPhoneDraft(e.target.value)}
+                            placeholder="+971 5x xxx xxxx"
+                            className="h-7 w-40 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                            autoFocus
+                          />
+                          <button
+                            type="submit"
+                            className="text-xs font-medium text-primary hover:underline"
+                          >
+                            {t('phoneSave')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPhoneEditing(null)}
+                            className="text-xs text-muted-foreground hover:underline"
+                          >
+                            {t('phoneCancel')}
+                          </button>
+                        </form>
+                      ) : (
+                        <p className="truncate text-xs text-muted-foreground">
+                          {member.phone ? `📱 ${member.phone}` : null}
+                          {canManageMembers ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPhoneEditing(member.user_id);
+                                setPhoneDraft(member.phone ?? '');
+                              }}
+                              className="ml-1 text-xs text-primary hover:underline"
+                            >
+                              {member.phone ? t('phoneEdit') : t('phoneAdd')}
+                            </button>
+                          ) : null}
                         </p>
                       )}
                     </div>

@@ -178,6 +178,7 @@ export const loadAnalysisContext = internalQuery({
     previousInquiry?: {
       serviceName: string | null;
       carried: { key: string; value: string }[];
+      completedAt: number;
     };
   } | null> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
@@ -211,6 +212,13 @@ export const loadAnalysisContext = internalQuery({
             key: f.key,
             value: f.value,
           })),
+          // Transcript boundary (v4): the analysis must only see
+          // messages AFTER the previous inquiry finished, so history
+          // can never be re-extracted into a duplicate lead.
+          completedAt:
+            session.qualifiedAt ??
+            session.lastCustomerMessageAt ??
+            session._creationTime,
         },
       };
     }
@@ -314,7 +322,23 @@ export const applyAnalysis = internalMutation({
     } else if (latest.status === "collecting") {
       session = latest;
     } else {
+      // v4 duplicate-lead guards (deterministic — never trust the model
+      // alone here; the Italy-duplicate incident): a new lead requires
+      //   1. the model's newInquiry verdict,
+      //   2. an identified service,
+      //   3. fresh evidence (at least one extracted field),
+      //   4. NOT the same service the previous session just finished —
+      //      same-service re-booking is only accepted after 48h.
       if (!analysis.newInquiry) return none;
+      if (!analysis.serviceName) return none;
+      if (analysis.fields.length === 0) return none;
+      const closedBoundary =
+        latest.qualifiedAt ?? latest.lastCustomerMessageAt ?? latest._creationTime;
+      const sameService =
+        !!latest.serviceName &&
+        analysis.serviceName.trim().toLowerCase() ===
+          latest.serviceName.trim().toLowerCase();
+      if (sameService && now - closedBoundary < 48 * 3_600_000) return none;
       // Fresh lead for the same contact: profile facts carry over at
       // medium confidence (marked `carried`) so the assistant verifies
       // them casually instead of re-collecting; trip-specific details
@@ -415,11 +439,22 @@ export const analyzeInbound = internalAction({
       // tracking works even when the assistant itself is off (spec §7).
       if (!aiCfg || !aiCfg.isActive) return;
 
-      const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
+      let historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
         accountId: args.accountId,
         conversationId: args.conversationId,
         limit: aiContextMessageLimit(),
       });
+      // Transcript boundary (v4 duplicate-lead fix): once the previous
+      // inquiry finished, only messages AFTER it may feed the analysis —
+      // otherwise the model re-extracts the finished inquiry from
+      // history and mints duplicate leads on every "thanks"/"hello".
+      const boundary = context.previousInquiry?.completedAt;
+      if (boundary) {
+        historyRows = historyRows.filter(
+          (r) => (r as { createdAt?: number }).createdAt === undefined ||
+            (r as { createdAt?: number }).createdAt! > boundary,
+        );
+      }
       const messages = toChatMessages(historyRows);
       if (messages.length === 0) return;
       const latest = latestUserMessage(messages);
@@ -530,6 +565,7 @@ export const getObjectives = internalQuery({
   ): Promise<{
     collected: { label: string; value: string }[];
     nextQuestion: string | null;
+    suppressReply?: boolean;
   } | null> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return null;
@@ -538,8 +574,18 @@ export const getObjectives = internalQuery({
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
       .order("desc")
       .first();
-    if (!session || session.status !== "collecting") return null;
-    if (session.accountId !== args.accountId) return null;
+    if (!session || session.accountId !== args.accountId) return null;
+    // v4: a fresh completion (< 90s) suppresses the assistant's regular
+    // reply entirely — the closing message IS the reply for that turn
+    // (previously the customer got closing message + a second AI reply
+    // that could even re-ask an already-given detail).
+    if (
+      session.status === "qualified" &&
+      session.qualifiedAt &&
+      Date.now() - session.qualifiedAt < 90_000
+    ) {
+      return { collected: [], nextQuestion: null, suppressReply: true };
+    }
 
     const collected = session.fields
       .filter((f) => f.confidence !== "low")
@@ -550,15 +596,21 @@ export const getObjectives = internalQuery({
         value: f.value,
       }));
 
-    let nextQuestion: string | null = session.pendingQuestion?.text ?? null;
-    if (!nextQuestion) {
-      const answered = new Set(
-        session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
-      );
-      const missing = config.basicFields.find(
-        (f) => f.required && !answered.has(f.key),
-      );
-      nextQuestion = missing?.phrasings[0] ?? null;
+    // Only a live (collecting) session still has something to ask; a
+    // finished one contributes its collected list ONLY (v4: so the
+    // assistant never re-asks answered details after completion).
+    let nextQuestion: string | null = null;
+    if (session.status === "collecting") {
+      nextQuestion = session.pendingQuestion?.text ?? null;
+      if (!nextQuestion) {
+        const answered = new Set(
+          session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
+        );
+        const missing = config.basicFields.find(
+          (f) => f.required && !answered.has(f.key),
+        );
+        nextQuestion = missing?.phrasings[0] ?? null;
+      }
     }
 
     return { collected, nextQuestion };
@@ -638,6 +690,21 @@ export const completeQualification = internalMutation({
       aiHandoffSummary: summary,
       updatedAt: now,
     });
+
+    // Mandatory auto-tag (v4): the contact carries a tag per qualified
+    // service — one lead per tag, multiple leads stack multiple tags.
+    // Best-effort: a tagging hiccup never fails completion.
+    if (session.serviceName) {
+      try {
+        await tagContactForService(ctx, {
+          accountId: args.accountId,
+          contactId: session.contactId,
+          serviceName: session.serviceName,
+        });
+      } catch (err) {
+        console.error("[qualification] auto-tag failed:", err);
+      }
+    }
 
     // In-app bell notifications: the assignee if any, else everyone who
     // works the shared pool (supervisor+ — same rule as inbound push).
@@ -1448,5 +1515,99 @@ export const relayAnswerToCustomer = internalAction({
     } catch (err) {
       console.error("[qualification] relayAnswerToCustomer failed:", err);
     }
+  },
+});
+
+// ============================================================
+// v4 — mandatory auto-tagging + duplicate-lead cleanup.
+// ============================================================
+
+/**
+ * Tags the CONTACT with the qualified lead's service (v4, owner rule:
+ * "tagging is mandatory when qualifying"). The tag is found by
+ * case-insensitive name (created flat/ungrouped if missing) and linked
+ * with `source: "ai"`, deduped via `by_contact_tag`. Multiple leads on
+ * one conversation therefore stack multiple service tags. Kept
+ * best-effort by the caller — a tagging hiccup must never fail
+ * completion.
+ */
+export async function tagContactForService(
+  ctx: { db: import("./_generated/server").MutationCtx["db"] },
+  args: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    serviceName: string;
+  },
+): Promise<void> {
+  const name = args.serviceName.trim();
+  if (!name) return;
+  const tags = await ctx.db
+    .query("tags")
+    .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+    .collect();
+  let tag = tags.find((t) => t.name.trim().toLowerCase() === name.toLowerCase());
+  if (!tag) {
+    const tagId = await ctx.db.insert("tags", {
+      accountId: args.accountId,
+      name,
+      color: "#0ea5e9",
+    });
+    tag = (await ctx.db.get(tagId))!;
+  }
+  const existing = await ctx.db
+    .query("contactTags")
+    .withIndex("by_contact_tag", (q) =>
+      q.eq("contactId", args.contactId).eq("tagId", tag._id),
+    )
+    .first();
+  if (existing) return;
+  await ctx.db.insert("contactTags", {
+    accountId: args.accountId,
+    contactId: args.contactId,
+    tagId: tag._id,
+    source: "ai",
+  });
+}
+
+/**
+ * One-off / operational dedupe (the Italy-duplicate incident): within
+ * each conversation, later QUALIFIED sessions repeating the SAME
+ * service within 48h of the kept one are retired to `disqualified`
+ * (`closedReason: "duplicate"`). Safe to re-run; returns the count.
+ */
+export const cleanupDuplicateLeads = internalMutation({
+  args: { accountId: v.id("accounts") },
+  handler: async (ctx, args): Promise<{ removed: number }> => {
+    const qualified = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", args.accountId).eq("status", "qualified"),
+      )
+      .take(500);
+    const kept = new Map<string, number>(); // conversation|service → earliest qualifiedAt
+    let removed = 0;
+    const sorted = [...qualified].sort(
+      (a, b) => (a.qualifiedAt ?? a._creationTime) - (b.qualifiedAt ?? b._creationTime),
+    );
+    for (const s of sorted) {
+      const key = `${s.conversationId}|${(s.serviceName ?? "").trim().toLowerCase()}`;
+      const at = s.qualifiedAt ?? s._creationTime;
+      const first = kept.get(key);
+      if (first === undefined) {
+        kept.set(key, at);
+        continue;
+      }
+      if (at - first < 48 * 3_600_000) {
+        await ctx.db.patch(s._id, {
+          status: "disqualified",
+          closedReason: "duplicate",
+          nextFollowUpAt: undefined,
+        });
+        removed++;
+      } else {
+        kept.set(key, at); // a later, legitimate re-booking becomes the new anchor
+      }
+    }
+    return { removed };
   },
 });
