@@ -131,6 +131,15 @@
       "total": "Total",
       "ariaLabel": "Pipeline value by stage"
     },
+    "leadsPipeline": {
+      "title": "Deals pipeline",
+      "description": "Qualified leads by sales stage",
+      "viewBoard": "Open board",
+      "empty": "No deals yet",
+      "emptyHint": "Leads land on the pipeline the moment they qualify.",
+      "winRate": "{rate}% win rate",
+      "inQualification": "{count} in qualification"
+    },
     "responseTimeChart": {
       "title": "Average First Response Time",
       "description": "Minutes to reply to a customer's first unreplied message, by weekday",
