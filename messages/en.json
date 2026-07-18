@@ -459,7 +459,21 @@
       "noMarks": "No marks yet — awaiting the first analysis.",
       "followUps": "{count, plural, =0 {No follow-ups sent} =1 {1 follow-up sent} other {# follow-ups sent}}",
       "nextFollowUp": "next {at}",
-      "qualifiedAt": "qualified {at}"
+      "qualifiedAt": "qualified {at}",
+      "assignmentTitle": "Assignment & activity",
+      "acceptedAgo": "accepted {ago}",
+      "unassigned": "Unassigned",
+      "offersMade": "{count, plural, =1 {1 offer sent to agents} other {# offers sent to agents}}",
+      "lastUpdate": "Latest update from the agent {ago}"
+    },
+    "copyPhone": "Copy phone",
+    "filters": {
+      "all": "All",
+      "closed": "Closed",
+      "service": "Service",
+      "allServices": "All services",
+      "searchPlaceholder": "Search name, phone, agent…",
+      "noMatches": "No leads match these filters."
     }
   },
   "Contacts": {
