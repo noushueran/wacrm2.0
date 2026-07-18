@@ -522,3 +522,34 @@ qualification toggle.
 Voice-note transcription; per-customer-language question sets; auto-created deals;
 editing/reopening terminal sessions; retroactive sessions for pre-launch conversations;
 LLM calls inside the cron (questions are pre-written at analysis time by design).
+
+---
+
+## 19. v3 addendum (2026-07-18, owner-directed changes after go-live prep)
+
+Three behavior changes supersede parts of §7–§9 above:
+
+1. **The assistant keeps the conversation after qualification.** Completion no longer
+   sets `aiAutoreplyDisabled`, auto-assigns, or charges — the bot answers until a human
+   actually takes over (assign / pause, the existing dispatch guards), at which point the
+   existing assignment paths charge as usual. Completion still: funnel+Meta signal,
+   closing message, `status: "pending"`, thread summary, notifications/push/admin alert.
+2. **Ask-admin relay replaces handoff-on-missing-info.** Auto-reply protocol gains
+   `[[ASK_ADMIN: question]]`: unknown facts → the customer hears "Let me check with my
+   team", the question goes to the admin numbers as a PLAIN WhatsApp message (owner-stated
+   assumption: the admin channel's 24h window never closes), the admin's next reply
+   answers the LATEST pending `adminInquiries` row and is relayed back by the assistant
+   (LLM-composed, cap-respecting); undelivered answers are injected as knowledge on the
+   customer's next turn. Handoff remains only for explicit human requests, upset
+   customers, and booking/payment/refund matters. No configured admin numbers → the
+   question falls back to the in-app human queue.
+3. **Multiple leads per contact.** Sessions are latest-per-conversation (the
+   `by_conversation` index is no longer 1:1). After a session ends, the analysis pass
+   decides `newInquiry` on each message — a new request (any service, even months later)
+   opens a fresh lead qualified per its own document; post-completion chit-chat never
+   reopens anything. Profile facts (`nationality`, `email`, `departure_city`,
+   `residence_status`) carry into the new session at medium confidence marked `carried`,
+   and the assistant reconfirms them casually instead of re-asking. Known limitation:
+   the Meta `qualified` conversion stays deduped per CONVERSATION
+   (`eventId = conversationId:qualified`), so second leads notify staff but do not
+   re-fire the Meta event.
