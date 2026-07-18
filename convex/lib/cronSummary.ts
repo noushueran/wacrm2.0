@@ -13,7 +13,9 @@
  *
  * The panel loads bounded slices — small defaults, "Show more" bumps
  * the limit — so opening Settings → Cron schedules never ships the
- * whole 7-day history over the wire.
+ * whole 7-day history over the wire. Those limits bound the *payload*;
+ * `SYSTEM_SCAN_WINDOW` below bounds the *scan*, which is a separate
+ * problem and the one that actually took the panel down.
  */
 
 export const CRON_REGISTRY = [
@@ -57,6 +59,16 @@ export interface CompletedTask {
   error: string | null;
 }
 
+/** What the single bounded read actually covered — see SYSTEM_SCAN_WINDOW. */
+export interface SystemTaskWindow {
+  /** Documents read from `_scheduled_functions` on this pass. */
+  scanned: number;
+  /** The window filled up: older jobs exist that were never examined. */
+  truncated: boolean;
+  /** `_creationTime` of the oldest job examined; null when nothing was read. */
+  oldestCreationTime: number | null;
+}
+
 export interface SystemTasksSummary {
   pending: PendingTask[];
   /** True pending total, capped at PENDING_SCAN_CAP (render "50+" on overflow). */
@@ -65,6 +77,11 @@ export interface SystemTasksSummary {
   completed: CompletedTask[];
   /** More completed rows exist beyond `completed` — offer "Show more". */
   completedOverflow: boolean;
+  /**
+   * Every count above describes the scanned window, not the whole table.
+   * When `truncated` the panel must say so rather than imply completeness.
+   */
+  window: SystemTaskWindow;
 }
 
 /** "aiReply.js:dispatchInbound" → "aiReply.dispatchInbound". */
@@ -82,6 +99,33 @@ export const COMPLETED_CAP = 100;
 export const PENDING_DEFAULT_LIMIT = 10;
 export const PENDING_SCAN_CAP = 50;
 
+/**
+ * How many `_scheduled_functions` documents one `listSystemTasks` pass
+ * may read. Both lists are split out of this single newest-first window.
+ *
+ * It CANNOT be replaced by a filtered query. `_scheduled_functions` is a
+ * system table, so it cannot carry a custom index, and Convex's
+ * `.filter()` does not reduce the documents a query scans — `.take(n)`
+ * stops after n *matches*, not n reads. So
+ * `.filter(state.kind === "pending").take(51)` walks the ENTIRE table
+ * whenever fewer than 51 rows match, which is the normal case: pending
+ * jobs are mostly sub-second, so production held 4,893 rows and zero
+ * pending ones. That scan tripped Convex's 4,096-document read limit and
+ * took the panel down on every load (2026-07-18). An unfiltered
+ * `.take(SYSTEM_SCAN_WINDOW)` reads exactly this many documents no
+ * matter how large the table grows.
+ *
+ * The price of that bound is coverage: roughly
+ * SYSTEM_SCAN_WINDOW ÷ (rows added per hour). At the ~26 rows/hour this
+ * deployment generates, 1024 rows ≈ 12 hours, so a job scheduled days
+ * out is invisible until it nears its run time. `window.truncated` makes
+ * the panel say that instead of implying the list is complete. Raising
+ * this buys coverage and costs reads on every re-run (the query is a
+ * live subscription over a table the schedulers write constantly) —
+ * keep it well clear of 4,096.
+ */
+export const SYSTEM_SCAN_WINDOW = 1024;
+
 /** Floor + clamp a client-supplied limit into [1, cap]; fall back on junk. */
 export function clampLimit(
   value: number | undefined,
@@ -93,16 +137,19 @@ export function clampLimit(
 }
 
 export function summarizeSystemTasks(input: {
-  /** Pending/inProgress rows, any order, at most PENDING_SCAN_CAP + 1. */
-  pendingRows: SystemJobRow[];
-  /** Completed rows newest-first, at most completedLimit + 1 (overflow probe). */
-  completedRows: SystemJobRow[];
+  /**
+   * One unfiltered window of `_scheduled_functions` rows — at most
+   * SYSTEM_SCAN_WINDOW documents, newest-first. Both lists are split out
+   * of this single read; see SYSTEM_SCAN_WINDOW for why the split cannot
+   * happen in the query.
+   */
+  rows: SystemJobRow[];
   pendingLimit: number;
   completedLimit: number;
 }): SystemTasksSummary {
-  // Re-filter defensively so the summary never depends on the query
-  // predicates staying in sync with this transform.
-  const pendingRows = input.pendingRows.filter(
+  // Bucket by state here rather than in the query. `canceled` rows match
+  // neither bucket and are simply dropped.
+  const pendingRows = input.rows.filter(
     (r) => r.state.kind === "pending" || r.state.kind === "inProgress",
   );
   const pending = pendingRows
@@ -115,7 +162,7 @@ export function summarizeSystemTasks(input: {
       inProgress: r.state.kind === "inProgress",
     }));
 
-  const completedRows = input.completedRows.filter(
+  const completedRows = input.rows.filter(
     (r) => r.state.kind === "success" || r.state.kind === "failed",
   );
   const completed = completedRows
@@ -131,11 +178,23 @@ export function summarizeSystemTasks(input: {
       error: r.state.kind === "failed" ? r.state.error : null,
     }));
 
+  // Order-agnostic on purpose: the transform never assumes the query
+  // handed rows over sorted, so a future caller cannot silently break it.
+  const oldestCreationTime = input.rows.reduce<number | null>(
+    (min, r) => (min === null || r._creationTime < min ? r._creationTime : min),
+    null,
+  );
+
   return {
     pending,
     pendingCount: Math.min(pendingRows.length, PENDING_SCAN_CAP),
     pendingOverflow: pendingRows.length > PENDING_SCAN_CAP,
     completed,
     completedOverflow: completedRows.length > input.completedLimit,
+    window: {
+      scanned: input.rows.length,
+      truncated: input.rows.length >= SYSTEM_SCAN_WINDOW,
+      oldestCreationTime,
+    },
   };
 }

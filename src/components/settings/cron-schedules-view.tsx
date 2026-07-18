@@ -75,6 +75,13 @@ export interface CompletedTaskEntry {
   error: string | null;
 }
 
+/** How far back the server's single bounded scan reached. */
+export interface SystemTaskWindowData {
+  scanned: number;
+  truncated: boolean;
+  oldestCreationTime: number | null;
+}
+
 export interface SystemTasksData {
   pending: PendingTaskEntry[];
   /** True pending total (scan-capped server-side; render "N+" on overflow). */
@@ -82,6 +89,12 @@ export interface SystemTasksData {
   pendingOverflow: boolean;
   completed: CompletedTaskEntry[];
   completedOverflow: boolean;
+  /**
+   * The one-off task counts describe this window, not the whole scheduler.
+   * When truncated the card says so — "nothing queued" would otherwise read
+   * as fact when it only means "nothing queued in the part we looked at".
+   */
+  window: SystemTaskWindowData;
 }
 
 /** Per-list expand state the panel owns; the view just renders it. */
@@ -409,6 +422,14 @@ export function CronSchedulesView({
 
           {upcomingTotal === 0 ? (
             <p className="text-sm text-muted-foreground">{t('upcoming.empty')}</p>
+          ) : null}
+
+          {tasks && tasks.window.truncated && tasks.window.oldestCreationTime !== null ? (
+            <p className="text-xs text-muted-foreground">
+              {t('upcoming.windowLimited', {
+                since: rel(tasks.window.oldestCreationTime, now, t),
+              })}
+            </p>
           ) : null}
 
           {!overview.qualificationEnabled ? (

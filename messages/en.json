@@ -1862,6 +1862,7 @@
         "queued": "Queued one-off tasks ({count})",
         "runningNow": "running now",
         "empty": "Nothing is scheduled right now.",
+        "windowLimited": "Checked one-off tasks queued as far back as {since}; anything scheduled further ahead appears here closer to its run time.",
         "qualificationOff": "Lead qualification is disabled, so no customer follow-ups get scheduled."
       },
       "recent": {
