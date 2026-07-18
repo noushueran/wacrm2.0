@@ -1,11 +1,12 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { ConvexError } from "convex/values";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
+import { LOG_CASCADE_BATCH } from "./automations";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches
@@ -795,6 +796,142 @@ test("remove deletes the automation and cascades its steps and logs", async () =
   expect(steps).toHaveLength(0);
   const logs = await t.run((ctx) => ctx.db.query("automationLogs").collect());
   expect(logs).toHaveLength(0);
+});
+
+/**
+ * Inserts `count` log rows in ONE `t.run`. The per-row `seedLog` above would
+ * be a separate transaction each, which is far too slow for the
+ * cascade-overflow fixtures below (hundreds of rows apiece).
+ */
+async function seedManyLogs(
+  t: ReturnType<typeof convexTest>,
+  opts: {
+    accountId: Id<"accounts">;
+    automationId: Id<"automations">;
+    count: number;
+  },
+) {
+  await t.run(async (ctx) => {
+    for (let i = 0; i < opts.count; i++) {
+      await ctx.db.insert("automationLogs", {
+        accountId: opts.accountId,
+        automationId: opts.automationId,
+        triggerEvent: "new_message_received",
+        stepsExecuted: [],
+        status: "success",
+      });
+    }
+  });
+}
+
+const OVERFLOW = LOG_CASCADE_BATCH + 10;
+
+async function seedAutomationWithLogOverflow(t: ReturnType<typeof convexTest>) {
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "x",
+    triggerType: "new_message_received",
+    steps: nestedSteps,
+  });
+  await seedManyLogs(t, { accountId, automationId, count: OVERFLOW });
+  return { asUser, accountId, automationId };
+}
+
+const countLogs = (t: ReturnType<typeof convexTest>) =>
+  t.run(async (ctx) => (await ctx.db.query("automationLogs").collect()).length);
+
+/**
+ * The write-limit fix. `remove` used to `.collect()` every log the automation
+ * had ever written and delete them all in ONE transaction, so an automation
+ * with more logs than Convex's per-transaction budget could not be deleted at
+ * all — the mutation threw every time, permanently. It now deletes one bounded
+ * batch and hands the remainder to a scheduled purge.
+ *
+ * convex-test does not enforce Convex's real transaction limits, so this
+ * asserts the mechanism rather than the throw: exactly the overflow is left
+ * behind, which is only true if the delete was bounded.
+ */
+test("remove deletes one bounded batch of logs and defers the overflow", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, automationId } = await seedAutomationWithLogOverflow(t);
+
+  await asUser.mutation(api.automations.remove, { automationId });
+
+  expect(await countLogs(t)).toBe(OVERFLOW - LOG_CASCADE_BATCH);
+});
+
+test("the scheduled purge drains the log overflow remove left behind", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const { asUser, automationId } = await seedAutomationWithLogOverflow(t);
+
+    await asUser.mutation(api.automations.remove, { automationId });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    expect(await countLogs(t)).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+/**
+ * The overflow fixture above needs only ONE purge run, so it would still pass
+ * if the purge deleted its batch and never re-scheduled itself. This seeds
+ * enough for three passes (remove + two continuations), which fails outright
+ * unless the purge chains. That self-reschedule is the part most likely to be
+ * wrong, and the part whose absence would silently strand rows forever.
+ */
+test("the purge chains across as many batches as the backlog needs", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+      role: "agent",
+    });
+    const automationId = await asUser.mutation(api.automations.create, {
+      name: "x",
+      triggerType: "new_message_received",
+      steps: nestedSteps,
+    });
+    await seedManyLogs(t, {
+      accountId,
+      automationId,
+      count: LOG_CASCADE_BATCH * 2 + 10,
+    });
+
+    await asUser.mutation(api.automations.remove, { automationId });
+    expect(await countLogs(t)).toBe(LOG_CASCADE_BATCH + 10);
+
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    expect(await countLogs(t)).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+/**
+ * The user-visible half of the delete stays synchronous — only the log
+ * cleanup is deferred. An automation that vanished from the list but came
+ * back on refresh because its logs were still draining would be a worse bug
+ * than the one being fixed.
+ */
+test("remove takes the automation and its steps immediately despite a log backlog", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, automationId } = await seedAutomationWithLogOverflow(t);
+
+  await asUser.mutation(api.automations.remove, { automationId });
+
+  expect(await t.run((ctx) => ctx.db.get(automationId))).toBeNull();
+  const steps = await t.run((ctx) => ctx.db.query("automationSteps").collect());
+  expect(steps).toHaveLength(0);
 });
 
 test("remove throws NOT_FOUND (not a silent no-op) for another account's automation, and leaves it in place", async () => {

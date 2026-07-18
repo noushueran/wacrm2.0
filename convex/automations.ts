@@ -1,7 +1,9 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
+import { internalMutation } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
+import { internal } from "./_generated/api";
 import {
   buildStepsTree,
   seedsToTree,
@@ -492,6 +494,57 @@ export const setActive = accountMutation({
   },
 });
 
+/**
+ * How many `automationLogs` rows one transaction may delete. Convex bounds
+ * both the documents a transaction reads and what it writes, and this cascade
+ * does both to every row — so an automation with a large enough log history
+ * could not be deleted AT ALL: the mutation threw on every attempt, with no
+ * way for a user to get past it.
+ *
+ * Deliberately conservative. `stepsExecuted` is `v.any()`, so a log row has no
+ * bounded size and a batch's byte cost cannot be predicted from its row count.
+ * Raising this trades scheduler rows (one continuation per batch) against
+ * per-transaction risk; 512 keeps a full batch far below the read budget while
+ * leaving room for rows with large step payloads.
+ */
+export const LOG_CASCADE_BATCH = 512;
+
+/**
+ * Deletes one batch of a removed automation's logs and re-schedules itself
+ * while a full batch keeps coming back. Internal-only: it takes `accountId`
+ * explicitly (an internalMutation has no user session) and ranges on the same
+ * `by_account_automation` index `remove` does, so it can never reach beyond
+ * the account whose automation was deleted.
+ *
+ * Terminates when a short batch comes back, which is also why the delete must
+ * be `.take(LOG_CASCADE_BATCH)` and not a filtered read: a `.filter()` that
+ * matched nothing would return short while rows remained, and the purge would
+ * stop early leaving orphans behind forever.
+ */
+export const purgeAutomationLogs = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    automationId: v.id("automations"),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const logs = await ctx.db
+      .query("automationLogs")
+      .withIndex("by_account_automation", (q) =>
+        q.eq("accountId", args.accountId).eq("automationId", args.automationId),
+      )
+      .take(LOG_CASCADE_BATCH);
+    for (const log of logs) {
+      await ctx.db.delete(log._id);
+    }
+    if (logs.length === LOG_CASCADE_BATCH) {
+      await ctx.scheduler.runAfter(0, internal.automations.purgeAutomationLogs, {
+        accountId: args.accountId,
+        automationId: args.automationId,
+      });
+    }
+  },
+});
+
 export const remove = accountMutation({
   args: { automationId: v.id("automations") },
   handler: async (ctx, args) => {
@@ -515,20 +568,33 @@ export const remove = accountMutation({
     }
 
     // Ranged on `by_account_automation` rather than filtering an account-wide
-    // scan: `.filter()` applies after the index scan, so the old form read
-    // every log row in the account to find this automation's. Still unbounded
-    // in the number of logs THIS automation produced — an automation with more
-    // rows than Convex's per-transaction write limit cannot be deleted at all.
-    // Draining that in scheduled batches is a separate change; the read bound
-    // is what this one fixes.
+    // scan, and capped at one batch rather than collecting the lot: this
+    // cascade both reads and writes every row it touches, so an automation
+    // with a large enough log history used to be undeletable outright — the
+    // mutation blew the per-transaction budget on every attempt. Whatever is
+    // left over drains through `purgeAutomationLogs`.
+    //
+    // Only the LOG cleanup is deferred. The automation and its steps go in
+    // this transaction, so the delete is immediate as far as the user is
+    // concerned; the trade-off is a window where log rows outlive the
+    // automation they point at. Nothing breaks on that — `dashboard.activity`
+    // is the only reader that resolves `log.automationId` and it already
+    // falls back to "Automation" for a missing row, and the logs page gates
+    // on `automations.get`, which is already gone by then.
     const logs = await ctx.db
       .query("automationLogs")
       .withIndex("by_account_automation", (q) =>
         q.eq("accountId", ctx.accountId).eq("automationId", args.automationId),
       )
-      .collect();
+      .take(LOG_CASCADE_BATCH);
     for (const log of logs) {
       await ctx.db.delete(log._id);
+    }
+    if (logs.length === LOG_CASCADE_BATCH) {
+      await ctx.scheduler.runAfter(0, internal.automations.purgeAutomationLogs, {
+        accountId: ctx.accountId,
+        automationId: args.automationId,
+      });
     }
 
     await ctx.db.delete(args.automationId);
