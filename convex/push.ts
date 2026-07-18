@@ -2,7 +2,11 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { internalQuery, internalMutation } from "./_generated/server";
 import { v } from "convex/values";
 import { recipientsForInbound } from "./lib/pushRecipients";
-import { buildInboundPayload, type PushPayload } from "./lib/pushPayload";
+import {
+  buildInboundPayload,
+  buildQualifiedLeadPayload,
+  type PushPayload,
+} from "./lib/pushPayload";
 import type { AccountRole } from "./lib/roles";
 
 // ---- Client-facing: one device's subscription ------------------------
@@ -198,6 +202,70 @@ export const assembleDelivery = internalQuery({
         contactName,
         contentType: args.contentType,
         text: args.text,
+        conversationId: args.conversationId,
+        hidePreview: prefs?.hidePreview ?? false,
+      });
+
+      const subs = await ctx.db
+        .query("pushSubscriptions")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .collect();
+      for (const s of subs) {
+        if (s.accountId !== args.accountId) continue; // tenant isolation
+        jobs.push({ endpoint: s.endpoint, p256dh: s.p256dh, auth: s.auth, payload });
+      }
+    }
+    return { jobs };
+  },
+});
+
+/**
+ * Assembles the qualified-lead push jobs (qualification P2). Recipient
+ * rule and per-user preference handling are identical to
+ * `assembleDelivery` above (assignee else supervisor+; `pushEnabled`
+ * false skips; `hidePreview` collapses the body).
+ */
+export const assembleQualifiedLeadDelivery = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+  },
+  handler: async (ctx, args) => {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) {
+      return { jobs: [] as { endpoint: string; p256dh: string; auth: string; payload: PushPayload }[] };
+    }
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .unique();
+    if (!session || session.status !== "qualified") return { jobs: [] };
+    const contact = await ctx.db.get(conversation.contactId);
+
+    const members = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    const recipients = recipientsForInbound({
+      assignedToUserId: conversation.assignedToUserId ?? null,
+      members: members.map((m) => ({ userId: m.userId, role: m.role as AccountRole })),
+    });
+    if (recipients.length === 0) return { jobs: [] };
+
+    const jobs: { endpoint: string; p256dh: string; auth: string; payload: PushPayload }[] = [];
+    for (const userId of recipients) {
+      const prefs = await ctx.db
+        .query("notificationPreferences")
+        .withIndex("by_user_account", (q) =>
+          q.eq("userId", userId).eq("accountId", args.accountId),
+        )
+        .first();
+      if (prefs?.pushEnabled === false) continue;
+
+      const payload = buildQualifiedLeadPayload({
+        contactName: contact?.name ?? contact?.phone,
+        serviceName: session.serviceName,
+        score: session.score ?? null,
         conversationId: args.conversationId,
         hidePreview: prefs?.hidePreview ?? false,
       });

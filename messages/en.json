@@ -17,6 +17,7 @@
   "Sidebar": {
     "title": "Holidayys WA CRM",
     "dashboard": "Dashboard",
+    "leads": "Leads",
     "inbox": "Inbox",
     "notifications": "Notifications",
     "contacts": "Contacts",
@@ -53,6 +54,7 @@
     "dashboard": "Dashboard",
     "inbox": "Inbox",
     "notifications": "Notifications",
+    "leads": "Leads",
     "contacts": "Contacts",
     "pipelines": "Pipelines",
     "broadcasts": "Broadcasts",
@@ -229,6 +231,10 @@
       "today": "Today",
       "yesterday": "Yesterday",
       "adLeadBadge": "Ad lead"
+    },
+    "qualification": {
+      "qualifiedBadge": "Qualified",
+      "progressTitle": "Lead qualification — next: {hint}"
     },
     "sessionTimer": {
       "expired": "Expired",
@@ -410,6 +416,50 @@
       "saved": "Saved",
       "failed": "Couldn’t save",
       "selectPlaceholder": "—"
+    }
+  },
+  "Leads": {
+    "pageTitle": "Leads",
+    "pageDesc": "Every qualification session the AI is running — qualified leads first, highest score on top.",
+    "loading": "Loading leads…",
+    "empty": "No qualification sessions yet. They appear as soon as lead qualification is enabled and customers write in.",
+    "openChat": "Open chat",
+    "assignedTo": "→ {name}",
+    "summary": {
+      "qualified": "Qualified",
+      "collecting": "In progress",
+      "expired": "Expired",
+      "optedOut": "Opted out",
+      "rate": "Qualification rate",
+      "avgScore": "Avg score"
+    },
+    "status": {
+      "qualified": "Qualified",
+      "collecting": "In progress",
+      "expired": "Expired",
+      "opted_out": "Opted out",
+      "disqualified": "Disqualified"
+    },
+    "source": {
+      "ad": "Ad",
+      "website": "Website",
+      "organic": "Organic"
+    },
+    "closedReason": {
+      "no_response": "No response within the window",
+      "conversation_closed": "Conversation closed",
+      "opted_out": "Asked to stop",
+      "disqualified": "Not a sales inquiry"
+    },
+    "detail": {
+      "answers": "Collected answers",
+      "noAnswers": "Nothing collected yet.",
+      "unsure": "unsure",
+      "marks": "Score breakdown",
+      "noMarks": "No marks yet — awaiting the first analysis.",
+      "followUps": "{count, plural, =0 {No follow-ups sent} =1 {1 follow-up sent} other {# follow-ups sent}}",
+      "nextFollowUp": "next {at}",
+      "qualifiedAt": "qualified {at}"
     }
   },
   "Contacts": {
@@ -1710,11 +1760,23 @@
       "deals": "Deals & currency",
       "members": "Team members",
       "api": "API keys",
-      "conversions": "Conversions"
+      "conversions": "Conversions",
+      "qualification": "Lead qualification"
     },
     "groups": {
       "account": "Account",
       "workspace": "Workspace"
+    },
+    "qualification": {
+      "title": "Lead qualification",
+      "description": "AI-driven qualification on every chat: questions from your service documents, automatic follow-ups, lead scoring, and a Meta signal when a lead qualifies.",
+      "enableLabel": "Enable lead qualification",
+      "enableDesc": "Dormant until enabled. Turning this on starts tracking qualification sessions for new conversations.",
+      "defaultsTitle": "Active configuration",
+      "hours": "Follow-up hours: {start}–{end} {tz} · {days}",
+      "cadence": "Up to {count} follow-ups within {window}h · qualify at score ≥ {threshold}",
+      "fallbackFields": "Fallback questions (used when no service document matches):",
+      "comingSoon": "Question editing, follow-up cadence, admin WhatsApp alerts and the Leads workspace arrive with the next phases — this switch only enables session tracking for now."
     },
     "profile": {
       "title": "Your profile",
@@ -1926,7 +1988,8 @@
   },
   "Agents": {
     "usage": {
-      "classifyLabel": "Tagging"
+      "classifyLabel": "Tagging",
+      "qualifyLabel": "Qualification"
     }
   }
 }

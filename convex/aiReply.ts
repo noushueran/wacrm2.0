@@ -378,10 +378,20 @@ export const dispatchInbound = internalAction({
         });
       }
 
+      // Lead-qualification steering (spec §7): tell the assistant which
+      // answers exist (never re-ask) and the ONE question to weave in.
+      // Null when the feature is dormant / session terminal — prompt is
+      // then byte-identical to pre-qualification behaviour.
+      const qualification = await ctx.runQuery(
+        internal.qualificationEngine.getObjectives,
+        { accountId: args.accountId, conversationId: args.conversationId },
+      );
+
       const systemPrompt = buildSystemPrompt({
         userPrompt: config.systemPrompt ?? null,
         mode: "auto_reply",
         knowledge,
+        qualification: qualification ?? undefined,
       });
 
       const generation: GenerateResult = isDryRun()

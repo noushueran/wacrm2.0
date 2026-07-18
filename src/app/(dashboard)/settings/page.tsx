@@ -20,6 +20,7 @@ import { DealsSettings } from '@/components/settings/deals-settings';
 import { MembersTab } from '@/components/settings/members-tab';
 import { ApiKeysSettings } from '@/components/settings/api-keys-settings';
 import { ConversionsTab } from '@/components/settings/conversions-tab';
+import { QualificationSettings } from '@/components/settings/qualification-settings';
 import {
   resolveSection,
   type SettingsSection,
@@ -82,6 +83,7 @@ export default function SettingsPage() {
     members: <MembersTab />,
     api: <ApiKeysSettings />,
     conversions: <ConversionsTab />,
+    qualification: <QualificationSettings />,
   };
 
   return (

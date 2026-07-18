@@ -679,7 +679,10 @@ export default defineSchema({
   notifications: defineTable({
     accountId: v.id("accounts"),
     userId: v.id("users"),
-    type: v.union(v.literal("conversation_assigned")),
+    type: v.union(
+      v.literal("conversation_assigned"),
+      v.literal("lead_qualified"),
+    ),
     conversationId: v.optional(v.id("conversations")),
     contactId: v.optional(v.id("contacts")),
     // Who triggered it; NULL means an automation/system action.
@@ -1101,7 +1104,12 @@ export default defineSchema({
   aiUsageLog: defineTable({
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(v.literal("auto_reply"), v.literal("draft"), v.literal("classify")),
+    mode: v.union(
+      v.literal("auto_reply"),
+      v.literal("draft"),
+      v.literal("classify"),
+      v.literal("qualify"),
+    ),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
     promptTokens: v.number(),
@@ -1384,4 +1392,110 @@ export default defineSchema({
     .index("by_account_ad", ["accountId", "adId"])
     .index("by_account", ["accountId"])
     .index("by_status", ["resolveStatus"]),
+
+  // ============================================================
+  // Lead qualification (spec: docs/superpowers/specs/
+  // 2026-07-18-lead-qualification-followup-design.md §5). Per-account
+  // config, one row (mirrors `aiConfigs` — `by_account` doubles as the
+  // enforcing unique index). DORMANT until `enabled`: every engine hook
+  // gates on it, so deploying this schema changes nothing user-visible.
+  // Working hours are ACCOUNT-LOCAL minutes-of-day against a FIXED UTC
+  // offset (Gulf/India have no DST; pure arithmetic, unit-testable) —
+  // `timezoneLabel` is display-only. `basicFields` is the fallback
+  // question set for off-topic inquiries; per-service questions live in
+  // the AI knowledge-base docs (QUALIFICATION CHECKLIST sections), not
+  // here. `adminAlertPhones` also drives the engine's loop guard (no
+  // sessions/AI on the alert channel itself).
+  // ============================================================
+  qualificationConfigs: defineTable({
+    accountId: v.id("accounts"),
+    enabled: v.boolean(),
+    basicFields: v.array(v.object({
+      key: v.string(),
+      label: v.string(),
+      required: v.boolean(),
+      phrasings: v.array(v.string()),
+    })),
+    qualifyThresholdScore: v.number(),
+    timezoneLabel: v.string(),
+    utcOffsetMinutes: v.number(),
+    workStartMinute: v.number(),
+    workEndMinute: v.number(),
+    workDays: v.array(v.number()),
+    followUpDelaysMinutes: v.array(v.number()),
+    maxFollowUps: v.number(),
+    sessionWindowHours: v.number(),
+    reengagementTemplateName: v.optional(v.string()),
+    reengagementTemplateLanguage: v.optional(v.string()),
+    closingMessage: v.string(),
+    adminAlertEnabled: v.boolean(),
+    adminAlertPhones: v.array(v.string()),
+    adminAlertTemplateName: v.optional(v.string()),
+    adminAlertTemplateLanguage: v.optional(v.string()),
+    outboundNudgesEnabled: v.boolean(),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One qualification session per conversation — this row IS the lead
+  // the sales team works from (spec §5; no separate leads table).
+  // `by_conversation` doubles as the 1:1 enforcing index (ensureSession
+  // is the only insert path). Keys in `fields` are DYNAMIC — whatever
+  // the matched service doc's checklist asks — so `key` is a plain
+  // string, not a union. `score`/`scoreBreakdown` are the analysis
+  // engine's marks (P1); `pendingQuestion` is the LLM-prewritten next
+  // ask the follow-up cron rotates through WITHOUT its own LLM call
+  // (P3); `by_due` partitions the cron sweep (status = "collecting",
+  // nextFollowUpAt <= now), mirroring conversionEvents.by_status.
+  qualificationSessions: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    status: v.union(
+      v.literal("collecting"),
+      v.literal("qualified"),
+      v.literal("expired"),
+      v.literal("opted_out"),
+      v.literal("disqualified"),
+    ),
+    origin: v.union(v.literal("inbound"), v.literal("outbound")),
+    serviceName: v.optional(v.string()),
+    fields: v.array(v.object({
+      key: v.string(),
+      label: v.optional(v.string()),
+      value: v.string(),
+      confidence: v.union(v.literal("high"), v.literal("medium"), v.literal("low")),
+      updatedAt: v.number(),
+    })),
+    score: v.optional(v.number()),
+    scoreBreakdown: v.optional(v.array(v.object({
+      criterion: v.string(),
+      marks: v.number(),
+      maxMarks: v.number(),
+      reason: v.optional(v.string()),
+    }))),
+    expectedCount: v.number(),
+    answeredCount: v.number(),
+    // Readiness marker (P1): stamped when the doc checklist is satisfied
+    // AND score >= threshold AND >= 3 answers. P2's completion pipeline
+    // consumes it; status flips to "qualified" only there, so a P1-only
+    // build never half-completes a lead.
+    checklistSatisfiedAt: v.optional(v.number()),
+    pendingQuestion: v.optional(v.object({
+      key: v.string(),
+      text: v.string(),
+      alternates: v.array(v.string()),
+    })),
+    lastCustomerMessageAt: v.optional(v.number()),
+    humanTouchedAt: v.optional(v.number()),
+    followUpsSent: v.number(),
+    phrasingCursor: v.number(),
+    nextFollowUpAt: v.optional(v.number()),
+    sendAttemptErrors: v.number(),
+    qualifiedAt: v.optional(v.number()),
+    closedReason: v.optional(v.string()),
+    summary: v.optional(v.string()),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_due", ["status", "nextFollowUpAt"]),
 });

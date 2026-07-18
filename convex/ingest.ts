@@ -616,6 +616,21 @@ export const processInbound = internalAction({
       });
     }
 
+    // ---- Qualification session tracking (P0 — spec §6). Every
+    // non-duplicate inbound counts as customer activity: upsert the
+    // session and bump the 24h/72h clocks BEFORE the reply engines run,
+    // so nothing downstream (flow-consumed or not) can lose the signal.
+    // Dormant-safe: no enabled config → the mutation no-ops. P1 adds
+    // the analysis step separately (after flows, before the AI reply).
+    await runBestEffort("qualificationEngine.onInbound", () =>
+      ctx.runMutation(internal.qualificationEngine.onInbound, {
+        accountId,
+        conversationId: res.conversationId,
+        contactId: res.contactId,
+        phoneNormalized: normalizePhone(from),
+      }),
+    );
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.
@@ -633,6 +648,26 @@ export const processInbound = internalAction({
       flowConsumed = flowResult.consumed;
     });
 
+    const inboundText = message.text ?? "";
+
+    // ---- Qualification ANALYSIS (P1 — spec §7). After Flows (so a
+    // scripted reply is never delayed by an LLM call), BEFORE the AI
+    // reply below (so the assistant's prompt sees freshly-extracted
+    // state). Awaited + best-effort; runs even when a flow consumed the
+    // message or a human owns the thread — extraction is passive
+    // tracking, not replying. Text-only: media/interactive taps carry
+    // nothing to extract (their activity bump already happened in
+    // `qualificationEngine.onInbound` above).
+    if (inboundText.trim() && !message.interactiveReplyId) {
+      await runBestEffort("qualificationEngine.analyzeInbound", () =>
+        ctx.runAction(internal.qualificationEngine.analyzeInbound, {
+          accountId,
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+        }),
+      );
+    }
+
     // ---- Automations (route.ts:756-797). Every trigger in the set
     // dispatches independently and best-effort — one failing (or
     // matching zero automations) must never affect the others.
@@ -642,7 +677,6 @@ export const processInbound = internalAction({
       isFirstInboundMessage: res.isFirstInboundMessage,
       interactiveReplyId: message.interactiveReplyId,
     });
-    const inboundText = message.text ?? "";
     await Promise.all(
       automationTriggers.map((triggerType) =>
         runBestEffort(`automationsEngine.runForTrigger(${triggerType})`, () =>

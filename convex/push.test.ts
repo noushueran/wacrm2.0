@@ -755,3 +755,56 @@ test("setAccountPushPolicy: a non-admin (agent) is rejected with FORBIDDEN", asy
     }),
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
+
+// ============================================================
+// assembleQualifiedLeadDelivery — qualification P2. Same recipient/
+// preference rules as assembleDelivery; payload from the session.
+// ============================================================
+
+test("assembleQualifiedLeadDelivery: builds jobs for supervisor+ with score in the body, nothing without a qualified session", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  await asUser.mutation(api.push.subscribe, {
+    endpoint: "eOwner", p256dh: "kOwner", auth: "aOwner",
+  });
+  const { contactId, conversationId } = await seedConversation(t, {
+    accountId, contactName: "Ravi Kumar",
+  });
+
+  // no session → no jobs
+  let result = await t.query(internal.push.assembleQualifiedLeadDelivery, {
+    accountId, conversationId,
+  });
+  expect(result.jobs).toHaveLength(0);
+
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId,
+      status: "qualified", origin: "inbound",
+      fields: [], expectedCount: 4, answeredCount: 4,
+      score: 82, serviceName: "UAE visa", qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }),
+  );
+  result = await t.query(internal.push.assembleQualifiedLeadDelivery, {
+    accountId, conversationId,
+  });
+  expect(result.jobs).toHaveLength(1);
+  expect(result.jobs[0].payload.title).toContain("qualified lead");
+  expect(result.jobs[0].payload.body).toContain("Ravi Kumar");
+  expect(result.jobs[0].payload.body).toContain("82");
+  expect(result.jobs[0].payload.tag).toBe(`qualified-${conversationId}`);
+
+  // hidePreview collapses the body
+  await asUser.mutation(api.push.setPreferences, {
+    pushEnabled: true, hidePreview: true,
+  });
+  result = await t.query(internal.push.assembleQualifiedLeadDelivery, {
+    accountId, conversationId,
+  });
+  expect(result.jobs[0].payload.body).toBe("New qualified lead");
+  expect(result.jobs[0].payload.body).not.toContain("Ravi");
+  void userId;
+});
