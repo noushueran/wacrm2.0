@@ -1524,3 +1524,117 @@ test("staffCheckinsDue keys a staff member's last inbound off their newest CUSTO
     vi.useRealTimers();
   }
 });
+
+// ============================================================
+// staffLoopsDue — newest-first take so fresh acceptances aren't starved
+// ============================================================
+
+test("staffLoopsDue reaches a freshly accepted offer instead of starving it behind 200 older ones", async () => {
+  // `accepted` is terminal and only accumulates. An UNORDERED `.take(200)`
+  // returns the OLDEST 200 by `offeredAt`, so once >200 exist the newest
+  // acceptance — the one whose feedback loop actually needs nudging — never
+  // enters the sweep. Newest-first keeps it reachable. Every offer here is
+  // firing-eligible, so on the pre-fix ordering the newest is simply absent.
+  const t = convexTest(schema, modules);
+  const now = Date.parse("2026-07-08T10:00:00.000Z");
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(now);
+    const ctxIds = await t.run(async (ctx) => {
+      const agentUserId = await ctx.db.insert("users", {
+        name: "Agent",
+        email: "agent@example.com",
+      });
+      const accountId = await ctx.db.insert("accounts", {
+        name: "A",
+        defaultCurrency: "AED",
+        ownerUserId: agentUserId,
+      });
+      await ctx.db.insert("memberships", {
+        userId: agentUserId,
+        accountId,
+        role: "admin",
+        fullName: "Agent",
+        email: "agent@example.com",
+      });
+      await ctx.db.insert("qualificationConfigs", {
+        accountId,
+        ...holidayysDefaultConfig(),
+        enabled: true,
+        adminAlertPhones: [],
+        // 24/7 so the working-hours guard never skips this fixture.
+        workDays: [0, 1, 2, 3, 4, 5, 6],
+        workStartMinute: 0,
+        workEndMinute: 1440,
+      });
+      const contactId = await ctx.db.insert("contacts", {
+        accountId,
+        phone: "+971500000001",
+        phoneNormalized: "971500000001",
+        name: "Cara",
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        accountId,
+        contactId,
+        status: "open",
+        unreadCount: 0,
+        assignedToUserId: agentUserId,
+      });
+      const sessionId = await ctx.db.insert("qualificationSessions", {
+        accountId,
+        conversationId,
+        contactId,
+        status: "qualified",
+        origin: "inbound",
+        serviceName: "UAE visa",
+        fields: [],
+        expectedCount: 4,
+        answeredCount: 4,
+        qualifiedAt: 1,
+        followUpsSent: 0,
+        phrasingCursor: 0,
+        sendAttemptErrors: 0,
+      });
+      return { accountId, agentUserId, conversationId, contactId, sessionId };
+    });
+
+    // respondedAt older than REMINDER_FIRST_MS (4h) and no prior reminder/
+    // feedback → every offer is due for its first reminder.
+    const respondedAt = now - 5 * 3_600_000;
+    const targetOfferId = await t.run(async (ctx) => {
+      for (let i = 0; i < 200; i++) {
+        await ctx.db.insert("leadOffers", {
+          accountId: ctxIds.accountId,
+          sessionId: ctxIds.sessionId,
+          conversationId: ctxIds.conversationId,
+          contactId: ctxIds.contactId,
+          agentUserId: ctxIds.agentUserId,
+          agentPhone: "+971551110001",
+          status: "accepted",
+          offeredAt: now - 10 * 3_600_000 + i, // all older than the target
+          respondedAt,
+        });
+      }
+      // Newest acceptance — the 201st, so an oldest-200 take never sees it.
+      return await ctx.db.insert("leadOffers", {
+        accountId: ctxIds.accountId,
+        sessionId: ctxIds.sessionId,
+        conversationId: ctxIds.conversationId,
+        contactId: ctxIds.contactId,
+        agentUserId: ctxIds.agentUserId,
+        agentPhone: "+971551110001",
+        status: "accepted",
+        offeredAt: now,
+        respondedAt,
+      });
+    });
+
+    const reminders = await t.query(
+      internal.qualificationEngine.staffLoopsDue,
+      {},
+    );
+    expect(reminders.some((r) => r.offerId === targetOfferId)).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});

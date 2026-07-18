@@ -2153,9 +2153,17 @@ export const staffLoopsDue = internalQuery({
       customerName: string;
       escalate: boolean;
     }[] = [];
+    // `.order("desc")` is load-bearing: `by_status_offered` is
+    // `["status","offeredAt"]`, so an UNORDERED `.take(200)` returns the
+    // OLDEST 200 accepted offers. `accepted` is terminal and only
+    // accumulates, so past 200 a freshly-accepted offer — the one whose
+    // feedback loop actually needs nudging — would never enter this sweep.
+    // Newest-first keeps new acceptances reachable (the tail beyond 200 has,
+    // in practice, already been reminded/escalated).
     const accepted = await ctx.db
       .query("leadOffers")
       .withIndex("by_status_offered", (q) => q.eq("status", "accepted"))
+      .order("desc")
       .take(200);
     for (const offer of accepted) {
       const config = await ctx.db
