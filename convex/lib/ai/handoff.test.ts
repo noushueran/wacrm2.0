@@ -63,31 +63,4 @@ describe("buildHandoffSummary", () => {
     });
     expect(summary).toBe("🤖 AI agent handed off without replying.");
   });
-
-  it('describes the reply-limit stop when reason is "cap"', () => {
-    const summary = buildHandoffSummary({
-      messages: [
-        { role: "user", content: "when are you open?" },
-        { role: "assistant", content: "10am to 9pm!" },
-        { role: "user", content: "and my email is sam@example.com" },
-      ],
-      replyCount: 8,
-      reason: "cap",
-    });
-    expect(summary).toBe(
-      "🤖 AI agent reached its reply limit after 8 replies — a human needs to continue. " +
-        "Last customer message: “and my email is sam@example.com”",
-    );
-  });
-
-  it("cap reason still quotes nothing when there is no customer message", () => {
-    const summary = buildHandoffSummary({
-      messages: [{ role: "assistant", content: "greeting" }],
-      replyCount: 3,
-      reason: "cap",
-    });
-    expect(summary).toBe(
-      "🤖 AI agent reached its reply limit after 3 replies — a human needs to continue.",
-    );
-  });
 });

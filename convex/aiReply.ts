@@ -269,29 +269,24 @@ export const hasKnowledgeChunks = internalQuery({
 // ------------------------------------------------------------
 
 /**
- * Atomically claims one reply slot: read-then-patch in a single Convex
- * mutation, so two concurrent inbounds for the same conversation can
- * never both squeeze past the cap (Convex's OCC serializes them — see
- * this file's own header comment). Returns `false` — no patch applied —
- * when the account/conversation mismatch OR the cap is already reached;
- * `dispatchInbound` skips the send in either case.
+ * Bumps the conversation's bot-reply tally after a successful send.
+ * PURELY a metric (usage tiles, future analytics) — there is NO reply
+ * cap: the bot answers every message until a human takes the chat from
+ * the dashboard (owner decision 2026-07-18; the old `claimReplySlot`
+ * cap-gate lived here before that).
  */
-export const claimReplySlot = internalMutation({
+export const bumpReplyCount = internalMutation({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
-    maxReplies: v.number(),
   },
-  handler: async (ctx, args): Promise<boolean> => {
+  handler: async (ctx, args): Promise<void> => {
     const conversation = await ctx.db.get(args.conversationId);
-    if (!conversation || conversation.accountId !== args.accountId) return false;
-    const current = conversation.aiReplyCount ?? 0;
-    if (current >= args.maxReplies) return false;
+    if (!conversation || conversation.accountId !== args.accountId) return;
     await ctx.db.patch(args.conversationId, {
-      aiReplyCount: current + 1,
+      aiReplyCount: (conversation.aiReplyCount ?? 0) + 1,
       updatedAt: Date.now(),
     });
-    return true;
   },
 });
 
@@ -379,13 +374,12 @@ export const markMessageAiGenerated = internalMutation({
  * Eligibility gates (any → silent no-op, no send):
  *   - AI off (`isActive` false) / auto-reply disabled for the account
  *   - `conversationId`/`contactId` don't resolve to THIS account
- *   - a human (or a prior handoff) already owns the thread (`assignedToUserId`)
- *   - auto-reply was disabled on this conversation (prior handoff)
- *   - there's no text history to ground a reply in
+ *   - a human already took the thread from the dashboard (`assignedToUserId`)
+ *   - auto-reply was paused on this conversation
+ *   - there's no history to ground a reply in
  *
- * The per-conversation reply cap is NOT a silent gate: a capped thread
- * with a customer still writing into it hands off to a human instead
- * (see the cap branch below) — silence would strand the customer.
+ * There is deliberately NO reply cap: the bot answers every message
+ * until a human takes over manually (owner decision 2026-07-18).
  */
 export const dispatchInbound = internalAction({
   args: {
@@ -442,30 +436,11 @@ export const dispatchInbound = internalAction({
         if (latestInbound && latestInbound !== args.triggerMessageId) return;
       }
 
-      const replyCountSoFar = conversation.aiReplyCount ?? 0;
-      // Reply budget spent: the customer is still writing, so going
-      // silent would strand them — hand the thread to a human instead
-      // (markHandoff sets `aiAutoreplyDisabled`, so this fires once).
-      // `claimReplySlot` below stays the authoritative, race-proof check
-      // at the point a reply is actually sent.
-      if (replyCountSoFar >= config.autoReplyMaxPerConversation) {
-        const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          limit: aiContextMessageLimit(),
-        });
-        await ctx.runMutation(internal.aiReply.markHandoff, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          handoffAgentId: config.handoffAgentId,
-          summary: buildHandoffSummary({
-            messages: toChatMessages(historyRows),
-            replyCount: replyCountSoFar,
-            reason: "cap",
-          }),
-        });
-        return;
-      }
+      // NO reply cap (owner decision): the bot answers every message
+      // until a human takes the chat from the dashboard — manual
+      // assignment / autoreply-pause (the two gates above) are the ONLY
+      // stops. `aiReplyCount` is still counted after each send, purely
+      // as a metric.
 
       // Every gate passed — we intend to reply. Blue-tick the triggering
       // message and show "typing…" for the LLM's think time (Meta
@@ -578,7 +553,10 @@ export const dispatchInbound = internalAction({
       if (handoff || !replyText) {
         // The model can't (or shouldn't) answer — stop auto-replying on
         // this thread and hand it to a human.
-        const summary = buildHandoffSummary({ messages, replyCount: replyCountSoFar });
+        const summary = buildHandoffSummary({
+          messages,
+          replyCount: conversation.aiReplyCount ?? 0,
+        });
         await ctx.runMutation(internal.aiReply.markHandoff, {
           accountId: args.accountId,
           conversationId: args.conversationId,
@@ -587,13 +565,6 @@ export const dispatchInbound = internalAction({
         });
         return;
       }
-
-      const claimed = await ctx.runMutation(internal.aiReply.claimReplySlot, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-        maxReplies: config.autoReplyMaxPerConversation,
-      });
-      if (!claimed) return; // lost the per-conversation cap race
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {
         accountId: args.accountId,
@@ -605,6 +576,10 @@ export const dispatchInbound = internalAction({
       await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
         accountId: args.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
+      });
+      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
       });
 
       // Ask-admin relay (v3): fan the question out to the admin numbers

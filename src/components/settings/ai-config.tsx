@@ -39,7 +39,6 @@ import { api } from '../../../convex/_generated/api';
 import type { Id } from '../../../convex/_generated/dataModel';
 
 const MASKED_KEY = '••••••••••••••••';
-const DEFAULT_MAX_AUTO_REPLIES = 8;
 
 // Radix Select can't use an empty-string item value, so the "leave
 // unassigned" choice gets a sentinel that maps to `undefined` in the
@@ -115,10 +114,6 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
-  // 8, not 3: the one-question-per-message qualification flow needs a
-  // full exchange's worth of turns — a cap of 3 silences the bot
-  // mid-qualification (the engine then hands off early).
-  const [maxPerConversation, setMaxPerConversation] = useState(DEFAULT_MAX_AUTO_REPLIES);
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
 
@@ -142,7 +137,6 @@ export function AiConfig() {
       setSystemPrompt(config.systemPrompt ?? '');
       setIsActive(config.isActive);
       setAutoReplyEnabled(config.autoReplyEnabled);
-      setMaxPerConversation(config.autoReplyMaxPerConversation ?? DEFAULT_MAX_AUTO_REPLIES);
       setHandoffAgentId(config.handoffAgentId ?? '');
       setApiKey(config.hasKey ? MASKED_KEY : '');
       setEmbeddingsKey(config.hasEmbeddingsKey ? MASKED_KEY : '');
@@ -206,7 +200,6 @@ export function AiConfig() {
         systemPrompt: systemPrompt.trim() || undefined,
         isActive,
         autoReplyEnabled,
-        autoReplyMaxPerConversation: maxPerConversation,
         handoffAgentId: handoffAgentId
           ? (handoffAgentId as Id<'users'>)
           : undefined,
@@ -438,29 +431,6 @@ export function AiConfig() {
                 checked={autoReplyEnabled}
                 onCheckedChange={setAutoReplyEnabled}
                 disabled={disabled || !isActive}
-              />
-            </div>
-
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <Label htmlFor="ai-max">{t('maxAutoReplies')}</Label>
-                <p className="text-xs text-muted-foreground">
-                  {t('maxAutoRepliesDesc')}
-                </p>
-              </div>
-              <Input
-                id="ai-max"
-                type="number"
-                min={1}
-                max={20}
-                value={maxPerConversation}
-                onChange={(e) =>
-                  setMaxPerConversation(
-                    Math.min(20, Math.max(1, Number(e.target.value) || 1)),
-                  )
-                }
-                disabled={disabled || !autoReplyEnabled}
-                className="w-20"
               />
             </div>
 

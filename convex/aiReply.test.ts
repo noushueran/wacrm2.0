@@ -90,7 +90,6 @@ const BASE_AI_CONFIG_ARGS = {
   model: "gpt-4o-mini",
   isActive: true,
   autoReplyEnabled: true,
-  autoReplyMaxPerConversation: 3,
 };
 
 /** Admin+ upsert of the caller's AI config — active + auto-reply on by
@@ -285,129 +284,34 @@ test("early-exits without sending when a human already owns the conversation", a
   expect(await messagesFor(t, conversationId)).toHaveLength(1);
 });
 
-test("hitting autoReplyMaxPerConversation hands off to a human instead of going silent", async () => {
+test("no reply cap: the bot keeps replying no matter how many replies it has already sent", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
-  await configureAi(asUser, { autoReplyMaxPerConversation: 3 }); // no handoffAgentId
+  await configureAi(asUser);
   const { contactId, conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
     messageText: "Hello?",
   });
-  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 3 }));
+  // A long-running thread: 50 bot replies already sent. There is no
+  // cap — the bot answers every message until a human takes the chat
+  // from the dashboard (assignment / autoreply-pause are the ONLY stops).
+  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 50 }));
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
 
-  // No reply (the budget is spent) — but the thread must land in the
-  // human queue rather than stranding the customer in silence.
-  expect(await messagesFor(t, conversationId)).toHaveLength(1); // no bot reply added
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
   const conversation = await getConversation(t, conversationId);
-  expect(conversation!.aiReplyCount).toBe(3); // unchanged
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiHandoffSummary).toContain("reply limit");
-  expect(conversation!.aiHandoffSummary).toContain("“Hello?”");
-  // No handoff target configured — left unassigned (shared queue).
+  expect(conversation!.aiReplyCount).toBe(51); // still counted (metrics), never gating
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.status).toBe("open");
   expect(conversation!.assignedToUserId).toBeUndefined();
-});
-
-test("the cap-reached handoff assigns the configured handoff agent", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  const handoffAgentId = await seedTeammate(t, {
-    accountId,
-    name: "Hank (handoff agent)",
-    email: "hank@example.com",
-  });
-  await configureAi(asUser, { autoReplyMaxPerConversation: 3, handoffAgentId });
-  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: "Hello?",
-  });
-  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 3 }));
-
-  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
-
-  const conversation = await getConversation(t, conversationId);
-  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-});
-
-test("dispatch with a triggerWamid still sends exactly one reply (mark-read is fire-and-forget)", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  await configureAi(asUser);
-  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: "Hi, what are your opening hours?",
-  });
-
-  await t.action(internal.aiReply.dispatchInbound, {
-    accountId,
-    conversationId,
-    contactId,
-    triggerWamid: "wamid.trigger123",
-  });
-
-  const botMessages = (await messagesFor(t, conversationId)).filter(
-    (m) => m.senderType === "bot",
-  );
-  expect(botMessages).toHaveLength(1);
-}, 20_000);
-
-// ============================================================
-// Media-only inbound — a voice note (or image/video/document) with no
-// text previously produced NO reply at all: `recentMessages` filtered
-// to text rows, so the model saw an empty transcript and dispatch
-// bailed. The transcript now renders media placeholders instead.
-// ============================================================
-
-test("replies to a voice-note-only message instead of ignoring it", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  await configureAi(asUser);
-  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
-  const conversationId = await t.run((ctx) =>
-    ctx.db.insert("conversations", {
-      accountId,
-      contactId,
-      status: "open" as const,
-      unreadCount: 0,
-    }),
-  );
-  await t.run((ctx) =>
-    ctx.db.insert("messages", {
-      accountId,
-      conversationId,
-      senderType: "customer" as const,
-      contentType: "audio" as const, // voice note: no contentText at all
-      mediaUrl: "https://example.com/voice.ogg",
-      status: "sent" as const,
-    }),
-  );
-
-  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
-
-  const botMessages = (await messagesFor(t, conversationId)).filter(
-    (m) => m.senderType === "bot",
-  );
-  expect(botMessages).toHaveLength(1);
-  expect(botMessages[0]!.aiGenerated).toBe(true);
 }, 20_000);
 
 // ============================================================

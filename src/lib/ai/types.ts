@@ -20,7 +20,8 @@ export interface AiConfig {
   systemPrompt: string | null
   isActive: boolean
   autoReplyEnabled: boolean
-  autoReplyMaxPerConversation: number
+  /** DEPRECATED — no reply cap anymore; kept optional for old rows. */
+  autoReplyMaxPerConversation?: number
   /** Where auto-reply hands a conversation off when the model bails: an
    *  agent's `auth.users.id`, or null to leave it unassigned (drop into
    *  the shared queue). */

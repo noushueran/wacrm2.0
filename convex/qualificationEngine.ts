@@ -1285,6 +1285,24 @@ export const pendingAnswers = internalQuery({
   },
 });
 
+/**
+ * Compare-and-set claim for `relayAnswerToCustomer`: flips exactly one
+ * `answered` inquiry to `delivered` BEFORE the send, so two concurrent
+ * relays (e.g. the scheduled one and a manual retry) can never both
+ * text the customer — Convex OCC serializes the two patches and the
+ * loser sees `delivered`. Same claim-before-send discipline as
+ * `claimFollowUpSlot`.
+ */
+export const claimAnswerDelivery = internalMutation({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args): Promise<boolean> => {
+    const row = await ctx.db.get(args.inquiryId);
+    if (!row || row.status !== "answered") return false;
+    await ctx.db.patch(args.inquiryId, { status: "delivered" });
+    return true;
+  },
+});
+
 export const markAnswersDelivered = internalMutation({
   args: { inquiryIds: v.array(v.id("adminInquiries")) },
   handler: async (ctx, args): Promise<void> => {
@@ -1669,12 +1687,17 @@ export const relayAnswerToCustomer = internalAction({
         text = gen.text || `Update on your question: ${context.answer}`;
       }
 
-      const claimed = await ctx.runMutation(internal.aiReply.claimReplySlot, {
-        accountId: context.accountId,
-        conversationId: context.conversationId,
-        maxReplies: aiCfg.autoReplyMaxPerConversation,
-      });
-      if (!claimed) return; // cap reached — pendingAnswers injection remains
+      // CLAIM the inquiry before sending (compare-and-set answered →
+      // delivered, the `claimFollowUpSlot` pattern): two concurrent
+      // relays for the same answer must never double-text the customer.
+      // At-most-once by design — a send failure after the claim falls
+      // back to nothing rather than ever risking a duplicate. No reply
+      // cap (owner decision): the count is bumped purely as a metric.
+      const claimed = await ctx.runMutation(
+        internal.qualificationEngine.claimAnswerDelivery,
+        { inquiryId: args.inquiryId },
+      );
+      if (!claimed) return; // another relay already delivered this answer
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {
         accountId: context.accountId,
@@ -1686,8 +1709,9 @@ export const relayAnswerToCustomer = internalAction({
         accountId: context.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
       });
-      await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
-        inquiryIds: [args.inquiryId],
+      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+        accountId: context.accountId,
+        conversationId: context.conversationId,
       });
     } catch (err) {
       console.error("[qualification] relayAnswerToCustomer failed:", err);
