@@ -82,6 +82,17 @@ function isDryRun(): boolean {
 const DRY_RUN_REPLY_TEXT =
   "Thanks for your message! This is an automated reply while our team follows up.";
 
+// One scheduled retry per inbound: a transient provider/network failure
+// (429, timeout) must not leave the customer unanswered, but a broken
+// config (bad key) mustn't loop either — attempt 2 is the last.
+const DISPATCH_MAX_ATTEMPTS = 2;
+const DISPATCH_RETRY_DELAY_MS = 30_000;
+
+/** `[[FAIL]]` in the triggering message steers the provider-failure
+ *  branch in DRY-RUN tests — thrown from `syntheticGeneration`, exactly
+ *  where a real `generateReply` network failure would surface. */
+const FAILURE_SENTINEL = "[[FAIL]]";
+
 /**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
  * network entirely, same convention as `convex/aiKnowledge.ts`'s
@@ -97,6 +108,9 @@ const DRY_RUN_REPLY_TEXT =
  * `aiUsage.log`'s own "skip when there's no usage" no-op.
  */
 function syntheticGeneration(latestMessage: string): GenerateResult {
+  if (latestMessage.includes(FAILURE_SENTINEL)) {
+    throw new Error("DRY-RUN synthetic provider failure");
+  }
   // `[[NEEDINFO:<q>]]` in the triggering message steers the ask-admin
   // branch in tests, same convention as the handoff sentinel below.
   const needInfo = latestMessage.match(/\[\[NEEDINFO:([\s\S]*?)\]\]/);
@@ -343,8 +357,15 @@ export const dispatchInbound = internalAction({
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
     contactId: v.id("contacts"),
+    // 1-based retry counter (absent = first attempt). Only the retry
+    // scheduled from the catch below ever passes it.
+    attempt: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
+    // Flipped right after the Meta send succeeds: a failure AFTER this
+    // point must never retry (the customer already has the reply —
+    // re-dispatching would double-text them).
+    let sent = false;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
@@ -505,6 +526,7 @@ export const dispatchInbound = internalAction({
         to,
         text: replyText,
       });
+      sent = true;
       await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
         accountId: args.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
@@ -532,6 +554,28 @@ export const dispatchInbound = internalAction({
       }
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
+      // Transient failures (provider 429/timeout, an infra hiccup) must
+      // not leave the customer unanswered — schedule ONE retry. The
+      // retry re-runs every eligibility gate, so a human takeover in the
+      // meantime turns it into a no-op. Never after a successful send.
+      const attempt = args.attempt ?? 1;
+      if (!sent && attempt < DISPATCH_MAX_ATTEMPTS) {
+        try {
+          await ctx.scheduler.runAfter(
+            DISPATCH_RETRY_DELAY_MS,
+            internal.aiReply.dispatchInbound,
+            {
+              accountId: args.accountId,
+              conversationId: args.conversationId,
+              contactId: args.contactId,
+              attempt: attempt + 1,
+            },
+          );
+        } catch (schedErr) {
+          // Preserve this action's never-throws contract even here.
+          console.error("[ai auto-reply] retry scheduling failed:", schedErr);
+        }
+      }
     }
   },
 });

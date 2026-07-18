@@ -27,6 +27,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.CONVEX_AI_DRY_RUN;
   delete process.env.CONVEX_META_DRY_RUN;
+  vi.useRealTimers(); // the retry tests below opt into fake timers
 });
 
 /**
@@ -339,6 +340,80 @@ test("the cap-reached handoff assigns the configured handoff agent", async () =>
   expect(conversation!.status).toBe("pending");
   expect(conversation!.aiAutoreplyDisabled).toBe(true);
 });
+
+// ============================================================
+// Transient-failure retry — `[[FAIL]]` in the triggering message makes
+// DRY-RUN's `syntheticGeneration` throw, exactly where a real provider/
+// network failure would surface (same steering convention as the
+// handoff sentinel). Fake timers + `finishAllScheduledFunctions` drain
+// the scheduled retry, the `broadcasts.test.ts` idiom.
+// ============================================================
+
+test("a provider failure schedules one retry, which replies once the failure clears", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "[[FAIL]] what are your opening hours?",
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  // First attempt failed — nothing sent, nothing claimed.
+  expect(
+    (await messagesFor(t, conversationId)).filter((m) => m.senderType === "bot"),
+  ).toHaveLength(0);
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+
+  // The transient failure clears before the retry fires.
+  await t.run(async (ctx) => {
+    const inbound = (await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect())[0]!;
+    await ctx.db.patch(inbound._id, { contentText: "what are your opening hours?" });
+  });
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect((await getConversation(t, conversationId))!.aiReplyCount).toBe(1);
+}, 20_000);
+
+test("a persistent failure stops after the single retry — no reply, no endless rescheduling", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "[[FAIL]] hello",
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  // Drains the retry (attempt 2), which fails again. If the code kept
+  // rescheduling, this drain would never terminate — the test timeout
+  // is the regression signal for that.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  expect(
+    (await messagesFor(t, conversationId)).filter((m) => m.senderType === "bot"),
+  ).toHaveLength(0);
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+}, 20_000);
 
 // ============================================================
 // Handoff
