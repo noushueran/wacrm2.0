@@ -1772,6 +1772,18 @@
       "description": "AI-driven qualification on every chat: questions from your service documents, automatic follow-ups, lead scoring, and a Meta signal when a lead qualifies.",
       "enableLabel": "Enable lead qualification",
       "enableDesc": "Dormant until enabled. Turning this on starts tracking qualification sessions for new conversations.",
+      "alerts": {
+        "title": "Admin alerts & templates",
+        "enableLabel": "WhatsApp a lead alert to the admin number(s) when a lead qualifies",
+        "phonesLabel": "Admin alert phone numbers",
+        "phonesHint": "Comma-separated, with country code. These numbers are excluded from qualification and the AI never replies to them.",
+        "alertTemplateLabel": "Lead-alert template",
+        "reengagementTemplateLabel": "Re-engagement template (follow-ups after 24h)",
+        "noTemplate": "— none —",
+        "save": "Save alert settings",
+        "saved": "Saved",
+        "saveError": "Could not save — check the values."
+      },
       "defaultsTitle": "Active configuration",
       "hours": "Follow-up hours: {start}–{end} {tz} · {days}",
       "cadence": "Up to {count} follow-ups within {window}h · qualify at score ≥ {threshold}",

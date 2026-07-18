@@ -66,6 +66,14 @@ export function holidayysDefaultConfig(): QualificationConfigSeed {
     followUpDelaysMinutes: [60, 180, 720, 1440],
     maxFollowUps: 4,
     sessionWindowHours: 72,
+    // The two templates submitted to Meta for this feature (2026-07-18):
+    // out-of-window follow-ups + the admin lead alert. Names only take
+    // effect when the features are on; an unapproved template just makes
+    // that send skip/fail gracefully.
+    reengagementTemplateName: "qualification_followup",
+    reengagementTemplateLanguage: "en_US",
+    adminAlertTemplateName: "lead_alert",
+    adminAlertTemplateLanguage: "en_US",
     closingMessage: "Thank you! Our travel expert will contact you shortly.",
     adminAlertEnabled: false,
     adminAlertPhones: [],

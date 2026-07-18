@@ -561,7 +561,16 @@ test("sendFollowUp inside the 24h window sends the rotating free-form question",
 test("sendFollowUp beyond 24h uses the re-engagement template, or waits for expiry without one", async () => {
   const t = convexTest(schema, modules);
   const base = await seedAllHours(t);
-  // no template configured → no message, rescheduled towards expiry
+  // Defaults now ship WITH a re-engagement template (the submitted
+  // qualification_followup) — clear it to exercise the no-template branch.
+  await t.run(async (ctx) => {
+    const config = await ctx.db.query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", base.accountId)).unique();
+    await ctx.db.patch(config!._id, {
+      reengagementTemplateName: undefined,
+      reengagementTemplateLanguage: undefined,
+    });
+  });
   const sessionId = await seedDueSession(t, base, {
     lastCustomerMessageAt: Date.now() - 30 * 3_600_000, // 30h ago: window closed
   });
