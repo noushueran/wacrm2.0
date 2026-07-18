@@ -126,17 +126,9 @@ function LoginPageInner() {
             </div>
 
             <div className="flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="password" className="text-muted-foreground">
-                  {t('passwordLabel')}
-                </Label>
-                <Link
-                  href="/forgot-password"
-                  className="text-sm text-primary hover:text-primary/80"
-                >
-                  {t('forgotPassword')}
-                </Link>
-              </div>
+              <Label htmlFor="password" className="text-muted-foreground">
+                {t('passwordLabel')}
+              </Label>
               <Input
                 id="password"
                 type="password"
