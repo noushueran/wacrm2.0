@@ -341,6 +341,32 @@ test("the cap-reached handoff assigns the configured handoff agent", async () =>
   expect(conversation!.aiAutoreplyDisabled).toBe(true);
 });
 
+test("dispatch with a triggerWamid still sends exactly one reply (mark-read is fire-and-forget)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi, what are your opening hours?",
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.trigger123",
+  });
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+}, 20_000);
+
 // ============================================================
 // Media-only inbound — a voice note (or image/video/document) with no
 // text previously produced NO reply at all: `recentMessages` filtered

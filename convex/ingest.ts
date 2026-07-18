@@ -748,6 +748,9 @@ export const processInbound = internalAction({
           accountId,
           conversationId: res.conversationId,
           contactId: res.contactId,
+          // Lets the bot blue-tick the customer's message + show
+          // "typing…" while the reply generates.
+          triggerWamid: message.wamid,
         });
       });
     }

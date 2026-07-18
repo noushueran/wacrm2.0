@@ -371,6 +371,10 @@ export const dispatchInbound = internalAction({
     // 1-based retry counter (absent = first attempt). Only the retry
     // scheduled from the catch below ever passes it.
     attempt: v.optional(v.number()),
+    // Meta wamid of the inbound message that triggered this dispatch —
+    // lets the bot mark it read (blue ticks) + show "typing…" while the
+    // reply generates. Optional: older callers simply skip the receipt.
+    triggerWamid: v.optional(v.string()),
   },
   handler: async (ctx, args): Promise<void> => {
     // Flipped right after the Meta send succeeds: a failure AFTER this
@@ -417,6 +421,22 @@ export const dispatchInbound = internalAction({
           }),
         });
         return;
+      }
+
+      // Every gate passed — we intend to reply. Blue-tick the triggering
+      // message and show "typing…" for the LLM's think time (Meta
+      // auto-dismisses it on our send). Polish, never load-bearing: a
+      // failure here must not cost the customer their reply.
+      if (args.triggerWamid) {
+        try {
+          await ctx.runAction(internal.metaSend.markRead, {
+            accountId: args.accountId,
+            whatsappMessageId: args.triggerWamid,
+            typingIndicator: true,
+          });
+        } catch (err) {
+          console.warn("[ai auto-reply] mark-read failed:", err);
+        }
       }
 
       const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
@@ -580,6 +600,7 @@ export const dispatchInbound = internalAction({
               conversationId: args.conversationId,
               contactId: args.contactId,
               attempt: attempt + 1,
+              triggerWamid: args.triggerWamid,
             },
           );
         } catch (schedErr) {

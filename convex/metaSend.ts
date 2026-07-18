@@ -12,6 +12,7 @@ import {
   sendInteractiveButtons,
   sendInteractiveList,
   sendReactionMessage,
+  markMessageRead,
 } from "./lib/whatsapp/metaApi";
 import {
   validateInteractivePayload,
@@ -409,6 +410,35 @@ export const sendReaction = internalAction({
     }
 
     return { whatsappMessageId };
+  },
+});
+
+/**
+ * Marks an inbound message as read on WhatsApp (blue ticks) and, with
+ * `typingIndicator`, shows "typing…" until the next send (Meta
+ * auto-dismisses it after ~25s). Customer-facing polish only —
+ * deliberately NO `messages.appendInternal` step and NO local state:
+ * the CRM's own unread counters track what the TEAM has read, and the
+ * bot acknowledging a thread must never clear the agent-facing badge.
+ */
+export const markRead = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    whatsappMessageId: v.string(),
+    typingIndicator: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    if (isDryRun()) return;
+    const { phoneNumberId, accessToken } = await loadDecryptedConfig(
+      ctx,
+      args.accountId,
+    );
+    await markMessageRead({
+      phoneNumberId,
+      accessToken,
+      messageId: args.whatsappMessageId,
+      typingIndicator: args.typingIndicator,
+    });
   },
 });
 
