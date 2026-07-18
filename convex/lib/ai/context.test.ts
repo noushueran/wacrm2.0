@@ -76,4 +76,28 @@ describe("toChatMessages", () => {
       ]),
     ).toEqual([{ role: "user", content: "real" }]);
   });
+
+  it("renders AI transcriptions after the placeholder so the model sees the actual content", () => {
+    expect(
+      toChatMessages([
+        {
+          senderType: "customer",
+          contentType: "audio",
+          transcription: "I want to visit Baku in August with my family",
+        },
+        {
+          senderType: "customer",
+          contentType: "image",
+          contentText: "my current visa",
+          transcription: "A photo of a UAE 30-day tourist visa page",
+        },
+      ]),
+    ).toEqual([
+      { role: "user", content: "[voice note] I want to visit Baku in August with my family" },
+      {
+        role: "user",
+        content: "[image] my current visa — A photo of a UAE 30-day tourist visa page",
+      },
+    ]);
+  });
 });

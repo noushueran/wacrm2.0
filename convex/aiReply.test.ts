@@ -315,6 +315,121 @@ test("no reply cap: the bot keeps replying no matter how many replies it has alr
 }, 20_000);
 
 // ============================================================
+// Media understanding — inbound voice notes are transcribed and images
+// described (OpenAI, DRY-RUN synthetic here), stored on the message
+// row (`aiTranscription`) and rendered into the transcript so the
+// reply addresses the ACTUAL content, not just "[voice note]".
+// ============================================================
+
+test("a voice note is transcribed before replying and the transcript is stored on the row", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBe("[dry-run transcript]");
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+}, 20_000);
+
+test("an inbound image is described the same way", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const imageMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "image" as const,
+      contentText: "my visa",
+      mediaUrl: "https://example.com/visa.jpg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const imageRow = await t.run((ctx) => ctx.db.get(imageMessageId));
+  expect(imageRow!.aiTranscription).toBe("[dry-run transcript]");
+}, 20_000);
+
+test("no usable OpenAI key (anthropic provider, no embeddings key) skips transcription but still replies", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser, { provider: "anthropic" as never, model: "claude-3-5-haiku-latest" });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBeUndefined();
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1); // placeholder-only context still gets a reply
+}, 20_000);
+
+// ============================================================
 // Transient-failure retry — `[[FAIL]]` in the triggering message makes
 // DRY-RUN's `syntheticGeneration` throw, exactly where a real provider/
 // network failure would surface (same steering convention as the

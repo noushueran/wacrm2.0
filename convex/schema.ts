@@ -291,6 +291,11 @@ export default defineSchema({
     replyToMessageId: v.optional(v.id("messages")),
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
+    // AI transcription of an inbound voice note / vision description of
+    // an inbound image (aiReply media understanding, 2026-07-18) —
+    // rendered into the assistant's transcript so replies address the
+    // actual content.
+    aiTranscription: v.optional(v.string()),
     // True when the AI auto-reply bot generated this message (migration
     // 033). Postgres: NOT NULL DEFAULT false; optional here for the same
     // reason as the conversations AI columns (late addition, no Convex

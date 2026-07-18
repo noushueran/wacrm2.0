@@ -12,6 +12,11 @@ import {
   type HistoryMessage,
 } from "./lib/ai/context";
 import { generateReply, parseGeneration } from "./lib/ai/generate";
+import {
+  transcribeAudioFromUrl,
+  describeImageFromUrl,
+  DESCRIBE_FALLBACK_MODEL,
+} from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
 
@@ -94,6 +99,13 @@ const DISPATCH_RETRY_DELAY_MS = 30_000;
  *  branch in DRY-RUN tests — thrown from `syntheticGeneration`, exactly
  *  where a real `generateReply` network failure would surface. */
 const FAILURE_SENTINEL = "[[FAIL]]";
+
+/** DRY-RUN stand-in for a voice-note transcript / image description. */
+const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
+
+/** Upper bound on media rows transcribed per dispatch — a burst of
+ *  voice notes costs at most this many transcription calls per reply. */
+const MAX_TRANSCRIPTIONS_PER_DISPATCH = 3;
 
 /**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
@@ -215,6 +227,7 @@ export const recentMessages = internalQuery({
       senderType: m.senderType,
       contentText: m.contentText,
       contentType: m.contentType,
+      transcription: m.aiTranscription,
       createdAt: m._creationTime,
     }));
   },
@@ -241,6 +254,51 @@ export const latestInboundMessageId = internalQuery({
       )
       .first();
     return row?._id ?? null;
+  },
+});
+
+/**
+ * Customer media rows (voice notes / images) still awaiting an AI
+ * transcription/description — newest first, bounded by `limit`. Only
+ * rows whose media already resolved into storage (`mediaUrl` set)
+ * qualify; the rest keep their placeholder until a later dispatch.
+ */
+export const untranscribedMediaRows = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    limit: v.number(),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<
+    { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
+  > => {
+    const rows = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .filter((q) =>
+        q.and(
+          q.eq(q.field("accountId"), args.accountId),
+          q.eq(q.field("senderType"), "customer"),
+          q.or(
+            q.eq(q.field("contentType"), "audio"),
+            q.eq(q.field("contentType"), "image"),
+          ),
+        ),
+      )
+      .take(Math.max(args.limit * 3, args.limit));
+    return rows
+      .filter((m) => m.mediaUrl && !m.aiTranscription)
+      .slice(0, args.limit)
+      .map((m) => ({
+        messageId: m._id,
+        contentType: m.contentType as "audio" | "image",
+        mediaUrl: m.mediaUrl!,
+        caption: m.contentText?.trim() || null,
+      }));
   },
 });
 
@@ -311,6 +369,20 @@ export const flagForHuman = internalMutation({
       status: "pending",
       updatedAt: Date.now(),
     });
+  },
+});
+
+/** Stores a just-computed transcription/description on its media row. */
+export const setTranscription = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    messageId: v.id("messages"),
+    text: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message || message.accountId !== args.accountId) return;
+    await ctx.db.patch(args.messageId, { aiTranscription: args.text });
   },
 });
 
@@ -428,6 +500,58 @@ export const dispatchInbound = internalAction({
           });
         } catch (err) {
           console.warn("[ai auto-reply] mark-read failed:", err);
+        }
+      }
+
+      // Voice notes & images: transcribe / describe BEFORE building the
+      // transcript, so the reply addresses the actual content (owner
+      // requirement — the bot "listens" and "reads", then answers in
+      // TEXT; it never sends media back). OpenAI-only: the account's own
+      // key, or the (also-OpenAI) embeddings key on an Anthropic-model
+      // account. Best-effort per row — a failure keeps the placeholder.
+      const openAiKey =
+        config.provider === "openai" ? config.apiKey : (config.embeddingsApiKey ?? null);
+      if (openAiKey) {
+        const pendingMedia = await ctx.runQuery(internal.aiReply.untranscribedMediaRows, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          limit: MAX_TRANSCRIPTIONS_PER_DISPATCH,
+        });
+        let transcribedAny = false;
+        for (const row of pendingMedia) {
+          try {
+            const text = isDryRun()
+              ? DRY_RUN_TRANSCRIPT
+              : row.contentType === "audio"
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: row.mediaUrl })
+                : await describeImageFromUrl({
+                    apiKey: openAiKey,
+                    model:
+                      config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
+                    mediaUrl: row.mediaUrl,
+                    caption: row.caption ?? undefined,
+                  });
+            if (text) {
+              await ctx.runMutation(internal.aiReply.setTranscription, {
+                accountId: args.accountId,
+                messageId: row.messageId,
+                text,
+              });
+              transcribedAny = true;
+            }
+          } catch (err) {
+            console.warn("[ai auto-reply] media transcription failed:", err);
+          }
+        }
+        // A fresh transcript is fresh extractable lead data — let the
+        // qualification analysis see it (dormant-safe no-op otherwise;
+        // ingest only triggers analysis for TEXT inbounds).
+        if (transcribedAny) {
+          await ctx.scheduler.runAfter(0, internal.qualificationEngine.analyzeInbound, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+          });
         }
       }
 

@@ -54,6 +54,10 @@ export interface HistoryMessage {
   senderType: "customer" | "agent" | "bot";
   contentText?: string;
   contentType?: string;
+  /** AI transcription of a voice note / vision description of an image
+   *  (`messages.aiTranscription`) — rendered after the placeholder so
+   *  the model can answer the actual content. */
+  transcription?: string;
 }
 
 /**
@@ -72,7 +76,16 @@ export function toChatMessages(rows: HistoryMessage[]): ChatMessage[] {
         ? (MEDIA_PLACEHOLDER[m.contentType] ?? null)
         : null;
     const text = (m.contentText ?? "").trim();
-    const content = placeholder ? (text ? `${placeholder} ${text}` : placeholder) : text;
+    let content: string;
+    if (placeholder) {
+      // Media row: placeholder, then caption and/or the AI transcript —
+      // "[voice note] <transcript>" / "[image] <caption> — <description>".
+      const transcription = (m.transcription ?? "").trim();
+      const detail = [text, transcription].filter(Boolean).join(" — ");
+      content = detail ? `${placeholder} ${detail}` : placeholder;
+    } else {
+      content = text;
+    }
     if (!content) return [];
     return [
       {
