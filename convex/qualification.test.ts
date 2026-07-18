@@ -45,12 +45,24 @@ test("schema accepts qualificationConfigs, qualificationSessions and lead_qualif
       closingMessage: "Thank you! Our travel expert will contact you shortly.",
       adminAlertEnabled: false, adminAlertPhones: [], outboundNudgesEnabled: false,
     });
+    await ctx.db.insert("memberTags", {
+      accountId, userId,
+      tagId: await ctx.db.insert("tags", { accountId, name: "UAE visa", color: "#0ea5e9" }),
+    });
+    await ctx.db.insert("staffCheckins", {
+      accountId, phoneNormalized: "971551234567", lastCheckinSentAt: 1,
+    });
     const sessionId = await ctx.db.insert("qualificationSessions", {
       accountId, conversationId, contactId,
       status: "collecting", origin: "inbound",
       fields: [], expectedCount: 0, answeredCount: 0,
       checklistSatisfiedAt: 123,
       followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+    await ctx.db.insert("leadOffers", {
+      accountId, sessionId, conversationId, contactId,
+      agentUserId: userId, agentPhone: "+971551234567",
+      status: "offered", offeredAt: 1,
     });
     await ctx.db.insert("notifications", {
       accountId, userId, type: "lead_qualified", title: "New qualified lead",

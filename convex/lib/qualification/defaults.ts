@@ -77,6 +77,13 @@ export function holidayysDefaultConfig(): QualificationConfigSeed {
     closingMessage: "Thank you! Our travel expert will contact you shortly.",
     adminAlertEnabled: false,
     adminAlertPhones: [],
+    // Phase 6: offer qualified leads to matching agents over WhatsApp,
+    // 10-minute consent window each, then rotate. The staff check-in
+    // template keeps staff windows open (submitted 2026-07-18).
+    autoAssignEnabled: true,
+    offerTimeoutMinutes: 10,
+    staffCheckinTemplateName: "staff_checkin",
+    staffCheckinTemplateLanguage: "en_US",
     outboundNudgesEnabled: false,
   };
 }

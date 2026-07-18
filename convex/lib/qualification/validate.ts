@@ -27,6 +27,10 @@ export const CONFIG_PATCH_KEYS = [
   "adminAlertPhones",
   "adminAlertTemplateName",
   "adminAlertTemplateLanguage",
+  "autoAssignEnabled",
+  "offerTimeoutMinutes",
+  "staffCheckinTemplateName",
+  "staffCheckinTemplateLanguage",
   "outboundNudgesEnabled",
 ] as const;
 
@@ -52,7 +56,7 @@ function isStringArray(x: unknown): x is string[] {
 export function validateConfigPatch(patch: QualificationConfigPatch): string | null {
   const p = patch as Record<string, unknown>;
 
-  for (const key of ["enabled", "adminAlertEnabled", "outboundNudgesEnabled"] as const) {
+  for (const key of ["enabled", "adminAlertEnabled", "outboundNudgesEnabled", "autoAssignEnabled"] as const) {
     if (p[key] !== undefined && typeof p[key] !== "boolean") {
       return `${key} must be a boolean`;
     }
@@ -64,6 +68,8 @@ export function validateConfigPatch(patch: QualificationConfigPatch): string | n
     "reengagementTemplateLanguage",
     "adminAlertTemplateName",
     "adminAlertTemplateLanguage",
+    "staffCheckinTemplateName",
+    "staffCheckinTemplateLanguage",
   ] as const) {
     if (p[key] !== undefined && typeof p[key] !== "string") {
       return `${key} must be a string`;
@@ -96,6 +102,11 @@ export function validateConfigPatch(patch: QualificationConfigPatch): string | n
       p.followUpDelaysMinutes.some((m) => m < 5)
     ) {
       return "followUpDelaysMinutes must be >= 5 minutes each";
+    }
+  }
+  if (p.offerTimeoutMinutes !== undefined) {
+    if (!isNumber(p.offerTimeoutMinutes) || p.offerTimeoutMinutes < 2 || p.offerTimeoutMinutes > 240) {
+      return "offerTimeoutMinutes must be 2–240";
     }
   }
   if (p.maxFollowUps !== undefined) {
