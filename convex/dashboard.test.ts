@@ -515,70 +515,6 @@ test("conversationsSeries buckets a message into its LOCAL day, not its UTC day,
 });
 
 // ============================================================
-// pipelineDonut
-// ============================================================
-
-test("pipelineDonut groups open deals by stage, hides empty stages, and excludes another account's pipeline", async () => {
-  const t = convexTest(schema, modules);
-  const clock = makeClock(T0);
-  clock(T0);
-  const { asUser: asAlice, accountId: aliceId } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-    role: "agent",
-  });
-  const { accountId: bobId } = await seedAccountMember(t, {
-    name: "Bob",
-    email: "bob@example.com",
-    role: "agent",
-  });
-
-  clock(BEFORE_YESTERDAY);
-  const { pipelineId, stageIds } = await seedPipelineWithStages(t, {
-    accountId: aliceId,
-    stages: [
-      { name: "New Lead", color: "#3b82f6" },
-      { name: "Qualified", color: "" }, // falsy color -> fallback
-      { name: "Won", color: "#22c55e" }, // stays empty -> hidden from output
-    ],
-  });
-  await seedDeal(t, { accountId: aliceId, pipelineId, stageId: stageIds[0]!, title: "D1", value: 100, status: "open" });
-  await seedDeal(t, { accountId: aliceId, pipelineId, stageId: stageIds[0]!, title: "D2", value: 50, status: "open" });
-  await seedDeal(t, { accountId: aliceId, pipelineId, stageId: stageIds[1]!, title: "D3", value: 200, status: "open" });
-  await seedDeal(t, { accountId: aliceId, pipelineId, stageId: stageIds[1]!, title: "D4", value: 999, status: "won" }); // excluded: not open
-
-  const { pipelineId: bobPipelineId, stageIds: bobStageIds } = await seedPipelineWithStages(t, {
-    accountId: bobId,
-    stages: [{ name: "Bob Stage", color: "#000000" }],
-  });
-  await seedDeal(t, {
-    accountId: bobId,
-    pipelineId: bobPipelineId,
-    stageId: bobStageIds[0]!,
-    title: "Bob Deal",
-    value: 5000,
-    status: "open",
-  });
-
-  const result = await asAlice.query(api.dashboard.pipelineDonut, {});
-
-  expect(result.stages.map((s) => s.id)).toEqual([stageIds[0], stageIds[1]]);
-  expect(result.stages[0]).toMatchObject({
-    name: "New Lead",
-    color: "#3b82f6",
-    dealCount: 2,
-    totalValue: 150,
-  });
-  expect(result.stages[1]).toMatchObject({
-    name: "Qualified",
-    color: "#64748b", // fallback for the falsy color above
-    dealCount: 1,
-    totalValue: 200,
-  });
-  expect(result.totalValue).toBe(350);
-});
-
-// ============================================================
 // responseTime
 // ============================================================
 
@@ -907,13 +843,6 @@ test("conversationsSeries throws UNAUTHENTICATED when there is no identity", asy
       tzOffsetMinutes: 0,
     }),
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
-});
-
-test("pipelineDonut throws UNAUTHENTICATED when there is no identity", async () => {
-  const t = convexTest(schema, modules);
-  await expect(t.query(api.dashboard.pipelineDonut, {})).rejects.toMatchObject({
-    data: { code: "UNAUTHENTICATED" },
-  });
 });
 
 test("responseTime throws UNAUTHENTICATED when there is no identity", async () => {

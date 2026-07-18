@@ -1,6 +1,5 @@
 import { accountQuery } from "./lib/auth";
 import { v } from "convex/values";
-import type { Id } from "./_generated/dataModel";
 import {
   localDayKeyFromMs,
   localMidnightMsDaysAgo,
@@ -39,15 +38,12 @@ import {
 //
 // Every read here is now bounded by something that does not grow
 // forever — a time window (`contacts`, `messages`), a fixed take
-// (`activity`'s sources), or a status range (`metrics`/`pipelineDonut`'s
-// open conversations and deals). None of them still scan a whole
+// (`activity`'s sources), or a status range (`metrics`'s open
+// conversations and deals). None of them still scan a whole
 // account partition. The status-ranged collects remain unbounded in the
 // size of the OPEN set, which tracks current workload rather than
 // accumulated history; bounding those further would need a denormalised
 // counter, since a count cannot be taken from a window.
-//
-// `pipelineStages` is collected per account without a range, which is
-// fine and deliberate: a handful of structural rows per pipeline.
 // ============================================================
 
 // --- 1. Metric cards ----------------------------------------------------
@@ -215,57 +211,6 @@ export const conversationsSeries = accountQuery({
       day,
       ...(buckets.get(day) ?? { incoming: 0, outgoing: 0 }),
     }));
-  },
-});
-
-// --- 3. Pipeline donut ----------------------------------------------------
-
-export const pipelineDonut = accountQuery({
-  args: {},
-  handler: async (ctx) => {
-    // Structural data (few stages per account) — not a scale concern.
-    const stages = await ctx.db
-      .query("pipelineStages")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .collect();
-    stages.sort((a, b) => a.position - b.position);
-
-    // Every open deal in the account — same range as `metrics`'s
-    // `openDeals` above (in fact the same underlying rows; each caller
-    // re-reads independently since there's no cross-request cache in
-    // Convex), and bounded the same way by `by_account_status`.
-    const openDeals = await ctx.db
-      .query("deals")
-      .withIndex("by_account_status", (q) =>
-        q.eq("accountId", ctx.accountId).eq("status", "open"),
-      )
-      .collect();
-
-    const byStage = new Map<Id<"pipelineStages">, { count: number; total: number }>();
-    for (const deal of openDeals) {
-      const row = byStage.get(deal.stageId) ?? { count: 0, total: 0 };
-      row.count += 1;
-      row.total += deal.value;
-      byStage.set(deal.stageId, row);
-    }
-
-    const slices = stages
-      .map((stage) => ({
-        id: stage._id,
-        name: stage.name,
-        color: stage.color || "#64748b",
-        dealCount: byStage.get(stage._id)?.count ?? 0,
-        totalValue: byStage.get(stage._id)?.total ?? 0,
-      }))
-      // Hide empty stages from the ring — mirrors `loadPipelineDonut`
-      // exactly (its own comment: still shown in a legend if a full
-      // breakdown were wanted, but trimmed here for the common case).
-      .filter((s) => s.totalValue > 0 || s.dealCount > 0);
-
-    return {
-      stages: slices,
-      totalValue: slices.reduce((sum, s) => sum + s.totalValue, 0),
-    };
   },
 });
 
