@@ -7,6 +7,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { resolveEventName, backendForLane } from "./lib/funnel";
+import { applyStageTransition } from "./funnel";
 
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
@@ -90,6 +91,15 @@ export const getWabaId = internalQuery({
  * schedules delivery), or `null` for an organic message (no identifier) or a
  * conversation whose `new_lead` was already seeded. Replaces the old
  * `attribution.recordSignal` first-touch write.
+ *
+ * Also advances `conversation.funnel`/`funnelTransitions` to `new_lead`
+ * (Task B3) via `funnel.ts`'s engine-path helper — same `auto` +
+ * `neverDowngrade` calling convention as `qualificationEngine.ts`'s
+ * `completeQualification` — so a fresh attributed lead is immediately
+ * visible in the stepper instead of showing "no stage yet" until an agent
+ * acts. `neverDowngrade` makes this a no-op when the conversation already
+ * sits at or past `new_lead` (its lowest stage), so it can never pull an
+ * already-progressed conversation backward.
  */
 export const seedNewLead = internalMutation({
   args: {
@@ -146,6 +156,25 @@ export const seedNewLead = internalMutation({
       status: "pending",
       attempts: 0,
     });
+
+    // Funnel visibility (Task B3). Re-read so `applyStageTransition` sees
+    // the attribution patch just above (if this call is what set it); its
+    // own `by_event_id` lookup for this same `eventId` finds the row just
+    // inserted, so it links `conversionEventId` onto the transition rather
+    // than creating a second event or re-scheduling delivery.
+    const withAttribution = await ctx.db.get(conversationId);
+    if (withAttribution) {
+      const account = await ctx.db.get(accountId);
+      await applyStageTransition(ctx, {
+        accountId,
+        conversation: withAttribution,
+        stage: "new_lead",
+        auto: true,
+        neverDowngrade: true,
+        defaultCurrency: account?.defaultCurrency ?? "USD",
+      });
+    }
+
     return { conversionEventId };
   },
 });

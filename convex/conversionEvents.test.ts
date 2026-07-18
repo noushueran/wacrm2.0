@@ -1,6 +1,6 @@
 import { convexTest } from "convex-test";
 import { expect, test, afterEach, vi } from "vitest";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import { MAX_DELIVER_ATTEMPTS } from "./conversionEvents";
@@ -20,6 +20,17 @@ async function seedConversation(t: ReturnType<typeof convexTest>, accountId: Id<
     const conversationId = await ctx.db.insert("conversations", { accountId, contactId, status: "open", unreadCount: 0 });
     return { contactId, conversationId };
   });
+}
+
+// An owner membership on `accountId` — `hasMinRole(_, "supervisor")` grants
+// `funnel.getState`'s "view" mode regardless of assignment, so this is
+// enough identity to read back what seeding wrote (Task B3 tests).
+async function seedOwner(t: ReturnType<typeof convexTest>, accountId: Id<"accounts">) {
+  const userId = await t.run((ctx) => ctx.db.insert("users", { name: "Own", email: "own@example.com" }));
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", { userId, accountId, role: "owner", fullName: "Own", email: "own@example.com" }),
+  );
+  return { userId, asOwner: t.withIdentity({ subject: `${userId}|s-Own` }) };
 }
 
 async function seedWaba(t: ReturnType<typeof convexTest>, accountId: Id<"accounts">) {
@@ -596,4 +607,53 @@ test("seedNewLead: returns null and writes nothing for an organic message", asyn
   const rows = await t.run((ctx) =>
     ctx.db.query("conversionEvents").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
   expect(rows).toHaveLength(0);
+});
+
+// B3: seedNewLead set conversation.attribution + the conversionEvents row
+// but never touched conversation.funnel/funnelTransitions, so a fresh
+// attributed lead rendered "no stage yet" (stepper all-upcoming) until an
+// agent acted, and /campaigns' transition-derived new_lead count
+// understated. Fix reuses funnel.ts's engine-path helper (auto +
+// neverDowngrade), same calling convention as qualificationEngine's
+// completeQualification.
+test("seedNewLead auto-advances a fresh attributed conversation to new_lead, visible in getState", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const { asOwner } = await seedOwner(t, accountId);
+
+  await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000, ctwaClid: "clid-fresh",
+  });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("new_lead");
+
+  const state = await asOwner.query(api.funnel.getState, { conversationId });
+  expect(state.attributed).toBe(true);
+  expect(state.currentStage).toBe("new_lead");
+
+  const trans = await t.run((ctx) =>
+    ctx.db.query("funnelTransitions").withIndex("by_conversation", (q) => q.eq("conversationId", conversationId)).collect());
+  const nl = trans.find((x) => x.stage === "new_lead");
+  expect(nl?.auto).toBe(true);
+});
+
+test("seedNewLead NEVER downgrades a conversation already past new_lead", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  // Already progressed by an agent before this (late-arriving) identifier
+  // was ever seen — e.g. a manually-created lead that only later replies
+  // with a tracked link.
+  await t.run((ctx) => ctx.db.patch(conversationId, { funnel: { stage: "qualified", stageUpdatedAt: 500 } }));
+
+  await t.mutation(internal.conversionEvents.seedNewLead, {
+    accountId, contactId, conversationId, waMessageId: "wamid.1",
+    phone: "+15551230000", firstMessageAt: 1_000_000, code: "ABCDEF",
+  });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("qualified"); // untouched by seeding
 });
