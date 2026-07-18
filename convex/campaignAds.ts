@@ -10,6 +10,54 @@ import type { Doc } from "./_generated/dataModel";
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_RESOLVE_ATTEMPTS = 5;
 
+/**
+ * Delay between each `resolveAd` the retry cron schedules. The cron pulls up
+ * to 100 rows and every one is an external Marketing API GET; firing them all
+ * at `runAfter(0)` is a 100-call burst that draws 429s from the very backend
+ * we're calling. Mirrors `conversionEvents.DELIVER_STAGGER_MS` /
+ * `broadcasts.ts` — Convex's scheduler already IS the queue, so a flat
+ * per-row interval is all it takes.
+ */
+const RESOLVE_STAGGER_MS = 100;
+
+/**
+ * A 429 or 5xx is the Marketing API telling us to come back later — it says
+ * nothing about the row itself, so spending an attempt on it is what would
+ * let a burst of our own making walk a live ad to the terminal `"abandoned"`
+ * state (its name never resolving again). Carried as its own Error subclass
+ * rather than parsed back out of the message text, so the classification
+ * can't drift from the status that set it.
+ */
+class TransientResolveError extends Error {}
+
+/**
+ * Everything that isn't a 429/5xx (4xx, a malformed body, a network failure)
+ * is treated as the row's own fault: it bumps `attempts` and can legitimately
+ * exhaust the budget and give up.
+ */
+function resolveError(status: number, message: string): Error {
+  return status === 429 || status >= 500
+    ? new TransientResolveError(message)
+    : new Error(message);
+}
+
+/**
+ * The `patchResolution` args a failed attempt should write. Transient
+ * failures re-queue as `"error"` WITHOUT a bump, so they stay selectable by
+ * `getResolvable` indefinitely and can never reach `MAX_RESOLVE_ATTEMPTS`.
+ */
+function errorPatchFor(err: unknown): {
+  resolveStatus: "error";
+  lastError: string;
+  bumpAttempts: boolean;
+} {
+  return {
+    resolveStatus: "error",
+    lastError: err instanceof Error ? err.message : String(err),
+    bumpAttempts: !(err instanceof TransientResolveError),
+  };
+}
+
 export const getById = internalQuery({
   args: { campaignAdId: v.id("campaignAds") },
   handler: async (ctx, args): Promise<Doc<"campaignAds"> | null> =>
@@ -20,10 +68,12 @@ export const getById = internalQuery({
  * Advances a campaignAds row after a `resolveAd` attempt. Only patches the
  * name fields the caller supplied (conditional spread, like
  * attribution.patchResult). `attempts` bumps only on an explicit
- * `bumpAttempts === true` (the error branch). An `"error"` bump that reaches
- * `MAX_RESOLVE_ATTEMPTS` is retired to the terminal `"abandoned"` state — the
- * single give-up point — so dead rows leave the retry cron's partition
- * (mirrors `conversionEvents.patchStatus` and `attribution.patchResult`).
+ * `bumpAttempts === true` — a transient (429/5xx) failure passes `false`
+ * (see `errorPatchFor`) so it re-queues without spending budget. An
+ * `"error"` bump that reaches `MAX_RESOLVE_ATTEMPTS` is retired to the
+ * terminal `"abandoned"` state — the single give-up point — so dead rows
+ * leave the retry cron's partition (mirrors `conversionEvents.patchStatus`
+ * and `attribution.patchResult`).
  *
  * Giving up by letting the row sit at `attempts >= MAX_RESOLVE_ATTEMPTS` while
  * still tagged `"error"` would be silently unbounded: `getResolvable` reads the
@@ -149,7 +199,10 @@ export const resolveAd = internalAction({
       const res = await fetch(url);
       if (!res.ok) {
         const body = await res.text();
-        throw new Error(`Marketing API ${res.status}: ${body.slice(0, 200)}`);
+        throw resolveError(
+          res.status,
+          `Marketing API ${res.status}: ${body.slice(0, 200)}`,
+        );
       }
       const data = (await res.json()) as {
         name?: string;
@@ -168,9 +221,7 @@ export const resolveAd = internalAction({
     } catch (err) {
       await ctx.runMutation(internal.campaignAds.patchResolution, {
         campaignAdId: args.campaignAdId,
-        resolveStatus: "error",
-        lastError: err instanceof Error ? err.message : String(err),
-        bumpAttempts: true,
+        ...errorPatchFor(err),
       });
     }
   },
@@ -240,10 +291,15 @@ export const retryResolutions = internalAction({
     // own two partitions, and `conversionEvents.retryConversionEvents`
     // between its).
     const batch = [...live, ...dormant].slice(0, 100);
-    for (const row of batch) {
-      await ctx.scheduler.runAfter(0, internal.campaignAds.resolveAd, {
-        campaignAdId: row._id,
-      });
+    for (const [i, row] of batch.entries()) {
+      // Staggered, not `runAfter(0)` for all: 100 simultaneous Marketing API
+      // GETs is a burst that draws the 429s the transient-error path exists
+      // to absorb.
+      await ctx.scheduler.runAfter(
+        i * RESOLVE_STAGGER_MS,
+        internal.campaignAds.resolveAd,
+        { campaignAdId: row._id },
+      );
     }
   },
 });

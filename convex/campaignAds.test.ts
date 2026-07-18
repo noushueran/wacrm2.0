@@ -201,3 +201,66 @@ test("an abandoned row leaves the error partition getResolvable scans", async ()
   );
   expect(stillErrored).toHaveLength(0);
 });
+
+// ------------------------------------------------------------
+// Transient (429/5xx) vs permanent errors — the retry budget must only
+// be spent on failures that are the row's own fault. Ported from
+// conversionEvents.test.ts's identical cases.
+// ------------------------------------------------------------
+
+test("resolveAd: a 429 re-queues as error WITHOUT bumping attempts — rate limiting can never retire a live ad", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () =>
+    new Response("rate limited", { status: 429 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  // One bump away from the give-up cap: a 429 here used to abandon the row
+  // and lose the ad's name permanently.
+  const adId = await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS - 1, "error");
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const row = await t.run((ctx) => ctx.db.get(adId));
+  expect(row?.resolveStatus).toBe("error");
+  expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS - 1);
+  // Still selectable by the cron — the whole point.
+  const batch = await t.query(internal.campaignAds.getResolvable, {});
+  expect(batch.map((r) => r._id)).toContain(adId);
+});
+
+test("resolveAd: a 5xx re-queues as error WITHOUT bumping attempts", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () =>
+    new Response("upstream down", { status: 503 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS - 1, "error");
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const row = await t.run((ctx) => ctx.db.get(adId));
+  expect(row?.resolveStatus).toBe("error");
+  expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS - 1);
+});
+
+test("retryResolutions staggers its fan-out instead of firing 100 Marketing API GETs at once", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  for (let i = 0; i < 5; i++) {
+    await seedAd(t, accountId, 0, "pending");
+  }
+
+  await t.action(internal.campaignAds.retryResolutions, {});
+
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  expect(scheduled).toHaveLength(5);
+  const times = scheduled.map((s) => s.scheduledTime).sort((a, b) => a - b);
+  // Each successive resolution is at least one stagger step later than the
+  // last; `runAfter(0)` for all 5 would leave these within a millisecond.
+  for (let i = 1; i < times.length; i++) {
+    expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(100);
+  }
+});
