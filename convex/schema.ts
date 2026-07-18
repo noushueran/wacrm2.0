@@ -1314,18 +1314,22 @@ export default defineSchema({
     .index("by_account", ["accountId"]),
 
   // ============================================================
-  // WA conversion attribution (Task B3). One row per detected
-  // attribution identifier (an `HY-XXXXXX` ref code or a Meta
-  // `ctwa_clid`) seen on an inbound WhatsApp message — written by
-  // `attribution.recordSignal` and later updated by the outbound
-  // partner-signal action as it lands. `by_account_identifier` backs
-  // `recordSignal`'s own idempotent first-occurrence-only insert (one
-  // row per account+identifier, ever); `by_account_result` supports a
-  // future dashboard filtering by landing outcome; `by_result` (Task
-  // B6) is the GLOBAL (non-account-scoped) counterpart that backs the
-  // retry cron's `getPendingToRetry` — it has no account context, so it
-  // needs a `landingResult`-only index to find retry candidates across
-  // every account without a full table scan.
+  // WA conversion attribution — HISTORICAL DATA ONLY (Task B5). One row
+  // per detected attribution identifier (an `HY-XXXXXX` ref code or a
+  // Meta `ctwa_clid`) seen on an inbound WhatsApp message, written by the
+  // old `convex/attribution.ts`'s `recordSignal` and updated by its
+  // outbound partner-signal action as it landed. That whole module
+  // (recordSignal/getSignal/patchResult/sendSignal/getPendingToRetry/
+  // retryPending/listConversions) was DELETED in Task B5 — ingest was
+  // rewired to `conversionEvents` (funnel Phase 1) and the retry cron
+  // was removed, leaving this table with NO remaining writers. Its rows
+  // stay queryable for historical reference only; nothing in the app
+  // reads or writes it anymore. The table itself is kept (not dropped)
+  // because Convex schema validation rejects removing a table that
+  // still holds prod data — drop it after a prod purge of these rows.
+  // The pure `extractRefCode`/`extractCtwaClid`/`decodeHidden` helpers
+  // that used to live alongside this table moved to
+  // `convex/lib/attribution.ts` (still used by `ingest.ts`).
   // ============================================================
   attributionSignals: defineTable({
     accountId: v.id("accounts"),
@@ -1342,9 +1346,9 @@ export default defineSchema({
       v.literal("unmatched"),
       v.literal("error"),
       // Terminal give-up state: a row whose retries hit `attempts` ==
-      // `MAX_ATTEMPTS` is retired here (by `attribution.patchResult`) so
-      // it leaves the `"error"` partition the retry cron's
-      // `getPendingToRetry` scans — see that function's own comment.
+      // `MAX_ATTEMPTS` was retired here by the old (now-deleted)
+      // `attribution.patchResult`, so it left the `"error"` partition
+      // the old retry cron's `getPendingToRetry` scanned.
       v.literal("abandoned"),
     ),
     offerSlug: v.optional(v.string()),

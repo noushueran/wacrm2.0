@@ -16,7 +16,7 @@ const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 /**
  * Funnel performance overview for the admin dashboard. Admin+ only (exposes
  * account-wide conversion/revenue aggregates — same gate as
- * `attribution.listConversions`). Read-only. Two account-scoped, window-
+ * `conversionEvents.listRecent`). Read-only. Two account-scoped, window-
  * bounded index scans (was 2×7 per-stage scans) bucketed in memory:
  *  - per-stage funnel counts (distinct conversations reaching each stage)
  *    from `funnelTransitions.by_account`,
