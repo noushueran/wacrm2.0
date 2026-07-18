@@ -934,3 +934,125 @@ test("draft returns ai_not_configured (never throws) when the account has no AI 
     code: "ai_not_configured",
   });
 });
+
+// ------------------------------------------------------------
+// draft — per-conversation RBAC. An agent must not draft a reply
+// grounded in a COLLEAGUE'S assigned thread that the message read layer
+// (`messages.listByConversation`) would refuse to show them. With no AI
+// config, an ALLOWED call falls through to `ai_not_configured`; a DENIED
+// call throws NOT_FOUND before ever reaching the config check.
+// ------------------------------------------------------------
+
+test("draft throws NOT_FOUND when an agent targets a conversation assigned to a different agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asAdmin } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asAdmin, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+  const bobId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const carlId = await seedTeammate(t, {
+    accountId,
+    name: "Carl",
+    email: "carl@example.com",
+    role: "agent",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, { assignedToUserId: bobId }),
+  );
+  const asCarl = t.withIdentity({ subject: `${carlId}|session-Carl` });
+
+  await expect(
+    asCarl.action(api.aiReply.draft, { conversationId }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "conversation" } });
+});
+
+test("draft allows the assigned agent (reaches ai_not_configured, not NOT_FOUND)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asAdmin } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asAdmin, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+  const bobId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, { assignedToUserId: bobId }),
+  );
+  const asBob = t.withIdentity({ subject: `${bobId}|session-Bob` });
+
+  const result = await asBob.action(api.aiReply.draft, { conversationId });
+  expect(result).toMatchObject({ code: "ai_not_configured" });
+});
+
+test("draft allows a supervisor on another agent's assigned conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asAdmin } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asAdmin, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+  const bobId = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const samId = await seedTeammate(t, {
+    accountId,
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, { assignedToUserId: bobId }),
+  );
+  const asSam = t.withIdentity({ subject: `${samId}|session-Sam` });
+
+  const result = await asSam.action(api.aiReply.draft, { conversationId });
+  expect(result).toMatchObject({ code: "ai_not_configured" });
+});
+
+test("draft allows an agent on an unassigned (pool) conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asAdmin } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { conversationId } = await seedInboundThread(t, asAdmin, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi",
+  });
+  const carlId = await seedTeammate(t, {
+    accountId,
+    name: "Carl",
+    email: "carl@example.com",
+    role: "agent",
+  });
+  const asCarl = t.withIdentity({ subject: `${carlId}|session-Carl` });
+
+  const result = await asCarl.action(api.aiReply.draft, { conversationId });
+  expect(result).toMatchObject({ code: "ai_not_configured" });
+});

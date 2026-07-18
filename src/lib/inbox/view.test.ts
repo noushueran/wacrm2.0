@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   inboxUrl,
   messageAreaState,
+  listSectionState,
   INITIAL_MESSAGE_PAGE_SIZE,
 } from "./view";
 
@@ -45,5 +46,23 @@ describe("INITIAL_MESSAGE_PAGE_SIZE", () => {
     // Thread and prefetcher must request the SAME first-page size or the
     // cache key won't match and the prefetch is wasted.
     expect(INITIAL_MESSAGE_PAGE_SIZE).toBe(30);
+  });
+});
+
+describe("listSectionState", () => {
+  it("is 'loading' while the query is still in flight (undefined), NOT 'empty'", () => {
+    // Regression: a Convex `useQuery` returns `undefined` while loading.
+    // Collapsing that to `[]` made the contact sidebar assert "No deals
+    // yet" for the whole cold round-trip (~590ms) — a falsehood a CRM
+    // agent could act on. Loading must be distinct from genuinely-empty.
+    expect(listSectionState(undefined)).toBe("loading");
+  });
+
+  it("is 'empty' once the query has loaded a genuinely empty list", () => {
+    expect(listSectionState([])).toBe("empty");
+  });
+
+  it("shows the 'list' once any rows exist", () => {
+    expect(listSectionState([{ id: "d1" }])).toBe("list");
   });
 });

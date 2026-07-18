@@ -5,6 +5,7 @@ import { encrypt } from "./lib/whatsappEncryption";
 import { normalizePhone, isValidE164 } from "./lib/phone";
 import { findOrCreateContactByPhone } from "./contacts";
 import { loadActiveApiKey } from "./apiKeys";
+import { clampLimit } from "./lib/cronSummary";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx, MutationCtx, ActionCtx } from "./_generated/server";
 
@@ -436,11 +437,16 @@ export const listMessages = query({
 
     // No filters on this endpoint — Convex's own `.paginate()` cursor is
     // used directly (unlike `listContacts`/`listConversations` above).
+    // Clamp `numItems` to the REST layer's [1,100]: a caller-supplied
+    // negative throws, and a huge value turns one page into a heavy read.
     const result = await ctx.db
       .query("messages")
       .withIndex("by_conversation", (q) => q.eq("conversationId", conversation._id))
       .order("desc")
-      .paginate({ numItems: args.limit, cursor: args.cursor ?? null });
+      .paginate({
+        numItems: clampLimit(args.limit, 50, 100),
+        cursor: args.cursor ?? null,
+      });
 
     return {
       items: result.page,

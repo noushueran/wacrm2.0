@@ -170,8 +170,11 @@ export const leadsBoard = accountQuery({
       .query("memberships")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .collect();
+    // No `email` fallback: `members.list` nulls a member's email below
+    // admin (staff PII), and this board is served to agents/supervisors —
+    // a name or the generic "Member", never the email.
     const memberName = new Map(
-      memberships.map((m) => [m.userId, m.fullName ?? m.email ?? "Member"]),
+      memberships.map((m) => [m.userId, m.fullName ?? "Member"]),
     );
 
     const summary: Record<string, number> = {};

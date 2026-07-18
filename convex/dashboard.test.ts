@@ -887,6 +887,43 @@ test("activity drops a deal with no updatedAt from the fetched window rather tha
   expect(items.filter((i) => i.kind === "deal")).toHaveLength(10);
 });
 
+test("activity surfaces only customer messages (not bot/agent) via by_account_sender", async () => {
+  // Guards the read-bound rewrite: the customer-message feed now filters
+  // to senderType==="customer" inside the `by_account_sender` index range
+  // instead of a post-scan `.filter()`, so this pins that the filter is
+  // still applied — a newer bot and agent message must NOT surface as
+  // message items. (convex-test counts only rows a query RETURNS, never
+  // `.filter()`-skipped scans, so it cannot reproduce the production
+  // read-limit this fix targets; this asserts the preserved semantics.)
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(NOW);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await seedContact(t, {
+    accountId,
+    phone: "+15551110000",
+    name: "Cara",
+  });
+  const conv = await seedConversation(t, { accountId, contactId });
+  const customerMsg = await seedMessage(t, {
+    accountId,
+    conversationId: conv,
+    senderType: "customer",
+  });
+  // Newer bot + agent messages: index-range filtering must exclude them.
+  await seedMessage(t, { accountId, conversationId: conv, senderType: "bot" });
+  await seedMessage(t, { accountId, conversationId: conv, senderType: "agent" });
+
+  const items = await asUser.query(api.dashboard.activity, { limit: 20 });
+  const messageItems = items.filter((it) => it.kind === "message");
+  expect(messageItems).toHaveLength(1);
+  expect(messageItems[0]!.id).toBe(`msg-${customerMsg}`);
+});
+
 // ============================================================
 // cross-cutting denial — every dashboard query requires an identity
 // ============================================================

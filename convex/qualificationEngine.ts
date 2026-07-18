@@ -2153,9 +2153,17 @@ export const staffLoopsDue = internalQuery({
       customerName: string;
       escalate: boolean;
     }[] = [];
+    // `.order("desc")` is load-bearing: `by_status_offered` is
+    // `["status","offeredAt"]`, so an UNORDERED `.take(200)` returns the
+    // OLDEST 200 accepted offers. `accepted` is terminal and only
+    // accumulates, so past 200 a freshly-accepted offer — the one whose
+    // feedback loop actually needs nudging — would never enter this sweep.
+    // Newest-first keeps new acceptances reachable (the tail beyond 200 has,
+    // in practice, already been reminded/escalated).
     const accepted = await ctx.db
       .query("leadOffers")
       .withIndex("by_status_offered", (q) => q.eq("status", "accepted"))
+      .order("desc")
       .take(200);
     for (const offer of accepted) {
       const config = await ctx.db
@@ -2272,13 +2280,17 @@ export const staffCheckinsDue = internalQuery({
             .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
             .first();
           if (conversation) {
+            // Ranged on `by_conversation_sender` so this reads only the
+            // customer partition: this runs inside a loop over EVERY
+            // account's staff, so each conversation's scan sums toward one
+            // 4096-read budget — a post-scan `.filter()` down a long
+            // outbound-heavy staff thread could blow it for the whole sweep.
             const lastMsg = await ctx.db
               .query("messages")
-              .withIndex("by_conversation", (q) =>
-                q.eq("conversationId", conversation._id),
+              .withIndex("by_conversation_sender", (q) =>
+                q.eq("conversationId", conversation._id).eq("senderType", "customer"),
               )
               .order("desc")
-              .filter((q) => q.eq(q.field("senderType"), "customer"))
               .first();
             lastInbound = lastMsg?._creationTime ?? 0;
           }

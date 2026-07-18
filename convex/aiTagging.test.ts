@@ -454,3 +454,116 @@ test("pendingForConversation returns the pending row, then null once it's review
   const afterDismiss = await asUser.query(api.aiTagging.pendingForConversation, { conversationId });
   expect(afterDismiss).toBeNull();
 });
+
+// ------------------------------------------------------------
+// suggest — per-conversation RBAC (mirrors aiReply.draft). An agent must
+// not classify a COLLEAGUE'S assigned thread grounded in history the
+// message read layer would hide. suggest never throws, so denial comes
+// back as {code:"not_found"}; with no AI config an ALLOWED call reaches
+// the config check and returns {code:"ai_not_configured"}.
+// ------------------------------------------------------------
+
+async function seedConversationForRbac(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  assignedToUserId?: Id<"users">,
+) {
+  return await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15550009",
+      phoneNormalized: "15550009",
+    });
+    return await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+      ...(assignedToUserId ? { assignedToUserId } : {}),
+    });
+  });
+}
+
+test("suggest returns not_found when an agent targets a conversation assigned to a different agent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { userId: bobId } = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const { asUser: asCarl } = await seedTeammate(t, {
+    accountId,
+    name: "Carl",
+    email: "carl@example.com",
+    role: "agent",
+  });
+  const conversationId = await seedConversationForRbac(t, accountId, bobId);
+
+  const res = await asCarl.action(api.aiTagging.suggest, { conversationId });
+  expect(res).toMatchObject({ code: "not_found" });
+});
+
+test("suggest allows the assigned agent (reaches ai_not_configured, not not_found)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { userId: bobId, asUser: asBob } = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const conversationId = await seedConversationForRbac(t, accountId, bobId);
+
+  const res = await asBob.action(api.aiTagging.suggest, { conversationId });
+  expect(res).toMatchObject({ code: "ai_not_configured" });
+});
+
+test("suggest allows a supervisor on another agent's assigned conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { userId: bobId } = await seedTeammate(t, {
+    accountId,
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const { asUser: asSam } = await seedTeammate(t, {
+    accountId,
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  const conversationId = await seedConversationForRbac(t, accountId, bobId);
+
+  const res = await asSam.action(api.aiTagging.suggest, { conversationId });
+  expect(res).toMatchObject({ code: "ai_not_configured" });
+});
+
+test("suggest allows an agent on an unassigned (pool) conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { asUser: asCarl } = await seedTeammate(t, {
+    accountId,
+    name: "Carl",
+    email: "carl@example.com",
+    role: "agent",
+  });
+  const conversationId = await seedConversationForRbac(t, accountId);
+
+  const res = await asCarl.action(api.aiTagging.suggest, { conversationId });
+  expect(res).toMatchObject({ code: "ai_not_configured" });
+});

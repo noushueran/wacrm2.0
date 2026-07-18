@@ -246,6 +246,65 @@ test("V4 RBAC: agents see ONLY their own assigned leads; supervisors see all wit
   expect(adminBoard.leads.some((l) => l.assigneeName === "Agent A")).toBe(true);
 });
 
+test("leadsBoard never leaks a member's email as their assignee name (no fullName falls back to 'Member', not the email)", async () => {
+  // `members.list` nulls `email` below admin (staff PII); the leads board,
+  // served to agents/supervisors, must not smuggle it back in as the
+  // assignee label.
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const agentUserId = await t.run(async (ctx) => {
+    const uid = await ctx.db.insert("users", {
+      name: "NoName",
+      email: "secret@example.com",
+    });
+    // Membership deliberately has NO fullName — only an email.
+    await ctx.db.insert("memberships", {
+      userId: uid,
+      accountId: admin.accountId,
+      role: "agent",
+      email: "secret@example.com",
+    });
+    return uid;
+  });
+  await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId: admin.accountId,
+      phone: "+971500000099",
+      phoneNormalized: "971500000099",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId: admin.accountId,
+      contactId,
+      status: "open",
+      unreadCount: 0,
+      assignedToUserId: agentUserId,
+    });
+    await ctx.db.insert("qualificationSessions", {
+      accountId: admin.accountId,
+      conversationId,
+      contactId,
+      status: "qualified",
+      origin: "inbound",
+      serviceName: "UAE visa",
+      fields: [],
+      expectedCount: 4,
+      answeredCount: 4,
+      score: 70,
+      qualifiedAt: 1,
+      followUpsSent: 0,
+      phrasingCursor: 0,
+      sendAttemptErrors: 0,
+    });
+  });
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {});
+  const assigned = board.leads.find((l) => l.assigneeName !== null);
+  expect(assigned?.assigneeName).toBe("Member");
+  expect(
+    board.leads.every((l) => l.assigneeName !== "secret@example.com"),
+  ).toBe(true);
+});
+
 test("P6: memberTags.setForTag replaces routing links, admin-gated", async () => {
   const t = convexTest(schema, modules);
   const admin = await seedMember(t, "admin");

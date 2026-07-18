@@ -164,6 +164,108 @@ test("a second inbound message from the same phone reuses the contact + conversa
 });
 
 // ============================================================
+// First-customer detection across an outbound-heavy thread (read-bound)
+// ============================================================
+
+test("ingestInbound detects the first customer message even when the conversation already holds only non-customer messages", async () => {
+  // Staff-alert-channel shape from the brief: a conversation that has only
+  // ever carried outbound bot/agent messages. The customer's first reply is
+  // still `isFirstInboundMessage: true` — detection keys on the ABSENCE of a
+  // prior CUSTOMER message, which `by_conversation_sender` now ranges
+  // directly instead of scanning the whole (outbound-heavy) thread.
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const conversationId = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "15551234567",
+      phoneNormalized: "15551234567",
+    });
+    const convId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open",
+      unreadCount: 0,
+    });
+    for (const senderType of ["bot", "agent", "bot"] as const) {
+      await ctx.db.insert("messages", {
+        accountId,
+        conversationId: convId,
+        senderType,
+        contentType: "text",
+        contentText: "outbound",
+        status: "sent",
+      });
+    }
+    return convId;
+  });
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "Hi, first time reaching out",
+      wamid: "wamid.FIRSTCUST",
+    },
+  });
+
+  expect(res.conversationId).toBe(conversationId);
+  expect(res.isFirstInboundMessage).toBe(true);
+});
+
+test("ingestInbound reports isFirstInboundMessage=false when an older customer message already exists under later outbound noise", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const conversationId = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: "15551234567",
+      phoneNormalized: "15551234567",
+    });
+    const convId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open",
+      unreadCount: 0,
+    });
+    // An earlier CUSTOMER message, then later bot noise on top of it.
+    await ctx.db.insert("messages", {
+      accountId,
+      conversationId: convId,
+      senderType: "customer",
+      contentType: "text",
+      contentText: "earlier question",
+      status: "sent",
+    });
+    await ctx.db.insert("messages", {
+      accountId,
+      conversationId: convId,
+      senderType: "bot",
+      contentType: "text",
+      contentText: "auto reply",
+      status: "sent",
+    });
+    return convId;
+  });
+
+  const res = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "following up again",
+      wamid: "wamid.NOTFIRST",
+    },
+  });
+
+  expect(res.conversationId).toBe(conversationId);
+  expect(res.isFirstInboundMessage).toBe(false);
+});
+
+// ============================================================
 // Cross-account isolation — same phone, different account
 // ============================================================
 
