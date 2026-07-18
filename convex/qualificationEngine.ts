@@ -27,7 +27,6 @@ import {
   pickFollowUpText,
 } from "./lib/qualification/schedule";
 import { insertNotification } from "./notifications";
-import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import type { AccountRole } from "./lib/roles";
 import { normalizePhone } from "./lib/phone";
@@ -546,11 +545,14 @@ export const completeQualification = internalMutation({
       defaultCurrency: account?.defaultCurrency ?? "USD",
     });
 
-    // Handoff to the human queue — mirrors `aiReply.markHandoff` (kept
-    // inline: a mutation cannot runMutation another; parity is pinned by
-    // the tests). Assigns the AI config's handoff agent only when the
-    // thread is unassigned, and the idempotent lead charge follows the
-    // same rule as every other assignment path.
+    // v3: the assistant KEEPS the conversation after qualification — no
+    // aiAutoreplyDisabled, no auto-assignment, no charge here. The bot
+    // only stands down when a human actually takes over (assign /
+    // pause — the existing dispatch guards), and the lead charge fires
+    // through those existing assignment paths at that moment. The
+    // conversation still surfaces to the team: status → "pending" (the
+    // needs-attention queue), the summary lands on the thread, and the
+    // notifications/push/alerts below all fire.
     const answers = session.fields
       .filter((f) => f.confidence !== "low")
       .map((f) => `${f.label ?? f.key}: ${f.value}`)
@@ -560,24 +562,11 @@ export const completeQualification = internalMutation({
       (session.serviceName ? ` — ${session.serviceName}` : "") +
       (session.summary ? `: ${session.summary}` : "") +
       (answers ? `. ${answers}` : "");
-    const aiCfg = await ctx.db
-      .query("aiConfigs")
-      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
-      .unique();
-    const assignTo =
-      !conversation.assignedToUserId && aiCfg?.handoffAgentId
-        ? aiCfg.handoffAgentId
-        : undefined;
     await ctx.db.patch(args.conversationId, {
-      aiAutoreplyDisabled: true,
       status: "pending",
       aiHandoffSummary: summary,
       updatedAt: now,
-      ...(assignTo ? { assignedToUserId: assignTo } : {}),
     });
-    if (assignTo) {
-      await chargeLeadIfAgent(ctx, args.accountId, assignTo, args.conversationId);
-    }
 
     // In-app bell notifications: the assignee if any, else everyone who
     // works the shared pool (supervisor+ — same rule as inbound push).
@@ -586,7 +575,7 @@ export const completeQualification = internalMutation({
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .collect();
     const recipients = recipientsForInbound({
-      assignedToUserId: assignTo ?? conversation.assignedToUserId ?? null,
+      assignedToUserId: conversation.assignedToUserId ?? null,
       members: members.map((m) => ({ userId: m.userId, role: m.role as AccountRole })),
     });
     const body =

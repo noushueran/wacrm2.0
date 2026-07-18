@@ -369,7 +369,10 @@ test("readiness completes the lead: session qualified, funnel auto-advanced, Met
 
   const conversation = await t.run((ctx) => ctx.db.get(conversationId));
   expect(conversation?.funnel?.stage).toBe("qualified");
-  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+  // v3 change: the assistant KEEPS replying after qualification — only a
+  // real human takeover (assign / pause) silences it.
+  expect(conversation?.aiAutoreplyDisabled).toBeFalsy();
+  expect(conversation?.assignedToUserId).toBeUndefined();
   expect(conversation?.status).toBe("pending");
   expect(conversation?.aiHandoffSummary).toContain("Qualified lead");
 
