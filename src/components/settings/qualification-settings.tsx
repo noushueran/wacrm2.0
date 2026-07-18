@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery } from 'convex/react';
 import { useTranslations } from 'next-intl';
 import { Loader2 } from 'lucide-react';
@@ -8,7 +8,9 @@ import { Loader2 } from 'lucide-react';
 import { RequireRole } from '@/components/auth/require-role';
 import { useAuth } from '@/hooks/use-auth';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { SettingsPanelHead } from './settings-panel-head';
 
@@ -40,8 +42,33 @@ export function QualificationSettings() {
     api.qualification.getConfig,
     canEditCriticalSettings ? {} : 'skip',
   );
+  const templates = useQuery(
+    api.templates.list,
+    canEditCriticalSettings ? {} : 'skip',
+  );
   const updateConfig = useMutation(api.qualification.updateConfig);
   const [saving, setSaving] = useState(false);
+  const [alertsSaving, setAlertsSaving] = useState(false);
+  const [alertsError, setAlertsError] = useState<string | null>(null);
+  const [alertsSaved, setAlertsSaved] = useState(false);
+
+  // Alerts & templates form state, hydrated from the stored config once.
+  const [phonesInput, setPhonesInput] = useState('');
+  const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [reengagementName, setReengagementName] = useState('');
+  const [alertTemplateName, setAlertTemplateName] = useState('');
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    if (!config || hydrated) return;
+    setPhonesInput(config.adminAlertPhones.join(', '));
+    setAlertsEnabled(config.adminAlertEnabled);
+    setReengagementName(config.reengagementTemplateName ?? '');
+    setAlertTemplateName(config.adminAlertTemplateName ?? '');
+    setHydrated(true);
+  }, [config, hydrated]);
+
+  const templateLanguage = (name: string): string | undefined =>
+    templates?.find((row) => row.name === name)?.language ?? undefined;
 
   const onToggle = async (enabled: boolean) => {
     setSaving(true);
@@ -51,6 +78,41 @@ export function QualificationSettings() {
       setSaving(false);
     }
   };
+
+  const onSaveAlerts = async () => {
+    setAlertsSaving(true);
+    setAlertsError(null);
+    setAlertsSaved(false);
+    try {
+      await updateConfig({
+        patch: {
+          adminAlertEnabled: alertsEnabled,
+          adminAlertPhones: phonesInput
+            .split(/[,\n]/)
+            .map((p) => p.trim())
+            .filter(Boolean),
+          reengagementTemplateName: reengagementName || undefined,
+          reengagementTemplateLanguage: reengagementName
+            ? templateLanguage(reengagementName)
+            : undefined,
+          adminAlertTemplateName: alertTemplateName || undefined,
+          adminAlertTemplateLanguage: alertTemplateName
+            ? templateLanguage(alertTemplateName)
+            : undefined,
+        },
+      });
+      setAlertsSaved(true);
+    } catch (err) {
+      const data = (err as { data?: { reason?: string } })?.data;
+      setAlertsError(data?.reason ?? t('alerts.saveError'));
+    } finally {
+      setAlertsSaving(false);
+    }
+  };
+
+  const templateOptions = (templates ?? []).filter((row) =>
+    ['APPROVED', 'PENDING'].includes(row.status ?? ''),
+  );
 
   return (
     <RequireRole min="admin">
@@ -75,6 +137,70 @@ export function QualificationSettings() {
                     onCheckedChange={onToggle}
                     disabled={saving}
                   />
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="space-y-4 pt-6 text-sm">
+                <p className="font-medium text-foreground">{t('alerts.title')}</p>
+                <div className="flex items-center justify-between gap-4">
+                  <p className="text-muted-foreground">{t('alerts.enableLabel')}</p>
+                  <Switch checked={alertsEnabled} onCheckedChange={setAlertsEnabled} />
+                </div>
+                <div className="space-y-1.5">
+                  <p className="text-muted-foreground">{t('alerts.phonesLabel')}</p>
+                  <Input
+                    value={phonesInput}
+                    onChange={(e) => setPhonesInput(e.target.value)}
+                    placeholder="+971 50 123 4567, +971 55 987 6543"
+                  />
+                  <p className="text-xs text-muted-foreground">{t('alerts.phonesHint')}</p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('alerts.alertTemplateLabel')}</p>
+                    <select
+                      value={alertTemplateName}
+                      onChange={(e) => setAlertTemplateName(e.target.value)}
+                      className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground"
+                    >
+                      <option value="">{t('alerts.noTemplate')}</option>
+                      {templateOptions.map((row) => (
+                        <option key={row._id} value={row.name}>
+                          {row.name} · {row.status}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="text-muted-foreground">{t('alerts.reengagementTemplateLabel')}</p>
+                    <select
+                      value={reengagementName}
+                      onChange={(e) => setReengagementName(e.target.value)}
+                      className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground"
+                    >
+                      <option value="">{t('alerts.noTemplate')}</option>
+                      {templateOptions.map((row) => (
+                        <option key={row._id} value={row.name}>
+                          {row.name} · {row.status}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <Button size="sm" onClick={onSaveAlerts} disabled={alertsSaving}>
+                    {alertsSaving ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    {t('alerts.save')}
+                  </Button>
+                  {alertsSaved ? (
+                    <span className="text-xs text-emerald-500">{t('alerts.saved')}</span>
+                  ) : null}
+                  {alertsError ? (
+                    <span className="text-xs text-red-400">{alertsError}</span>
+                  ) : null}
                 </div>
               </CardContent>
             </Card>
