@@ -196,6 +196,12 @@ export const leadsBoard = accountQuery({
       assigneeName: string | null;
       fields: { key: string; label: string | null; value: string; confidence: string }[];
       scoreBreakdown: { criterion: string; marks: number; maxMarks: number; reason: string | null }[];
+      assignment: {
+        acceptedAt: number | null;
+        offersMade: number;
+        lastFeedback: string | null;
+        lastFeedbackAt: number | null;
+      };
     }[] = [];
 
     for (const status of LEAD_STATUSES) {
@@ -218,6 +224,15 @@ export const leadsBoard = accountQuery({
             : conversation.attribution?.lane === "code"
               ? "website"
               : "organic";
+        // P6 assignment trail for the board (offers, acceptance, agent
+        // feedback) — one small indexed collect per rendered session.
+        const offers = await ctx.db
+          .query("leadOffers")
+          .withIndex("by_session", (q) => q.eq("sessionId", s._id))
+          .collect();
+        const accepted = offers
+          .filter((o) => o.status === "accepted")
+          .sort((a, b) => (b.respondedAt ?? 0) - (a.respondedAt ?? 0))[0];
         leads.push({
           sessionId: s._id,
           conversationId: s.conversationId,
@@ -251,6 +266,12 @@ export const leadsBoard = accountQuery({
             maxMarks: b.maxMarks,
             reason: b.reason ?? null,
           })),
+          assignment: {
+            acceptedAt: accepted?.respondedAt ?? null,
+            offersMade: offers.length,
+            lastFeedback: accepted?.feedback ?? null,
+            lastFeedbackAt: accepted?.feedbackAt ?? null,
+          },
         });
       }
     }
