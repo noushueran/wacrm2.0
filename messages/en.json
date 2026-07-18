@@ -1777,13 +1777,21 @@
         "noTemplate": "— none —",
         "save": "Save alert settings",
         "saved": "Saved",
-        "saveError": "Could not save — check the values."
+        "saveError": "Could not save — check the values.",
+        "autoAssignLabel": "Offer qualified leads to matching agents on WhatsApp (auto-assign on YES)"
       },
       "defaultsTitle": "Active configuration",
       "hours": "Follow-up hours: {start}–{end} {tz} · {days}",
       "cadence": "Up to {count} follow-ups within {window}h · qualify at score ≥ {threshold}",
       "fallbackFields": "Fallback questions (used when no service document matches):",
-      "comingSoon": "Question editing, follow-up cadence, admin WhatsApp alerts and the Leads workspace arrive with the next phases — this switch only enables session tracking for now."
+      "comingSoon": "Question editing, follow-up cadence, admin WhatsApp alerts and the Leads workspace arrive with the next phases — this switch only enables session tracking for now.",
+      "routing": {
+        "title": "Service routing",
+        "desc": "Tick which team members can take leads for each service tag. The AI offers new leads to them on WhatsApp (fewest recent leads first) and assigns on YES.",
+        "noTags": "No tags yet — service tags appear automatically when leads qualify, or create them under Fields & tags.",
+        "noAgents": "No agents or supervisors on the team yet.",
+        "noPhone": " (no WhatsApp number set)"
+      }
     },
     "profile": {
       "title": "Your profile",

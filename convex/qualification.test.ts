@@ -245,3 +245,33 @@ test("V4 RBAC: agents see ONLY their own assigned leads; supervisors see all wit
   expect(adminBoard.leads).toHaveLength(2);
   expect(adminBoard.leads.some((l) => l.assigneeName === "Agent A")).toBe(true);
 });
+
+test("P6: memberTags.setForTag replaces routing links, admin-gated", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const { tagId, u1, u2 } = await t.run(async (ctx) => {
+    const tagId = await ctx.db.insert("tags", {
+      accountId: admin.accountId, name: "UAE visa", color: "#0ea5e9",
+    });
+    const mk = async (name: string) => {
+      const uid = await ctx.db.insert("users", { name, email: `${name}@example.com` });
+      await ctx.db.insert("memberships", {
+        userId: uid, accountId: admin.accountId, role: "agent", fullName: name, email: `${name}@example.com`,
+      });
+      return uid;
+    };
+    return { tagId, u1: await mk("R1"), u2: await mk("R2") };
+  });
+  await admin.as.mutation(api.memberTags.setForTag, { tagId, userIds: [u1, u2] });
+  let links = await admin.as.query(api.memberTags.list, {});
+  expect(links).toHaveLength(2);
+  await admin.as.mutation(api.memberTags.setForTag, { tagId, userIds: [u2] });
+  links = await admin.as.query(api.memberTags.list, {});
+  expect(links).toHaveLength(1);
+  expect(links[0].userId).toBe(u2);
+
+  const agent = await seedMember(t, "agent");
+  await expect(
+    agent.as.mutation(api.memberTags.setForTag, { tagId, userIds: [] }),
+  ).rejects.toThrow();
+});
