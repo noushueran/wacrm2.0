@@ -1893,7 +1893,19 @@
         "conversion": "Meta conversion event",
         "whatsappSend": "WhatsApp send",
         "ingest": "Message processing",
-        "cronWrapper": "Cron execution"
+        "cronWrapper": "Cron execution",
+        "qualification": "Lead qualification step",
+        "broadcast": "Broadcast delivery",
+        "attribution": "Website conversion signal",
+        "adResolution": "Ad campaign lookup",
+        "kbIngest": "AI knowledge indexing",
+        "flowTimer": "Flow timeout",
+        "automationTimer": "Automation wait",
+        "checklist": "Sales checklist generation"
+      },
+      "actions": {
+        "showMore": "Show more",
+        "showLess": "Show less"
       },
       "rel": {
         "justNow": "just now",

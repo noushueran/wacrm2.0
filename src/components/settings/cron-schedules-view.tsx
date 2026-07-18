@@ -1,9 +1,10 @@
 'use client';
 
 import { useTranslations } from 'next-intl';
-import { ExternalLink, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, ExternalLink, Loader2 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { softBadge } from '@/lib/ui/soft-badge';
 import { cn } from '@/lib/utils';
@@ -53,6 +54,7 @@ export interface OfferEntry {
 export interface CronOverviewData {
   crons: CronEntry[];
   recentRuns: CronRunEntry[];
+  recentRunsOverflow: boolean;
   followUps: FollowUpEntry[];
   offers: OfferEntry[];
   qualificationEnabled: boolean;
@@ -75,15 +77,32 @@ export interface CompletedTaskEntry {
 
 export interface SystemTasksData {
   pending: PendingTaskEntry[];
+  /** True pending total (scan-capped server-side; render "N+" on overflow). */
   pendingCount: number;
+  pendingOverflow: boolean;
   completed: CompletedTaskEntry[];
+  completedOverflow: boolean;
+}
+
+/** Per-list expand state the panel owns; the view just renders it. */
+export interface ListControl {
+  canShowMore: boolean;
+  expanded: boolean;
+  showMore: () => void;
+  showLess: () => void;
 }
 
 type Translator = ReturnType<typeof useTranslations<'Settings.cron'>>;
 
-/** Known one-off scheduler functions → friendly i18n label keys. */
+/**
+ * Known one-off scheduler functions → friendly i18n label keys.
+ * Specific prefixes first — the module-wide catch-alls below them pick
+ * up any sibling function so new scheduler targets in a covered module
+ * still get a sensible label. Unmatched names render raw (never
+ * hidden), so an entirely new module remains visible either way.
+ */
 const JOB_LABELS: Array<[prefix: string, key: string]> = [
-  ['aiReply.dispatchInbound', 'aiReply'],
+  ['aiReply.', 'aiReply'],
   ['qualificationEngine.analyzeInbound', 'leadAnalysis'],
   ['qualificationEngine.sendFollowUp', 'followUpNudge'],
   ['qualificationEngine.sendClosingMessage', 'closingMessage'],
@@ -93,12 +112,20 @@ const JOB_LABELS: Array<[prefix: string, key: string]> = [
   ['qualificationEngine.startLeadOffer', 'leadOffer'],
   ['qualificationEngine.announceAssignment', 'leadOffer'],
   ['qualificationEngine.notifyStaffText', 'staffMessage'],
+  ['qualificationEngine.', 'qualification'],
   ['pushSend.', 'push'],
   ['webhookDelivery.', 'webhook'],
   ['conversionEvents.', 'conversion'],
   ['metaSend.', 'whatsappSend'],
   ['ingest.', 'ingest'],
   ['cronSchedules.', 'cronWrapper'],
+  ['broadcasts.', 'broadcast'],
+  ['attribution.', 'attribution'],
+  ['campaignAds.', 'adResolution'],
+  ['aiKnowledge.', 'kbIngest'],
+  ['flowsEngine.', 'flowTimer'],
+  ['automationsEngine.', 'automationTimer'],
+  ['salesChecklists.', 'checklist'],
 ];
 
 function jobLabel(name: string, t: Translator): string {
@@ -143,7 +170,7 @@ function StatusDot({ status }: { status: CronRunEntry['status'] | 'idle' }) {
   );
 }
 
-function GroupHead({ label, count }: { label: string; count: number }) {
+function GroupHead({ label, count }: { label: string; count: number | string }) {
   return (
     <div className="flex items-center gap-2">
       <p className="text-sm font-medium text-foreground">{label}</p>
@@ -154,14 +181,54 @@ function GroupHead({ label, count }: { label: string; count: number }) {
   );
 }
 
+/**
+ * "Show more" / "Show less" footer under a bounded list. "Show more"
+ * re-queries with a bigger limit — nothing beyond the visible slice is
+ * fetched until it is clicked.
+ */
+function ShowMoreFooter({ control }: { control: ListControl }) {
+  const t = useTranslations('Settings.cron');
+  if (!control.canShowMore && !control.expanded) return null;
+  return (
+    <div className="mt-1 flex items-center gap-2">
+      {control.canShowMore ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+          onClick={control.showMore}
+        >
+          <ChevronDown className="size-3.5" />
+          {t('actions.showMore')}
+        </Button>
+      ) : null}
+      {control.expanded ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+          onClick={control.showLess}
+        >
+          <ChevronUp className="size-3.5" />
+          {t('actions.showLess')}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 export function CronSchedulesView({
   overview,
   tasks,
   now,
+  controls,
 }: {
   overview: CronOverviewData | undefined;
   tasks: SystemTasksData | undefined;
   now: number;
+  controls: { runs: ListControl; pending: ListControl; completed: ListControl };
 }) {
   const t = useTranslations('Settings.cron');
 
@@ -173,6 +240,16 @@ export function CronSchedulesView({
     overview.followUps.length +
     overview.offers.length +
     (tasks?.pendingCount ?? 0);
+  // "N+" wherever a server-side cap may hide rows beyond the count.
+  const upcomingLabel = tasks?.pendingOverflow
+    ? `${upcomingTotal}+`
+    : upcomingTotal;
+  const completedTotal =
+    overview.recentRuns.length + (tasks?.completed.length ?? 0);
+  const completedLabel =
+    overview.recentRunsOverflow || (tasks?.completedOverflow ?? false)
+      ? `${completedTotal}+`
+      : completedTotal;
 
   return (
     <div className="space-y-4">
@@ -232,7 +309,7 @@ export function CronSchedulesView({
       <Card>
         <CardContent className="space-y-4 pt-6">
           <div>
-            <GroupHead label={t('upcoming.title')} count={upcomingTotal} />
+            <GroupHead label={t('upcoming.title')} count={upcomingLabel} />
             <p className="mt-1 text-xs text-muted-foreground">{t('upcoming.desc')}</p>
           </div>
 
@@ -298,7 +375,11 @@ export function CronSchedulesView({
           {tasks && tasks.pending.length > 0 ? (
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {t('upcoming.queued', { count: tasks.pendingCount })}
+                {t('upcoming.queued', {
+                  count: tasks.pendingOverflow
+                    ? `${tasks.pendingCount}+`
+                    : tasks.pendingCount,
+                })}
               </p>
               <div className="mt-1 divide-y divide-border">
                 {tasks.pending.map((p) => (
@@ -322,6 +403,7 @@ export function CronSchedulesView({
                   </div>
                 ))}
               </div>
+              <ShowMoreFooter control={controls.pending} />
             </div>
           ) : null}
 
@@ -339,17 +421,18 @@ export function CronSchedulesView({
       <Card>
         <CardContent className="space-y-4 pt-6">
           <div>
-            <GroupHead
-              label={t('recent.title')}
-              count={overview.recentRuns.length + (tasks?.completed.length ?? 0)}
-            />
+            <GroupHead label={t('recent.title')} count={completedLabel} />
             <p className="mt-1 text-xs text-muted-foreground">{t('recent.desc')}</p>
           </div>
 
           {overview.recentRuns.length > 0 ? (
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {t('recent.cronRuns', { count: overview.recentRuns.length })}
+                {t('recent.cronRuns', {
+                  count: overview.recentRunsOverflow
+                    ? `${overview.recentRuns.length}+`
+                    : overview.recentRuns.length,
+                })}
               </p>
               <div className="mt-1 divide-y divide-border">
                 {overview.recentRuns.map((run) => (
@@ -376,13 +459,18 @@ export function CronSchedulesView({
                   </div>
                 ))}
               </div>
+              <ShowMoreFooter control={controls.runs} />
             </div>
           ) : null}
 
           {tasks && tasks.completed.length > 0 ? (
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                {t('recent.tasks', { count: tasks.completed.length })}
+                {t('recent.tasks', {
+                  count: tasks.completedOverflow
+                    ? `${tasks.completed.length}+`
+                    : tasks.completed.length,
+                })}
               </p>
               <div className="mt-1 divide-y divide-border">
                 {tasks.completed.map((c) => (
@@ -405,6 +493,7 @@ export function CronSchedulesView({
                   </div>
                 ))}
               </div>
+              <ShowMoreFooter control={controls.completed} />
             </div>
           ) : null}
 

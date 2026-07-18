@@ -6,8 +6,15 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { internal } from "./_generated/api";
 import { accountQuery } from "./lib/auth";
 import {
+  clampLimit,
+  COMPLETED_CAP,
+  COMPLETED_DEFAULT_LIMIT,
   CRON_REGISTRY,
-  summarizeScheduledFunctions,
+  PENDING_DEFAULT_LIMIT,
+  PENDING_SCAN_CAP,
+  RUNS_CAP,
+  RUNS_DEFAULT_LIMIT,
+  summarizeSystemTasks,
   type CronName,
 } from "./lib/cronSummary";
 
@@ -155,9 +162,10 @@ function pickRun(row: Doc<"cronRuns">) {
 }
 
 export const overview = accountQuery({
-  args: {},
-  handler: async (ctx) => {
+  args: { runsLimit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
     ctx.requireRole("admin");
+    const runsLimit = clampLimit(args.runsLimit, RUNS_DEFAULT_LIMIT, RUNS_CAP);
 
     const crons = [];
     for (const entry of CRON_REGISTRY) {
@@ -174,9 +182,14 @@ export const overview = accountQuery({
       });
     }
 
-    const recentRuns = (
-      await ctx.db.query("cronRuns").order("desc").take(30)
-    ).map(pickRun);
+    // limit + 1 probe row: tells the client whether "Show more" has
+    // anything left to reveal without reading the whole history.
+    const runRows = await ctx.db
+      .query("cronRuns")
+      .order("desc")
+      .take(runsLimit + 1);
+    const recentRuns = runRows.slice(0, runsLimit).map(pickRun);
+    const recentRunsOverflow = runRows.length > runsLimit;
 
     const config = await ctx.db
       .query("qualificationConfigs")
@@ -235,6 +248,7 @@ export const overview = accountQuery({
     return {
       crons,
       recentRuns,
+      recentRunsOverflow,
       followUps,
       offers,
       qualificationEnabled: config?.enabled ?? false,
@@ -247,13 +261,57 @@ export const overview = accountQuery({
 // because convex-test cannot emulate `ctx.db.system` — the transform
 // lives in lib/cronSummary.ts where it is unit-tested.
 export const listSystemTasks = accountQuery({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    pendingLimit: v.optional(v.number()),
+    completedLimit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
     ctx.requireRole("admin");
-    const rows = await ctx.db.system
+    const pendingLimit = clampLimit(
+      args.pendingLimit,
+      PENDING_DEFAULT_LIMIT,
+      PENDING_SCAN_CAP,
+    );
+    const completedLimit = clampLimit(
+      args.completedLimit,
+      COMPLETED_DEFAULT_LIMIT,
+      COMPLETED_CAP,
+    );
+
+    // Pending/in-progress: filtered across the WHOLE table, not a
+    // recency window — long-dated jobs (automation waits, flow
+    // timeouts, agent-SLA checks) must never fall out of view just
+    // because newer completed rows buried them. Capped at
+    // PENDING_SCAN_CAP + 1 result rows so the payload stays bounded;
+    // beyond the cap the panel shows "50+".
+    const pendingRows = await ctx.db.system
+      .query("_scheduled_functions")
+      .filter((q) =>
+        q.or(
+          q.eq(q.field("state.kind"), "pending"),
+          q.eq(q.field("state.kind"), "inProgress"),
+        ),
+      )
+      .take(PENDING_SCAN_CAP + 1);
+
+    // Completed: newest-first history. Completed rows dominate the
+    // table, so this reads only ~limit + 1 rows before satisfying take.
+    const completedRows = await ctx.db.system
       .query("_scheduled_functions")
       .order("desc")
-      .take(300);
-    return summarizeScheduledFunctions(rows);
+      .filter((q) =>
+        q.or(
+          q.eq(q.field("state.kind"), "success"),
+          q.eq(q.field("state.kind"), "failed"),
+        ),
+      )
+      .take(completedLimit + 1);
+
+    return summarizeSystemTasks({
+      pendingRows,
+      completedRows,
+      pendingLimit,
+      completedLimit,
+    });
   },
 });
