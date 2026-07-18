@@ -140,6 +140,13 @@ export function TemplateManager() {
   const loading = templatesResult === undefined;
 
   const removeTemplate = useMutation(api.templates.remove);
+  // Task B8: a template with a metaTemplateId must be deleted on Meta
+  // FIRST — `removeWithMeta` wraps `remove`'s delete behind that Meta
+  // call (and never deletes locally if Meta rejects it). Local-only
+  // templates (no metaTemplateId) keep calling `removeTemplate` directly
+  // above — nothing on Meta to check, so no need to route them through
+  // the action.
+  const removeTemplateWithMeta = useAction(api.templates.removeWithMeta);
   // P8-T4: submit-to-Meta + sync-from-Meta now run through Convex
   // actions (`convex/templates.ts`'s `submit`/`syncFromMeta`, which wrap
   // `convex/metaTemplates.ts`'s Meta Graph API calls) instead of the
@@ -348,13 +355,16 @@ export function TemplateManager() {
     if (!target || deletingId) return;
     setDeletingId(target.id);
     try {
-      // Convex-only delete. Unlike the old route (which scoped a Meta
-      // delete via hsm_id before removing the local row), this only
-      // removes the local catalog row — a template with a
-      // meta_template_id set is left behind on Meta's side until the
-      // Meta-coupled delete path is migrated (TODO(P8-T4), same as
-      // submit/sync above).
-      await removeTemplate({ templateId: target.id as Id<'messageTemplates'> });
+      // Meta-first delete (Task B8): a template with a meta_template_id
+      // is deleted on Meta before the local row — if Meta rejects it,
+      // removeWithMeta throws and the local row is left untouched (no
+      // orphaned-but-hidden state: still live on Meta AND still visible
+      // here to retry). Local-only templates keep the plain mutation.
+      if (target.meta_template_id) {
+        await removeTemplateWithMeta({ templateId: target.id as Id<'messageTemplates'> });
+      } else {
+        await removeTemplate({ templateId: target.id as Id<'messageTemplates'> });
+      }
       toast.success(t('toastDeleteSuccess'));
       setTemplateToDelete(null);
     } catch (err) {
@@ -1077,12 +1087,10 @@ export function TemplateManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Confirm-delete dialog. Copy still distinguishes the
-          meta_template_id case (deleteMetaDesc vs deleteLocalDesc below)
-          — but see the TODO(P8-T4) in confirmDelete above: the Convex
-          rewire only removes the local catalog row, so that copy is
-          currently aspirational for rows with a meta_template_id until
-          the Meta-side delete is migrated too. */}
+      {/* Confirm-delete dialog. Copy distinguishes the meta_template_id
+          case (deleteMetaDesc vs deleteLocalDesc below) — confirmDelete
+          above now actually delivers on it (Task B8): a meta_template_id
+          row is deleted on Meta before the local row, not just locally. */}
       <Dialog
         open={templateToDelete !== null}
         onOpenChange={(open) => {
