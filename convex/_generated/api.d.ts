@@ -78,6 +78,7 @@ import type * as lib_qualification_staffReply from "../lib/qualification/staffRe
 import type * as lib_qualification_track from "../lib/qualification/track.js";
 import type * as lib_qualification_validate from "../lib/qualification/validate.js";
 import type * as lib_roles from "../lib/roles.js";
+import type * as lib_salesChecklist from "../lib/salesChecklist.js";
 import type * as lib_whatsapp_interactive from "../lib/whatsapp/interactive.js";
 import type * as lib_whatsapp_metaApi from "../lib/whatsapp/metaApi.js";
 import type * as lib_whatsapp_templateComponents from "../lib/whatsapp/templateComponents.js";
@@ -183,6 +184,7 @@ declare const fullApi: ApiFromModules<{
   "lib/qualification/track": typeof lib_qualification_track;
   "lib/qualification/validate": typeof lib_qualification_validate;
   "lib/roles": typeof lib_roles;
+  "lib/salesChecklist": typeof lib_salesChecklist;
   "lib/whatsapp/interactive": typeof lib_whatsapp_interactive;
   "lib/whatsapp/metaApi": typeof lib_whatsapp_metaApi;
   "lib/whatsapp/templateComponents": typeof lib_whatsapp_templateComponents;
