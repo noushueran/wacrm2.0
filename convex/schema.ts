@@ -1610,4 +1610,21 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     .index("by_account_status", ["accountId", "status"])
     .index("by_due", ["status", "nextFollowUpAt"]),
+
+  // Run history for the interval crons in crons.ts — one row per
+  // execution, stamped by the wrapper actions in cronSchedules.ts.
+  // Deployment-global (no accountId): crons are infrastructure, not
+  // tenant data; the admin-gated Settings → Cron schedules panel is the
+  // only reader. Rows older than 7 days are pruned on each start.
+  cronRuns: defineTable({
+    name: v.string(),
+    startedAt: v.number(),
+    finishedAt: v.optional(v.number()),
+    status: v.union(
+      v.literal("running"),
+      v.literal("success"),
+      v.literal("failed"),
+    ),
+    error: v.optional(v.string()),
+  }).index("by_name", ["name", "startedAt"]),
 });

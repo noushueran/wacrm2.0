@@ -1,6 +1,10 @@
 import { cronJobs } from "convex/server";
 import { internal } from "./_generated/api";
 
+// Every cron registers its cronSchedules.ts wrapper (not the target
+// directly) so each execution stamps a cronRuns history row for the
+// Settings → Cron schedules panel. Keep names + intervals in sync with
+// lib/cronSummary.ts's CRON_REGISTRY.
 const crons = cronJobs();
 
 // Retry CTWA ad->campaign name resolution (campaignAds pending/error with
@@ -9,7 +13,7 @@ const crons = cronJobs();
 crons.interval(
   "retry-ad-resolution",
   { minutes: 60 },
-  internal.campaignAds.retryResolutions,
+  internal.cronSchedules.runRetryAdResolution,
   {},
 );
 
@@ -19,7 +23,7 @@ crons.interval(
 crons.interval(
   "retry-conversion-events",
   { minutes: 15 },
-  internal.conversionEvents.retryConversionEvents,
+  internal.cronSchedules.runRetryConversionEvents,
   {},
 );
 
@@ -30,7 +34,7 @@ crons.interval(
 crons.interval(
   "qualification-follow-ups",
   { minutes: 5 },
-  internal.qualificationEngine.sweepFollowUps,
+  internal.cronSchedules.runSweepFollowUps,
   {},
 );
 
@@ -39,7 +43,7 @@ crons.interval(
 crons.interval(
   "qualification-lead-offers",
   { minutes: 5 },
-  internal.qualificationEngine.sweepLeadOffers,
+  internal.cronSchedules.runSweepLeadOffers,
   {},
 );
 
@@ -49,7 +53,7 @@ crons.interval(
 crons.interval(
   "qualification-staff-loops",
   { minutes: 60 },
-  internal.qualificationEngine.runStaffLoops,
+  internal.cronSchedules.runStaffLoops,
   {},
 );
 
