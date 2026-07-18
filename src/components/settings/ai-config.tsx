@@ -39,6 +39,7 @@ import { api } from '../../../convex/_generated/api';
 import type { Id } from '../../../convex/_generated/dataModel';
 
 const MASKED_KEY = '••••••••••••••••';
+const DEFAULT_MAX_AUTO_REPLIES = 8;
 
 // Radix Select can't use an empty-string item value, so the "leave
 // unassigned" choice gets a sentinel that maps to `undefined` in the
@@ -114,7 +115,10 @@ export function AiConfig() {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
-  const [maxPerConversation, setMaxPerConversation] = useState(3);
+  // 8, not 3: the one-question-per-message qualification flow needs a
+  // full exchange's worth of turns — a cap of 3 silences the bot
+  // mid-qualification (the engine then hands off early).
+  const [maxPerConversation, setMaxPerConversation] = useState(DEFAULT_MAX_AUTO_REPLIES);
   // Empty string = leave unassigned (shared queue).
   const [handoffAgentId, setHandoffAgentId] = useState('');
 
@@ -138,7 +142,7 @@ export function AiConfig() {
       setSystemPrompt(config.systemPrompt ?? '');
       setIsActive(config.isActive);
       setAutoReplyEnabled(config.autoReplyEnabled);
-      setMaxPerConversation(config.autoReplyMaxPerConversation ?? 3);
+      setMaxPerConversation(config.autoReplyMaxPerConversation ?? DEFAULT_MAX_AUTO_REPLIES);
       setHandoffAgentId(config.handoffAgentId ?? '');
       setApiKey(config.hasKey ? MASKED_KEY : '');
       setEmbeddingsKey(config.hasEmbeddingsKey ? MASKED_KEY : '');
