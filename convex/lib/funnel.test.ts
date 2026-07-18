@@ -7,7 +7,7 @@ import {
   backendForLane,
 } from "./funnel";
 
-test("there are 7 stages in funnel order, new_lead first and purchased last", () => {
+test("stages run new_lead → purchased with the terminal lost appended last", () => {
   expect(FUNNEL_STAGE_KEYS).toEqual([
     "new_lead",
     "qualified",
@@ -16,7 +16,15 @@ test("there are 7 stages in funnel order, new_lead first and purchased last", ()
     "itinerary_sent",
     "invoice_sent",
     "purchased",
+    // LAST on purpose: neverDowngrade index math means the engine can
+    // never pull a lost deal back into the working stages.
+    "lost",
   ]);
+});
+
+test("lost is internal-only on both lanes (Meta has no lost event)", () => {
+  expect(resolveEventName("ctwa", "lost")).toBeNull();
+  expect(resolveEventName("code", "lost")).toBeNull();
 });
 
 test("only new_lead is auto; only purchased needs a value", () => {

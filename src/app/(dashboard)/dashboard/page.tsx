@@ -20,7 +20,7 @@ import { SkeletonCard } from '@/components/dashboard/skeleton'
 import { LeadSpendCard } from '@/components/dashboard/lead-spend-card'
 import { QuickActions } from '@/components/dashboard/quick-actions'
 import { ConversationsChart } from '@/components/dashboard/conversations-chart'
-import { PipelineDonut } from '@/components/dashboard/pipeline-donut'
+import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
 import { ResponsePerformance } from '@/components/dashboard/response-performance'
 import { NeedsAttentionCard } from '@/components/dashboard/needs-attention-panel'
 import { ActivityFeed } from '@/components/dashboard/activity-feed'
@@ -37,7 +37,7 @@ export default function DashboardPage() {
   // caller's membership resolves. Gating each query on `accountId` (via
   // the "skip" sentinel) means they only ever fire once the account is
   // known, so a fresh sign-in shows skeletons instead of a thrown error.
-  const { defaultCurrency, accountId } = useAuth()
+  const { defaultCurrency, accountId, accountRole } = useAuth()
 
   const [range, setRange] = useState<RangeDays>(30)
 
@@ -91,7 +91,9 @@ export default function DashboardPage() {
   // independent-loading UX the old per-query `finally(setLoading)` gave.
   const metricsData = useQuery(api.dashboard.metrics, metricsArgs)
   const seriesData = useQuery(api.dashboard.conversationsSeries, seriesArgs)
-  const pipelineData = useQuery(api.dashboard.pipelineDonut, accountId ? {} : 'skip')
+  // The leads-pipeline card self-gates its query; viewers (no lead queue)
+  // just get the chart at full width.
+  const showLeadsPipeline = accountRole !== 'viewer'
   const responseTimeData = useQuery(api.dashboard.responseTime, responseTimeArgs)
   // Fetch up to 50 so the biggest page-size option in the feed (50 rows)
   // is already in memory — switching sizes is then a pure client slice.
@@ -102,8 +104,6 @@ export default function DashboardPage() {
 
   const metrics = metricsData ?? null
   const metricsLoading = metricsData === undefined
-  const pipeline = pipelineData ?? null
-  const pipelineLoading = pipelineData === undefined
   const responseTime = responseTimeData ?? null
   const responseTimeLoading = responseTimeData === undefined
   const activity = activityData ?? null
@@ -215,7 +215,7 @@ export default function DashboardPage() {
           this, the pipeline card rendered at its natural (shorter)
           height while the line chart drove the row height. */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
-        <div className="h-full lg:col-span-3">
+        <div className={showLeadsPipeline ? 'h-full lg:col-span-3' : 'h-full lg:col-span-5'}>
           <ConversationsChart
             series={series}
             loading={seriesLoading}
@@ -223,13 +223,11 @@ export default function DashboardPage() {
             onRangeChange={setRange}
           />
         </div>
-        <div className="h-full lg:col-span-2">
-          <PipelineDonut
-            data={pipeline}
-            loading={pipelineLoading}
-            currency={defaultCurrency}
-          />
-        </div>
+        {showLeadsPipeline ? (
+          <div className="h-full lg:col-span-2">
+            <LeadsPipelineCard />
+          </div>
+        ) : null}
       </div>
 
       {/* Response performance — week-over-week averages vs SLA target. */}

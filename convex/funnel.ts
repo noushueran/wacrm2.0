@@ -12,6 +12,7 @@ import {
   FUNNEL_STAGE_KEYS,
   type FunnelStageKey,
 } from "./lib/funnel";
+import { allItemsDone, isLossCategory } from "./lib/salesChecklist";
 
 const STAGE_VALIDATOR = v.union(
   v.literal("new_lead"),
@@ -21,6 +22,7 @@ const STAGE_VALIDATOR = v.union(
   v.literal("itinerary_sent"),
   v.literal("invoice_sent"),
   v.literal("purchased"),
+  v.literal("lost"),
 );
 
 /**
@@ -59,6 +61,9 @@ export async function applyStageTransition(
     saleCurrency?: string;
     defaultCurrency: string;
     neverDowngrade?: boolean;
+    // Set only on `lost` transitions — persisted onto the audit row.
+    lossCategory?: string;
+    lossDetail?: string;
   },
 ): Promise<{ applied: boolean }> {
   const { conversation, stage } = args;
@@ -114,7 +119,10 @@ export async function applyStageTransition(
           accountId: args.accountId,
           conversationId,
           contactId: conversation.contactId,
-          stage,
+          // `lost` can never reach here (resolveEventName returns null for
+          // it, so the eventName guard above filters it) — the narrow cast
+          // records that invariant instead of widening the events schema.
+          stage: stage as Exclude<FunnelStageKey, "lost">,
           lane: attribution.lane,
           backend: backendForLane(attribution.lane),
           eventName,
@@ -144,6 +152,8 @@ export async function applyStageTransition(
     ...(args.byUserId ? { byUserId: args.byUserId } : {}),
     auto: args.auto,
     ...(conversionEventId ? { conversionEventId } : {}),
+    ...(args.lossCategory ? { lossCategory: args.lossCategory } : {}),
+    ...(args.lossDetail ? { lossDetail: args.lossDetail } : {}),
   });
 
   return { applied: true };
@@ -155,6 +165,9 @@ export const setStage = accountMutation({
     stage: STAGE_VALIDATOR,
     saleValue: v.optional(v.number()),
     saleCurrency: v.optional(v.string()),
+    // Required (validated below) when stage === "lost".
+    lossCategory: v.optional(v.string()),
+    lossDetail: v.optional(v.string()),
   },
   handler: async (ctx, args): Promise<Id<"conversations">> => {
     ctx.requireRole("agent");
@@ -171,7 +184,52 @@ export const setStage = accountMutation({
       throw new ConvexError({ code: "BAD_REQUEST", reason: "value_required" });
     }
 
+    // Losing a deal demands the exact why: a fixed category + free text.
+    const lossDetail = args.lossDetail?.trim() ?? "";
+    if (
+      stage === "lost" &&
+      (!args.lossCategory ||
+        !isLossCategory(args.lossCategory) ||
+        lossDetail.length < 5)
+    ) {
+      throw new ConvexError({
+        code: "BAD_REQUEST",
+        reason: "loss_reason_required",
+      });
+    }
+
+    // The deal-discipline gates work off the conversation's latest
+    // qualification session's sales checklist (absent for organic /
+    // pre-feature conversations → no gate).
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .first();
+    const checklist =
+      session && session.accountId === ctx.accountId
+        ? await ctx.db
+            .query("salesChecklists")
+            .withIndex("by_session", (q) => q.eq("sessionId", session._id))
+            .unique()
+        : null;
+
+    if (
+      stage === "purchased" &&
+      checklist &&
+      !allItemsDone(checklist.items)
+    ) {
+      throw new ConvexError({
+        code: "BAD_REQUEST",
+        reason: "checklist_incomplete",
+      });
+    }
+
+    const previousStage = conversation.funnel?.stage ?? null;
     const account = await ctx.db.get(ctx.accountId);
+    const currency = args.saleCurrency ?? account?.defaultCurrency ?? "USD";
     await applyStageTransition(ctx, {
       accountId: ctx.accountId,
       conversation,
@@ -181,7 +239,56 @@ export const setStage = accountMutation({
       saleValue: args.saleValue,
       saleCurrency: args.saleCurrency,
       defaultCurrency: account?.defaultCurrency ?? "USD",
+      ...(stage === "lost"
+        ? { lossCategory: args.lossCategory, lossDetail }
+        : {}),
     });
+
+    // Deal outcome bookkeeping + the AI-processable contact-note trail
+    // (same trail agent WhatsApp feedback lands on). Authed path only —
+    // the engine's auto transitions never touch won/lost.
+    if (checklist) {
+      if (stage === "purchased") {
+        await ctx.db.patch(checklist._id, {
+          outcome: { result: "won", at: Date.now(), byUserId: ctx.userId },
+        });
+      } else if (stage === "lost") {
+        await ctx.db.patch(checklist._id, {
+          outcome: {
+            result: "lost",
+            lossCategory: args.lossCategory,
+            lossDetail,
+            at: Date.now(),
+            byUserId: ctx.userId,
+          },
+        });
+      } else if (checklist.outcome) {
+        await ctx.db.patch(checklist._id, { outcome: undefined });
+      }
+    }
+
+    if (stage === "purchased") {
+      await ctx.db.insert("contactNotes", {
+        accountId: ctx.accountId,
+        contactId: conversation.contactId,
+        createdByUserId: ctx.userId,
+        noteText: `🏆 Deal won — ${args.saleValue} ${currency}`,
+      });
+    } else if (stage === "lost") {
+      await ctx.db.insert("contactNotes", {
+        accountId: ctx.accountId,
+        contactId: conversation.contactId,
+        createdByUserId: ctx.userId,
+        noteText: `❌ Deal lost (${args.lossCategory}): ${lossDetail}`,
+      });
+    } else if (previousStage === "purchased" || previousStage === "lost") {
+      await ctx.db.insert("contactNotes", {
+        accountId: ctx.accountId,
+        contactId: conversation.contactId,
+        createdByUserId: ctx.userId,
+        noteText: `↩️ Deal reopened → ${stageDef.label}`,
+      });
+    }
 
     return args.conversationId;
   },

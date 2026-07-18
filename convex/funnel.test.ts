@@ -208,6 +208,203 @@ test("setStage is forbidden for an agent who is not the assignee (own-mode, not 
   ).rejects.toThrow();
 });
 
+// Seeds a qualified session (+ optional checklist items) for the deal
+// gates. The session row IS the lead; the checklist hangs off it.
+async function seedLead(
+  t: TestConvex<typeof schema>,
+  args: {
+    accountId: Id<"accounts">;
+    conversationId: Id<"conversations">;
+    contactId: Id<"contacts">;
+    items?: { key: string; title: string; done: boolean }[];
+  },
+) {
+  return await t.run(async (ctx) => {
+    const sessionId = await ctx.db.insert("qualificationSessions", {
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      status: "qualified",
+      origin: "inbound",
+      fields: [],
+      expectedCount: 5,
+      answeredCount: 5,
+      followUpsSent: 0,
+      phrasingCursor: 0,
+      sendAttemptErrors: 0,
+      qualifiedAt: Date.now(),
+    });
+    let checklistId: Id<"salesChecklists"> | null = null;
+    if (args.items) {
+      checklistId = await ctx.db.insert("salesChecklists", {
+        accountId: args.accountId,
+        sessionId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        source: "default",
+        items: args.items,
+        generatedAt: Date.now(),
+      });
+    }
+    return { sessionId, checklistId };
+  });
+}
+
+async function notesFor(t: TestConvex<typeof schema>, contactId: Id<"contacts">) {
+  return await t.run((ctx) =>
+    ctx.db.query("contactNotes").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect());
+}
+
+test("setStage lost requires a category + a real detail text", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Lia", email: "lia@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-l1", assignedToUserId: userId });
+
+  // No reason at all.
+  await expect(
+    asUser.mutation(api.funnel.setStage, { conversationId, stage: "lost" }),
+  ).rejects.toThrow(/loss_reason_required/);
+  // Bogus category.
+  await expect(
+    asUser.mutation(api.funnel.setStage, {
+      conversationId, stage: "lost", lossCategory: "vibes", lossDetail: "long enough detail",
+    }),
+  ).rejects.toThrow(/loss_reason_required/);
+  // Detail too short.
+  await expect(
+    asUser.mutation(api.funnel.setStage, {
+      conversationId, stage: "lost", lossCategory: "price", lossDetail: "no",
+    }),
+  ).rejects.toThrow(/loss_reason_required/);
+});
+
+test("setStage lost records the reason on the audit row + checklist outcome + contact note, seeds NO Meta event", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Mo", email: "mo@example.com", role: "agent" });
+  const { conversationId, contactId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-l2", assignedToUserId: userId });
+  const { checklistId } = await seedLead(t, {
+    accountId, conversationId, contactId,
+    items: [{ key: "call", title: "Call the lead", done: true }],
+  });
+
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "lost", lossCategory: "competitor", lossDetail: "Booked with a cheaper agency yesterday",
+  });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("lost");
+
+  const trans = await transitionsFor(t, conversationId);
+  const lostTr = trans.find((x) => x.stage === "lost");
+  expect(lostTr?.lossCategory).toBe("competitor");
+  expect(lostTr?.lossDetail).toBe("Booked with a cheaper agency yesterday");
+  expect(lostTr?.byUserId).toBe(userId);
+
+  // Terminal + internal-only: no Meta event even though attributed.
+  const evs = await eventsFor(t, conversationId);
+  expect(evs.map((e) => e.stage as string)).not.toContain("lost");
+
+  const checklist = await t.run((ctx) => ctx.db.get(checklistId!));
+  expect(checklist?.outcome?.result).toBe("lost");
+  expect(checklist?.outcome?.lossCategory).toBe("competitor");
+
+  const notes = await notesFor(t, contactId);
+  expect(notes.some((n) => n.noteText.includes("Deal lost") && n.noteText.includes("Booked with a cheaper agency"))).toBe(true);
+});
+
+test("setStage purchased is gated on checklist completion; completing it unblocks and stamps a won outcome", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Nia", email: "nia@example.com", role: "agent" });
+  const { conversationId, contactId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-l3", assignedToUserId: userId });
+  const { checklistId } = await seedLead(t, {
+    accountId, conversationId, contactId,
+    items: [
+      { key: "call", title: "Call the lead", done: true },
+      { key: "pitch", title: "Give a proper pitch", done: false },
+    ],
+  });
+
+  await expect(
+    asUser.mutation(api.funnel.setStage, { conversationId, stage: "purchased", saleValue: 9000 }),
+  ).rejects.toThrow(/checklist_incomplete/);
+
+  await t.run(async (ctx) => {
+    const row = await ctx.db.get(checklistId!);
+    await ctx.db.patch(checklistId!, {
+      items: row!.items.map((i) => ({ ...i, done: true })),
+    });
+  });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "purchased", saleValue: 9000 });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("purchased");
+  const checklist = await t.run((ctx) => ctx.db.get(checklistId!));
+  expect(checklist?.outcome?.result).toBe("won");
+  const notes = await notesFor(t, contactId);
+  expect(notes.some((n) => n.noteText.includes("Deal won"))).toBe(true);
+});
+
+test("a conversation with NO checklist is not gated on purchased", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Oli", email: "oli@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { assignedToUserId: userId });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "purchased", saleValue: 500 });
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("purchased");
+});
+
+test("moving a lost deal back to a working stage clears the outcome and notes the reopen", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Pia", email: "pia@example.com", role: "agent" });
+  const { conversationId, contactId } = await seedConv(t, accountId, { assignedToUserId: userId });
+  const { checklistId } = await seedLead(t, {
+    accountId, conversationId, contactId,
+    items: [{ key: "call", title: "Call the lead", done: false }],
+  });
+
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "lost", lossCategory: "timing", lossDetail: "Travel postponed to next year",
+  });
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "price_quoted" });
+
+  const checklist = await t.run((ctx) => ctx.db.get(checklistId!));
+  expect(checklist?.outcome).toBeUndefined();
+  const notes = await notesFor(t, contactId);
+  expect(notes.some((n) => n.noteText.includes("reopened"))).toBe(true);
+});
+
+test("neverDowngrade: the engine can never pull a lost conversation back", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Raj", email: "raj@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { assignedToUserId: userId });
+
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "lost", lossCategory: "unresponsive", lossDetail: "Ghosted after three follow-ups",
+  });
+
+  // Engine-style transition (auto + neverDowngrade), as completeQualification runs it.
+  const applied = await t.run(async (ctx) => {
+    const { applyStageTransition } = await import("./funnel");
+    const conversation = await ctx.db.get(conversationId);
+    return await applyStageTransition(
+      { db: ctx.db, scheduler: ctx.scheduler },
+      {
+        accountId,
+        conversation: conversation!,
+        stage: "qualified",
+        auto: true,
+        neverDowngrade: true,
+        defaultCurrency: "AED",
+      },
+    );
+  });
+  expect(applied.applied).toBe(false);
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("lost");
+});
+
 test("getState composes current stage, reached-at, and per-stage Meta status", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Gia", email: "gia@example.com", role: "agent" });

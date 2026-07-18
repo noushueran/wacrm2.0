@@ -504,6 +504,68 @@ test("tagGroups table accepts a group and a tag can reference it", async () => {
   expect(tags[0].accountId).toBe(accountId);
 });
 
+test("salesChecklists + lost funnel stage + loss audit fields round-trip", async () => {
+  const t = convexTest(schema, modules);
+  const { sessionId, checklistId, conversationId } = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "S", email: "s@x.com" });
+    const accountId = await ctx.db.insert("accounts", { name: "A", defaultCurrency: "USD", ownerUserId: userId });
+    const contactId = await ctx.db.insert("contacts", { accountId, phone: "+15550001", phoneNormalized: "15550001" });
+    // A conversation can sit at the terminal `lost` stage.
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+      funnel: { stage: "lost", stageUpdatedAt: Date.now(), stageUpdatedByUserId: userId },
+    });
+    // The audit row carries the exact loss reason.
+    await ctx.db.insert("funnelTransitions", {
+      accountId, conversationId, contactId, stage: "lost",
+      byUserId: userId, auto: false,
+      lossCategory: "price", lossDetail: "Budget was 2k below our floor",
+    });
+    const sessionId = await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "qualified",
+      origin: "inbound", fields: [], expectedCount: 5, answeredCount: 5,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+    const checklistId = await ctx.db.insert("salesChecklists", {
+      accountId, sessionId, conversationId, contactId,
+      source: "default",
+      items: [
+        { key: "call", title: "Call the lead", done: true, doneAt: Date.now(), doneByUserId: userId, note: "Spoke 10 min, wants Bali" },
+        { key: "pitch", title: "Give a proper pitch", description: "Present the right package", done: false },
+      ],
+      outcome: { result: "lost", lossCategory: "price", lossDetail: "Budget was 2k below our floor", at: Date.now(), byUserId: userId },
+      generatedAt: Date.now(),
+    });
+    await ctx.db.insert("aiUsageLog", {
+      accountId, conversationId, mode: "checklist", provider: "openai", model: "m",
+      promptTokens: 1, completionTokens: 1, totalTokens: 2,
+    });
+    return { sessionId, checklistId, conversationId };
+  });
+
+  const bySession = await t.run((ctx) =>
+    ctx.db.query("salesChecklists").withIndex("by_session", (q) => q.eq("sessionId", sessionId)).unique(),
+  );
+  expect(bySession!._id).toBe(checklistId);
+  expect(bySession!.items).toHaveLength(2);
+  expect(bySession!.items[0].note).toBe("Spoke 10 min, wants Bali");
+  expect(bySession!.outcome?.result).toBe("lost");
+  expect(bySession!.outcome?.lossCategory).toBe("price");
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.funnel?.stage).toBe("lost");
+
+  // Out-of-union outcome result is rejected.
+  await expect(
+    t.run(async (ctx) => {
+      const row = await ctx.db.get(checklistId);
+      await ctx.db.patch(checklistId, {
+        outcome: { ...row!.outcome!, result: "abandoned" as unknown as "won" },
+      });
+    }),
+  ).rejects.toThrow();
+});
+
 test("tagSuggestions row inserts and is queryable by_account_status", async () => {
   const t = convexTest(schema, modules);
   const { accountId, sugId } = await t.run(async (ctx) => {

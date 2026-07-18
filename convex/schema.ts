@@ -227,6 +227,7 @@ export default defineSchema({
           v.literal("itinerary_sent"),
           v.literal("invoice_sent"),
           v.literal("purchased"),
+          v.literal("lost"),
         ),
         stageUpdatedAt: v.number(),
         stageUpdatedByUserId: v.optional(v.id("users")),
@@ -1125,6 +1126,7 @@ export default defineSchema({
       v.literal("draft"),
       v.literal("classify"),
       v.literal("qualify"),
+      v.literal("checklist"),
     ),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),
@@ -1349,10 +1351,15 @@ export default defineSchema({
       v.literal("itinerary_sent"),
       v.literal("invoice_sent"),
       v.literal("purchased"),
+      v.literal("lost"),
     ),
     byUserId: v.optional(v.id("users")),
     auto: v.boolean(),
     conversionEventId: v.optional(v.id("conversionEvents")),
+    // Set only on `lost` transitions — the exact why, for the audit trail
+    // and downstream AI analysis (category from a fixed list + free text).
+    lossCategory: v.optional(v.string()),
+    lossDetail: v.optional(v.string()),
   })
     .index("by_conversation", ["conversationId"])
     // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
@@ -1610,6 +1617,46 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     .index("by_account_status", ["accountId", "status"])
     .index("by_due", ["status", "nextFollowUpAt"]),
+
+  // The post-qualification sales checklist — one row per qualification
+  // session (the session IS the lead), posted automatically when the lead
+  // qualifies. Items come from the knowledge base's `SALES CHECKLIST`
+  // section via the account's LLM when available, else the built-in
+  // 6-step default — so every qualified lead ALWAYS gets one. Completing
+  // an item requires a note (mirrored to `contactNotes`, the
+  // AI-processable trail). `outcome` denormalizes the deal's terminal
+  // state (won/lost + the exact loss reason) for the leads board;
+  // `funnelTransitions` stays the audit source of truth.
+  salesChecklists: defineTable({
+    accountId: v.id("accounts"),
+    sessionId: v.id("qualificationSessions"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    source: v.union(v.literal("kb"), v.literal("default")),
+    items: v.array(
+      v.object({
+        key: v.string(),
+        title: v.string(),
+        description: v.optional(v.string()),
+        done: v.boolean(),
+        doneAt: v.optional(v.number()),
+        doneByUserId: v.optional(v.id("users")),
+        note: v.optional(v.string()),
+      }),
+    ),
+    outcome: v.optional(
+      v.object({
+        result: v.union(v.literal("won"), v.literal("lost")),
+        lossCategory: v.optional(v.string()),
+        lossDetail: v.optional(v.string()),
+        at: v.number(),
+        byUserId: v.optional(v.id("users")),
+      }),
+    ),
+    generatedAt: v.number(),
+  })
+    .index("by_session", ["sessionId"])
+    .index("by_account", ["accountId"]),
 
   // Run history for the interval crons in crons.ts — one row per
   // execution, stamped by the wrapper actions in cronSchedules.ts.

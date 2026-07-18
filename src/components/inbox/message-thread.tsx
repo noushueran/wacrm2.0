@@ -79,6 +79,8 @@ import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
 import { canAssignToOthers } from "@/lib/auth/roles";
 import { UI_FUNNEL_STAGES } from "@/lib/inbox/funnel";
+import { LossReasonDialog } from "@/components/leads/loss-reason-dialog";
+import { convexErrorData } from "@/lib/convex/adapters";
 
 interface ReplyDraft {
   id: string;
@@ -188,19 +190,30 @@ export function MessageThread({
   const setStageMutation = useMutation(api.funnel.setStage);
   const [purchaseOpen, setPurchaseOpen] = useState(false);
   const [purchaseAmount, setPurchaseAmount] = useState("");
+  const [lossOpen, setLossOpen] = useState(false);
 
   const applyStage = useCallback(
-    async (stage: string, saleValue?: number) => {
+    async (
+      stage: string,
+      extras?: { saleValue?: number; lossCategory?: string; lossDetail?: string },
+    ) => {
       if (!conversation) return;
       try {
         await setStageMutation({
           conversationId: conversation.id as Id<"conversations">,
           stage: stage as never,
-          ...(saleValue !== undefined ? { saleValue } : {}),
+          ...(extras?.saleValue !== undefined ? { saleValue: extras.saleValue } : {}),
+          ...(extras?.lossCategory ? { lossCategory: extras.lossCategory } : {}),
+          ...(extras?.lossDetail ? { lossDetail: extras.lossDetail } : {}),
         });
       } catch (err) {
         console.error("Failed to update stage:", err);
-        toast.error(tFunnel("updateError"));
+        // The won-gate: the sales checklist must be complete first.
+        toast.error(
+          convexErrorData(err)?.reason === "checklist_incomplete"
+            ? tFunnel("checklistIncomplete")
+            : tFunnel("updateError"),
+        );
       }
     },
     [conversation, setStageMutation, tFunnel],
@@ -212,6 +225,11 @@ export function MessageThread({
       if (def?.needsValue) {
         setPurchaseAmount("");
         setPurchaseOpen(true);
+        return;
+      }
+      if (def?.terminal) {
+        // Losing demands the exact reason — same dialog as the pipeline.
+        setLossOpen(true);
         return;
       }
       void applyStage(stage);
@@ -1108,7 +1126,7 @@ export function MessageThread({
                 const v = Number(purchaseAmount);
                 if (!Number.isFinite(v) || v <= 0) return;
                 setPurchaseOpen(false);
-                void applyStage("purchased", v);
+                void applyStage("purchased", { saleValue: v });
               }}
               disabled={!(Number(purchaseAmount) > 0)}
             >
@@ -1117,6 +1135,14 @@ export function MessageThread({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <LossReasonDialog
+        open={lossOpen}
+        onOpenChange={setLossOpen}
+        onConfirm={(category, detail) =>
+          void applyStage("lost", { lossCategory: category, lossDetail: detail })
+        }
+      />
     </div>
   );
 }

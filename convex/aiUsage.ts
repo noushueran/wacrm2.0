@@ -39,6 +39,7 @@ export const log = internalMutation({
       v.literal("draft"),
       v.literal("classify"),
       v.literal("qualify"),
+      v.literal("checklist"),
     ),
     provider: v.union(v.literal("openai"), v.literal("anthropic")),
     model: v.string(),

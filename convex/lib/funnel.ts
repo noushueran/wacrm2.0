@@ -17,6 +17,10 @@ export const FUNNEL_STAGES = [
   { key: "itinerary_sent", label: "Itinerary sent", metaCapi: "AddToCart", webPixel: "AddToCart", auto: false, needsValue: false },
   { key: "invoice_sent", label: "Invoice sent", metaCapi: "OrderCreated", webPixel: "InitiateCheckout", auto: false, needsValue: false },
   { key: "purchased", label: "Purchased", metaCapi: "Purchase", webPixel: "Purchase", auto: false, needsValue: true },
+  // Terminal exit, appended LAST so `neverDowngrade` index math means the
+  // engine can never pull a lost deal back into the working stages. Meta's
+  // business-messaging vocabulary has no "lost" event → internal-only.
+  { key: "lost", label: "Lost", metaCapi: null, webPixel: null, auto: false, needsValue: false },
 ] as const;
 
 export type FunnelStageKey = (typeof FUNNEL_STAGES)[number]["key"];

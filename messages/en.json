@@ -131,6 +131,15 @@
       "total": "Total",
       "ariaLabel": "Pipeline value by stage"
     },
+    "leadsPipeline": {
+      "title": "Deals pipeline",
+      "description": "Qualified leads by sales stage",
+      "viewBoard": "Open board",
+      "empty": "No deals yet",
+      "emptyHint": "Leads land on the pipeline the moment they qualify.",
+      "winRate": "{rate}% win rate",
+      "inQualification": "{count} in qualification"
+    },
     "responseTimeChart": {
       "title": "Average First Response Time",
       "description": "Minutes to reply to a customer's first unreplied message, by weekday",
@@ -400,6 +409,22 @@
       "saleAmountLabel": "Sale amount",
       "saleAmountConfirm": "Mark purchased",
       "updateError": "Couldn't update the stage.",
+      "checklistIncomplete": "Finish the sales checklist before closing this deal as won.",
+      "lossTitle": "Why is this deal lost?",
+      "lossDesc": "Every lost lead needs the exact reason — the team and the AI learn from it.",
+      "lossCategoryLabel": "Reason",
+      "lossDetailLabel": "Exactly why",
+      "lossDetailPlaceholder": "e.g. Their budget was AED 2,000 below our best offer for the Bali package…",
+      "lossConfirm": "Mark lost",
+      "lossCategory": {
+        "price": "Price too high",
+        "competitor": "Chose a competitor",
+        "budget": "No budget",
+        "timing": "Bad timing / postponed",
+        "unresponsive": "Stopped responding",
+        "changed_plans": "Plans changed",
+        "other": "Other"
+      },
       "stage": {
         "new_lead": "New lead",
         "qualified": "Qualified lead",
@@ -407,7 +432,8 @@
         "itinerary_created": "Itinerary created",
         "itinerary_sent": "Itinerary sent",
         "invoice_sent": "Invoice sent",
-        "purchased": "Purchased"
+        "purchased": "Purchased",
+        "lost": "Lost"
       }
     },
     "customFields": {
@@ -474,6 +500,42 @@
       "allServices": "All services",
       "searchPlaceholder": "Search name, phone, agent…",
       "noMatches": "No leads match these filters."
+    },
+    "view": {
+      "list": "List",
+      "pipeline": "Pipeline"
+    },
+    "pipeline": {
+      "empty": "No deals on the board yet — leads land here the moment they qualify.",
+      "inQualification": "{count} still in qualification",
+      "deals": "{count} deals",
+      "wonValue": "{value} won",
+      "winRate": "{rate}% win rate",
+      "moveTo": "Move to stage",
+      "inStageSince": "in stage {ago}",
+      "dropHere": "Drop to move here",
+      "openLead": "Open lead",
+      "checklistShort": "{done}/{total}"
+    },
+    "checklist": {
+      "title": "Sales checklist",
+      "subtitle": "Complete every step — a comment is required each time.",
+      "sourceKb": "From product documentation",
+      "sourceDefault": "Standard 6-step process",
+      "progress": "{done} of {total} done",
+      "complete": "Checklist complete",
+      "markDone": "Mark done",
+      "notePlaceholder": "Okay, I have done this — add what happened…",
+      "noteHint": "Saved on the lead for the team and the AI.",
+      "save": "Save",
+      "cancel": "Cancel",
+      "reopen": "Reopen",
+      "doneBy": "{name} · {ago}",
+      "none": "No checklist yet — it's posted automatically when the lead qualifies.",
+      "outcomeWon": "Deal won",
+      "outcomeLost": "Deal lost",
+      "noteRequired": "Add a short comment about how you completed this step.",
+      "updateError": "Couldn't update the checklist."
     }
   },
   "Contacts": {
@@ -2083,7 +2145,8 @@
   "Agents": {
     "usage": {
       "classifyLabel": "Tagging",
-      "qualifyLabel": "Qualification"
+      "qualifyLabel": "Qualification",
+      "checklistLabel": "Checklists"
     }
   }
 }

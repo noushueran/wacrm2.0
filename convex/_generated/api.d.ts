@@ -80,6 +80,7 @@ import type * as lib_qualification_staffReply from "../lib/qualification/staffRe
 import type * as lib_qualification_track from "../lib/qualification/track.js";
 import type * as lib_qualification_validate from "../lib/qualification/validate.js";
 import type * as lib_roles from "../lib/roles.js";
+import type * as lib_salesChecklist from "../lib/salesChecklist.js";
 import type * as lib_whatsapp_interactive from "../lib/whatsapp/interactive.js";
 import type * as lib_whatsapp_metaApi from "../lib/whatsapp/metaApi.js";
 import type * as lib_whatsapp_templateComponents from "../lib/whatsapp/templateComponents.js";
@@ -99,6 +100,7 @@ import type * as qualification from "../qualification.js";
 import type * as qualificationEngine from "../qualificationEngine.js";
 import type * as quickReplies from "../quickReplies.js";
 import type * as reactions from "../reactions.js";
+import type * as salesChecklists from "../salesChecklists.js";
 import type * as send from "../send.js";
 import type * as tagGroups from "../tagGroups.js";
 import type * as tags from "../tags.js";
@@ -186,6 +188,7 @@ declare const fullApi: ApiFromModules<{
   "lib/qualification/track": typeof lib_qualification_track;
   "lib/qualification/validate": typeof lib_qualification_validate;
   "lib/roles": typeof lib_roles;
+  "lib/salesChecklist": typeof lib_salesChecklist;
   "lib/whatsapp/interactive": typeof lib_whatsapp_interactive;
   "lib/whatsapp/metaApi": typeof lib_whatsapp_metaApi;
   "lib/whatsapp/templateComponents": typeof lib_whatsapp_templateComponents;
@@ -205,6 +208,7 @@ declare const fullApi: ApiFromModules<{
   qualificationEngine: typeof qualificationEngine;
   quickReplies: typeof quickReplies;
   reactions: typeof reactions;
+  salesChecklists: typeof salesChecklists;
   send: typeof send;
   tagGroups: typeof tagGroups;
   tags: typeof tags;
