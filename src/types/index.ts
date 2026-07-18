@@ -214,13 +214,13 @@ export interface Conversation {
   updated_at: string;
   contact?: Contact;
   /**
-   * AI auto-reply state for this thread (migration 029 + 033):
+   * AI auto-reply state for this thread:
    *  - `ai_autoreply_disabled` — the bot is paused here (a human took
-   *    over, or the model handed off). Sticky until re-enabled.
-   *  - `ai_reply_count` — how many times the bot has auto-replied,
-   *    checked against the account's per-conversation cap.
-   *  - `ai_handoff_summary` — short internal note the bot wrote when it
-   *    handed off, shown to whoever takes the thread over.
+   *    over manually, or the customer opted out). Sticky until resumed.
+   *  - `ai_reply_count` — how many times the bot has auto-replied.
+   *    Purely a metric; there is no reply cap.
+   *  - `ai_handoff_summary` — short internal note written when the AI
+   *    flagged this thread for human eyes (it keeps replying meanwhile).
    */
   ai_autoreply_disabled?: boolean;
   ai_reply_count?: number;

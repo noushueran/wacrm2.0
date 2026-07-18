@@ -1960,12 +1960,12 @@ test("an assigned agent who replied in time never escalates", async () => {
   expect(await notificationsFor(t, accountId)).toHaveLength(0);
 }, 30_000);
 
-test("checkAgentReplySla stands down for a stale inbound and for unassigned conversations", async () => {
+test("checkAgentReplySla anchors on the OLDEST unanswered message — rapid pings never reset the clock", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
-  const { agentUserId } = await seedSlaTeam(t, accountId);
-  const { conversationId, firstMessageId } = await t.run(async (ctx) => {
+  const { agentUserId, supervisorUserId } = await seedSlaTeam(t, accountId);
+  const { conversationId, firstMessageId, secondMessageId } = await t.run(async (ctx) => {
     const contactId = await ctx.db.insert("contacts", {
       accountId, phone: "+15551234567", phoneNormalized: "15551234567",
     });
@@ -1976,11 +1976,11 @@ test("checkAgentReplySla stands down for a stale inbound and for unassigned conv
       accountId, conversationId, senderType: "customer",
       contentType: "text", contentText: "first", status: "sent",
     });
-    await ctx.db.insert("messages", {
+    const secondMessageId = await ctx.db.insert("messages", {
       accountId, conversationId, senderType: "customer",
-      contentType: "text", contentText: "second", status: "sent",
+      contentType: "text", contentText: "second (still ignored!)", status: "sent",
     });
-    return { conversationId, firstMessageId };
+    return { conversationId, firstMessageId, secondMessageId };
   });
 
   // Unassigned: the bot owns the thread (it always replies) — no alert.
@@ -1989,11 +1989,57 @@ test("checkAgentReplySla stands down for a stale inbound and for unassigned conv
   });
   expect(await notificationsFor(t, accountId)).toHaveLength(0);
 
-  // Assigned but the checked inbound is STALE (a newer customer message
-  // exists — its own scheduled check owns the cycle).
   await t.run((ctx) => ctx.db.patch(conversationId, { assignedToUserId: agentUserId }));
+
+  // The NEWER message's check stands down — the oldest unanswered
+  // message anchors the cycle (otherwise every rapid ping would push
+  // the alert forever while the customer waits).
+  await t.mutation(internal.ingest.checkAgentReplySla, {
+    accountId, conversationId, inboundMessageId: secondMessageId, stage: 1,
+  });
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+
+  // The anchor's own check FIRES even though newer pings exist.
   await t.mutation(internal.ingest.checkAgentReplySla, {
     accountId, conversationId, inboundMessageId: firstMessageId, stage: 1,
   });
-  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+  const bells = await notificationsFor(t, accountId);
+  expect(bells.filter((n) => n.userId === supervisorUserId)).toHaveLength(1);
 });
+
+test("a bot reply before takeover satisfies the SLA — no false alarm after assignment", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId } = await seedSlaTeam(t, accountId);
+  await seedAiConfig(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello!", wamid: "wamid.SLA3" },
+  });
+  // Let ONLY the debounced bot reply land (not the 10-min SLA check yet).
+  vi.advanceTimersByTime(15_000);
+  await t.finishInProgressScheduledFunctions();
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  const botReplies = (await messagesFor(t, conversation!._id)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botReplies).toHaveLength(1); // the customer WAS answered (by the bot)
+
+  // Routine takeover a few minutes later — then the SLA check fires.
+  await t.run((ctx) => ctx.db.patch(conversation!._id, { assignedToUserId: agentUserId }));
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  // The customer isn't waiting: the bot already replied to their last
+  // message. No supervisor alarm may fire.
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+}, 30_000);

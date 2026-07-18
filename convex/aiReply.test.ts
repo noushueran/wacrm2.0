@@ -546,13 +546,19 @@ test("a model-emitted handoff marker never silences the bot — the customer sti
 // exclusively a manual dashboard action.
 // ============================================================
 
-test("flagForHuman marks the thread pending with a summary but never silences, assigns, or charges", async () => {
+test("flagForHuman marks the thread pending + bells supervisors, but never silences, assigns, or charges — and never double-bells", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
   await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
+  const supervisorUserId = await seedTeammate(t, {
+    accountId,
+    name: "Sam (supervisor)",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
   const { conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
@@ -573,6 +579,34 @@ test("flagForHuman marks the thread pending with a summary but never silences, a
 
   const charges = await t.run((ctx) => ctx.db.query("leadCharges").collect());
   expect(charges).toHaveLength(0);
+
+  // Surfacing means someone actually HEARS about it: supervisors get a
+  // bell (the admin seeding user does too — supervisor+ role).
+  const bells = await t.run((ctx) =>
+    ctx.db
+      .query("notifications")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(bells.filter((n) => n.userId === supervisorUserId)).toHaveLength(1);
+  expect(bells.every((n) => n.type === "sla_alert")).toBe(true);
+
+  // Re-flagging an already-flagged thread refreshes the note, no re-bell.
+  await t.mutation(internal.aiReply.flagForHuman, {
+    accountId,
+    conversationId,
+    summary: "🤖 Customer asked again.",
+  });
+  const bellsAfter = await t.run((ctx) =>
+    ctx.db
+      .query("notifications")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(bellsAfter.length).toBe(bells.length);
+  expect((await getConversation(t, conversationId))!.aiHandoffSummary).toBe(
+    "🤖 Customer asked again.",
+  );
 });
 
 // ============================================================

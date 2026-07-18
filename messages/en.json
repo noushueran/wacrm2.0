@@ -1947,7 +1947,7 @@
       "enableAssistant": "Enable AI assistant",
       "enableAssistantDesc": "Master switch. Turns on the “Draft with AI” button in the inbox.",
       "autoReply": "Auto-reply to inbound messages",
-      "autoReplyDesc": "The bot answers new inbound messages automatically (only when no flow handles them and no agent is assigned). Hands off to a human when it can’t help.",
+      "autoReplyDesc": "The bot answers every new inbound message automatically (when no flow handles it) until a teammate takes the conversation over.",
       "remove": "Remove",
       "save": "Save",
       "missingModel": "Enter a model name.",

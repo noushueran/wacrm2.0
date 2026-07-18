@@ -929,12 +929,19 @@ export const checkAgentReplySla = internalMutation({
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
       .order("desc")
       .take(30);
-    const latestCustomer = recent.find((m) => m.senderType === "customer");
-    if (latestCustomer && latestCustomer._id !== args.inboundMessageId) return; // stale
-    const agentReplied = recent.some(
-      (m) => m.senderType === "agent" && m._creationTime > inbound._creationTime,
-    );
-    if (agentReplied) return;
+    // The unanswered run = customer messages newer than the last
+    // outbound of ANY kind (agent or bot — a bot reply before the
+    // takeover means the customer wasn't left hanging). The OLDEST
+    // message of that run anchors the cycle: only ITS check fires, and
+    // the wait is measured from it — so rapid follow-up pings can never
+    // keep resetting the clock while the customer grows angrier.
+    const lastOutboundIdx = recent.findIndex((m) => m.senderType !== "customer");
+    const unansweredRun = (
+      lastOutboundIdx === -1 ? recent : recent.slice(0, lastOutboundIdx)
+    ).filter((m) => m.senderType === "customer");
+    if (unansweredRun.length === 0) return; // answered — nothing to escalate
+    const anchor = unansweredRun[unansweredRun.length - 1];
+    if (anchor._id !== args.inboundMessageId) return; // the anchor's check owns the cycle
 
     const memberships = await ctx.db
       .query("memberships")

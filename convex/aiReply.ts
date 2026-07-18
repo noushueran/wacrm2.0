@@ -3,6 +3,7 @@ import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { hasMinRole } from "./lib/roles";
+import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
@@ -110,16 +111,15 @@ const MAX_TRANSCRIPTIONS_PER_DISPATCH = 3;
 /**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
  * network entirely, same convention as `convex/aiKnowledge.ts`'s
- * `syntheticEmbedding`. There's no live model to consult, so it makes
- * the handoff/no-handoff call along the SAME signal a real model is
- * instructed to use (`buildSystemPrompt`'s auto-reply guidance: reply
- * with exactly `HANDOFF_SENTINEL` to bail) — just sourced from the
- * latest customer message instead of a model's own judgement. That
- * gives `aiReply.test.ts` a deterministic way to steer the handoff
- * branch (seed the triggering inbound message with the sentinel in it)
- * without ever touching the network. Usage is all-zero, matching the
- * brief ("DRY-RUN returns a synthetic reply + zero usage") and
- * `aiUsage.log`'s own "skip when there's no usage" no-op.
+ * `syntheticEmbedding`. Markers in the triggering customer message
+ * steer deterministic branches for `aiReply.test.ts`:
+ *   - `[[FAIL]]` → throws (the retry path);
+ *   - `[[NEEDINFO:<q>]]` → holding line + ask-admin marker;
+ *   - the legacy `[[HANDOFF]]` sentinel → raw sentinel output, which
+ *     dispatch must IGNORE (strip + fall back to a real reply — the
+ *     model has no silence escape; handoff is manual-only).
+ * Usage is all-zero, matching `aiUsage.log`'s own "skip when there's
+ * no usage" no-op.
  */
 function syntheticGeneration(latestMessage: string): GenerateResult {
   if (latestMessage.includes(FAILURE_SENTINEL)) {
@@ -275,23 +275,31 @@ export const untranscribedMediaRows = internalQuery({
   ): Promise<
     { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
   > => {
+    // BOUNDED raw window, filtered in JS: a DB-level contentType filter
+    // would stream the index until it found `limit` media matches —
+    // i.e. read a long text-only conversation end-to-end on every
+    // dispatch. Reading the newest 50 rows flat keeps the cost constant;
+    // media older than that (or than the age cutoff below) simply keeps
+    // its placeholder.
     const rows = await ctx.db
       .query("messages")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
       .order("desc")
-      .filter((q) =>
-        q.and(
-          q.eq(q.field("accountId"), args.accountId),
-          q.eq(q.field("senderType"), "customer"),
-          q.or(
-            q.eq(q.field("contentType"), "audio"),
-            q.eq(q.field("contentType"), "image"),
-          ),
-        ),
-      )
-      .take(Math.max(args.limit * 3, args.limit));
+      .take(50);
+    // Age cutoff: never backfill historical media from before this
+    // feature (privacy + token spend) — only recent conversation media
+    // is transcribed.
+    const cutoff = Date.now() - 24 * 3_600_000;
     return rows
-      .filter((m) => m.mediaUrl && !m.aiTranscription)
+      .filter(
+        (m) =>
+          m.accountId === args.accountId &&
+          m.senderType === "customer" &&
+          (m.contentType === "audio" || m.contentType === "image") &&
+          m._creationTime > cutoff &&
+          m.mediaUrl &&
+          !m.aiTranscription,
+      )
       .slice(0, args.limit)
       .map((m) => ({
         messageId: m._id,
@@ -348,12 +356,15 @@ export const bumpReplyCount = internalMutation({
 
 /**
  * Surfaces a thread that needs human eyes WITHOUT touching the bot:
- * status → `"pending"` (the needs-attention queue) + an internal
- * summary. That is ALL the AI stack may ever do — taking a chat over
- * (assignment, autoreply pause, the lead charge) is exclusively a
- * manual dashboard action (owner decision 2026-07-18; the automatic
- * `markHandoff` that used to live here silenced the bot and could
- * auto-assign, stranding customers mid-conversation).
+ * status → `"pending"` (the needs-attention queue), an internal summary
+ * (shown in the inbox AI banner), and — on the FIRST flag only — a bell
+ * to every supervisor+ member so somebody actually hears about it. That
+ * is ALL the AI stack may ever do — taking a chat over (assignment,
+ * autoreply pause, the lead charge) is exclusively a manual dashboard
+ * action (owner decision 2026-07-18; the automatic `markHandoff` that
+ * used to live here silenced the bot and could auto-assign, stranding
+ * customers mid-conversation). Re-flagging an already-flagged thread
+ * refreshes the note without re-belling.
  */
 export const flagForHuman = internalMutation({
   args: {
@@ -364,11 +375,30 @@ export const flagForHuman = internalMutation({
   handler: async (ctx, args) => {
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
+    const alreadyFlagged =
+      conversation.status === "pending" && !!conversation.aiHandoffSummary;
     await ctx.db.patch(args.conversationId, {
       aiHandoffSummary: args.summary,
       status: "pending",
       updatedAt: Date.now(),
     });
+    if (alreadyFlagged) return;
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    for (const member of memberships) {
+      if (!hasMinRole(member.role, "supervisor")) continue;
+      await insertNotification(ctx, {
+        accountId: args.accountId,
+        userId: member.userId,
+        type: "sla_alert",
+        conversationId: args.conversationId,
+        contactId: conversation.contactId,
+        title: "AI flagged a conversation for the team",
+        body: args.summary,
+      });
+    }
   },
 });
 
@@ -650,6 +680,18 @@ export const dispatchInbound = internalAction({
       }
       if (!replyText) {
         replyText = FALLBACK_REPLY_TEXT;
+      }
+
+      // Re-check the debounce token at the last moment: transcription +
+      // generation can take many seconds, and a message that arrived
+      // meanwhile owns the reply (its own dispatch fires shortly). One
+      // wasted generation beats a reply that ignores the newest message.
+      if (args.triggerMessageId) {
+        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+        });
+        if (latestNow && latestNow !== args.triggerMessageId) return;
       }
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {

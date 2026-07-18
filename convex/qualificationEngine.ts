@@ -1041,6 +1041,10 @@ export const followUpContext = internalQuery({
     const expiryRevisit =
       session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
     if (conversation.aiAutoreplyDisabled) return { kind: "reschedule", at: expiryRevisit };
+    // Assignment IS the takeover signal (owner strategy 2026-07-18):
+    // once a human owns the thread, scheduled nudges yield exactly like
+    // a pause — the human decides the cadence now.
+    if (conversation.assignedToUserId) return { kind: "reschedule", at: expiryRevisit };
     if (
       session.humanTouchedAt &&
       session.humanTouchedAt > session.lastCustomerMessageAt
@@ -1302,6 +1306,19 @@ export const claimAnswerDelivery = internalMutation({
     if (!row || row.status !== "answered") return false;
     await ctx.db.patch(args.inquiryId, { status: "delivered" });
     return true;
+  },
+});
+
+/** Reverts a failed relay's claim (`delivered` → `answered`) so the
+ *  `pendingAnswers` injection path can still carry the answer into the
+ *  bot's next reply — an answered question must never be silently lost
+ *  to one bad Meta call. */
+export const unclaimAnswerDelivery = internalMutation({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args): Promise<void> => {
+    const row = await ctx.db.get(args.inquiryId);
+    if (!row || row.status !== "delivered") return;
+    await ctx.db.patch(args.inquiryId, { status: "answered" });
   },
 });
 
@@ -1648,10 +1665,12 @@ export const answerContext = internalQuery({
 
 /**
  * Relays the admin's answer to the waiting customer as a warm assistant
- * reply (LLM-composed; deterministic in DRY-RUN). Best-effort: if the
- * immediate send can't happen (human took over, cap, window closed),
- * the answer stays `answered` and reaches the customer through the
- * `pendingAnswers` knowledge injection on their next message.
+ * reply (LLM-composed; deterministic in DRY-RUN). Best-effort with no
+ * loss: if the immediate send can't happen (human took over, window
+ * closed, Meta failure — the claim is reverted on a failed send), the
+ * answer stays `answered` and reaches the customer through the
+ * `pendingAnswers` knowledge injection on their next message. The
+ * claim-before-send only guards against two relays double-texting.
  */
 export const relayAnswerToCustomer = internalAction({
   args: { inquiryId: v.id("adminInquiries") },
@@ -1706,20 +1725,30 @@ export const relayAnswerToCustomer = internalAction({
       );
       if (!claimed) return; // another relay already delivered this answer
 
-      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
-        accountId: context.accountId,
-        conversationId: context.conversationId,
-        to: context.to,
-        text,
-      });
-      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
-        accountId: context.accountId,
-        whatsappMessageId: sendResult.whatsappMessageId,
-      });
-      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
-        accountId: context.accountId,
-        conversationId: context.conversationId,
-      });
+      try {
+        const sendResult = await ctx.runAction(internal.metaSend.sendText, {
+          accountId: context.accountId,
+          conversationId: context.conversationId,
+          to: context.to,
+          text,
+        });
+        await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
+          accountId: context.accountId,
+          whatsappMessageId: sendResult.whatsappMessageId,
+        });
+        await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+          accountId: context.accountId,
+          conversationId: context.conversationId,
+        });
+      } catch (err) {
+        // Send failed AFTER the claim — un-claim so the answer stays
+        // "answered" and reaches the customer through the pendingAnswers
+        // injection on their next message. Nothing is lost.
+        console.error("[qualification] relay send failed — un-claiming:", err);
+        await ctx.runMutation(internal.qualificationEngine.unclaimAnswerDelivery, {
+          inquiryId: args.inquiryId,
+        });
+      }
     } catch (err) {
       console.error("[qualification] relayAnswerToCustomer failed:", err);
     }

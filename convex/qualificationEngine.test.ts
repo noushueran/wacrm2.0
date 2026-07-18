@@ -257,6 +257,43 @@ test("wants-human intent flags the thread for the team while the bot keeps reply
   expect(conversation?.assignedToUserId).toBeUndefined();
 });
 
+test("a failed relay send un-claims the answer so injection can still deliver it", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await configureAi(base.asUser);
+  const inquiryId = await t.run((ctx) =>
+    ctx.db.insert("adminInquiries", {
+      accountId: base.accountId, conversationId: base.conversationId,
+      contactId: base.contactId, question: "Q?",
+      customerName: "Ravi", customerPhone: "+971500000001",
+      status: "answered", answer: "Visa on arrival, 30 days", askedAt: 1, answeredAt: Date.now(),
+    }));
+  // Force the Meta send to FAIL: no whatsappConfig row + META dry-run off
+  // ("WhatsApp not configured" throw). AI dry-run stays on (compose step).
+  delete process.env.CONVEX_META_DRY_RUN;
+  await t.action(internal.qualificationEngine.relayAnswerToCustomer, { inquiryId });
+  const inquiry = await t.run((ctx) => ctx.db.get(inquiryId));
+  // NOT stuck on "delivered": the failed send un-claims so pendingAnswers
+  // injection (status "answered") still gets it to the customer later.
+  expect(inquiry?.status).toBe("answered");
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+});
+
+test("follow-up nudges yield once a human is assigned (assignment = takeover)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "A", email: "a@x.com" });
+    await ctx.db.patch(base.conversationId, { assignedToUserId: userId });
+  });
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0); // no nudge
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.status).toBe("collecting");
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now()); // parked, not sent
+});
+
 test("ask-admin with no admin numbers flags the thread pending but never silences the bot", async () => {
   const t = convexTest(schema, modules);
   const base = await seed(t);
