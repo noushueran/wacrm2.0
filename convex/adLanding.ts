@@ -30,7 +30,13 @@ const RETRY_ERROR_MS = 3_600_000;
 /** A `pending` claim older than this is presumed dead (action crashed /
  *  timed out before `storeResult`) and may be taken over. */
 const PENDING_TAKEOVER_MS = 120_000;
-const FETCH_TIMEOUT_MS = 8_000;
+/** Generous on purpose (2026-07-18 live test): a Cloudflare-fronted
+ *  origin that's slow — or erroring, a 522 takes ~15-30s to surface —
+ *  blew an 8s budget and cached only "AbortError" instead of the real
+ *  story. The ingest-time prefetch is async (scheduled), so this costs
+ *  nothing in the common path; the dispatch-side inline ensure is rare
+ *  (cache misses only) and retry-gated by `RETRY_ERROR_MS` after that. */
+const FETCH_TIMEOUT_MS = 20_000;
 /** Reject up front on Content-Length; pages this size are never landing
  *  pages. (The body read is additionally capped at `LANDING_HTML_MAX`.) */
 const MAX_CONTENT_LENGTH_BYTES = 5_000_000;
