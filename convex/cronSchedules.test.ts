@@ -2,8 +2,9 @@ import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
+import crons from "./crons";
 import type { AccountRole } from "./lib/roles";
-import { CRON_REGISTRY } from "./lib/cronSummary";
+import { CRON_REGISTRY, RUNS_DEFAULT_LIMIT } from "./lib/cronSummary";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -25,16 +26,31 @@ async function seedMember(t: ReturnType<typeof convexTest>, role: AccountRole) {
   return { userId, accountId, as: t.withIdentity({ subject: `${userId}|s` }) };
 }
 
-test("registry covers the five interval crons registered in crons.ts", () => {
-  expect(CRON_REGISTRY.map((c) => c.name).sort()).toEqual([
-    "qualification-follow-ups",
-    "qualification-lead-offers",
-    "qualification-staff-loops",
-    "retry-ad-resolution",
-    "retry-conversion-events",
-  ]);
+// Drift-proof audit: introspect the ACTUAL registrations in crons.ts.
+// If someone adds/renames a cron or changes an interval there without
+// updating CRON_REGISTRY (what the Settings panel renders), or wires a
+// cron straight to its target instead of a cronSchedules wrapper (so it
+// would run without leaving run history), this fails.
+test("crons.ts registrations match CRON_REGISTRY exactly, all via cronSchedules wrappers", () => {
+  const registered = crons.crons;
+  expect(Object.keys(registered).sort()).toEqual(
+    CRON_REGISTRY.map((c) => c.name).slice().sort(),
+  );
   for (const entry of CRON_REGISTRY) {
-    expect(entry.intervalMinutes).toBeGreaterThan(0);
+    const job = registered[entry.name]!;
+    const s = job.schedule as {
+      type: string;
+      seconds?: number;
+      minutes?: number;
+      hours?: number;
+    };
+    expect(s.type).toBe("interval");
+    const minutes =
+      s.minutes ?? (s.seconds !== undefined ? s.seconds / 60 : (s.hours ?? 0) * 60);
+    expect(minutes).toBe(entry.intervalMinutes);
+    // Every cron must run through a run-history wrapper, never the
+    // target directly — otherwise the panel would show "never ran".
+    expect(job.name.startsWith("cronSchedules:")).toBe(true);
   }
 });
 
@@ -137,6 +153,41 @@ test("overview returns registry crons with last run, next-run estimate and recen
 
   expect(out.recentRuns.length).toBeGreaterThanOrEqual(1);
   expect(out.recentRuns[0].name).toBe("qualification-follow-ups");
+});
+
+test("overview bounds recent runs by runsLimit and flags overflow", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const base = Date.now();
+  await t.run(async (ctx) => {
+    // Insertion order == startedAt order, as recordStart produces live.
+    for (let i = 0; i < 12; i++) {
+      await ctx.db.insert("cronRuns", {
+        name: "retry-conversion-events",
+        startedAt: base + i * 1_000,
+        finishedAt: base + i * 1_000 + 10,
+        status: "success",
+      });
+    }
+  });
+
+  const def = await admin.as.query(api.cronSchedules.overview, {});
+  expect(def.recentRuns).toHaveLength(RUNS_DEFAULT_LIMIT);
+  expect(def.recentRunsOverflow).toBe(true);
+  // Newest first, untouched by the bound.
+  expect(def.recentRuns[0].startedAt).toBe(base + 11_000);
+
+  const three = await admin.as.query(api.cronSchedules.overview, {
+    runsLimit: 3,
+  });
+  expect(three.recentRuns).toHaveLength(3);
+  expect(three.recentRunsOverflow).toBe(true);
+
+  const big = await admin.as.query(api.cronSchedules.overview, {
+    runsLimit: 999, // clamped to the cap server-side
+  });
+  expect(big.recentRuns).toHaveLength(12);
+  expect(big.recentRunsOverflow).toBe(false);
 });
 
 test("overview lists upcoming follow-up nudges and pending lead offers for this account only", async () => {
