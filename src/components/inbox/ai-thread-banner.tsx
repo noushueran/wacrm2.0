@@ -132,11 +132,21 @@ export function AiThreadBanner({
   // Active on this thread.
   return (
     <Banner tone="primary">
-      <div className="flex min-w-0 flex-1 items-center gap-1.5">
-        <Sparkles className="h-3.5 w-3.5 flex-shrink-0 text-primary" />
-        <span className="truncate font-medium text-foreground">
-          {t("activeText")}
-        </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Sparkles className="h-3.5 w-3.5 flex-shrink-0 text-primary" />
+          <span className="truncate font-medium text-foreground">
+            {t("activeText")}
+          </span>
+        </div>
+        {/* A thread the AI flagged for human eyes (customer asked for a
+            person / open team question) — the bot keeps replying, but
+            surface the note so takeover is an informed one click. */}
+        {handoffSummary && (
+          <p className="truncate text-muted-foreground" title={handoffSummary}>
+            {handoffSummary}
+          </p>
+        )}
       </div>
       <BannerButton onClick={() => toggle(true)} busy={busy} icon={Hand}>
         {t("takeOver")}

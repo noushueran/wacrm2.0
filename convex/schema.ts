@@ -292,6 +292,11 @@ export default defineSchema({
     replyToMessageId: v.optional(v.id("messages")),
     interactivePayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
+    // AI transcription of an inbound voice note / vision description of
+    // an inbound image (aiReply media understanding, 2026-07-18) —
+    // rendered into the assistant's transcript so replies address the
+    // actual content.
+    aiTranscription: v.optional(v.string()),
     // True when the AI auto-reply bot generated this message (migration
     // 033). Postgres: NOT NULL DEFAULT false; optional here for the same
     // reason as the conversations AI columns (late addition, no Convex
@@ -687,6 +692,9 @@ export default defineSchema({
     type: v.union(
       v.literal("conversation_assigned"),
       v.literal("lead_qualified"),
+      // Assigned-agent reply-SLA breach (customer waiting on a taken
+      // chat) — targets supervisors+.
+      v.literal("sla_alert"),
     ),
     conversationId: v.optional(v.id("conversations")),
     contactId: v.optional(v.id("contacts")),
@@ -1083,7 +1091,11 @@ export default defineSchema({
     systemPrompt: v.optional(v.string()),
     isActive: v.boolean(),
     autoReplyEnabled: v.boolean(),
-    autoReplyMaxPerConversation: v.number(),
+    // DEPRECATED (owner decision 2026-07-18): there is NO reply cap —
+    // the bot answers every message until a human takes the chat from
+    // the dashboard. Optional so existing rows stay valid; nothing
+    // reads it anymore.
+    autoReplyMaxPerConversation: v.optional(v.number()),
     // Migration 030: optional OpenAI-compatible embeddings key —
     // encrypted like `apiKey`; its presence turns on semantic KB
     // retrieval (else lexical-only).
@@ -1645,4 +1657,21 @@ export default defineSchema({
   })
     .index("by_session", ["sessionId"])
     .index("by_account", ["accountId"]),
+
+  // Run history for the interval crons in crons.ts — one row per
+  // execution, stamped by the wrapper actions in cronSchedules.ts.
+  // Deployment-global (no accountId): crons are infrastructure, not
+  // tenant data; the admin-gated Settings → Cron schedules panel is the
+  // only reader. Rows older than 7 days are pruned on each start.
+  cronRuns: defineTable({
+    name: v.string(),
+    startedAt: v.number(),
+    finishedAt: v.optional(v.number()),
+    status: v.union(
+      v.literal("running"),
+      v.literal("success"),
+      v.literal("failed"),
+    ),
+    error: v.optional(v.string()),
+  }).index("by_name", ["name", "startedAt"]),
 });

@@ -27,6 +27,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.CONVEX_AI_DRY_RUN;
   delete process.env.CONVEX_META_DRY_RUN;
+  vi.useRealTimers(); // the retry tests below opt into fake timers
 });
 
 /**
@@ -89,7 +90,6 @@ const BASE_AI_CONFIG_ARGS = {
   model: "gpt-4o-mini",
   isActive: true,
   autoReplyEnabled: true,
-  autoReplyMaxPerConversation: 3,
 };
 
 /** Admin+ upsert of the caller's AI config — active + auto-reply on by
@@ -284,37 +284,236 @@ test("early-exits without sending when a human already owns the conversation", a
   expect(await messagesFor(t, conversationId)).toHaveLength(1);
 });
 
-test("hitting autoReplyMaxPerConversation early-exits with no send and leaves the count unchanged", async () => {
+test("no reply cap: the bot keeps replying no matter how many replies it has already sent", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
-  await configureAi(asUser, { autoReplyMaxPerConversation: 3 });
+  await configureAi(asUser);
   const { contactId, conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
     messageText: "Hello?",
   });
-  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 3 }));
+  // A long-running thread: 50 bot replies already sent. There is no
+  // cap — the bot answers every message until a human takes the chat
+  // from the dashboard (assignment / autoreply-pause are the ONLY stops).
+  await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 50 }));
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
 
-  expect(await messagesFor(t, conversationId)).toHaveLength(1); // no bot reply added
-  expect((await getConversation(t, conversationId))!.aiReplyCount).toBe(3); // unchanged
-});
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.aiReplyCount).toBe(51); // still counted (metrics), never gating
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.status).toBe("open");
+  expect(conversation!.assignedToUserId).toBeUndefined();
+}, 20_000);
 
 // ============================================================
-// Handoff
+// Media understanding — inbound voice notes are transcribed and images
+// described (OpenAI, DRY-RUN synthetic here), stored on the message
+// row (`aiTranscription`) and rendered into the transcript so the
+// reply addresses the ACTUAL content, not just "[voice note]".
 // ============================================================
 
-test("a handoff-signalled reply disables auto-reply, sets status pending + a summary, and sends no normal reply", async () => {
+test("a voice note is transcribed before replying and the transcript is stored on the row", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
-  await configureAi(asUser); // no handoffAgentId configured
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBe("[dry-run transcript]");
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+}, 20_000);
+
+test("an inbound image is described the same way", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const imageMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "image" as const,
+      contentText: "my visa",
+      mediaUrl: "https://example.com/visa.jpg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const imageRow = await t.run((ctx) => ctx.db.get(imageMessageId));
+  expect(imageRow!.aiTranscription).toBe("[dry-run transcript]");
+}, 20_000);
+
+test("no usable OpenAI key (anthropic provider, no embeddings key) skips transcription but still replies", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser, { provider: "anthropic" as never, model: "claude-3-5-haiku-latest" });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBeUndefined();
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1); // placeholder-only context still gets a reply
+}, 20_000);
+
+// ============================================================
+// Transient-failure retry — `[[FAIL]]` in the triggering message makes
+// DRY-RUN's `syntheticGeneration` throw, exactly where a real provider/
+// network failure would surface (same steering convention as the
+// handoff sentinel). Fake timers + `finishAllScheduledFunctions` drain
+// the scheduled retry, the `broadcasts.test.ts` idiom.
+// ============================================================
+
+test("a provider failure schedules one retry, which replies once the failure clears", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "[[FAIL]] what are your opening hours?",
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  // First attempt failed — nothing sent, nothing claimed.
+  expect(
+    (await messagesFor(t, conversationId)).filter((m) => m.senderType === "bot"),
+  ).toHaveLength(0);
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+
+  // The transient failure clears before the retry fires.
+  await t.run(async (ctx) => {
+    const inbound = (await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect())[0]!;
+    await ctx.db.patch(inbound._id, { contentText: "what are your opening hours?" });
+  });
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect((await getConversation(t, conversationId))!.aiReplyCount).toBe(1);
+}, 20_000);
+
+test("a persistent failure stops after the single retry — no reply, no endless rescheduling", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "[[FAIL]] hello",
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  // Drains the retry (attempt 2), which fails again. If the code kept
+  // rescheduling, this drain would never terminate — the test timeout
+  // is the regression signal for that.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  expect(
+    (await messagesFor(t, conversationId)).filter((m) => m.senderType === "bot"),
+  ).toHaveLength(0);
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+}, 20_000);
+
+// ============================================================
+// Handoff
+// ============================================================
+
+test("a model-emitted handoff marker never silences the bot — the customer still gets a reply", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
   const { contactId, conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
@@ -323,67 +522,42 @@ test("a handoff-signalled reply disables auto-reply, sets status pending + a sum
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
 
-  const messages = await messagesFor(t, conversationId);
-  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+  // Handoff is MANUAL-ONLY (dashboard takeover). Even if the model
+  // emits the legacy marker, the customer still hears something and the
+  // thread stays fully bot-owned.
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0]!.contentText).toBeTruthy();
+  expect(botMessages[0]!.contentText).not.toContain("[[HANDOFF]]");
 
   const conversation = await getConversation(t, conversationId);
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiHandoffSummary).toContain("AI agent handed off");
-  expect(conversation!.aiReplyCount ?? 0).toBe(0);
-  // No handoff target configured — left unassigned (shared queue).
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.status).toBe("open");
   expect(conversation!.assignedToUserId).toBeUndefined();
-});
-
-test("a handoff-signalled reply assigns the conversation to the configured handoff agent", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  const handoffAgentId = await seedTeammate(t, {
-    accountId,
-    name: "Hank (handoff agent)",
-    email: "hank@example.com",
-  });
-  await configureAi(asUser, { handoffAgentId });
-  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: `This is unacceptable, get me a human ${HANDOFF_SENTINEL}`,
-  });
-
-  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
-
-  const conversation = await getConversation(t, conversationId);
-  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-  const messages = await messagesFor(t, conversationId);
-  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
-});
+  expect(conversation!.aiReplyCount).toBe(1);
+}, 20_000);
 
 // ============================================================
-// markHandoff — direct `internalMutation` coverage of the lead-charge
-// wiring (lead-value fix wave — final review, Fix 1). The two handoff
-// tests above already prove `dispatchInbound` reaches `markHandoff` and
-// that it assigns `handoffAgentId`; these call `markHandoff` itself
-// directly (skipping the whole config/generation pipeline) to focus
-// narrowly on the charge side, mirroring `automationsEngine.test.ts`'s
-// own focused `assign_conversation` charge test.
+// flagForHuman — the ONLY thing the AI stack may do when a thread
+// needs human eyes: surface it (status pending + summary). It must
+// never silence the bot, assign anyone, or charge a lead — takeover is
+// exclusively a manual dashboard action.
 // ============================================================
 
-test("markHandoff charges the handoff agent when a lead value is set", async () => {
+test("flagForHuman marks the thread pending + bells supervisors, but never silences, assigns, or charges — and never double-bells", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
   await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
-  const handoffAgentId = await seedTeammate(t, {
+  const supervisorUserId = await seedTeammate(t, {
     accountId,
-    name: "Hank (handoff agent)",
-    email: "hank@example.com",
+    name: "Sam (supervisor)",
+    email: "sam@example.com",
+    role: "supervisor",
   });
   const { conversationId } = await seedInboundThread(t, asUser, {
     accountId,
@@ -391,49 +565,48 @@ test("markHandoff charges the handoff agent when a lead value is set", async () 
     messageText: "I need a human",
   });
 
-  await t.mutation(internal.aiReply.markHandoff, {
+  await t.mutation(internal.aiReply.flagForHuman, {
     accountId,
     conversationId,
-    handoffAgentId,
-    summary: "test handoff",
+    summary: "🤖 Customer asked for a human.",
   });
 
   const conversation = await getConversation(t, conversationId);
-  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
+  expect(conversation!.status).toBe("pending");
+  expect(conversation!.aiHandoffSummary).toBe("🤖 Customer asked for a human.");
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.assignedToUserId).toBeUndefined();
 
-  const charges = await t.run((ctx) =>
+  const charges = await t.run((ctx) => ctx.db.query("leadCharges").collect());
+  expect(charges).toHaveLength(0);
+
+  // Surfacing means someone actually HEARS about it: supervisors get a
+  // bell (the admin seeding user does too — supervisor+ role).
+  const bells = await t.run((ctx) =>
     ctx.db
-      .query("leadCharges")
-      .withIndex("by_user_conversation", (q) =>
-        q.eq("userId", handoffAgentId).eq("conversationId", conversationId),
-      )
+      .query("notifications")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
       .collect(),
   );
-  expect(charges).toHaveLength(1);
-  expect(charges[0]).toMatchObject({ accountId, value: 5, currency: "USD" });
-});
+  expect(bells.filter((n) => n.userId === supervisorUserId)).toHaveLength(1);
+  expect(bells.every((n) => n.type === "sla_alert")).toBe(true);
 
-test("markHandoff writes no charge when no handoff agent is configured (unassigned queue)", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
-  const { conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: "I need a human",
-  });
-
-  await t.mutation(internal.aiReply.markHandoff, {
+  // Re-flagging an already-flagged thread refreshes the note, no re-bell.
+  await t.mutation(internal.aiReply.flagForHuman, {
     accountId,
     conversationId,
-    summary: "test handoff",
+    summary: "🤖 Customer asked again.",
   });
-
-  expect((await getConversation(t, conversationId))!.assignedToUserId).toBeUndefined();
-  expect(await t.run((ctx) => ctx.db.query("leadCharges").collect())).toHaveLength(0);
+  const bellsAfter = await t.run((ctx) =>
+    ctx.db
+      .query("notifications")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  expect(bellsAfter.length).toBe(bells.length);
+  expect((await getConversation(t, conversationId))!.aiHandoffSummary).toBe(
+    "🤖 Customer asked again.",
+  );
 });
 
 // ============================================================

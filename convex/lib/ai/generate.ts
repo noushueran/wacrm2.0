@@ -60,19 +60,19 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
 }
 
 /**
- * Split the raw model output into `{ text, handoff, usage }`. The
- * sentinel can appear alone or trailing a partial reply; either way we
- * treat the turn as a handoff and strip the marker from any remaining
- * text. `usage` is passed straight through (null when the provider
- * didn't report it). Also used by `convex/aiReply.ts`'s DRY-RUN path to
- * process its own synthetic raw text through the same logic a real
- * provider response would go through.
+ * Split the raw model output into `{ text, handoff, askAdmin, usage }`.
+ * The legacy handoff sentinel is stripped from the text and REPORTED
+ * (`handoff: true`) but no longer changes behavior anywhere — handoff
+ * is manual-only, and dispatch ignores the flag. `askAdmin` is
+ * extracted independently: an open team question must never be lost to
+ * a stray legacy marker. `usage` passes straight through (null when the
+ * provider didn't report it). Also used by `convex/aiReply.ts`'s
+ * DRY-RUN path.
  */
 export function parseGeneration(raw: string, usage: AiUsage | null = null): GenerateResult {
   const handoff = raw.includes(HANDOFF_SENTINEL);
   // Ask-admin marker (qualification v3): `[[ASK_ADMIN: <question>]]` —
-  // extracted and stripped like the handoff sentinel. Handoff wins when
-  // both appear (the model bailing outranks it wanting information).
+  // extracted and stripped like the handoff sentinel.
   let askAdmin: string | null = null;
   const withoutMarker = raw.replace(
     /\[\[ASK_ADMIN:([\s\S]*?)\]\]/g,
@@ -82,5 +82,5 @@ export function parseGeneration(raw: string, usage: AiUsage | null = null): Gene
     },
   );
   const text = withoutMarker.split(HANDOFF_SENTINEL).join("").trim();
-  return { text, handoff, askAdmin: handoff ? null : askAdmin, usage };
+  return { text, handoff, askAdmin, usage };
 }

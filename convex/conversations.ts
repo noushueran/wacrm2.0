@@ -521,8 +521,8 @@ export const unassign = accountMutation({
  * assignment (not just the caller's own — the route's own comment: a
  * stale assignee from a prior handoff would otherwise keep the "human
  * owns this" eligibility gate tripped and make Resume AI a no-op), and
- * gives the bot a fresh reply budget (`aiReplyCount: 0`) + clears the
- * handoff note. `status` is deliberately left untouched in BOTH
+ * resets the bot's reply tally (`aiReplyCount: 0` — a metric, there
+ * is no cap) + clears the flag note. `status` is deliberately left untouched in BOTH
  * branches, exactly like the route — unlike `assign`, which bumps it to
  * "pending".
  */

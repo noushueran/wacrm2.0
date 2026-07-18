@@ -1,5 +1,6 @@
 import {
   Bell,
+  CalendarClock,
   ClipboardCheck,
   Coins,
   FileText,
@@ -37,6 +38,7 @@ export const SETTINGS_SECTIONS = [
   'api',
   'conversions',
   'qualification',
+  'cron',
 ] as const;
 
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
@@ -65,6 +67,7 @@ export const SECTION_META: Record<SettingsSection, SectionMeta> = {
   api: { id: 'api', label: 'API keys', icon: KeyRound, group: 'workspace' },
   conversions: { id: 'conversions', label: 'Conversions', icon: Target, group: 'workspace' },
   qualification: { id: 'qualification', label: 'Lead qualification', icon: ClipboardCheck, group: 'workspace' },
+  cron: { id: 'cron', label: 'Cron schedules', icon: CalendarClock, group: 'workspace' },
 };
 
 export const RAIL_GROUPS: { label: string | null; group: SectionMeta['group'] }[] = [

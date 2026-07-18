@@ -184,10 +184,10 @@ describe("parseGeneration ask-admin marker", () => {
     expect(out.handoff).toBe(false);
   });
 
-  it("handoff wins over ask-admin; absent marker yields null", () => {
+  it("a legacy handoff marker no longer suppresses ask-admin (handoff is manual-only); absent marker yields null", () => {
     const both = parseGeneration("[[HANDOFF]] [[ASK_ADMIN: x?]]");
-    expect(both.handoff).toBe(true);
-    expect(both.askAdmin).toBeNull();
+    expect(both.handoff).toBe(true); // still reported; dispatch ignores it
+    expect(both.askAdmin).toBe("x?"); // the open question must not be lost
     expect(parseGeneration("plain reply").askAdmin).toBeNull();
   });
 });

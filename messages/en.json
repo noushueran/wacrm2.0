@@ -1832,11 +1832,81 @@
       "members": "Team members",
       "api": "API keys",
       "conversions": "Conversions",
-      "qualification": "Lead qualification"
+      "qualification": "Lead qualification",
+      "cron": "Cron schedules"
     },
     "groups": {
       "account": "Account",
       "workspace": "Workspace"
+    },
+    "cron": {
+      "title": "Cron schedules",
+      "description": "Every scheduled job in the workspace: the recurring background crons, work queued to run next, and what already ran.",
+      "recurring": {
+        "title": "Recurring jobs",
+        "desc": "Background crons that run on a fixed interval.",
+        "every": "every {min} min",
+        "lastRun": "Last run",
+        "nextRun": "Next run",
+        "never": "never",
+        "pendingFirstRun": "after next deploy tick"
+      },
+      "upcoming": {
+        "title": "Upcoming",
+        "desc": "Work already scheduled to run — it moves to Completed as it happens.",
+        "followUps": "Customer follow-up nudges ({count})",
+        "attempt": "Nudge {n} of {max}",
+        "openChat": "Open conversation",
+        "offers": "Lead offers awaiting reply ({count})",
+        "expires": "expires",
+        "queued": "Queued one-off tasks ({count})",
+        "runningNow": "running now",
+        "empty": "Nothing is scheduled right now.",
+        "qualificationOff": "Lead qualification is disabled, so no customer follow-ups get scheduled."
+      },
+      "recent": {
+        "title": "Completed",
+        "desc": "Recent cron executions and finished one-off tasks (kept 7 days).",
+        "cronRuns": "Cron runs ({count})",
+        "tasks": "One-off tasks ({count})",
+        "empty": "No completed runs recorded yet."
+      },
+      "crons": {
+        "retry-ad-resolution": { "title": "Ad campaign resolution retry" },
+        "retry-conversion-events": { "title": "Meta conversion retry" },
+        "qualification-follow-ups": { "title": "Customer follow-up nudges" },
+        "qualification-lead-offers": { "title": "Lead offer expiry sweep" },
+        "qualification-staff-loops": { "title": "Staff reminders & keepalive" }
+      },
+      "jobs": {
+        "aiReply": "AI auto-reply",
+        "leadAnalysis": "Lead analysis",
+        "followUpNudge": "Customer follow-up nudge",
+        "closingMessage": "Closing message",
+        "adminAlert": "Admin lead alert",
+        "askAdmin": "Ask-admin relay",
+        "adminAnswer": "Admin answer relay",
+        "leadOffer": "Lead offer step",
+        "staffMessage": "Staff WhatsApp message",
+        "push": "Push notification",
+        "webhook": "Webhook delivery",
+        "conversion": "Meta conversion event",
+        "whatsappSend": "WhatsApp send",
+        "ingest": "Message processing",
+        "cronWrapper": "Cron execution"
+      },
+      "rel": {
+        "justNow": "just now",
+        "dueNow": "due now",
+        "inS": "in {n}s",
+        "inM": "in {n}m",
+        "inH": "in {n}h",
+        "inD": "in {n}d",
+        "agoS": "{n}s ago",
+        "agoM": "{n}m ago",
+        "agoH": "{n}h ago",
+        "agoD": "{n}d ago"
+      }
     },
     "qualification": {
       "title": "Lead qualification",
@@ -2009,12 +2079,7 @@
       "enableAssistant": "Enable AI assistant",
       "enableAssistantDesc": "Master switch. Turns on the “Draft with AI” button in the inbox.",
       "autoReply": "Auto-reply to inbound messages",
-      "autoReplyDesc": "The bot answers new inbound messages automatically (only when no flow handles them and no agent is assigned). Hands off to a human when it can’t help.",
-      "maxAutoReplies": "Max auto-replies per conversation",
-      "maxAutoRepliesDesc": "After this many bot replies in one thread, the bot goes quiet.",
-      "handoffTo": "Hand off to",
-      "handoffToDesc": "When the bot can’t help — or hits the reply cap — it pauses and routes the chat here, with a short note on what happened.",
-      "handoffQueue": "Unassigned queue (any agent can pick it up)",
+      "autoReplyDesc": "The bot answers every new inbound message automatically (when no flow handles it) until a teammate takes the conversation over.",
       "remove": "Remove",
       "save": "Save",
       "missingModel": "Enter a model name.",

@@ -3,13 +3,21 @@ import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { hasMinRole } from "./lib/roles";
-import { chargeLeadIfAgent } from "./lib/leadCharge";
+import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
-import { buildHandoffSummary } from "./lib/ai/handoff";
-import { toChatMessages, type HistoryMessage } from "./lib/ai/context";
+import {
+  AI_VISIBLE_MEDIA_TYPES,
+  toChatMessages,
+  type HistoryMessage,
+} from "./lib/ai/context";
 import { generateReply, parseGeneration } from "./lib/ai/generate";
+import {
+  transcribeAudioFromUrl,
+  describeImageFromUrl,
+  DESCRIBE_FALLBACK_MODEL,
+} from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
 
@@ -18,8 +26,8 @@ import type { GenerateResult } from "./lib/ai/types";
 // task) — Convex port of `src/lib/ai/auto-reply.ts`'s
 // `dispatchInboundToAiReply`. On a freshly-arrived inbound message,
 // loads the account's RAG-grounded prompt, calls the account's own
-// LLM (BYO key), and either sends the reply or hands the thread off to
-// a human. `dispatchInbound` is an `internalAction` — never exposed to
+// LLM (BYO key), and sends the reply — ALWAYS (handoff is manual-only;
+// see `flagForHuman`). `dispatchInbound` is an `internalAction` — never exposed to
 // any client, `accountId` always an explicit caller-supplied argument
 // (there is no user session inside a webhook-triggered dispatch),
 // exactly like `convex/automationsEngine.ts`'s `runForTrigger` and
@@ -48,19 +56,13 @@ import type { GenerateResult } from "./lib/ai/types";
 //     state); left for a future task if BYO-key throttling turns out to
 //     matter here.
 //
-// Two deliberate IMPROVEMENTS over the source, both directed by this
-// task's own brief:
-//   1. On handoff, the conversation's `status` is set to `"pending"` —
-//      the source never touched `status` on handoff (an oversight fixed
-//      here, matching `flowsEngine.ts`'s own `executeHandoff`, which
-//      already does exactly this for a flow-triggered handoff).
-//   2. The source's `claim_ai_reply_slot` Postgres RPC existed solely to
-//      make the cap-check-then-increment atomic against a concurrent
-//      inbound. Convex mutations are already serializable per document
-//      via OCC (see `bumpExecutionCount`'s own comment on this same
-//      point) — so `claimReplySlot` below is a plain read-then-patch
-//      `internalMutation`, no special RPC needed, and is exactly as
-//      race-proof.
+// Two deliberate departures from the source (owner decisions,
+// 2026-07-18): the source's automatic handoff (sentinel-triggered
+// `markHandoff` that silenced the bot and could auto-assign) and its
+// per-conversation reply cap (`claim_ai_reply_slot`) are both GONE —
+// the bot answers every message until a human manually takes the chat
+// from the dashboard, and threads needing eyes are surfaced via
+// `flagForHuman` (status pending) without ever stopping the bot.
 //
 // One gap this task closes without touching any Phase 0–6 file: sending
 // via `convex/metaSend.ts`'s `sendText` persists the reply as an
@@ -82,21 +84,47 @@ function isDryRun(): boolean {
 const DRY_RUN_REPLY_TEXT =
   "Thanks for your message! This is an automated reply while our team follows up.";
 
+/** Sent when the model returns nothing usable (empty / marker-only
+ *  output). Handoff is manual-only, so silence is never an option —
+ *  the customer always hears SOMETHING. */
+const FALLBACK_REPLY_TEXT =
+  "Thanks for your message! Let me look into this and get right back to you.";
+
+// One scheduled retry per inbound: a transient provider/network failure
+// (429, timeout) must not leave the customer unanswered, but a broken
+// config (bad key) mustn't loop either — attempt 2 is the last.
+const DISPATCH_MAX_ATTEMPTS = 2;
+const DISPATCH_RETRY_DELAY_MS = 30_000;
+
+/** `[[FAIL]]` in the triggering message steers the provider-failure
+ *  branch in DRY-RUN tests — thrown from `syntheticGeneration`, exactly
+ *  where a real `generateReply` network failure would surface. */
+const FAILURE_SENTINEL = "[[FAIL]]";
+
+/** DRY-RUN stand-in for a voice-note transcript / image description. */
+const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
+
+/** Upper bound on media rows transcribed per dispatch — a burst of
+ *  voice notes costs at most this many transcription calls per reply. */
+const MAX_TRANSCRIPTIONS_PER_DISPATCH = 3;
+
 /**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
  * network entirely, same convention as `convex/aiKnowledge.ts`'s
- * `syntheticEmbedding`. There's no live model to consult, so it makes
- * the handoff/no-handoff call along the SAME signal a real model is
- * instructed to use (`buildSystemPrompt`'s auto-reply guidance: reply
- * with exactly `HANDOFF_SENTINEL` to bail) — just sourced from the
- * latest customer message instead of a model's own judgement. That
- * gives `aiReply.test.ts` a deterministic way to steer the handoff
- * branch (seed the triggering inbound message with the sentinel in it)
- * without ever touching the network. Usage is all-zero, matching the
- * brief ("DRY-RUN returns a synthetic reply + zero usage") and
- * `aiUsage.log`'s own "skip when there's no usage" no-op.
+ * `syntheticEmbedding`. Markers in the triggering customer message
+ * steer deterministic branches for `aiReply.test.ts`:
+ *   - `[[FAIL]]` → throws (the retry path);
+ *   - `[[NEEDINFO:<q>]]` → holding line + ask-admin marker;
+ *   - the legacy `[[HANDOFF]]` sentinel → raw sentinel output, which
+ *     dispatch must IGNORE (strip + fall back to a real reply — the
+ *     model has no silence escape; handoff is manual-only).
+ * Usage is all-zero, matching `aiUsage.log`'s own "skip when there's
+ * no usage" no-op.
  */
 function syntheticGeneration(latestMessage: string): GenerateResult {
+  if (latestMessage.includes(FAILURE_SENTINEL)) {
+    throw new Error("DRY-RUN synthetic provider failure");
+  }
   // `[[NEEDINFO:<q>]]` in the triggering message steers the ask-admin
   // branch in tests, same convention as the handoff sentinel below.
   const needInfo = latestMessage.match(/\[\[NEEDINFO:([\s\S]*?)\]\]/);
@@ -158,13 +186,16 @@ export const getConversationForAccount = internalQuery({
 });
 
 /**
- * The last `limit` TEXT messages of a conversation, oldest → newest,
- * re-asserting `accountId` on every row even though `by_conversation`
- * alone would already scope correctly in practice (belt-and-braces,
- * same discipline as `aiKnowledge.ts`'s `getChunksByIds` — see that
- * file's header for why isolation here is layered, not single-point).
- * Convex port of `src/lib/ai/context.ts`'s DB half; `toChatMessages`
- * (called by `dispatchInbound`, not here) is the pure other half.
+ * The last `limit` conversation messages the AI can "see" (text + the
+ * customer-content media types — see `context.ts`'s
+ * `AI_VISIBLE_MEDIA_TYPES`), oldest → newest, re-asserting `accountId`
+ * on every row even though `by_conversation` alone would already scope
+ * correctly in practice (belt-and-braces, same discipline as
+ * `aiKnowledge.ts`'s `getChunksByIds` — see that file's header for why
+ * isolation here is layered, not single-point). Convex port of
+ * `src/lib/ai/context.ts`'s DB half; `toChatMessages` (called by
+ * `dispatchInbound`, not here) is the pure other half — it renders the
+ * media rows as placeholders.
  */
 export const recentMessages = internalQuery({
   args: {
@@ -180,7 +211,10 @@ export const recentMessages = internalQuery({
       .filter((q) =>
         q.and(
           q.eq(q.field("accountId"), args.accountId),
-          q.eq(q.field("contentType"), "text"),
+          q.or(
+            q.eq(q.field("contentType"), "text"),
+            ...AI_VISIBLE_MEDIA_TYPES.map((t) => q.eq(q.field("contentType"), t)),
+          ),
         ),
       )
       .take(args.limit);
@@ -192,8 +226,87 @@ export const recentMessages = internalQuery({
     return rows.reverse().map((m) => ({
       senderType: m.senderType,
       contentText: m.contentText,
+      contentType: m.contentType,
+      transcription: m.aiTranscription,
       createdAt: m._creationTime,
     }));
+  },
+});
+
+/**
+ * Newest CUSTOMER message in a conversation — the debounce token
+ * `dispatchInbound` compares its `triggerMessageId` against: when they
+ * differ, a newer inbound arrived after this dispatch was scheduled and
+ * that message's own dispatch owns the reply to the whole burst.
+ */
+export const latestInboundMessageId = internalQuery({
+  args: { accountId: v.id("accounts"), conversationId: v.id("conversations") },
+  handler: async (ctx, args): Promise<Id<"messages"> | null> => {
+    const row = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .filter((q) =>
+        q.and(
+          q.eq(q.field("accountId"), args.accountId),
+          q.eq(q.field("senderType"), "customer"),
+        ),
+      )
+      .first();
+    return row?._id ?? null;
+  },
+});
+
+/**
+ * Customer media rows (voice notes / images) still awaiting an AI
+ * transcription/description — newest first, bounded by `limit`. Only
+ * rows whose media already resolved into storage (`mediaUrl` set)
+ * qualify; the rest keep their placeholder until a later dispatch.
+ */
+export const untranscribedMediaRows = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    limit: v.number(),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<
+    { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
+  > => {
+    // BOUNDED raw window, filtered in JS: a DB-level contentType filter
+    // would stream the index until it found `limit` media matches —
+    // i.e. read a long text-only conversation end-to-end on every
+    // dispatch. Reading the newest 50 rows flat keeps the cost constant;
+    // media older than that (or than the age cutoff below) simply keeps
+    // its placeholder.
+    const rows = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .take(50);
+    // Age cutoff: never backfill historical media from before this
+    // feature (privacy + token spend) — only recent conversation media
+    // is transcribed.
+    const cutoff = Date.now() - 24 * 3_600_000;
+    return rows
+      .filter(
+        (m) =>
+          m.accountId === args.accountId &&
+          m.senderType === "customer" &&
+          (m.contentType === "audio" || m.contentType === "image") &&
+          m._creationTime > cutoff &&
+          m.mediaUrl &&
+          !m.aiTranscription,
+      )
+      .slice(0, args.limit)
+      .map((m) => ({
+        messageId: m._id,
+        contentType: m.contentType as "audio" | "image",
+        mediaUrl: m.mediaUrl!,
+        caption: m.contentText?.trim() || null,
+      }));
   },
 });
 
@@ -220,80 +333,86 @@ export const hasKnowledgeChunks = internalQuery({
 // ------------------------------------------------------------
 
 /**
- * Atomically claims one reply slot: read-then-patch in a single Convex
- * mutation, so two concurrent inbounds for the same conversation can
- * never both squeeze past the cap (Convex's OCC serializes them — see
- * this file's own header comment). Returns `false` — no patch applied —
- * when the account/conversation mismatch OR the cap is already reached;
- * `dispatchInbound` skips the send in either case.
+ * Bumps the conversation's bot-reply tally after a successful send.
+ * PURELY a metric (usage tiles, future analytics) — there is NO reply
+ * cap: the bot answers every message until a human takes the chat from
+ * the dashboard (owner decision 2026-07-18; the old `claimReplySlot`
+ * cap-gate lived here before that).
  */
-export const claimReplySlot = internalMutation({
+export const bumpReplyCount = internalMutation({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
-    maxReplies: v.number(),
   },
-  handler: async (ctx, args): Promise<boolean> => {
+  handler: async (ctx, args): Promise<void> => {
     const conversation = await ctx.db.get(args.conversationId);
-    if (!conversation || conversation.accountId !== args.accountId) return false;
-    const current = conversation.aiReplyCount ?? 0;
-    if (current >= args.maxReplies) return false;
+    if (!conversation || conversation.accountId !== args.accountId) return;
     await ctx.db.patch(args.conversationId, {
-      aiReplyCount: current + 1,
+      aiReplyCount: (conversation.aiReplyCount ?? 0) + 1,
       updatedAt: Date.now(),
     });
-    return true;
   },
 });
 
 /**
- * Applies a handoff: pauses the bot on this thread (sticky — the
- * conversation-level early-exit in `dispatchInbound` checks
- * `aiAutoreplyDisabled` on every future inbound), records the internal
- * summary, bumps `status` to `"pending"` (see this file's header on why
- * that's an intentional addition over the source), and assigns
- * `handoffAgentId` when one is configured — omitted (never stomping an
- * existing assignment) when it isn't, dropping the conversation into the
- * shared unassigned queue instead.
+ * Surfaces a thread that needs human eyes WITHOUT touching the bot:
+ * status → `"pending"` (the needs-attention queue), an internal summary
+ * (shown in the inbox AI banner), and — on the FIRST flag only — a bell
+ * to every supervisor+ member so somebody actually hears about it. That
+ * is ALL the AI stack may ever do — taking a chat over (assignment,
+ * autoreply pause, the lead charge) is exclusively a manual dashboard
+ * action (owner decision 2026-07-18; the automatic `markHandoff` that
+ * used to live here silenced the bot and could auto-assign, stranding
+ * customers mid-conversation). Re-flagging an already-flagged thread
+ * refreshes the note without re-belling.
  */
-export const markHandoff = internalMutation({
+export const flagForHuman = internalMutation({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
-    handoffAgentId: v.optional(v.id("users")),
     summary: v.string(),
   },
   handler: async (ctx, args) => {
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
-
-    const patch: Partial<{
-      aiAutoreplyDisabled: boolean;
-      aiHandoffSummary: string;
-      status: "open" | "pending" | "closed";
-      updatedAt: number;
-      assignedToUserId: Id<"users">;
-    }> = {
-      aiAutoreplyDisabled: true,
+    const alreadyFlagged =
+      conversation.status === "pending" && !!conversation.aiHandoffSummary;
+    await ctx.db.patch(args.conversationId, {
       aiHandoffSummary: args.summary,
       status: "pending",
       updatedAt: Date.now(),
-    };
-    if (args.handoffAgentId) patch.assignedToUserId = args.handoffAgentId;
-
-    await ctx.db.patch(args.conversationId, patch);
-
-    // Same charge-on-assignment guarantee as `conversations.assign`,
-    // `conversations.setAutoreplyPaused`, and `automationsEngine.ts`'s
-    // `assign_conversation` step — feature-off/agents-only/idempotent, so
-    // safe to call unconditionally right after the patch. Guarded on
-    // `handoffAgentId` itself (not just the patch above) since there's
-    // nothing to charge when the bot handed off into the shared
-    // unassigned queue rather than to a specific agent (lead-value fix
-    // wave — final review).
-    if (args.handoffAgentId) {
-      await chargeLeadIfAgent(ctx, args.accountId, args.handoffAgentId, args.conversationId);
+    });
+    if (alreadyFlagged) return;
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    for (const member of memberships) {
+      if (!hasMinRole(member.role, "supervisor")) continue;
+      await insertNotification(ctx, {
+        accountId: args.accountId,
+        userId: member.userId,
+        type: "sla_alert",
+        conversationId: args.conversationId,
+        contactId: conversation.contactId,
+        title: "AI flagged a conversation for the team",
+        body: args.summary,
+      });
     }
+  },
+});
+
+/** Stores a just-computed transcription/description on its media row. */
+export const setTranscription = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    messageId: v.id("messages"),
+    text: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message || message.accountId !== args.accountId) return;
+    await ctx.db.patch(args.messageId, { aiTranscription: args.text });
   },
 });
 
@@ -330,18 +449,38 @@ export const markMessageAiGenerated = internalMutation({
  * Eligibility gates (any → silent no-op, no send):
  *   - AI off (`isActive` false) / auto-reply disabled for the account
  *   - `conversationId`/`contactId` don't resolve to THIS account
- *   - a human (or a prior handoff) already owns the thread (`assignedToUserId`)
- *   - auto-reply was disabled on this conversation (prior handoff)
- *   - the per-conversation reply cap is already reached
- *   - there's no text history to ground a reply in
+ *   - a human already took the thread from the dashboard (`assignedToUserId`)
+ *   - auto-reply was paused on this conversation
+ *   - there's no history to ground a reply in
+ *
+ * There is deliberately NO reply cap: the bot answers every message
+ * until a human takes over manually (owner decision 2026-07-18).
  */
 export const dispatchInbound = internalAction({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
     contactId: v.id("contacts"),
+    // 1-based retry counter (absent = first attempt). Only the retry
+    // scheduled from the catch below ever passes it.
+    attempt: v.optional(v.number()),
+    // Meta wamid of the inbound message that triggered this dispatch —
+    // lets the bot mark it read (blue ticks) + show "typing…" while the
+    // reply generates. Optional: older callers simply skip the receipt.
+    triggerWamid: v.optional(v.string()),
+    // Row id of that same inbound message — the debounce token. The
+    // ingest layer schedules dispatch `aiReplyDebounceMs()` after each
+    // inbound; at fire time only the dispatch whose trigger is still
+    // the newest customer message replies, so a burst of quick
+    // fragments gets ONE reply. Optional: direct callers (tests, a
+    // future manual trigger) skip the staleness check.
+    triggerMessageId: v.optional(v.id("messages")),
   },
   handler: async (ctx, args): Promise<void> => {
+    // Flipped right after the Meta send succeeds: a failure AFTER this
+    // point must never retry (the customer already has the reply —
+    // re-dispatching would double-text them).
+    let sent = false;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
@@ -359,10 +498,92 @@ export const dispatchInbound = internalAction({
 
       if (conversation.assignedToUserId) return; // a human owns this thread
       if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
-      const replyCountSoFar = conversation.aiReplyCount ?? 0;
-      // Cheap early-out; `claimReplySlot` below is the authoritative,
-      // race-proof check at the point a reply is actually sent.
-      if (replyCountSoFar >= config.autoReplyMaxPerConversation) return;
+
+      // Debounce gate (burst aggregation): a newer customer message
+      // means ITS scheduled dispatch owns the reply to the whole burst —
+      // this one stands down without sending, marking, or claiming
+      // anything.
+      if (args.triggerMessageId) {
+        const latestInbound = await ctx.runQuery(
+          internal.aiReply.latestInboundMessageId,
+          { accountId: args.accountId, conversationId: args.conversationId },
+        );
+        if (latestInbound && latestInbound !== args.triggerMessageId) return;
+      }
+
+      // NO reply cap (owner decision): the bot answers every message
+      // until a human takes the chat from the dashboard — manual
+      // assignment / autoreply-pause (the two gates above) are the ONLY
+      // stops. `aiReplyCount` is still counted after each send, purely
+      // as a metric.
+
+      // Every gate passed — we intend to reply. Blue-tick the triggering
+      // message and show "typing…" for the LLM's think time (Meta
+      // auto-dismisses it on our send). Polish, never load-bearing: a
+      // failure here must not cost the customer their reply.
+      if (args.triggerWamid) {
+        try {
+          await ctx.runAction(internal.metaSend.markRead, {
+            accountId: args.accountId,
+            whatsappMessageId: args.triggerWamid,
+            typingIndicator: true,
+          });
+        } catch (err) {
+          console.warn("[ai auto-reply] mark-read failed:", err);
+        }
+      }
+
+      // Voice notes & images: transcribe / describe BEFORE building the
+      // transcript, so the reply addresses the actual content (owner
+      // requirement — the bot "listens" and "reads", then answers in
+      // TEXT; it never sends media back). OpenAI-only: the account's own
+      // key, or the (also-OpenAI) embeddings key on an Anthropic-model
+      // account. Best-effort per row — a failure keeps the placeholder.
+      const openAiKey =
+        config.provider === "openai" ? config.apiKey : (config.embeddingsApiKey ?? null);
+      if (openAiKey) {
+        const pendingMedia = await ctx.runQuery(internal.aiReply.untranscribedMediaRows, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          limit: MAX_TRANSCRIPTIONS_PER_DISPATCH,
+        });
+        let transcribedAny = false;
+        for (const row of pendingMedia) {
+          try {
+            const text = isDryRun()
+              ? DRY_RUN_TRANSCRIPT
+              : row.contentType === "audio"
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: row.mediaUrl })
+                : await describeImageFromUrl({
+                    apiKey: openAiKey,
+                    model:
+                      config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
+                    mediaUrl: row.mediaUrl,
+                    caption: row.caption ?? undefined,
+                  });
+            if (text) {
+              await ctx.runMutation(internal.aiReply.setTranscription, {
+                accountId: args.accountId,
+                messageId: row.messageId,
+                text,
+              });
+              transcribedAny = true;
+            }
+          } catch (err) {
+            console.warn("[ai auto-reply] media transcription failed:", err);
+          }
+        }
+        // A fresh transcript is fresh extractable lead data — let the
+        // qualification analysis see it (dormant-safe no-op otherwise;
+        // ingest only triggers analysis for TEXT inbounds).
+        if (transcribedAny) {
+          await ctx.scheduler.runAfter(0, internal.qualificationEngine.analyzeInbound, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+          });
+        }
+      }
 
       const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
         accountId: args.accountId,
@@ -426,7 +647,7 @@ export const dispatchInbound = internalAction({
             systemPrompt,
             messages,
           });
-      const { text, handoff, usage } = generation;
+      const { text, usage } = generation;
 
       // Record token spend on the account's BYO key. Awaited (unlike the
       // source's fire-and-forget `void logAiUsage(...)`: an action's own
@@ -449,32 +670,29 @@ export const dispatchInbound = internalAction({
         console.warn("[ai auto-reply] usage log failed:", err);
       }
 
-      // Ask-admin (v3): a marker with no accompanying text still owes the
-      // customer a holding line — never fall through to handoff for it.
+      // The customer ALWAYS hears something (handoff is manual-only —
+      // the model has no escape hatch). A bare ask-admin marker owes a
+      // holding line; any other empty/marker-only output (rare) gets the
+      // warm generic fallback rather than silence.
       let replyText = text;
-      if (!handoff && !replyText && generation.askAdmin) {
+      if (!replyText && generation.askAdmin) {
         replyText = "Let me check with my team and get back to you shortly!";
       }
-
-      if (handoff || !replyText) {
-        // The model can't (or shouldn't) answer — stop auto-replying on
-        // this thread and hand it to a human.
-        const summary = buildHandoffSummary({ messages, replyCount: replyCountSoFar });
-        await ctx.runMutation(internal.aiReply.markHandoff, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          handoffAgentId: config.handoffAgentId,
-          summary,
-        });
-        return;
+      if (!replyText) {
+        replyText = FALLBACK_REPLY_TEXT;
       }
 
-      const claimed = await ctx.runMutation(internal.aiReply.claimReplySlot, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-        maxReplies: config.autoReplyMaxPerConversation,
-      });
-      if (!claimed) return; // lost the per-conversation cap race
+      // Re-check the debounce token at the last moment: transcription +
+      // generation can take many seconds, and a message that arrived
+      // meanwhile owns the reply (its own dispatch fires shortly). One
+      // wasted generation beats a reply that ignores the newest message.
+      if (args.triggerMessageId) {
+        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+        });
+        if (latestNow && latestNow !== args.triggerMessageId) return;
+      }
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {
         accountId: args.accountId,
@@ -482,9 +700,14 @@ export const dispatchInbound = internalAction({
         to,
         text: replyText,
       });
+      sent = true;
       await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
         accountId: args.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
+      });
+      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
       });
 
       // Ask-admin relay (v3): fan the question out to the admin numbers
@@ -509,6 +732,32 @@ export const dispatchInbound = internalAction({
       }
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
+      // Transient failures (provider 429/timeout, an infra hiccup) must
+      // not leave the customer unanswered — schedule ONE retry. The
+      // retry re-runs every eligibility gate, so a human takeover in the
+      // meantime turns it into a no-op. Never after a successful send.
+      const attempt = args.attempt ?? 1;
+      if (!sent && attempt < DISPATCH_MAX_ATTEMPTS) {
+        try {
+          await ctx.scheduler.runAfter(
+            DISPATCH_RETRY_DELAY_MS,
+            internal.aiReply.dispatchInbound,
+            {
+              accountId: args.accountId,
+              conversationId: args.conversationId,
+              contactId: args.contactId,
+              attempt: attempt + 1,
+              triggerWamid: args.triggerWamid,
+              // Keeps the debounce gate honest on the retry too: if a
+              // newer inbound arrived meanwhile, its dispatch replies.
+              triggerMessageId: args.triggerMessageId,
+            },
+          );
+        } catch (schedErr) {
+          // Preserve this action's never-throws contract even here.
+          console.error("[ai auto-reply] retry scheduling failed:", schedErr);
+        }
+      }
     }
   },
 });
