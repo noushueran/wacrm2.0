@@ -14,6 +14,15 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Vendored minified opus-recorder encoder worker (served statically).
     "public/opus/**",
+    // Nested worktrees each carry their own generated `.next/**` (and
+    // other build output) that ESLint would otherwise walk in full —
+    // multi-MB chunks across every stale worktree under here, which is
+    // what pushes a bare `npm run lint` past its runtime budget.
+    ".claude/**",
+    // Convex codegen output — hand-maintained to stay byte-identical to
+    // what `convex dev`/`deploy` regenerates (see convex-codegen notes),
+    // so it must never be edited to satisfy lint. Don't lint it at all.
+    "convex/_generated/**",
   ]),
 ]);
 

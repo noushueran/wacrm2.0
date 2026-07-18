@@ -700,7 +700,7 @@ test("supervisor can send.send into any conversation, including one assigned to 
 test("agent cannot send.send to a brand-new contact (would create an unassigned conversation), and no orphan conversation is left behind", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
+  const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
     role: "agent",

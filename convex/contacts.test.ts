@@ -318,7 +318,7 @@ test("byCustomFieldValue matches by is/is_not/contains, and never matches a cont
     phone: "222",
     name: "Free User",
   });
-  const noValueContactId = await asAlice.mutation(api.contacts.create, {
+  await asAlice.mutation(api.contacts.create, {
     phone: "333",
     name: "No Value User",
   });
@@ -1309,7 +1309,7 @@ test("filterByTags masks phone for agent/viewer", async () => {
     email: "ag@x.com",
     role: "agent",
   });
-  const { contactId, tagId } = await t.run(async (ctx) => {
+  const { tagId } = await t.run(async (ctx) => {
     const contactId = await ctx.db.insert("contacts", {
       accountId,
       phone: "+15551230148",
