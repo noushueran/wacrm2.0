@@ -754,6 +754,12 @@ export const completeQualification = internalMutation({
       accountId: args.accountId,
       conversationId: args.conversationId,
     });
+    // Post the sales checklist on the fresh lead (KB/AI-driven with a
+    // built-in default fallback — always lands one).
+    await ctx.scheduler.runAfter(0, internal.salesChecklists.generateForSession, {
+      accountId: args.accountId,
+      sessionId: session._id,
+    });
     // P6: consent-based auto-assignment — offer the lead to a matching
     // agent over WhatsApp (no-ops when disabled, already assigned, or
     // nobody routes for this service).

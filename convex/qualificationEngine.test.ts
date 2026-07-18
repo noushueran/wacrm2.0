@@ -1,5 +1,5 @@
 import { convexTest, type TestConvex } from "convex-test";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
@@ -1365,4 +1365,45 @@ test("P6: staff keepalive — closed window gets the template, and never twice i
   await t.action(internal.qualificationEngine.runStaffLoops, {});
   msgs = await messagesFor(t, staffConversation!._id);
   expect(msgs).toHaveLength(1);
+});
+
+// ---- sales checklist hook ----
+
+test("completing qualification posts the sales checklist on the lead", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seed(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("qualificationSessions", {
+        accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+        status: "collecting", origin: "inbound", serviceName: "Bali package",
+        fields: [], expectedCount: 4, answeredCount: 4,
+        checklistSatisfiedAt: Date.now(), lastCustomerMessageAt: Date.now(),
+        followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+      });
+    });
+
+    await t.mutation(internal.qualificationEngine.completeQualification, {
+      accountId: base.accountId, conversationId: base.conversationId,
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const session = await t.run((ctx) =>
+      ctx.db.query("qualificationSessions")
+        .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+        .order("desc").first());
+    expect(session!.status).toBe("qualified");
+
+    const checklist = await t.run((ctx) =>
+      ctx.db.query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", session!._id))
+        .unique());
+    expect(checklist).not.toBeNull();
+    expect(checklist!.source).toBe("default"); // no AI config in this seed
+    expect(checklist!.items.length).toBeGreaterThanOrEqual(6);
+    expect(checklist!.items.every((i) => !i.done)).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
 });
