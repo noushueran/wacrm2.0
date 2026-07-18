@@ -403,19 +403,20 @@ export const activity = accountQuery({
     };
     const items: Item[] = [];
 
-    // Customer-authored messages, newest 10. `.take(10)` on an
-    // index-ordered ("desc") scan is normally bounded regardless of
-    // table size — but combined with the `senderType==="customer"`
-    // `.filter()`, the WORST case (an account with few/no customer
-    // messages among its most recent activity) still walks the full
-    // `messages` `by_account` range looking for 10 matches. `messages`
-    // is the highest-volume table in the schema, so this is worth
-    // flagging even though the common case is cheap (see report).
+    // Customer-authored messages, newest 10. `senderType` is now part of
+    // the index range (`by_account_sender`) rather than a post-scan
+    // `.filter()`: the previous `by_account` + `.filter(senderType===
+    // "customer").take(10)` walked every non-customer message newer than
+    // the 10th customer one — a single broadcast fan-out of ≥4096 bot
+    // messages was enough to blow Convex's read limit and take down every
+    // dashboard load. Ranging the index to the customer partition reads
+    // only customer rows, so the take is genuinely bounded to 10 reads.
     const recentCustomerMessages = await ctx.db
       .query("messages")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .withIndex("by_account_sender", (q) =>
+        q.eq("accountId", ctx.accountId).eq("senderType", "customer"),
+      )
       .order("desc")
-      .filter((q) => q.eq(q.field("senderType"), "customer"))
       .take(10);
     // Two parallel waves rather than a per-message `get` chain. The
     // conversation -> contact hop is genuinely dependent (the contact id

@@ -338,7 +338,13 @@ export default defineSchema({
   })
     .index("by_conversation", ["conversationId"])
     .index("by_message_id", ["messageId"])
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    // `dashboard.activity`'s "newest N customer messages" feed. Ranging
+    // `senderType` on the index returns only that sender's rows, so a long
+    // run of non-customer messages (a broadcast fan-out) can no longer
+    // force a scan past Convex's read limit the way a post-scan
+    // `.filter(senderType===...)` on `by_account` did.
+    .index("by_account_sender", ["accountId", "senderType"]),
 
   // One row per (message, actor) reaction. `conversationId` is denormalized
   // here exactly like Postgres denormalized it (migration 009: "so Supabase
