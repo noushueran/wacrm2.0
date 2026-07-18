@@ -165,3 +165,23 @@ describe("generateReply — Anthropic", () => {
     expect(body.messages).toHaveLength(1);
   });
 });
+
+// ---- qualification v3: ask-admin marker ----
+
+describe("parseGeneration ask-admin marker", () => {
+  it("extracts the ASK_ADMIN question and strips the marker", () => {
+    const out = parseGeneration(
+      "Let me check with my team and get back to you shortly! [[ASK_ADMIN: What is the Georgia visa fee for Indian nationals?]]",
+    );
+    expect(out.askAdmin).toBe("What is the Georgia visa fee for Indian nationals?");
+    expect(out.text).toBe("Let me check with my team and get back to you shortly!");
+    expect(out.handoff).toBe(false);
+  });
+
+  it("handoff wins over ask-admin; absent marker yields null", () => {
+    const both = parseGeneration("[[HANDOFF]] [[ASK_ADMIN: x?]]");
+    expect(both.handoff).toBe(true);
+    expect(both.askAdmin).toBeNull();
+    expect(parseGeneration("plain reply").askAdmin).toBeNull();
+  });
+});

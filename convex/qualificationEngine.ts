@@ -14,7 +14,7 @@ import {
   countAnswered,
   type AnalysisResult,
 } from "./lib/qualification/analyze";
-import { aiContextMessageLimit } from "./lib/ai/defaults";
+import { aiContextMessageLimit, buildSystemPrompt } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
 import { toChatMessages } from "./lib/ai/context";
 import { generateReply } from "./lib/ai/generate";
@@ -1078,5 +1078,301 @@ export const sendTarget = internalQuery({
     const session = await ctx.db.get(args.sessionId);
     if (!session) return null;
     return { accountId: session.accountId, conversationId: session.conversationId };
+  },
+});
+
+// ============================================================
+// v3 — the ask-admin relay. When the assistant lacks an answer it tells
+// the customer "let me check with my team" (aiReply parses the
+// [[ASK_ADMIN: …]] marker) and the question is WhatsApped to the admin
+// numbers as a PLAIN message — owner-stated operating assumption: the
+// admin channel's 24h window never closes, so no template is needed.
+// The admin's next reply answers the LATEST pending inquiry and is
+// relayed back to the customer by the assistant. Undelivered answers
+// are also injected into the assistant's knowledge on the customer's
+// next turn (`pendingAnswers`), so nothing gets lost if the immediate
+// relay can't send.
+// ============================================================
+
+/** Team answers not yet delivered to this customer thread — injected as
+ *  knowledge notes into the assistant's next reply. */
+export const pendingAnswers = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ notes: string[]; inquiryIds: Id<"adminInquiries">[] }> => {
+    const rows = await ctx.db
+      .query("adminInquiries")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .collect();
+    const cutoff = Date.now() - 48 * 3_600_000;
+    const answered = rows.filter(
+      (r) =>
+        r.accountId === args.accountId &&
+        r.status === "answered" &&
+        (r.answeredAt ?? 0) > cutoff,
+    );
+    return {
+      notes: answered.map(
+        (r) =>
+          `Team answer to the customer's earlier question. Question: "${r.question}" — Team answer: "${r.answer}". Relay this warmly and accurately; do not add facts beyond it.`,
+      ),
+      inquiryIds: answered.map((r) => r._id),
+    };
+  },
+});
+
+export const markAnswersDelivered = internalMutation({
+  args: { inquiryIds: v.array(v.id("adminInquiries")) },
+  handler: async (ctx, args): Promise<void> => {
+    for (const id of args.inquiryIds) {
+      const row = await ctx.db.get(id);
+      if (row && row.status === "answered") {
+        await ctx.db.patch(id, { status: "delivered" });
+      }
+    }
+  },
+});
+
+export const recordAdminInquiry = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    question: v.string(),
+    customerName: v.string(),
+    customerPhone: v.string(),
+  },
+  handler: async (ctx, args): Promise<Id<"adminInquiries">> => {
+    return await ctx.db.insert("adminInquiries", {
+      ...args,
+      status: "pending",
+      askedAt: Date.now(),
+    });
+  },
+});
+
+/** Read side for `relayQuestionToAdmin`. Null = nowhere to ask. */
+export const relayContext = internalQuery({
+  args: { accountId: v.id("accounts"), contactId: v.id("contacts") },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ phones: string[]; customerName: string; customerPhone: string } | null> => {
+    // Deliberately NOT gated on `enabled`: the ask-admin protocol lives
+    // in the assistant's own prompt, so it must work whenever admin
+    // numbers are configured — even with lead qualification off.
+    const config = await ctx.db
+      .query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .unique();
+    if (!config || config.adminAlertPhones.length === 0) return null;
+    const contact = await ctx.db.get(args.contactId);
+    if (!contact || contact.accountId !== args.accountId) return null;
+    return {
+      phones: config.adminAlertPhones,
+      customerName: contact.name?.trim() || contact.phone,
+      customerPhone: contact.phone,
+    };
+  },
+});
+
+/**
+ * Sends the assistant's question to every admin number (plain text; see
+ * the section header on why no template). Without configured admin
+ * numbers the question falls back to the in-app human queue
+ * (`markHandoff`) so it is never silently dropped.
+ */
+export const relayQuestionToAdmin = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    question: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const context = await ctx.runQuery(internal.qualificationEngine.relayContext, {
+        accountId: args.accountId,
+        contactId: args.contactId,
+      });
+      if (!context) {
+        await ctx.runMutation(internal.aiReply.markHandoff, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          summary: `🤖 Needs an answer for the customer: ${args.question}`,
+        });
+        return;
+      }
+      await ctx.runMutation(internal.qualificationEngine.recordAdminInquiry, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        question: args.question,
+        customerName: context.customerName,
+        customerPhone: context.customerPhone,
+      });
+      const text =
+        `❓ Question from ${context.customerName} (${context.customerPhone}):\n` +
+        `${args.question}\n\n` +
+        "Reply here and I'll pass your answer straight to the customer.";
+      for (const phone of context.phones) {
+        try {
+          const target = await ctx.runMutation(
+            internal.qualificationEngine.ensureAdminConversation,
+            { accountId: args.accountId, phone },
+          );
+          await ctx.runAction(internal.metaSend.sendText, {
+            accountId: args.accountId,
+            conversationId: target.conversationId,
+            to: target.to,
+            text,
+          });
+        } catch (err) {
+          console.error("[qualification] admin question relay failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] relayQuestionToAdmin failed:", err);
+    }
+  },
+});
+
+/**
+ * Inbound from an admin number answers the LATEST pending inquiry
+ * (admins reply to what's on their screen). Records the answer and
+ * schedules the customer-facing relay.
+ */
+export const onAdminInbound = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    phoneNormalized: v.string(),
+    text: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    if (!args.text.trim()) return;
+    const config = await ctx.db
+      .query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .unique();
+    if (!config || !isAdminAlertNumber(config, args.phoneNormalized)) return;
+    const pending = await ctx.db
+      .query("adminInquiries")
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", args.accountId).eq("status", "pending"),
+      )
+      .order("desc")
+      .first();
+    if (!pending) return;
+    await ctx.db.patch(pending._id, {
+      status: "answered",
+      answer: args.text.trim(),
+      answeredAt: Date.now(),
+    });
+    await ctx.scheduler.runAfter(0, internal.qualificationEngine.relayAnswerToCustomer, {
+      inquiryId: pending._id,
+    });
+  },
+});
+
+/** Read side for `relayAnswerToCustomer`. */
+export const answerContext = internalQuery({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args) => {
+    const inquiry = await ctx.db.get(args.inquiryId);
+    if (!inquiry || inquiry.status !== "answered" || !inquiry.answer) return null;
+    const conversation = await ctx.db.get(inquiry.conversationId);
+    if (!conversation || conversation.accountId !== inquiry.accountId) return null;
+    const contact = await ctx.db.get(inquiry.contactId);
+    if (!contact) return null;
+    return {
+      accountId: inquiry.accountId,
+      conversationId: inquiry.conversationId,
+      question: inquiry.question,
+      answer: inquiry.answer,
+      to: contact.phone,
+      // A human who took the thread owns the relay too — the assistant
+      // stands down (the answer stays injected via `pendingAnswers` if
+      // the bot ever resumes).
+      aiEligible: !conversation.aiAutoreplyDisabled && !conversation.assignedToUserId,
+    };
+  },
+});
+
+/**
+ * Relays the admin's answer to the waiting customer as a warm assistant
+ * reply (LLM-composed; deterministic in DRY-RUN). Best-effort: if the
+ * immediate send can't happen (human took over, cap, window closed),
+ * the answer stays `answered` and reaches the customer through the
+ * `pendingAnswers` knowledge injection on their next message.
+ */
+export const relayAnswerToCustomer = internalAction({
+  args: { inquiryId: v.id("adminInquiries") },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const context = await ctx.runQuery(internal.qualificationEngine.answerContext, {
+        inquiryId: args.inquiryId,
+      });
+      if (!context || !context.aiEligible) return;
+
+      const aiCfg = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: context.accountId,
+      });
+      if (!aiCfg || !aiCfg.isActive) return;
+
+      let text: string;
+      if (isAiDryRun()) {
+        text = `Good news about your question — ${context.answer}`;
+      } else {
+        const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
+          accountId: context.accountId,
+          conversationId: context.conversationId,
+          limit: aiContextMessageLimit(),
+        });
+        const messages = toChatMessages(historyRows);
+        const systemPrompt = buildSystemPrompt({
+          userPrompt: aiCfg.systemPrompt ?? null,
+          mode: "auto_reply",
+          knowledge: [
+            `The team answered the customer's earlier question. Question: "${context.question}" — Team answer: "${context.answer}". Write the next reply relaying this answer warmly and accurately; do not add facts beyond it and do not ask the team again.`,
+          ],
+        });
+        const gen = await generateReply({
+          provider: aiCfg.provider,
+          model: aiCfg.model,
+          apiKey: aiCfg.apiKey,
+          systemPrompt,
+          messages,
+        });
+        text = gen.text || `Update on your question: ${context.answer}`;
+      }
+
+      const claimed = await ctx.runMutation(internal.aiReply.claimReplySlot, {
+        accountId: context.accountId,
+        conversationId: context.conversationId,
+        maxReplies: aiCfg.autoReplyMaxPerConversation,
+      });
+      if (!claimed) return; // cap reached — pendingAnswers injection remains
+
+      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
+        accountId: context.accountId,
+        conversationId: context.conversationId,
+        to: context.to,
+        text,
+      });
+      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
+        accountId: context.accountId,
+        whatsappMessageId: sendResult.whatsappMessageId,
+      });
+      await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+        inquiryIds: [args.inquiryId],
+      });
+    } catch (err) {
+      console.error("[qualification] relayAnswerToCustomer failed:", err);
+    }
   },
 });

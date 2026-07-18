@@ -1436,6 +1436,35 @@ export default defineSchema({
     updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
 
+  // ============================================================
+  // Admin Q&A relay (qualification v3): when the assistant lacks an
+  // answer it tells the customer "let me check with my team", records
+  // the question here, and WhatsApps it to the admin numbers as a plain
+  // message (the admin channel's window never closes — owner-stated
+  // operating assumption). The admin's next reply answers the LATEST
+  // pending inquiry and is relayed back to the customer by the
+  // assistant. `delivered` = the answer reached the customer chat.
+  // ============================================================
+  adminInquiries: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"), // the CUSTOMER thread
+    contactId: v.id("contacts"),
+    question: v.string(),
+    customerName: v.string(),
+    customerPhone: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("answered"),
+      v.literal("delivered"),
+      v.literal("expired"),
+    ),
+    answer: v.optional(v.string()),
+    askedAt: v.number(),
+    answeredAt: v.optional(v.number()),
+  })
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_conversation", ["conversationId"]),
+
   // One qualification session per conversation — this row IS the lead
   // the sales team works from (spec §5; no separate leads table).
   // `by_conversation` doubles as the 1:1 enforcing index (ensureSession

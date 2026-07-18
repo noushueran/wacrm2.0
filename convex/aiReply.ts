@@ -97,9 +97,16 @@ const DRY_RUN_REPLY_TEXT =
  * `aiUsage.log`'s own "skip when there's no usage" no-op.
  */
 function syntheticGeneration(latestMessage: string): GenerateResult {
-  const raw = latestMessage.includes(HANDOFF_SENTINEL) ? HANDOFF_SENTINEL : DRY_RUN_REPLY_TEXT;
-  const { text, handoff } = parseGeneration(raw);
-  return { text, handoff, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
+  // `[[NEEDINFO:<q>]]` in the triggering message steers the ask-admin
+  // branch in tests, same convention as the handoff sentinel below.
+  const needInfo = latestMessage.match(/\[\[NEEDINFO:([\s\S]*?)\]\]/);
+  const raw = latestMessage.includes(HANDOFF_SENTINEL)
+    ? HANDOFF_SENTINEL
+    : needInfo
+      ? `Let me check with my team and get back to you shortly! [[ASK_ADMIN: ${needInfo[1].trim()}]]`
+      : DRY_RUN_REPLY_TEXT;
+  const parsed = parseGeneration(raw);
+  return { ...parsed, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } };
 }
 
 // ------------------------------------------------------------
@@ -387,6 +394,15 @@ export const dispatchInbound = internalAction({
         { accountId: args.accountId, conversationId: args.conversationId },
       );
 
+      // Ask-admin relay (v3): team answers that haven't reached the
+      // customer yet are injected as knowledge so THIS reply can deliver
+      // them; marked delivered after a successful send below.
+      const teamAnswers = await ctx.runQuery(
+        internal.qualificationEngine.pendingAnswers,
+        { accountId: args.accountId, conversationId: args.conversationId },
+      );
+      if (teamAnswers.notes.length > 0) knowledge = [...knowledge, ...teamAnswers.notes];
+
       const systemPrompt = buildSystemPrompt({
         userPrompt: config.systemPrompt ?? null,
         mode: "auto_reply",
@@ -426,7 +442,14 @@ export const dispatchInbound = internalAction({
         console.warn("[ai auto-reply] usage log failed:", err);
       }
 
-      if (handoff || !text) {
+      // Ask-admin (v3): a marker with no accompanying text still owes the
+      // customer a holding line — never fall through to handoff for it.
+      let replyText = text;
+      if (!handoff && !replyText && generation.askAdmin) {
+        replyText = "Let me check with my team and get back to you shortly!";
+      }
+
+      if (handoff || !replyText) {
         // The model can't (or shouldn't) answer — stop auto-replying on
         // this thread and hand it to a human.
         const summary = buildHandoffSummary({ messages, replyCount: replyCountSoFar });
@@ -450,12 +473,33 @@ export const dispatchInbound = internalAction({
         accountId: args.accountId,
         conversationId: args.conversationId,
         to,
-        text,
+        text: replyText,
       });
       await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
         accountId: args.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
       });
+
+      // Ask-admin relay (v3): fan the question out to the admin numbers
+      // AFTER the holding reply went out; and retire any team answers
+      // this reply just delivered.
+      if (generation.askAdmin) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.qualificationEngine.relayQuestionToAdmin,
+          {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+            question: generation.askAdmin,
+          },
+        );
+      }
+      if (teamAnswers.inquiryIds.length > 0) {
+        await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+          inquiryIds: teamAnswers.inquiryIds,
+        });
+      }
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
     }
