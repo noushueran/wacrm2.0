@@ -876,7 +876,10 @@ test("shouldDispatchAiReply: a media message still respects the flow/auto-respon
 // same two-flag convention `aiReply.test.ts` documents).
 // ------------------------------------------------------------
 
-test("processInbound on a brand-new contact runs the full fan-out in order: ingest -> flows (no match) -> automations (all four triggers) -> AI stands down (active auto-responder automation) -> webhook delivery", async () => {
+// 15s, not the 5s default: this is the suite's heaviest e2e (full inbound
+// fan-out, ~5s alone) and it sits right at the cap under full-suite transform
+// load, flaking on slow disks while passing in isolation.
+test("processInbound on a brand-new contact runs the full fan-out in order: ingest -> flows (no match) -> automations (all four triggers) -> AI stands down (active auto-responder automation) -> webhook delivery", { timeout: 15_000 }, async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
   const t = convexTest(schema, modules);
