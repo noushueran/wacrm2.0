@@ -1212,3 +1212,57 @@ test("logs applies the limit to the automationId-filtered branch", async () => {
 
   expect(rows.map((l) => l._id)).toEqual([newest, middle]);
 });
+
+test("logs clamps a huge limit to 200 so one request can't take the whole log table", async () => {
+  // `.take(limit)` bounds the read only as tightly as the limit itself: an
+  // unclamped caller-supplied 100_000 reads the account's whole log history
+  // again. With `documentsRead` capped, the unclamped take of 260 seeded rows
+  // throws "Scanned too many documents"; the clamped `.take(200)` does not.
+  const t = convexTest({
+    schema,
+    modules,
+    transactionLimits: { documentsRead: 230 },
+  });
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "A",
+    triggerType: "new_message_received",
+  });
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 260; i++) {
+      await ctx.db.insert("automationLogs", {
+        accountId,
+        automationId,
+        triggerEvent: "new_message_received",
+        stepsExecuted: [],
+        status: "success",
+      });
+    }
+  });
+
+  const rows = await asUser.query(api.automations.logs, { limit: 100_000 });
+  expect(rows).toHaveLength(200);
+});
+
+test("logs clamps a non-positive limit up to 1 rather than returning nothing", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationId = await asUser.mutation(api.automations.create, {
+    name: "A",
+    triggerType: "new_message_received",
+  });
+  await seedLog(t, { accountId, automationId });
+  await seedLog(t, { accountId, automationId });
+
+  // Unclamped, `.take(0)` returned []; the clamp floors the limit at 1.
+  const rows = await asUser.query(api.automations.logs, { limit: 0 });
+  expect(rows).toHaveLength(1);
+});

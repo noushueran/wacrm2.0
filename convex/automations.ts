@@ -14,6 +14,7 @@ import {
   validateStepsForActivation,
   validateTriggerForActivation,
 } from "./lib/automations/validate";
+import { clampLimit } from "./lib/cronSummary";
 
 // ============================================================
 // Automations config CRUD — the account-scoped builder-facing
@@ -661,7 +662,9 @@ export const logs = accountQuery({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const limit = args.limit ?? 100;
+    // Clamp before it reaches `.take()`: a negative throws, and a huge value
+    // makes either branch's read as heavy as the `.collect()` this replaced.
+    const limit = clampLimit(args.limit, 100, 200);
     const { automationId } = args;
 
     if (automationId !== undefined) {
