@@ -15,6 +15,7 @@ import {
   RUNS_CAP,
   RUNS_DEFAULT_LIMIT,
   summarizeSystemTasks,
+  SYSTEM_SCAN_WINDOW,
   type CronName,
 } from "./lib/cronSummary";
 
@@ -278,40 +279,18 @@ export const listSystemTasks = accountQuery({
       COMPLETED_CAP,
     );
 
-    // Pending/in-progress: filtered across the WHOLE table, not a
-    // recency window — long-dated jobs (automation waits, flow
-    // timeouts, agent-SLA checks) must never fall out of view just
-    // because newer completed rows buried them. Capped at
-    // PENDING_SCAN_CAP + 1 result rows so the payload stays bounded;
-    // beyond the cap the panel shows "50+".
-    const pendingRows = await ctx.db.system
-      .query("_scheduled_functions")
-      .filter((q) =>
-        q.or(
-          q.eq(q.field("state.kind"), "pending"),
-          q.eq(q.field("state.kind"), "inProgress"),
-        ),
-      )
-      .take(PENDING_SCAN_CAP + 1);
-
-    // Completed: newest-first history. Completed rows dominate the
-    // table, so this reads only ~limit + 1 rows before satisfying take.
-    const completedRows = await ctx.db.system
+    // ONE unfiltered newest-first window feeding both lists, because a
+    // filtered read of this table is unbounded: `.filter()` does not
+    // narrow what Convex scans, and `.take(n)` stops after n *matches*,
+    // so filtering for the (usually zero) pending rows scans every
+    // document until the table runs out. See SYSTEM_SCAN_WINDOW —
+    // that scan is what blew the 4,096-read limit in production.
+    // Unfiltered, `.take` is a true read bound: exactly this many docs.
+    const rows = await ctx.db.system
       .query("_scheduled_functions")
       .order("desc")
-      .filter((q) =>
-        q.or(
-          q.eq(q.field("state.kind"), "success"),
-          q.eq(q.field("state.kind"), "failed"),
-        ),
-      )
-      .take(completedLimit + 1);
+      .take(SYSTEM_SCAN_WINDOW);
 
-    return summarizeSystemTasks({
-      pendingRows,
-      completedRows,
-      pendingLimit,
-      completedLimit,
-    });
+    return summarizeSystemTasks({ rows, pendingLimit, completedLimit });
   },
 });
