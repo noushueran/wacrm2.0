@@ -67,10 +67,58 @@ export const patchResolution = internalMutation({
 });
 
 /**
+ * Retires a row that cannot be attempted at all — no `META_ADS_ACCESS_TOKEN`,
+ * so there is nothing to call. Spends NO attempt: dormancy is the
+ * deployment's state, not the row's fault, and burning retries on it would
+ * walk a perfectly resolvable ad to `"abandoned"` the moment a token finally
+ * appeared.
+ *
+ * Leaving such a row `"pending"` instead is what made the retry cron churn:
+ * `pending`/`attempts: 0` is exactly `getResolvable`'s predicate, so every
+ * run rescheduled a row that could never progress. `conversionEvents` carried
+ * the same bug and it accounted for 87% of `_scheduled_functions` on
+ * production (19 rows, ~250 reschedules each).
+ */
+export const retireDormant = internalMutation({
+  args: { campaignAdId: v.id("campaignAds"), reason: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    const row = await ctx.db.get(args.campaignAdId);
+    if (!row) return;
+    if (row.resolveStatus === "resolved") return;
+    await ctx.db.patch(args.campaignAdId, {
+      resolveStatus: "dormant",
+      lastError: `dormant: ${args.reason}`,
+    });
+  },
+});
+
+/**
+ * Dormant rows, for the cron to revive once a token exists. An unfiltered
+ * `by_status` range — no `.filter()`, so the read is bounded by `.take(100)`
+ * outright rather than by how many matches happen to be near the front.
+ *
+ * That is the payoff of giving dormancy its own status instead of parking it
+ * in `"abandoned"` alongside genuinely-given-up rows and separating them with
+ * `attempts < MAX_RESOLVE_ATTEMPTS` (which is what
+ * `conversionEvents.getDormantToSweep` does, and which its own comment notes
+ * would be cleaner this way). Given-up rows never leave their partition, so a
+ * filtered read over it degrades exactly as this table's `getResolvable` once
+ * did.
+ */
+export const getDormantToSweep = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Doc<"campaignAds">[]> =>
+    await ctx.db
+      .query("campaignAds")
+      .withIndex("by_status", (q) => q.eq("resolveStatus", "dormant"))
+      .take(100),
+});
+
+/**
  * Resolves one ad id to its ad/ad set/campaign names via the Marketing
  * API and caches them. Never throws. Dormant (no `META_ADS_ACCESS_TOKEN`)
- * → leave `pending`, no attempt bump (the retry cron resolves it once a
- * token exists). Idempotent: an already-`resolved` row is skipped.
+ * → `retireDormant`, which the cron re-sweeps once a token is configured.
+ * Idempotent: an already-`resolved` row is skipped.
  */
 export const resolveAd = internalAction({
   args: { campaignAdId: v.id("campaignAds") },
@@ -82,7 +130,13 @@ export const resolveAd = internalAction({
     if (row.resolveStatus === "resolved") return;
 
     const token = process.env.META_ADS_ACCESS_TOKEN;
-    if (!token) return; // dormant
+    if (!token) {
+      await ctx.runMutation(internal.campaignAds.retireDormant, {
+        campaignAdId: args.campaignAdId,
+        reason: "META_ADS_ACCESS_TOKEN unset",
+      });
+      return;
+    }
 
     try {
       const params = new URLSearchParams({
@@ -123,10 +177,12 @@ export const resolveAd = internalAction({
 });
 
 /**
- * Retry candidates for the cron: `pending` OR `error` rows with
- * `attempts < MAX_RESOLVE_ATTEMPTS`, capped at 100. `pending` covers both
- * never-attempted rows and dormant ones skipped for lack of a token — so
- * once a token is configured, the cron picks them up.
+ * LIVE retry candidates for the cron: `pending` OR `error` rows with
+ * `attempts < MAX_RESOLVE_ATTEMPTS`, capped at 100. `pending` means
+ * never-attempted only; a row skipped for lack of a token is no longer left
+ * here but retired to `"dormant"` by `retireDormant` and revived through
+ * `getDormantToSweep`. Leaving it here was the churn bug — the predicate
+ * matched it forever while it could never progress.
  *
  * `by_status` bounds each read to one status partition, but the
  * `attempts` test below is a `.filter()`, which does NOT narrow what
@@ -159,12 +215,32 @@ export const getResolvable = internalQuery({
  * Cron entry point (`convex/crons.ts`): pulls the retry batch and
  * re-schedules `resolveAd` for each. Tiny by design — all resolution
  * logic (dormant/idempotent/error) lives in `resolveAd`.
+ *
+ * Only an action can read `process.env`, so the dormant sweep is gated here:
+ * while no token is configured there is nothing to revive, and asking for
+ * the dormant set anyway would just re-retire it every run — the churn this
+ * whole mechanism exists to stop. Live rows are still pulled unconditionally;
+ * a `pending` row with no token reaches `resolveAd` once, retires itself, and
+ * is not seen again until a token appears.
  */
 export const retryResolutions = internalAction({
   args: {},
   handler: async (ctx): Promise<void> => {
-    const rows = await ctx.runQuery(internal.campaignAds.getResolvable, {});
-    for (const row of rows) {
+    const configured = Boolean(process.env.META_ADS_ACCESS_TOKEN);
+
+    const [live, dormant] = await Promise.all([
+      ctx.runQuery(internal.campaignAds.getResolvable, {}),
+      configured
+        ? ctx.runQuery(internal.campaignAds.getDormantToSweep, {})
+        : Promise.resolve([] as Doc<"campaignAds">[]),
+    ]);
+
+    // Live rows first: a dormant backlog must never crowd them out of the
+    // 100-row budget (same ordering rule `getResolvable` applies between its
+    // own two partitions, and `conversionEvents.retryConversionEvents`
+    // between its).
+    const batch = [...live, ...dormant].slice(0, 100);
+    for (const row of batch) {
       await ctx.scheduler.runAfter(0, internal.campaignAds.resolveAd, {
         campaignAdId: row._id,
       });

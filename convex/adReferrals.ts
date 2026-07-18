@@ -73,7 +73,11 @@ export const recordAdReferral = internalMutation({
           resolveStatus: "pending",
           attempts: 0,
         });
-        // resolveAd is dormant without META_ADS_ACCESS_TOKEN — safe no-op.
+        // Without META_ADS_ACCESS_TOKEN, resolveAd retires the row to
+        // "dormant" rather than leaving it "pending" — so a CTWA lead
+        // arriving while the token is unset costs one scheduled run, not a
+        // reschedule on every cron tick from now on. The retry cron revives
+        // it once a token exists.
         await ctx.scheduler.runAfter(0, internal.campaignAds.resolveAd, {
           campaignAdId,
         });

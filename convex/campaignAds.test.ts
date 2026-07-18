@@ -25,7 +25,7 @@ async function seedAd(
   t: ReturnType<typeof convexTest>,
   accountId: Id<"accounts">,
   attempts = 0,
-  resolveStatus: "pending" | "error" = "pending",
+  resolveStatus: "pending" | "error" | "dormant" | "abandoned" = "pending",
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("campaignAds", {
@@ -45,7 +45,7 @@ afterEach(() => {
   globalThis.fetch = origFetch;
 });
 
-test("resolveAd is dormant without META_ADS_ACCESS_TOKEN (leaves pending, no attempt bump)", async () => {
+test("resolveAd retires a row to dormant without META_ADS_ACCESS_TOKEN, spending no attempt", async () => {
   delete process.env.META_ADS_ACCESS_TOKEN;
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t);
@@ -54,8 +54,60 @@ test("resolveAd is dormant without META_ADS_ACCESS_TOKEN (leaves pending, no att
   await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
 
   const row = await t.run((ctx) => ctx.db.get(adId));
-  expect(row?.resolveStatus).toBe("pending");
+  expect(row?.resolveStatus).toBe("dormant");
+  // Dormancy is not the row's fault, so it must not consume a retry.
   expect(row?.attempts).toBe(0);
+});
+
+/**
+ * The live bug this fixes, and the reason the fix is worth a status of its own.
+ * A dormant row used to sit at `pending`/`attempts: 0` — which is precisely
+ * `getResolvable`'s predicate — so the cron rescheduled it every single run,
+ * forever, without ever being able to make progress. Production held three
+ * campaignAds rows and all three were in exactly that state. This is the same
+ * failure `conversionEvents` was carrying (87% of `_scheduled_functions`: 19
+ * events rescheduled ~250 times each) and that PR #30 fixed there.
+ */
+test("a dormant row leaves getResolvable, so the cron stops rescheduling it", async () => {
+  delete process.env.META_ADS_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId);
+
+  const before = await t.run(() =>
+    t.query(internal.campaignAds.getResolvable, {}),
+  );
+  expect(before.map((r) => r._id)).toEqual([adId]);
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const after = await t.run(() =>
+    t.query(internal.campaignAds.getResolvable, {}),
+  );
+  expect(after).toEqual([]);
+});
+
+/**
+ * Dormant gets its own status rather than sharing `"abandoned"` with
+ * genuinely-given-up rows (which is how `conversionEvents.getDormantToSweep`
+ * does it, distinguishing the two by `attempts < MAX` in a post-index
+ * `.filter()`). A separate status makes this an unfiltered `by_status` range:
+ * given-up rows accumulate forever, and a `.filter()` over the partition
+ * holding them is the exact scan shape this branch exists to remove. The
+ * assertion below is that distinction — the abandoned row is never swept.
+ */
+test("getDormantToSweep returns dormant rows only, never live or given-up ones", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const dormantId = await seedAd(t, accountId, 0, "dormant");
+  await seedAd(t, accountId, 0, "pending");
+  await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS, "abandoned");
+
+  const rows = await t.run(() =>
+    t.query(internal.campaignAds.getDormantToSweep, {}),
+  );
+
+  expect(rows.map((r) => r._id)).toEqual([dormantId]);
 });
 
 test("resolveAd resolves ad/adset/campaign names on a 200", async () => {

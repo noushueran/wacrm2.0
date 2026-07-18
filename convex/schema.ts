@@ -1490,11 +1490,21 @@ export default defineSchema({
     // would accumulate there forever, matching nothing, growing the cron's
     // scan without bound. Mirrors conversionEvents.status and
     // attributionSignals.landingResult, which retire the same way.
+    // "dormant" is the OTHER terminal-for-now state: a row that cannot be
+    // attempted at all because META_ADS_ACCESS_TOKEN is unset. It is not a
+    // failure and costs no attempt; `getDormantToSweep` brings it back the
+    // moment a token exists. It exists as its own status rather than
+    // sharing "abandoned" (which is how conversionEvents does it,
+    // separating the two by `attempts < MAX` in a post-index `.filter()`)
+    // so the sweep is an unfiltered `by_status` range. Given-up rows
+    // accumulate forever, and filtering across the partition holding them
+    // is the scan shape this table's own history argues against.
     resolveStatus: v.union(
       v.literal("pending"),
       v.literal("resolved"),
       v.literal("error"),
       v.literal("abandoned"),
+      v.literal("dormant"),
     ),
     attempts: v.number(),
     lastError: v.optional(v.string()),
