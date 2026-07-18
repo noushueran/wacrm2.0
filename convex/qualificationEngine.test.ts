@@ -238,7 +238,7 @@ test("opt-out intent closes the session and silences the bot", async () => {
   expect(conversation?.aiAutoreplyDisabled).toBe(true);
 });
 
-test("wants-human intent hands off to the human queue while the session keeps collecting", async () => {
+test("wants-human intent flags the thread for the team while the bot keeps replying", async () => {
   const t = convexTest(schema, modules);
   const { accountId, contactId, conversationId, asUser } = await seed(t);
   await configureAi(asUser);
@@ -249,9 +249,28 @@ test("wants-human intent hands off to the human queue while the session keeps co
   const [s] = await sessionsFor(t, conversationId);
   expect(s.status).toBe("collecting");
   const conversation = await t.run((ctx) => ctx.db.get(conversationId));
-  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+  // Handoff is manual-only: the thread is SURFACED (pending + summary)
+  // but the bot is never silenced and nobody is auto-assigned.
+  expect(conversation?.aiAutoreplyDisabled).not.toBe(true);
   expect(conversation?.status).toBe("pending");
   expect(conversation?.aiHandoffSummary).toContain("human");
+  expect(conversation?.assignedToUserId).toBeUndefined();
+});
+
+test("ask-admin with no admin numbers flags the thread pending but never silences the bot", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  await t.action(internal.qualificationEngine.relayQuestionToAdmin, {
+    accountId: base.accountId,
+    conversationId: base.conversationId,
+    contactId: base.contactId,
+    question: "What is the Georgia visa fee?",
+  });
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.status).toBe("pending");
+  expect(conversation?.aiHandoffSummary).toContain("Georgia visa fee");
+  expect(conversation?.aiAutoreplyDisabled).not.toBe(true);
 });
 
 test("analyzeInbound is a no-op without an active AI config or on terminal sessions", async () => {

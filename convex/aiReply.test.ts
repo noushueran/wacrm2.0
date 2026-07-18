@@ -392,13 +392,13 @@ test("a persistent failure stops after the single retry — no reply, no endless
 // Handoff
 // ============================================================
 
-test("a handoff-signalled reply disables auto-reply, sets status pending + a summary, and sends no normal reply", async () => {
+test("a model-emitted handoff marker never silences the bot — the customer still gets a reply", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
   });
-  await configureAi(asUser); // no handoffAgentId configured
+  await configureAi(asUser);
   const { contactId, conversationId } = await seedInboundThread(t, asUser, {
     accountId,
     phone: "15551234567",
@@ -407,97 +407,31 @@ test("a handoff-signalled reply disables auto-reply, sets status pending + a sum
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
 
-  const messages = await messagesFor(t, conversationId);
-  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
-
-  const conversation = await getConversation(t, conversationId);
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiHandoffSummary).toContain("AI agent handed off");
-  expect(conversation!.aiReplyCount ?? 0).toBe(0);
-  // No handoff target configured — left unassigned (shared queue).
-  expect(conversation!.assignedToUserId).toBeUndefined();
-});
-
-test("a handoff-signalled reply assigns the conversation to the configured handoff agent", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  const handoffAgentId = await seedTeammate(t, {
-    accountId,
-    name: "Hank (handoff agent)",
-    email: "hank@example.com",
-  });
-  await configureAi(asUser, { handoffAgentId });
-  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: `This is unacceptable, get me a human ${HANDOFF_SENTINEL}`,
-  });
-
-  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
-
-  const conversation = await getConversation(t, conversationId);
-  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
-  expect(conversation!.status).toBe("pending");
-  expect(conversation!.aiAutoreplyDisabled).toBe(true);
-  const messages = await messagesFor(t, conversationId);
-  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
-});
-
-// ============================================================
-// markHandoff — direct `internalMutation` coverage of the lead-charge
-// wiring (lead-value fix wave — final review, Fix 1). The two handoff
-// tests above already prove `dispatchInbound` reaches `markHandoff` and
-// that it assigns `handoffAgentId`; these call `markHandoff` itself
-// directly (skipping the whole config/generation pipeline) to focus
-// narrowly on the charge side, mirroring `automationsEngine.test.ts`'s
-// own focused `assign_conversation` charge test.
-// ============================================================
-
-test("markHandoff charges the handoff agent when a lead value is set", async () => {
-  const t = convexTest(schema, modules);
-  const { accountId, asUser } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-  });
-  await t.run((ctx) => ctx.db.patch(accountId, { leadValue: 5 }));
-  const handoffAgentId = await seedTeammate(t, {
-    accountId,
-    name: "Hank (handoff agent)",
-    email: "hank@example.com",
-  });
-  const { conversationId } = await seedInboundThread(t, asUser, {
-    accountId,
-    phone: "15551234567",
-    messageText: "I need a human",
-  });
-
-  await t.mutation(internal.aiReply.markHandoff, {
-    accountId,
-    conversationId,
-    handoffAgentId,
-    summary: "test handoff",
-  });
-
-  const conversation = await getConversation(t, conversationId);
-  expect(conversation!.assignedToUserId).toBe(handoffAgentId);
-
-  const charges = await t.run((ctx) =>
-    ctx.db
-      .query("leadCharges")
-      .withIndex("by_user_conversation", (q) =>
-        q.eq("userId", handoffAgentId).eq("conversationId", conversationId),
-      )
-      .collect(),
+  // Handoff is MANUAL-ONLY (dashboard takeover). Even if the model
+  // emits the legacy marker, the customer still hears something and the
+  // thread stays fully bot-owned.
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
   );
-  expect(charges).toHaveLength(1);
-  expect(charges[0]).toMatchObject({ accountId, value: 5, currency: "USD" });
-});
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0]!.contentText).toBeTruthy();
+  expect(botMessages[0]!.contentText).not.toContain("[[HANDOFF]]");
 
-test("markHandoff writes no charge when no handoff agent is configured (unassigned queue)", async () => {
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.status).toBe("open");
+  expect(conversation!.assignedToUserId).toBeUndefined();
+  expect(conversation!.aiReplyCount).toBe(1);
+}, 20_000);
+
+// ============================================================
+// flagForHuman — the ONLY thing the AI stack may do when a thread
+// needs human eyes: surface it (status pending + summary). It must
+// never silence the bot, assign anyone, or charge a lead — takeover is
+// exclusively a manual dashboard action.
+// ============================================================
+
+test("flagForHuman marks the thread pending with a summary but never silences, assigns, or charges", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -510,14 +444,20 @@ test("markHandoff writes no charge when no handoff agent is configured (unassign
     messageText: "I need a human",
   });
 
-  await t.mutation(internal.aiReply.markHandoff, {
+  await t.mutation(internal.aiReply.flagForHuman, {
     accountId,
     conversationId,
-    summary: "test handoff",
+    summary: "🤖 Customer asked for a human.",
   });
 
-  expect((await getConversation(t, conversationId))!.assignedToUserId).toBeUndefined();
-  expect(await t.run((ctx) => ctx.db.query("leadCharges").collect())).toHaveLength(0);
+  const conversation = await getConversation(t, conversationId);
+  expect(conversation!.status).toBe("pending");
+  expect(conversation!.aiHandoffSummary).toBe("🤖 Customer asked for a human.");
+  expect(conversation!.aiAutoreplyDisabled).not.toBe(true);
+  expect(conversation!.assignedToUserId).toBeUndefined();
+
+  const charges = await t.run((ctx) => ctx.db.query("leadCharges").collect());
+  expect(charges).toHaveLength(0);
 });
 
 // ============================================================

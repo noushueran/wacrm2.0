@@ -3,11 +3,9 @@ import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { hasMinRole } from "./lib/roles";
-import { chargeLeadIfAgent } from "./lib/leadCharge";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
-import { buildHandoffSummary } from "./lib/ai/handoff";
 import {
   AI_VISIBLE_MEDIA_TYPES,
   toChatMessages,
@@ -22,8 +20,8 @@ import type { GenerateResult } from "./lib/ai/types";
 // task) — Convex port of `src/lib/ai/auto-reply.ts`'s
 // `dispatchInboundToAiReply`. On a freshly-arrived inbound message,
 // loads the account's RAG-grounded prompt, calls the account's own
-// LLM (BYO key), and either sends the reply or hands the thread off to
-// a human. `dispatchInbound` is an `internalAction` — never exposed to
+// LLM (BYO key), and sends the reply — ALWAYS (handoff is manual-only;
+// see `flagForHuman`). `dispatchInbound` is an `internalAction` — never exposed to
 // any client, `accountId` always an explicit caller-supplied argument
 // (there is no user session inside a webhook-triggered dispatch),
 // exactly like `convex/automationsEngine.ts`'s `runForTrigger` and
@@ -52,19 +50,13 @@ import type { GenerateResult } from "./lib/ai/types";
 //     state); left for a future task if BYO-key throttling turns out to
 //     matter here.
 //
-// Two deliberate IMPROVEMENTS over the source, both directed by this
-// task's own brief:
-//   1. On handoff, the conversation's `status` is set to `"pending"` —
-//      the source never touched `status` on handoff (an oversight fixed
-//      here, matching `flowsEngine.ts`'s own `executeHandoff`, which
-//      already does exactly this for a flow-triggered handoff).
-//   2. The source's `claim_ai_reply_slot` Postgres RPC existed solely to
-//      make the cap-check-then-increment atomic against a concurrent
-//      inbound. Convex mutations are already serializable per document
-//      via OCC (see `bumpExecutionCount`'s own comment on this same
-//      point) — so `claimReplySlot` below is a plain read-then-patch
-//      `internalMutation`, no special RPC needed, and is exactly as
-//      race-proof.
+// Two deliberate departures from the source (owner decisions,
+// 2026-07-18): the source's automatic handoff (sentinel-triggered
+// `markHandoff` that silenced the bot and could auto-assign) and its
+// per-conversation reply cap (`claim_ai_reply_slot`) are both GONE —
+// the bot answers every message until a human manually takes the chat
+// from the dashboard, and threads needing eyes are surfaced via
+// `flagForHuman` (status pending) without ever stopping the bot.
 //
 // One gap this task closes without touching any Phase 0–6 file: sending
 // via `convex/metaSend.ts`'s `sendText` persists the reply as an
@@ -85,6 +77,12 @@ function isDryRun(): boolean {
 
 const DRY_RUN_REPLY_TEXT =
   "Thanks for your message! This is an automated reply while our team follows up.";
+
+/** Sent when the model returns nothing usable (empty / marker-only
+ *  output). Handoff is manual-only, so silence is never an option —
+ *  the customer always hears SOMETHING. */
+const FALLBACK_REPLY_TEXT =
+  "Thanks for your message! Let me look into this and get right back to you.";
 
 // One scheduled retry per inbound: a transient provider/network failure
 // (429, timeout) must not leave the customer unanswered, but a broken
@@ -291,53 +289,28 @@ export const bumpReplyCount = internalMutation({
 });
 
 /**
- * Applies a handoff: pauses the bot on this thread (sticky — the
- * conversation-level early-exit in `dispatchInbound` checks
- * `aiAutoreplyDisabled` on every future inbound), records the internal
- * summary, bumps `status` to `"pending"` (see this file's header on why
- * that's an intentional addition over the source), and assigns
- * `handoffAgentId` when one is configured — omitted (never stomping an
- * existing assignment) when it isn't, dropping the conversation into the
- * shared unassigned queue instead.
+ * Surfaces a thread that needs human eyes WITHOUT touching the bot:
+ * status → `"pending"` (the needs-attention queue) + an internal
+ * summary. That is ALL the AI stack may ever do — taking a chat over
+ * (assignment, autoreply pause, the lead charge) is exclusively a
+ * manual dashboard action (owner decision 2026-07-18; the automatic
+ * `markHandoff` that used to live here silenced the bot and could
+ * auto-assign, stranding customers mid-conversation).
  */
-export const markHandoff = internalMutation({
+export const flagForHuman = internalMutation({
   args: {
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
-    handoffAgentId: v.optional(v.id("users")),
     summary: v.string(),
   },
   handler: async (ctx, args) => {
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
-
-    const patch: Partial<{
-      aiAutoreplyDisabled: boolean;
-      aiHandoffSummary: string;
-      status: "open" | "pending" | "closed";
-      updatedAt: number;
-      assignedToUserId: Id<"users">;
-    }> = {
-      aiAutoreplyDisabled: true,
+    await ctx.db.patch(args.conversationId, {
       aiHandoffSummary: args.summary,
       status: "pending",
       updatedAt: Date.now(),
-    };
-    if (args.handoffAgentId) patch.assignedToUserId = args.handoffAgentId;
-
-    await ctx.db.patch(args.conversationId, patch);
-
-    // Same charge-on-assignment guarantee as `conversations.assign`,
-    // `conversations.setAutoreplyPaused`, and `automationsEngine.ts`'s
-    // `assign_conversation` step — feature-off/agents-only/idempotent, so
-    // safe to call unconditionally right after the patch. Guarded on
-    // `handoffAgentId` itself (not just the patch above) since there's
-    // nothing to charge when the bot handed off into the shared
-    // unassigned queue rather than to a specific agent (lead-value fix
-    // wave — final review).
-    if (args.handoffAgentId) {
-      await chargeLeadIfAgent(ctx, args.accountId, args.handoffAgentId, args.conversationId);
-    }
+    });
   },
 });
 
@@ -520,7 +493,7 @@ export const dispatchInbound = internalAction({
             systemPrompt,
             messages,
           });
-      const { text, handoff, usage } = generation;
+      const { text, usage } = generation;
 
       // Record token spend on the account's BYO key. Awaited (unlike the
       // source's fire-and-forget `void logAiUsage(...)`: an action's own
@@ -543,27 +516,16 @@ export const dispatchInbound = internalAction({
         console.warn("[ai auto-reply] usage log failed:", err);
       }
 
-      // Ask-admin (v3): a marker with no accompanying text still owes the
-      // customer a holding line — never fall through to handoff for it.
+      // The customer ALWAYS hears something (handoff is manual-only —
+      // the model has no escape hatch). A bare ask-admin marker owes a
+      // holding line; any other empty/marker-only output (rare) gets the
+      // warm generic fallback rather than silence.
       let replyText = text;
-      if (!handoff && !replyText && generation.askAdmin) {
+      if (!replyText && generation.askAdmin) {
         replyText = "Let me check with my team and get back to you shortly!";
       }
-
-      if (handoff || !replyText) {
-        // The model can't (or shouldn't) answer — stop auto-replying on
-        // this thread and hand it to a human.
-        const summary = buildHandoffSummary({
-          messages,
-          replyCount: conversation.aiReplyCount ?? 0,
-        });
-        await ctx.runMutation(internal.aiReply.markHandoff, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          handoffAgentId: config.handoffAgentId,
-          summary,
-        });
-        return;
+      if (!replyText) {
+        replyText = FALLBACK_REPLY_TEXT;
       }
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {

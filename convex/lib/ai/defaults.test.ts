@@ -38,6 +38,14 @@ test("buildSystemPrompt omits the block without the arg, without a next question
   ).not.toContain("Lead qualification objective");
 });
 
+test("auto_reply prompt never teaches a handoff escape — always answer, team follows up, ask-admin for unknowns", () => {
+  const auto = buildSystemPrompt({ userPrompt: null, mode: "auto_reply" });
+  expect(auto).not.toContain("[[HANDOFF]]");
+  expect(auto).toContain("ALWAYS answer");
+  expect(auto).toContain("team member will follow up");
+  expect(auto).toContain("ASK_ADMIN");
+});
+
 test("the prompt teaches honest attachment handling in both modes", () => {
   const auto = buildSystemPrompt({ userPrompt: null, mode: "auto_reply" });
   expect(auto).toContain("[voice note]");

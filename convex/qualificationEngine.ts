@@ -283,7 +283,7 @@ const analysisValidator = v.object({
  * checklistSatisfied AND score >= threshold AND >= 3 answers.
  * Intents: opt_out/disqualified close the session here (opt-out also
  * silences the bot entirely); wants_human is returned to the action,
- * which routes through `aiReply.markHandoff`.
+ * which routes through `aiReply.flagForHuman` (surface, never silence).
  */
 export const applyAnalysis = internalMutation({
   args: {
@@ -538,10 +538,12 @@ export const analyzeInbound = internalAction({
           conversationId: args.conversationId,
         });
       } else if (wantsHuman) {
-        await ctx.runMutation(internal.aiReply.markHandoff, {
+        // Surface it for the team (pending + summary) — the bot keeps
+        // replying and reassuring; takeover is a manual dashboard
+        // action only (owner decision 2026-07-18).
+        await ctx.runMutation(internal.aiReply.flagForHuman, {
           accountId: args.accountId,
           conversationId: args.conversationId,
-          handoffAgentId: aiCfg.handoffAgentId ?? undefined,
           summary:
             "🤖 Customer asked for a human during qualification." +
             (analysis.summary ? ` ${analysis.summary}` : ""),
@@ -1362,7 +1364,8 @@ export const relayContext = internalQuery({
  * Sends the assistant's question to every admin number (plain text; see
  * the section header on why no template). Without configured admin
  * numbers the question falls back to the in-app human queue
- * (`markHandoff`) so it is never silently dropped.
+ * (`flagForHuman` — pending + summary, bot stays on) so it is never
+ * silently dropped.
  */
 export const relayQuestionToAdmin = internalAction({
   args: {
@@ -1378,7 +1381,11 @@ export const relayQuestionToAdmin = internalAction({
         contactId: args.contactId,
       });
       if (!context) {
-        await ctx.runMutation(internal.aiReply.markHandoff, {
+        // No admin numbers configured — nobody to ask over WhatsApp.
+        // Surface the thread (pending + the open question) WITHOUT
+        // silencing the bot: it keeps answering what it can from the KB
+        // while the team picks the question up from the dashboard.
+        await ctx.runMutation(internal.aiReply.flagForHuman, {
           accountId: args.accountId,
           conversationId: args.conversationId,
           summary: `🤖 Needs an answer for the customer: ${args.question}`,
