@@ -51,6 +51,10 @@ export default defineSchema({
     // the AI uses to reach agents (lead offers, questions) when they're
     // away from the desktop. Set by admin+ in Settings → Team members.
     phone: v.optional(v.string()),
+    // Shown on the WhatsApp contact card sent to customers when this
+    // member accepts a lead (e.g. "Senior Travel Consultant"). Set by
+    // admin+ in Settings → Team members, like `phone` above.
+    jobTitle: v.optional(v.string()),
   })
     .index("by_user", ["userId"])
     .index("by_account", ["accountId"])
@@ -292,6 +296,7 @@ export default defineSchema({
       v.literal("location"),
       v.literal("template"),
       v.literal("interactive"),
+      v.literal("contacts"),
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
@@ -306,6 +311,10 @@ export default defineSchema({
     ),
     replyToMessageId: v.optional(v.id("messages")),
     interactivePayload: v.optional(v.any()),
+    // The Cloud API `contacts` array we sent (outbound contact cards) —
+    // rendered by the inbox as a card bubble. `contentText` keeps a
+    // readable fallback for previews/older clients.
+    contactsPayload: v.optional(v.any()),
     interactiveReplyId: v.optional(v.string()),
     // AI transcription of an inbound voice note / vision description of
     // an inbound image (aiReply media understanding, 2026-07-18) —
@@ -1593,6 +1602,25 @@ export default defineSchema({
     staffCheckinTemplateName: v.optional(v.string()),
     staffCheckinTemplateLanguage: v.optional(v.string()),
     outboundNudgesEnabled: v.boolean(),
+    // Company-wide fields for the WhatsApp contact card sent to the
+    // customer when an agent accepts a lead (announceAssignment). The
+    // per-person half (name/phone/jobTitle) comes from the membership;
+    // `companyName` falls back to the account name when unset. The Cloud
+    // API card has no photo field, so there is no logo entry here.
+    contactCard: v.optional(
+      v.object({
+        companyName: v.optional(v.string()),
+        website: v.optional(v.string()),
+        email: v.optional(v.string()),
+        phone: v.optional(v.string()),
+        street: v.optional(v.string()),
+        city: v.optional(v.string()),
+        state: v.optional(v.string()),
+        zip: v.optional(v.string()),
+        country: v.optional(v.string()),
+        countryCode: v.optional(v.string()),
+      }),
+    ),
     updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
 

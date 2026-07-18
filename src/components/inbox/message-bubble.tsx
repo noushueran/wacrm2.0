@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { cn } from "@/lib/utils";
-import type { Message, MessageReaction } from "@/types";
+import type { ContactsPayloadEntry, Message, MessageReaction } from "@/types";
 import {
   Clock,
   Check,
@@ -14,6 +14,9 @@ import {
   ImageOff,
   CornerDownLeft,
   Sparkles,
+  Phone,
+  Mail,
+  Globe,
 } from "lucide-react";
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
@@ -277,6 +280,26 @@ function MessageContentBody({ message, t, isAgent }: { message: Message, t: Retu
       );
     }
 
+    case "contacts": {
+      // Outbound contact card (the vCard the customer received). Rows
+      // with no stored payload (mid-deploy sends) fall back to the
+      // readable `content_text` the send path always persists.
+      if (message.contacts_payload?.length) {
+        return (
+          <div className="flex flex-col gap-2">
+            {message.contacts_payload.map((entry, i) => (
+              <ContactCardPreview key={i} entry={entry} isAgent={isAgent} t={t} />
+            ))}
+          </div>
+        );
+      }
+      return (
+        <p className="whitespace-pre-wrap break-words text-sm">
+          {message.content_text || t("contactCard")}
+        </p>
+      );
+    }
+
     default:
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
@@ -284,6 +307,78 @@ function MessageContentBody({ message, t, isAgent }: { message: Message, t: Retu
         </p>
       );
   }
+}
+
+/** One saved-contact card inside a `contacts` bubble — mirrors the
+ *  WhatsApp client's own card: avatar initial, name, title/company, then
+ *  the tappable details. Styled per bubble fill (agent = primary). */
+function ContactCardPreview({
+  entry,
+  isAgent,
+  t,
+}: {
+  entry: ContactsPayloadEntry;
+  isAgent: boolean;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  const name = entry.name?.formatted_name || entry.name?.first_name || t("contactCard");
+  const orgLine = [entry.org?.title, entry.org?.company].filter(Boolean).join(" · ");
+  const muted = isAgent ? "text-primary-foreground/75" : "text-muted-foreground";
+  return (
+    <div
+      className={cn(
+        "min-w-52 rounded-lg border px-3 py-2",
+        isAgent
+          ? "border-primary-foreground/20 bg-primary-foreground/10"
+          : "border-border bg-background/60",
+      )}
+    >
+      <div className="flex items-center gap-2.5">
+        <div
+          className={cn(
+            "flex size-9 shrink-0 items-center justify-center rounded-full text-sm font-semibold",
+            isAgent
+              ? "bg-primary-foreground/20 text-primary-foreground"
+              : "bg-primary/10 text-primary",
+          )}
+        >
+          {name.charAt(0).toUpperCase()}
+        </div>
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold">{name}</p>
+          {orgLine && <p className={cn("truncate text-xs", muted)}>{orgLine}</p>}
+        </div>
+      </div>
+      {(entry.phones?.length || entry.emails?.length || entry.urls?.length) ? (
+        <div className={cn("mt-2 space-y-1 border-t pt-2 text-xs", isAgent ? "border-primary-foreground/15" : "border-border/70")}>
+          {entry.phones?.map((p, i) =>
+            p.phone ? (
+              <p key={`p${i}`} className="flex items-center gap-1.5">
+                <Phone className={cn("h-3 w-3 shrink-0", muted)} />
+                <span className="truncate">{p.phone}</span>
+              </p>
+            ) : null,
+          )}
+          {entry.emails?.map((e, i) =>
+            e.email ? (
+              <p key={`e${i}`} className="flex items-center gap-1.5">
+                <Mail className={cn("h-3 w-3 shrink-0", muted)} />
+                <span className="truncate">{e.email}</span>
+              </p>
+            ) : null,
+          )}
+          {entry.urls?.map((u, i) =>
+            u.url ? (
+              <p key={`u${i}`} className="flex items-center gap-1.5">
+                <Globe className={cn("h-3 w-3 shrink-0", muted)} />
+                <span className="truncate">{u.url}</span>
+              </p>
+            ) : null,
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function MessageBubble({

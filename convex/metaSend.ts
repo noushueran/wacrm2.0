@@ -7,6 +7,8 @@ import { decrypt } from "./lib/whatsappEncryption";
 import {
   sendTextMessage,
   sendContactsMessage,
+  buildContactsPayload,
+  type ContactCard,
   sendMediaMessage,
   sendTemplateMessage,
   sendInteractiveButtons,
@@ -443,10 +445,13 @@ export const markRead = internalAction({
 });
 
 /**
- * Phase 6: send a WhatsApp CONTACT CARD (Cloud API `type: "contacts"`)
- * — used when a lead is assigned so the customer can save the agent's
- * number. Persists a readable text row locally (the messages schema has
- * no dedicated contacts contentType; the bubble shows the card info).
+ * Phase 6: send a WhatsApp CONTACT CARD (Cloud API `type: "contacts"`,
+ * WhatsApp's native vCard) — used when a lead is assigned so the
+ * customer can save the agent's full details. Beyond the required
+ * name+phone, every extra field (title, company, email, website,
+ * address) enriches the card the customer taps to save. Persists a
+ * `"contacts"` row with the exact payload sent (the inbox renders it as
+ * a card bubble) plus a readable `contentText` fallback for previews.
  */
 export const sendContactCard = internalAction({
   args: {
@@ -455,8 +460,33 @@ export const sendContactCard = internalAction({
     to: v.string(),
     cardName: v.string(),
     cardPhone: v.string(),
+    jobTitle: v.optional(v.string()),
+    company: v.optional(v.string()),
+    email: v.optional(v.string()),
+    website: v.optional(v.string()),
+    companyPhone: v.optional(v.string()),
+    address: v.optional(
+      v.object({
+        street: v.optional(v.string()),
+        city: v.optional(v.string()),
+        state: v.optional(v.string()),
+        zip: v.optional(v.string()),
+        country: v.optional(v.string()),
+        countryCode: v.optional(v.string()),
+      }),
+    ),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
+    const card: ContactCard = {
+      name: args.cardName,
+      phone: args.cardPhone,
+      jobTitle: args.jobTitle,
+      company: args.company,
+      email: args.email,
+      website: args.website,
+      companyPhone: args.companyPhone,
+      address: args.address,
+    };
     let whatsappMessageId: string;
     if (isDryRun()) {
       whatsappMessageId = dryRunWamid();
@@ -469,17 +499,24 @@ export const sendContactCard = internalAction({
         phoneNumberId,
         accessToken,
         to: args.to,
-        contactName: args.cardName,
-        contactPhone: args.cardPhone,
+        card,
       });
       whatsappMessageId = result.messageId;
     }
+    const titleLine = [args.jobTitle, args.company]
+      .map((s) => s?.trim())
+      .filter(Boolean)
+      .join(" · ");
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
       senderType: "bot",
-      contentType: "text",
-      contentText: `📇 ${args.cardName}\n${args.cardPhone}\n(save this contact for future reference)`,
+      contentType: "contacts",
+      contentText:
+        `📇 ${args.cardName}` +
+        (titleLine ? `\n${titleLine}` : "") +
+        `\n${args.cardPhone}`,
+      contactsPayload: [buildContactsPayload(card)],
       messageId: whatsappMessageId,
     });
     return { whatsappMessageId };

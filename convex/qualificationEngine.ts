@@ -2045,6 +2045,12 @@ export const announceAssignment = internalAction({
         to: data.customerPhone,
         cardName: data.agentName,
         cardPhone: data.agentPhone,
+        jobTitle: data.agentJobTitle,
+        company: data.company,
+        email: data.companyEmail,
+        website: data.companyWebsite,
+        companyPhone: data.companyPhone,
+        address: data.companyAddress,
       });
       const staff = await ctx.runMutation(
         internal.qualificationEngine.ensureAdminConversation,
@@ -2077,6 +2083,24 @@ export const announceContext = internalQuery({
       )
       .first();
     if (!contact || !membership) return null;
+    // Company half of the contact card: the admin-configured
+    // `contactCard` settings, with the account name as the company-name
+    // fallback so the card names the business even before any setup.
+    const config = await ctx.db
+      .query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+      .unique();
+    const account = await ctx.db.get(offer.accountId);
+    const cc = config?.contactCard;
+    const address = {
+      street: cc?.street,
+      city: cc?.city,
+      state: cc?.state,
+      zip: cc?.zip,
+      country: cc?.country,
+      countryCode: cc?.countryCode,
+    };
+    const hasAddress = Object.values(address).some((s) => s?.trim());
     return {
       accountId: offer.accountId,
       customerConversationId: offer.conversationId,
@@ -2084,6 +2108,12 @@ export const announceContext = internalQuery({
       customerName: contact.name?.trim() || contact.phone,
       agentName: membership.fullName ?? membership.email ?? "our travel expert",
       agentPhone: offer.agentPhone,
+      agentJobTitle: membership.jobTitle,
+      company: cc?.companyName?.trim() || account?.name,
+      companyEmail: cc?.email,
+      companyWebsite: cc?.website,
+      companyPhone: cc?.phone,
+      companyAddress: hasAddress ? address : undefined,
     };
   },
 });

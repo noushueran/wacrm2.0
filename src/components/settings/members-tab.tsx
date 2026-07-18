@@ -156,6 +156,9 @@ export function MembersTab() {
   const setMemberPhone = useMutation(api.members.setPhone);
   const [phoneEditing, setPhoneEditing] = useState<string | null>(null);
   const [phoneDraft, setPhoneDraft] = useState('');
+  const setMemberJobTitle = useMutation(api.members.setJobTitle);
+  const [titleEditing, setTitleEditing] = useState<string | null>(null);
+  const [titleDraft, setTitleDraft] = useState('');
   const removeMember = useMutation(api.members.remove);
   const revokeInvitation = useMutation(api.invitations.revoke);
 
@@ -385,6 +388,64 @@ export function MembersTab() {
                               className="ml-1 text-xs text-primary hover:underline"
                             >
                               {member.phone ? t('phoneEdit') : t('phoneAdd')}
+                            </button>
+                          ) : null}
+                        </p>
+                      )}
+                      {/* Job title — shown on the WhatsApp contact card
+                          the customer receives when this member accepts
+                          a lead. Same inline-edit shape as phone above. */}
+                      {titleEditing === member.user_id ? (
+                        <form
+                          className="mt-1 flex items-center gap-1.5"
+                          onSubmit={async (e) => {
+                            e.preventDefault();
+                            try {
+                              await setMemberJobTitle({
+                                userId: member.user_id as Id<'users'>,
+                                jobTitle: titleDraft,
+                              });
+                              setTitleEditing(null);
+                            } catch (err) {
+                              console.error('[MembersTab] job title save error:', err);
+                              toast.error(convexErrorMessage(err));
+                            }
+                          }}
+                        >
+                          <input
+                            value={titleDraft}
+                            onChange={(e) => setTitleDraft(e.target.value)}
+                            placeholder={t('titlePlaceholder')}
+                            className="h-7 w-48 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+                            autoFocus
+                          />
+                          <button
+                            type="submit"
+                            className="text-xs font-medium text-primary hover:underline"
+                          >
+                            {t('phoneSave')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTitleEditing(null)}
+                            className="text-xs text-muted-foreground hover:underline"
+                          >
+                            {t('phoneCancel')}
+                          </button>
+                        </form>
+                      ) : (
+                        <p className="truncate text-xs text-muted-foreground">
+                          {member.job_title ? `💼 ${member.job_title}` : null}
+                          {canManageMembers ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setTitleEditing(member.user_id);
+                                setTitleDraft(member.job_title ?? '');
+                              }}
+                              className="ml-1 text-xs text-primary hover:underline"
+                            >
+                              {member.job_title ? t('titleEdit') : t('titleAdd')}
                             </button>
                           ) : null}
                         </p>

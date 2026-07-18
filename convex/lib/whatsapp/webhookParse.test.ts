@@ -469,3 +469,29 @@ test("flattenInboundMessage: an image ad carries both mediaId and the referral c
   expect(result?.referral?.headline).toBe("Offer");
   expect(result?.referral?.imageUrl).toBe("https://scontent.example/x.jpg");
 });
+
+test("flattenInboundMessage: shared contact card surfaces name + number, not an '[Unsupported message type]' placeholder", () => {
+  expect(
+    flattenInboundMessage(
+      msg({
+        type: "contacts",
+        contacts: [
+          {
+            name: { formatted_name: "John Traveller" },
+            phones: [{ phone: "+44 7700 900123", wa_id: "447700900123" }],
+          },
+        ],
+      }),
+    ),
+  ).toMatchObject({
+    type: "text",
+    text: "📇 Shared contact: John Traveller — +44 7700 900123",
+  });
+});
+
+test("flattenInboundMessage: a payload-less contacts message still renders a generic card line", () => {
+  expect(flattenInboundMessage(msg({ type: "contacts" }))).toMatchObject({
+    type: "text",
+    text: "📇 Shared contact",
+  });
+});

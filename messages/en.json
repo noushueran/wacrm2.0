@@ -298,7 +298,8 @@
       "aiBadge": "AI",
       "aiBadgeTitle": "Sent automatically by the AI assistant",
       "fromAd": "From an ad",
-      "viewAd": "View ad"
+      "viewAd": "View ad",
+      "contactCard": "Contact card"
     },
     "actions": {
       "reply": "Reply",
@@ -1561,7 +1562,10 @@
       "phoneEdit": "edit",
       "phoneSave": "Save",
       "phoneCancel": "Cancel",
-      "phoneInvalid": "That does not look like a valid phone number."
+      "phoneInvalid": "That does not look like a valid phone number.",
+      "titleAdd": "Add job title",
+      "titleEdit": "Edit title",
+      "titlePlaceholder": "e.g. Senior Travel Consultant"
     },
     "invite": {
       "inviteCreated": "Invite created",
@@ -1951,6 +1955,24 @@
         "noTags": "No tags yet — service tags appear automatically when leads qualify, or create them under Fields & tags.",
         "noAgents": "No agents or supervisors on the team yet.",
         "noPhone": " (no WhatsApp number set)"
+      },
+      "contactCard": {
+        "title": "Contact card sent to customers",
+        "desc": "When a salesperson accepts a lead, the customer receives their WhatsApp contact card. These company details go on every card, alongside the salesperson's name, number and job title (set per member in Team members).",
+        "companyName": "Company name",
+        "website": "Website",
+        "email": "Company email",
+        "phone": "Company phone",
+        "street": "Street",
+        "city": "City",
+        "state": "State / Emirate",
+        "zip": "ZIP",
+        "country": "Country",
+        "countryCode": "Code",
+        "hint": "Leave any field empty to omit it from the card. WhatsApp contact cards cannot carry a logo image — your business profile photo shows on the chat itself.",
+        "save": "Save contact card",
+        "saved": "Saved.",
+        "saveError": "Could not save the contact card."
       }
     },
     "profile": {

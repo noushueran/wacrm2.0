@@ -78,6 +78,9 @@ export interface AccountMember {
   /** The member's own WhatsApp number (qualification v4) — the channel
    *  the AI uses to reach them when they're off the desktop. */
   phone: string | null;
+  /** Job title shown on the WhatsApp contact card sent to customers
+   *  when this member accepts a lead. */
+  job_title: string | null;
 }
 
 /**
@@ -264,7 +267,29 @@ export type ContentType =
   | 'location'
   | 'template'
   /** Customer tapped a reply button or list row on a message we sent. */
-  | 'interactive';
+  | 'interactive'
+  /** Outbound WhatsApp contact card (Cloud API `contacts` message). */
+  | 'contacts';
+
+/** One entry of a Cloud API `contacts` message payload — the shape we
+ *  persist on the message row and render as a card bubble. Mirrors
+ *  `buildContactsPayload` in `convex/lib/whatsapp/metaApi.ts`. */
+export interface ContactsPayloadEntry {
+  name?: { formatted_name?: string; first_name?: string; last_name?: string };
+  org?: { company?: string; title?: string; department?: string };
+  phones?: { phone?: string; type?: string; wa_id?: string }[];
+  emails?: { email?: string; type?: string }[];
+  urls?: { url?: string; type?: string }[];
+  addresses?: {
+    street?: string;
+    city?: string;
+    state?: string;
+    zip?: string;
+    country?: string;
+    country_code?: string;
+    type?: string;
+  }[];
+}
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
 export interface MessageAdReferral {
@@ -319,6 +344,12 @@ export interface Message {
    * 'interactive'` and `sender_type` is agent/bot. Migration 035.
    */
   interactive_payload?: InteractiveMessagePayload;
+  /**
+   * The Cloud API `contacts` array of an OUTBOUND contact card we sent
+   * (`content_type === 'contacts'`) — the inbox renders it as a
+   * tap-to-save card, mirroring what the customer received.
+   */
+  contacts_payload?: ContactsPayloadEntry[];
   /**
    * True when the AI auto-reply bot generated + sent this message (as
    * opposed to a human agent or a deterministic Flow/automation send,

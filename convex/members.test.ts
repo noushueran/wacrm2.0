@@ -470,3 +470,43 @@ test("setPhone (v4): admin sets/clears a member's WhatsApp number; bad numbers r
       .first());
   expect(row?.phone).toBeUndefined();
 });
+
+test("setJobTitle: admin sets/clears a member's job title; over-long titles rejected", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedOwner(t, { name: "Owner", email: "o@example.com" });
+  const teammate = await addMember(t, owner.accountId, {
+    name: "Agent", email: "ag@example.com", role: "agent",
+  });
+  await owner.asUser.mutation(api.members.setJobTitle, {
+    userId: teammate.userId, jobTitle: "  Senior Travel Consultant  ",
+  });
+  let row = await t.run((ctx) =>
+    ctx.db.query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", teammate.userId).eq("accountId", owner.accountId))
+      .first());
+  expect(row?.jobTitle).toBe("Senior Travel Consultant"); // trimmed
+
+  await expect(
+    owner.asUser.mutation(api.members.setJobTitle, {
+      userId: teammate.userId, jobTitle: "x".repeat(81),
+    }),
+  ).rejects.toThrow();
+
+  await owner.asUser.mutation(api.members.setJobTitle, {
+    userId: teammate.userId, jobTitle: "",
+  });
+  row = await t.run((ctx) =>
+    ctx.db.query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", teammate.userId).eq("accountId", owner.accountId))
+      .first());
+  expect(row?.jobTitle).toBeUndefined();
+
+  // Same admin gate as setPhone — an agent can't title themselves.
+  await expect(
+    teammate.asUser.mutation(api.members.setJobTitle, {
+      userId: owner.userId, jobTitle: "CEO",
+    }),
+  ).rejects.toThrow();
+});
