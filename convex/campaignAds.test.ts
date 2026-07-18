@@ -3,7 +3,10 @@ import { expect, test, afterEach } from "vitest";
 import { internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
-import { MAX_RESOLVE_ATTEMPTS } from "./campaignAds";
+import {
+  MAX_RESOLVE_ATTEMPTS,
+  MAX_TRANSIENT_RESOLVE_ATTEMPTS,
+} from "./campaignAds";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -26,13 +29,16 @@ async function seedAd(
   accountId: Id<"accounts">,
   attempts = 0,
   resolveStatus: "pending" | "error" | "dormant" | "abandoned" = "pending",
+  over: Partial<{ transientAttempts: number; nextAttemptAt: number; adId: string }> = {},
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("campaignAds", {
       accountId,
-      adId: "AD1",
+      adId: over.adId ?? "AD1",
       resolveStatus,
       attempts,
+      transientAttempts: over.transientAttempts,
+      nextAttemptAt: over.nextAttemptAt,
     }),
   );
 }
@@ -223,9 +229,16 @@ test("resolveAd: a 429 re-queues as error WITHOUT bumping attempts — rate limi
   const row = await t.run((ctx) => ctx.db.get(adId));
   expect(row?.resolveStatus).toBe("error");
   expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS - 1);
-  // Still selectable by the cron — the whole point.
-  const batch = await t.query(internal.campaignAds.getResolvable, {});
-  expect(batch.map((r) => r._id)).toContain(adId);
+  // Transient lane: own budget + backoff gate (see conversionEvents — the
+  // never-bump-no-backoff shape was the livelock).
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
+  // Backing off ⇒ out of the batch now, back in once the gate passes.
+  const backingOff = await t.query(internal.campaignAds.getResolvable, {});
+  expect(backingOff.map((r) => r._id)).not.toContain(adId);
+  await t.run((ctx) => ctx.db.patch(adId, { nextAttemptAt: Date.now() - 1_000 }));
+  const due = await t.query(internal.campaignAds.getResolvable, {});
+  expect(due.map((r) => r._id)).toContain(adId);
 });
 
 test("resolveAd: a 5xx re-queues as error WITHOUT bumping attempts", async () => {
@@ -241,6 +254,59 @@ test("resolveAd: a 5xx re-queues as error WITHOUT bumping attempts", async () =>
   const row = await t.run((ctx) => ctx.db.get(adId));
   expect(row?.resolveStatus).toBe("error");
   expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS - 1);
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
+});
+
+test("resolveAd: a network failure (no HTTP status) is transient, not a spent attempt", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => {
+    throw new Error("ECONNRESET");
+  }) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId, MAX_RESOLVE_ATTEMPTS - 1, "error");
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const row = await t.run((ctx) => ctx.db.get(adId));
+  expect(row?.resolveStatus).toBe("error");
+  expect(row?.attempts).toBe(MAX_RESOLVE_ATTEMPTS - 1);
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.lastError).toContain("network");
+});
+
+test("resolveAd: the transient budget gives up at MAX_TRANSIENT_RESOLVE_ATTEMPTS", async () => {
+  process.env.META_ADS_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () =>
+    new Response("rate limited", { status: 429 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const adId = await seedAd(t, accountId, 0, "error", {
+    transientAttempts: MAX_TRANSIENT_RESOLVE_ATTEMPTS - 1,
+  });
+
+  await t.action(internal.campaignAds.resolveAd, { campaignAdId: adId });
+
+  const row = await t.run((ctx) => ctx.db.get(adId));
+  expect(row?.resolveStatus).toBe("abandoned");
+  expect(row?.transientAttempts).toBe(MAX_TRANSIENT_RESOLVE_ATTEMPTS);
+  expect(row?.attempts).toBe(0);
+});
+
+test("a backing-off error row yields its slot: pending rows still resolve", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const backingOff = await seedAd(t, accountId, 0, "error", {
+    transientAttempts: 1,
+    nextAttemptAt: Date.now() + 60_000,
+    adId: "AD-backoff",
+  });
+  const fresh = await seedAd(t, accountId, 0, "pending", { adId: "AD-fresh" });
+
+  const batch = await t.query(internal.campaignAds.getResolvable, {});
+  expect(batch.map((r) => r._id)).not.toContain(backingOff);
+  expect(batch.map((r) => r._id)).toContain(fresh);
 });
 
 test("retryResolutions staggers its fan-out instead of firing 100 Marketing API GETs at once", async () => {

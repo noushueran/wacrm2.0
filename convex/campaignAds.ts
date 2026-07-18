@@ -11,6 +11,24 @@ const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_RESOLVE_ATTEMPTS = 5;
 
 /**
+ * The transient lane's own budget + backoff — same design as
+ * `conversionEvents` (see its constants for the full livelock rationale),
+ * scaled to this engine's hourly cron: base one tick, cap a day, give up
+ * after 10 (worst case ≈ 6.3 days of trying). Ad names are a cosmetic cache
+ * and re-seedable, so a week is generous.
+ */
+export const MAX_TRANSIENT_RESOLVE_ATTEMPTS = 10;
+const TRANSIENT_BACKOFF_BASE_MS = 60 * 60 * 1000; // one cron tick
+const TRANSIENT_BACKOFF_CAP_MS = 24 * 60 * 60 * 1000;
+
+function transientBackoffMs(transientAttempts: number): number {
+  return Math.min(
+    TRANSIENT_BACKOFF_BASE_MS * 2 ** (transientAttempts - 1),
+    TRANSIENT_BACKOFF_CAP_MS,
+  );
+}
+
+/**
  * Delay between each `resolveAd` the retry cron schedules. The cron pulls up
  * to 100 rows and every one is an external Marketing API GET; firing them all
  * at `runAfter(0)` is a 100-call burst that draws 429s from the very backend
@@ -31,9 +49,12 @@ const RESOLVE_STAGGER_MS = 100;
 class TransientResolveError extends Error {}
 
 /**
- * Everything that isn't a 429/5xx (4xx, a malformed body, a network failure)
- * is treated as the row's own fault: it bumps `attempts` and can legitimately
- * exhaust the budget and give up.
+ * Everything else with an HTTP status (a 4xx, a malformed body) is the row's
+ * own fault: it bumps `attempts` and can legitimately exhaust the budget and
+ * give up. A failure with NO status (reset/timeout — the fetch itself threw)
+ * is wrapped as transient at the call site, exactly as `conversionEvents`
+ * does: it's the failure mode most likely to be self-inflicted by our own
+ * burst.
  */
 function resolveError(status: number, message: string): Error {
   return status === 429 || status >= 500
@@ -41,20 +62,32 @@ function resolveError(status: number, message: string): Error {
     : new Error(message);
 }
 
+/** The fetch call itself threw — no HTTP status to classify on. Transient. */
+function networkError(err: unknown): TransientResolveError {
+  return new TransientResolveError(
+    `network: ${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
 /**
  * The `patchResolution` args a failed attempt should write. Transient
- * failures re-queue as `"error"` WITHOUT a bump, so they stay selectable by
- * `getResolvable` indefinitely and can never reach `MAX_RESOLVE_ATTEMPTS`.
+ * failures re-queue as `"error"` without spending `attempts`; they spend
+ * `transientAttempts` instead and back off via `nextAttemptAt` (see
+ * `patchResolution`), so they neither retire a live ad NOR occupy a retry
+ * slot on every cron run forever.
  */
 function errorPatchFor(err: unknown): {
   resolveStatus: "error";
   lastError: string;
   bumpAttempts: boolean;
+  transient: boolean;
 } {
+  const transient = err instanceof TransientResolveError;
   return {
     resolveStatus: "error",
     lastError: err instanceof Error ? err.message : String(err),
-    bumpAttempts: !(err instanceof TransientResolveError),
+    bumpAttempts: !transient,
+    transient,
   };
 }
 
@@ -91,18 +124,23 @@ export const patchResolution = internalMutation({
     campaignName: v.optional(v.string()),
     lastError: v.optional(v.string()),
     bumpAttempts: v.optional(v.boolean()),
+    transient: v.optional(v.boolean()),
   },
   handler: async (ctx, args): Promise<void> => {
     const row = await ctx.db.get(args.campaignAdId);
     if (!row) return;
     const bumping = args.bumpAttempts === true;
+    const transient = args.transient === true && args.resolveStatus === "error";
     const nextAttempts = row.attempts + 1;
+    const nextTransientAttempts = (row.transientAttempts ?? 0) + 1;
     const resolveStatus =
       bumping &&
       args.resolveStatus === "error" &&
       nextAttempts >= MAX_RESOLVE_ATTEMPTS
         ? ("abandoned" as const)
-        : args.resolveStatus;
+        : transient && nextTransientAttempts >= MAX_TRANSIENT_RESOLVE_ATTEMPTS
+          ? ("abandoned" as const)
+          : args.resolveStatus;
     const patch: Record<string, unknown> = { resolveStatus };
     if (args.adName !== undefined) patch.adName = args.adName;
     if (args.adSetId !== undefined) patch.adSetId = args.adSetId;
@@ -111,7 +149,19 @@ export const patchResolution = internalMutation({
     if (args.campaignName !== undefined) patch.campaignName = args.campaignName;
     if (args.lastError !== undefined) patch.lastError = args.lastError;
     if (args.resolveStatus === "resolved") patch.resolvedAt = Date.now();
-    if (bumping) patch.attempts = nextAttempts;
+    if (bumping) {
+      patch.attempts = nextAttempts;
+      // A permanent failure is immediately retryable on its own budget —
+      // don't let a stale transient gate delay it.
+      if (row.nextAttemptAt !== undefined) patch.nextAttemptAt = undefined;
+    }
+    if (transient) {
+      patch.transientAttempts = nextTransientAttempts;
+      if (resolveStatus === "error") {
+        patch.nextAttemptAt =
+          Date.now() + transientBackoffMs(nextTransientAttempts);
+      }
+    }
     await ctx.db.patch(args.campaignAdId, patch);
   },
 });
@@ -196,7 +246,12 @@ export const resolveAd = internalAction({
       const url = `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(
         row.adId,
       )}?${params.toString()}`;
-      const res = await fetch(url);
+      let res: Response;
+      try {
+        res = await fetch(url);
+      } catch (err) {
+        throw networkError(err);
+      }
       if (!res.ok) {
         const body = await res.text();
         throw resolveError(
@@ -248,6 +303,13 @@ export const resolveAd = internalAction({
 export const getResolvable = internalQuery({
   args: {},
   handler: async (ctx): Promise<Doc<"campaignAds">[]> => {
+    // The `nextAttemptAt` backoff gate is applied in JS over the bounded
+    // window, NOT as a query `.filter()` — that would not narrow the scan and
+    // would walk the partition end-to-end whenever due rows are rare (the
+    // `.filter().take()` trap). A backing-off row shrinking the batch is fine:
+    // its gate expires (capped backoff) and its budget is finite, so the
+    // window always drains. See `conversionEvents.getPendingToRetry`.
+    const now = Date.now();
     const pending = await ctx.db
       .query("campaignAds")
       .withIndex("by_status", (q) => q.eq("resolveStatus", "pending"))
@@ -258,7 +320,9 @@ export const getResolvable = internalQuery({
       .withIndex("by_status", (q) => q.eq("resolveStatus", "error"))
       .filter((q) => q.lt(q.field("attempts"), MAX_RESOLVE_ATTEMPTS))
       .take(100);
-    return [...pending, ...errored].slice(0, 100);
+    return [...pending, ...errored]
+      .filter((row) => (row.nextAttemptAt ?? 0) <= now)
+      .slice(0, 100);
   },
 });
 

@@ -3,7 +3,10 @@ import { expect, test, afterEach, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
-import { MAX_DELIVER_ATTEMPTS } from "./conversionEvents";
+import {
+  MAX_DELIVER_ATTEMPTS,
+  MAX_TRANSIENT_DELIVER_ATTEMPTS,
+} from "./conversionEvents";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -50,7 +53,7 @@ async function seedEvent(
   accountId: Id<"accounts">,
   conversationId: Id<"conversations">,
   contactId: Id<"contacts">,
-  over: Partial<{ backend: "platformA" | "capi"; lane: "code" | "ctwa"; eventName: string; identifier: string; stage: string; value: number; currency: string; status: string; attempts: number }> = {},
+  over: Partial<{ backend: "platformA" | "capi"; lane: "code" | "ctwa"; eventName: string; identifier: string; stage: string; value: number; currency: string; status: string; attempts: number; transientAttempts: number; nextAttemptAt: number }> = {},
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("conversionEvents", {
@@ -68,6 +71,8 @@ async function seedEvent(
       eventId: `${conversationId}:${over.stage ?? "new_lead"}`,
       status: (over.status ?? "pending") as "pending",
       attempts: over.attempts ?? 0,
+      transientAttempts: over.transientAttempts,
+      nextAttemptAt: over.nextAttemptAt,
     }),
   );
 }
@@ -154,9 +159,18 @@ test("capi: a 429 re-queues as error WITHOUT bumping attempts — rate limiting 
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("error");
   expect(row?.attempts).toBe(4);
-  // Still selectable by the cron — the whole point.
-  const batch = await t.query(internal.conversionEvents.getPendingToRetry, {});
-  expect(batch.map((r) => r._id)).toContain(id);
+  // The transient lane spends its OWN budget and gates the next try — a row
+  // that never backed off used to be re-selected every tick, and 100 such
+  // rows starved every pending row behind them (the never-bump livelock).
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
+  // Backing off ⇒ NOT selectable this tick…
+  const backingOff = await t.query(internal.conversionEvents.getPendingToRetry, {});
+  expect(backingOff.map((r) => r._id)).not.toContain(id);
+  // …but selectable again the moment the gate passes — never retired.
+  await t.run((ctx) => ctx.db.patch(id, { nextAttemptAt: Date.now() - 1_000 }));
+  const due = await t.query(internal.conversionEvents.getPendingToRetry, {});
+  expect(due.map((r) => r._id)).toContain(id);
 });
 
 test("capi: a 5xx re-queues as error WITHOUT bumping attempts", async () => {
@@ -174,6 +188,8 @@ test("capi: a 5xx re-queues as error WITHOUT bumping attempts", async () => {
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("error");
   expect(row?.attempts).toBe(4);
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
 });
 
 test("platformA: a 429 re-queues as error WITHOUT bumping attempts", async () => {
@@ -190,6 +206,8 @@ test("platformA: a 429 re-queues as error WITHOUT bumping attempts", async () =>
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("error");
   expect(row?.attempts).toBe(4);
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
 });
 
 test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", async () => {
@@ -313,9 +331,13 @@ test("a permanent (4xx) error bumps attempts; the bump that reaches MAX retires 
   expect(row?.attempts).toBe(5);
 });
 
-test("a network failure (no HTTP status) bumps attempts — still terminal after MAX", async () => {
+test("a network failure (no HTTP status) is TRANSIENT: no attempts bump, backs off instead", async () => {
   process.env.META_CAPI_DATASET_ID = "DS1";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  // A reset/timeout carries no status, but it's the failure mode MOST likely
+  // to be self-inflicted by our own send burst — classifying it permanent
+  // (as this engine used to) let 5 connection resets destroy a conversion a
+  // 503 would have survived.
   globalThis.fetch = (async () => { throw new Error("ECONNREFUSED"); }) as typeof fetch;
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t);
@@ -326,8 +348,86 @@ test("a network failure (no HTTP status) bumps attempts — still terminal after
   await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
 
   const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(4);
+  expect(row?.transientAttempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeGreaterThan(Date.now());
+  expect(row?.lastError).toContain("network");
+});
+
+test("the transient budget is finite: the bump that reaches MAX_TRANSIENT_DELIVER_ATTEMPTS retires to abandoned", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => new Response("rate limited", { status: 429 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  // One transient bump away from the cap: without a budget this row would
+  // retry forever — the unbounded-availability half of the old livelock.
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", status: "error",
+    transientAttempts: MAX_TRANSIENT_DELIVER_ATTEMPTS - 1,
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("abandoned");
-  expect(row?.attempts).toBe(5);
+  expect(row?.transientAttempts).toBe(MAX_TRANSIENT_DELIVER_ATTEMPTS);
+  // The permanent budget was never touched.
+  expect(row?.attempts).toBe(0);
+});
+
+test("a backing-off error row yields its retry slot: pending rows behind it still deliver", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  // The livelock shape: an error row that keeps failing transiently sits at
+  // the FRONT of the oldest-first error partition, which is read before
+  // `pending`. Backing off must take it out of the batch, not just delay it.
+  const backingOff = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", status: "error",
+    transientAttempts: 1, nextAttemptAt: Date.now() + 60_000,
+    identifier: "clid-backoff",
+  });
+  const fresh = await t.run((ctx) =>
+    ctx.db.insert("conversionEvents", {
+      accountId, conversationId, contactId,
+      stage: "new_lead", lane: "code", backend: "platformA",
+      eventName: "Lead", identifier: "ABCDEF",
+      phone: "+15551230000", waMessageId: "wamid.fresh", firstMessageAt: 2_000_000,
+      eventId: `${conversationId}:fresh`, status: "pending", attempts: 0,
+    }),
+  );
+
+  const batch = await t.query(internal.conversionEvents.getPendingToRetry, {});
+  expect(batch.map((r) => r._id)).not.toContain(backingOff);
+  expect(batch.map((r) => r._id)).toContain(fresh);
+});
+
+test("a permanent error clears a stale backoff gate along with bumping attempts", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  globalThis.fetch = (async () => new Response("bad payload", { status: 400 })) as typeof fetch;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  // Transient history first (gate in the future), then a genuine 400: the row
+  // is now immediately retryable on its own (permanent) budget — a stale gate
+  // from the transient lane must not delay it.
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", status: "error",
+    transientAttempts: 3, nextAttemptAt: Date.now() + 60_000,
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.attempts).toBe(1);
+  expect(row?.nextAttemptAt).toBeUndefined();
 });
 
 // ------------------------------------------------------------
