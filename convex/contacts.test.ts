@@ -364,6 +364,54 @@ test("byCustomFieldValue matches by is/is_not/contains, and never matches a cont
   expect(noMatches).toEqual([]);
 });
 
+/**
+ * Same account, two fields, both holding the value "Pro". Pins that the query
+ * discriminates on `customFieldId` and not merely on the value — the contract
+ * the `by_account_field` range has to preserve. Cross-ACCOUNT isolation is the
+ * next test down; this is the same-account sibling case, which nothing covered.
+ */
+test("byCustomFieldValue returns only the requested field's matches, not a sibling field's identical value", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+
+  const planFieldId = await asAlice.mutation(api.customFields.create, {
+    fieldName: "Plan",
+    fieldType: "text",
+  });
+  const tierFieldId = await asAlice.mutation(api.customFields.create, {
+    fieldName: "Tier",
+    fieldType: "text",
+  });
+
+  const planContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const tierContactId = await asAlice.mutation(api.contacts.create, {
+    phone: "222",
+  });
+
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: planContactId,
+    values: [{ customFieldId: planFieldId, value: "Pro" }],
+  });
+  await asAlice.mutation(api.customFields.setForContact, {
+    contactId: tierContactId,
+    values: [{ customFieldId: tierFieldId, value: "Pro" }],
+  });
+
+  const matches = await asAlice.query(api.contacts.byCustomFieldValue, {
+    customFieldId: planFieldId,
+    operator: "is",
+    value: "Pro",
+  });
+
+  expect(matches.map((c) => c._id)).toEqual([planContactId]);
+});
+
 test("byCustomFieldValue never returns another account's contacts, even when the caller supplies the other account's real customFieldId", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAlice } = await seedAccountMember(t, {
@@ -815,6 +863,45 @@ test("remove cascades: SET NULL on broadcastRecipients.contactId, but keeps the 
   const recipient = await t.run((ctx) => ctx.db.get(recipientId));
   expect(recipient).not.toBeNull();
   expect(recipient!.contactId).toBeUndefined();
+});
+
+/**
+ * Two contacts in ONE account, each with a recipient row; only the removed
+ * contact's is nulled. Pins that the cascade discriminates on `contactId`
+ * rather than sweeping the account — the contract the `by_account_contact`
+ * range has to preserve, and the one a wrong index prefix would silently
+ * break by nulling every recipient in the account. Cross-ACCOUNT isolation is
+ * covered separately below; this is the same-account sibling case.
+ */
+test("remove leaves another contact's broadcastRecipients row in the same account untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const doomedContactId = await asUser.mutation(api.contacts.create, {
+    phone: "111",
+  });
+  const survivingContactId = await asUser.mutation(api.contacts.create, {
+    phone: "222",
+  });
+  const doomedRecipientId = await seedBroadcastRecipient(t, {
+    accountId,
+    contactId: doomedContactId,
+  });
+  const survivingRecipientId = await seedBroadcastRecipient(t, {
+    accountId,
+    contactId: survivingContactId,
+  });
+
+  await asUser.mutation(api.contacts.remove, { contactId: doomedContactId });
+
+  const doomed = await t.run((ctx) => ctx.db.get(doomedRecipientId));
+  expect(doomed!.contactId).toBeUndefined();
+
+  const surviving = await t.run((ctx) => ctx.db.get(survivingRecipientId));
+  expect(surviving!.contactId).toBe(survivingContactId);
 });
 
 test("remove cascades never touch another account's contactCustomValues/contactNotes/deals/broadcastRecipients rows", async () => {

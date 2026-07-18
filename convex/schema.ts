@@ -433,7 +433,16 @@ export default defineSchema({
   })
     .index("by_contact_field", ["contactId", "customFieldId"])
     .index("by_contact", ["contactId"])
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    // `contacts.byCustomFieldValue` (the broadcast composer's audience
+    // filter) and `customFields.remove`'s cascade both want one field's
+    // value rows across every contact. `by_contact_field` cannot serve that
+    // — its prefix is `contactId`, so it can only answer "this contact's
+    // value for this field", not "every contact's value for this field".
+    // On `by_account` the `customFieldId` test was a `.filter()`, i.e. a
+    // scan of every custom value in the account. Grows with contacts ×
+    // fields.
+    .index("by_account_field", ["accountId", "customFieldId"]),
 
   // A free-text note an account member left on a contact.
   contactNotes: defineTable({
@@ -601,6 +610,16 @@ export default defineSchema({
     // the same range.
     .index("by_broadcast_status", ["broadcastId", "status"])
     .index("by_account", ["accountId"])
+    // `contacts.remove`'s SET NULL cascade wants one contact's recipient
+    // rows. On `by_account` alone that read the account's ENTIRE broadcast
+    // history and narrowed it with a `.filter()`, which does not narrow what
+    // Convex reads. This table is the spikiest in the schema — one send
+    // inserts a row per recipient at once — so the scan a single contact
+    // deletion pays grows with total broadcast volume, not with that
+    // contact's. `contactId` is optional (this cascade is what clears it);
+    // Convex sorts missing values before all present ones, so a `.eq` range
+    // on a present id is unaffected.
+    .index("by_account_contact", ["accountId", "contactId"])
     .index("by_wamid", ["whatsappMessageId"]),
 
   // A reusable inbox-composer snippet — either plain text or a saved
