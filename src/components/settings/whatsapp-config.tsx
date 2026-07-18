@@ -281,14 +281,13 @@ export function WhatsAppConfig() {
     }
   }
 
-  // TODO(P8-T4): Meta-coupled — left as-is, still calls the legacy
-  // Supabase-backed route. Previously also refetched the Supabase
-  // config row afterward; that refetch is dropped here since the
-  // config row this form reads is Convex now and this route doesn't
-  // write to it, so there is nothing for a refetch to pick up — the
+  // Calls the Convex `verifyRegistration` action (bound above) — the
+  // Meta-coupled probe this form uses to double-check the account's
+  // WhatsApp registration is actually live, independent of the
   // persistent `isRegistered`/`lastRegistrationError` badge above
-  // (sourced from `config`, i.e. Convex) can go stale relative to a
-  // fresh verification result until this route is ported too.
+  // (sourced from `config`, i.e. the reactive `configDoc` query), which
+  // only reflects what was recorded at connect/save time and can go
+  // stale relative to a fresh probe.
   async function handleVerifyRegistration() {
     setVerifyingRegistration(true);
     setRegistrationProbe(null);
@@ -311,15 +310,12 @@ export function WhatsAppConfig() {
     }
   }
 
-  // TODO(P8-T4): `convex/whatsappConfig.ts` has no `remove`/reset
-  // mutation yet, so there is no Convex-backed way to clear the row
-  // this form reads from — left calling the legacy Supabase DELETE
-  // route (best-effort only), but deliberately NOT hand-clearing the
-  // phoneNumberId/wabaId/accessToken form fields the way the old
-  // version did: those are hydrated from `configDoc` (Convex), which
-  // this call does not touch, so clearing them locally would just be
-  // silently overwritten back on the next render — worse than leaving
-  // them showing the (accurate, still-current) Convex state.
+  // Calls the Convex `remove` mutation (bound above) to clear the
+  // row this form reads from. Deliberately NOT hand-clearing the
+  // phoneNumberId/wabaId/accessToken form fields here: those are
+  // hydrated from `configDoc` (Convex), which reactively updates once
+  // the row is gone, so clearing them locally would just be redundant
+  // with — and could race — that reactive update.
   async function handleReset() {
     if (!confirm('This will delete the current WhatsApp config so you can re-enter it. Continue?')) {
       return;
