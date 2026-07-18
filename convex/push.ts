@@ -235,11 +235,13 @@ export const assembleQualifiedLeadDelivery = internalQuery({
     if (!conversation || conversation.accountId !== args.accountId) {
       return { jobs: [] as { endpoint: string; p256dh: string; auth: string; payload: PushPayload }[] };
     }
-    const session = await ctx.db
+    const rows = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
-    if (!session || session.status !== "qualified") return { jobs: [] };
+      .order("desc")
+      .collect();
+    const session = rows.find((s) => s.status === "qualified");
+    if (!session) return { jobs: [] };
     const contact = await ctx.db.get(conversation.contactId);
 
     const members = await ctx.db

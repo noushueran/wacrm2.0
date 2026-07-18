@@ -845,3 +845,63 @@ test("V3-B: a human-owned thread stops the auto-relay; non-admin numbers never a
       .collect());
   expect(stillPending).toHaveLength(1);
 });
+
+// ---- v3: multiple leads per contact ----
+
+test("V3-C: a new service inquiry after a qualified lead opens a SECOND session with carried profile fields", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  // first lead: qualified, with profile fields worth carrying
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "Dubai Holiday Packages",
+      fields: [
+        { key: "nationality", label: "Nationality", value: "Indian", confidence: "high", updatedAt: 1 },
+        { key: "email", label: "Email", value: "ravi@x.com", confidence: "high", updatedAt: 1 },
+        { key: "travel_dates", label: "Travel dates", value: "August", confidence: "high", updatedAt: 1 },
+      ],
+      expectedCount: 4, answeredCount: 3, score: 80, qualifiedAt: 5,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[NEW]] field:destination_country=Georgia; score:30");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  const sessions = await sessionsFor(t, base.conversationId);
+  expect(sessions).toHaveLength(2);
+  const fresh = sessions.find((s) => s.status === "collecting")!;
+  expect(fresh).toBeTruthy();
+  const byKey = Object.fromEntries(fresh.fields.map((f) => [f.key, f]));
+  expect(byKey.destination_country.value).toBe("Georgia"); // new extraction
+  expect(byKey.nationality.value).toBe("Indian"); // carried over
+  expect(byKey.nationality.confidence).toBe("medium"); // verify-not-reask
+  expect(byKey.nationality.carried).toBe(true);
+  expect(byKey.email.carried).toBe(true);
+  expect(byKey.travel_dates).toBeUndefined(); // trip-specific — never carried
+  // the chip/board surface the NEW session
+  const chip = await base.asUser.query(api.qualification.getSessionForConversation, {
+    conversationId: base.conversationId,
+  });
+  expect(chip?.status).toBe("collecting");
+});
+
+test("V3-C: post-qualification chit-chat does NOT open a new lead", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "Dubai Holiday Packages",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 80, qualifiedAt: 5,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "thanks a lot!");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(1);
+});

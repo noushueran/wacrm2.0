@@ -12,6 +12,7 @@ import {
   parseAnalysis,
   mergeFields,
   countAnswered,
+  carryoverFields,
   type AnalysisResult,
 } from "./lib/qualification/analyze";
 import { aiContextMessageLimit, buildSystemPrompt } from "./lib/ai/defaults";
@@ -81,7 +82,8 @@ export const onInbound = internalMutation({
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
+      .order("desc")
+      .first();
     if (session && session.status === "collecting") {
       // Past the nudge cap the ladder returns null — fall back to the
       // expiry revisit so the 72h clock still fires (review fix: without
@@ -131,7 +133,9 @@ export function syntheticAnalysisRaw(latestText: string): string {
         ? "disqualified"
         : "none";
   const checklistSatisfied = latestText.includes("[[COMPLETE]]");
+  const newInquiry = latestText.includes("[[NEW]]");
   return JSON.stringify({
+    newInquiry,
     service: "UAE visa",
     fields,
     score: scoreMatch ? Number(scoreMatch[1]) : 50,
@@ -171,6 +175,10 @@ export const loadAnalysisContext = internalQuery({
     serviceName: string | null;
     knownFields: { key: string; value: string }[];
     basicFields: { key: string; label: string; required: boolean; phrasings: string[] }[];
+    previousInquiry?: {
+      serviceName: string | null;
+      carried: { key: string; value: string }[];
+    };
   } | null> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return null;
@@ -184,15 +192,33 @@ export const loadAnalysisContext = internalQuery({
     // the model could "qualify" the staff thread and echo fresh alerts).
     const contact = await ctx.db.get(conversation.contactId);
     if (contact && isAdminAlertNumber(config, contact.phoneNormalized)) return null;
+    // v3 multi-lead: the LATEST session is the live one; older terminal
+    // rows are history. A terminal latest no longer bails — the analysis
+    // decides whether this message starts a NEW inquiry.
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
-    if (session && session.status !== "collecting") return null; // terminal
+      .order("desc")
+      .first();
+    if (session && session.status !== "collecting") {
+      return {
+        serviceName: null,
+        knownFields: [],
+        basicFields: config.basicFields,
+        previousInquiry: {
+          serviceName: session.serviceName ?? null,
+          carried: carryoverFields(session.fields, Date.now()).map((f) => ({
+            key: f.key,
+            value: f.value,
+          })),
+        },
+      };
+    }
     return {
       serviceName: session?.serviceName ?? null,
       knownFields: (session?.fields ?? []).map((f) => ({ key: f.key, value: f.value })),
       basicFields: config.basicFields,
+      previousInquiry: undefined,
     };
   },
 });
@@ -229,6 +255,7 @@ const analysisValidator = v.object({
     v.literal("disqualified"),
   ),
   summary: v.union(v.string(), v.null()),
+  newInquiry: v.boolean(),
 });
 
 /**
@@ -264,17 +291,53 @@ export const applyAnalysis = internalMutation({
       return none;
     }
     const now = Date.now();
-    const sessionId = await ensureSession(ctx, {
-      accountId: args.accountId,
-      conversationId: args.conversationId,
-      contactId: args.contactId,
-      origin: "inbound",
-      now,
-    });
-    const session = await ctx.db.get(sessionId);
-    if (!session || session.status !== "collecting") return none;
-
     const analysis = args.analysis as AnalysisResult;
+
+    // v3 multi-lead: work on the LATEST session. A terminal latest only
+    // yields a fresh lead when the analysis says the customer started a
+    // NEW request — post-completion chit-chat never reopens anything.
+    const latest = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .first();
+    let session: Doc<"qualificationSessions"> | null = null;
+    if (!latest) {
+      const sessionId = await ensureSession(ctx, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        origin: "inbound",
+        now,
+      });
+      session = await ctx.db.get(sessionId);
+    } else if (latest.status === "collecting") {
+      session = latest;
+    } else {
+      if (!analysis.newInquiry) return none;
+      // Fresh lead for the same contact: profile facts carry over at
+      // medium confidence (marked `carried`) so the assistant verifies
+      // them casually instead of re-collecting; trip-specific details
+      // start blank.
+      const carried = carryoverFields(latest.fields, now);
+      const sessionId = await ctx.db.insert("qualificationSessions", {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        status: "collecting",
+        origin: "inbound",
+        fields: carried,
+        expectedCount: Math.max(analysis.expectedCount, 1),
+        answeredCount: countAnswered(carried),
+        lastCustomerMessageAt: now,
+        followUpsSent: 0,
+        phrasingCursor: 0,
+        sendAttemptErrors: 0,
+      });
+      session = await ctx.db.get(sessionId);
+    }
+    if (!session || session.status !== "collecting") return none;
+    const sessionId = session._id;
     const merged = mergeFields(session.fields, analysis.fields, now);
     const answeredCount = countAnswered(merged);
     const expectedCount = Math.max(analysis.expectedCount, answeredCount, 1);
@@ -379,6 +442,7 @@ export const analyzeInbound = internalAction({
         checklistExcerpts,
         basicFields: context.basicFields,
         knownFields: context.knownFields,
+        previousInquiry: context.previousInquiry,
       });
 
       let raw: string;
@@ -472,13 +536,19 @@ export const getObjectives = internalQuery({
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
+      .order("desc")
+      .first();
     if (!session || session.status !== "collecting") return null;
     if (session.accountId !== args.accountId) return null;
 
     const collected = session.fields
       .filter((f) => f.confidence !== "low")
-      .map((f) => ({ label: f.label ?? f.key, value: f.value }));
+      .map((f) => ({
+        label:
+          (f.label ?? f.key) +
+          (f.carried ? " (from a previous inquiry — reconfirm casually once)" : ""),
+        value: f.value,
+      }));
 
     let nextQuestion: string | null = session.pendingQuestion?.text ?? null;
     if (!nextQuestion) {
@@ -514,7 +584,8 @@ export const completeQualification = internalMutation({
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
+      .order("desc")
+      .first();
     if (!session || session.accountId !== args.accountId) return;
     // Compare-and-set: only a collecting session that reached readiness
     // completes; Convex OCC serializes concurrent inbounds, so a second
@@ -620,12 +691,15 @@ export const closingContext = internalQuery({
   ): Promise<{ to: string; text: string } | null> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config || !config.closingMessage.trim()) return null;
-    const session = await ctx.db
+    const rows = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
-    if (!session || session.accountId !== args.accountId) return null;
-    if (session.status !== "qualified") return null;
+      .order("desc")
+      .collect();
+    const session = rows.find(
+      (s) => s.accountId === args.accountId && s.status === "qualified",
+    );
+    if (!session) return null;
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return null;
     const contact = await ctx.db.get(conversation.contactId);

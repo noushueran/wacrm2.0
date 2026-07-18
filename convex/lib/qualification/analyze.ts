@@ -34,6 +34,10 @@ export interface AnalysisResult {
   nextQuestion: { key: string; text: string; alternates: string[] } | null;
   intent: "none" | "opt_out" | "wants_human" | "disqualified";
   summary: string | null;
+  /** v3 multi-lead: true when the customer is starting a NEW request
+   *  after their previous session already finished — the engine opens a
+   *  fresh lead for it. Always false while a session is still open. */
+  newInquiry: boolean;
 }
 
 const INTENTS = ["none", "opt_out", "wants_human", "disqualified"] as const;
@@ -63,8 +67,14 @@ export function buildAnalysisPrompt(args: {
   checklistExcerpts: string[];
   basicFields: Doc<"qualificationConfigs">["basicFields"];
   knownFields: { key: string; value: string }[];
+  /** v3 multi-lead: set when the contact's PREVIOUS session already
+   *  finished — teaches the newInquiry decision + carryover semantics. */
+  previousInquiry?: {
+    serviceName: string | null;
+    carried: { key: string; value: string }[];
+  };
 }): string {
-  const { checklistExcerpts, basicFields, knownFields } = args;
+  const { checklistExcerpts, basicFields, knownFields, previousInquiry } = args;
 
   const known =
     knownFields.length > 0
@@ -90,6 +100,18 @@ export function buildAnalysisPrompt(args: {
       basics,
     "Already collected (from earlier messages — do NOT lower confidence or re-extract unless the customer corrected themselves):\n" +
       known,
+    ...(previousInquiry
+      ? [
+          `IMPORTANT — the customer's previous inquiry${previousInquiry.serviceName ? ` (${previousInquiry.serviceName})` : ""} is already FINISHED. ` +
+            "Decide: is this message starting a NEW request (any service, even the same one again)? " +
+            "If YES: set newInquiry true and extract for the new request only. " +
+            "If they are merely chatting about or thanking us for the finished inquiry: set newInquiry false, service null, and no fields.\n" +
+            (previousInquiry.carried.length > 0
+              ? "Known profile details from the previous inquiry (already pre-filled at medium confidence — the assistant will reconfirm them casually; only re-extract if the customer states a DIFFERENT value):\n" +
+                previousInquiry.carried.map((c) => `- ${c.key}: ${c.value}`).join("\n")
+              : ""),
+        ]
+      : []),
     "Instructions:\n" +
       "1. Identify which service the customer wants (or null if unclear/off-topic).\n" +
       "2. Extract every checklist item the conversation answers, with confidence high/medium/low.\n" +
@@ -109,7 +131,8 @@ export function buildAnalysisPrompt(args: {
       ' "expectedCount": 5,' +
       ' "nextQuestion": {"key": "insideUae", "text": "Are you currently inside the UAE or outside?", "alternates": ["Quick check — are you in the UAE right now, or abroad?", "Just so I guide you right: are you inside the UAE at the moment?"]},' +
       ' "intent": "none",' +
-      ' "summary": "Indian national, 60-day UAE tourist visa, travelling next week"}',
+      ' "summary": "Indian national, 60-day UAE tourist visa, travelling next week",' +
+      ' "newInquiry": false}',
   ].join("\n\n");
 }
 
@@ -219,6 +242,7 @@ export function parseAnalysis(raw: string): AnalysisResult | null {
       typeof obj.summary === "string" && obj.summary.trim()
         ? obj.summary.trim()
         : null,
+    newInquiry: obj.newInquiry === true,
   };
 }
 
@@ -252,4 +276,38 @@ export function mergeFields(
  *  toward completion (spec §7's premature-completion floor). */
 export function countAnswered(fields: SessionField[]): number {
   return fields.filter((f) => f.confidence !== "low").length;
+}
+
+/**
+ * Profile-ish keys that survive into a NEW inquiry from the same
+ * contact (v3 multi-lead): stable facts about the person, never
+ * trip-specific details (dates, destination, travelers change per
+ * trip). Seeded at "medium" confidence with `carried: true` so they
+ * count as answered but the assistant reconfirms them casually.
+ */
+export const CARRYOVER_KEYS = [
+  "nationality",
+  "email",
+  "departure_city",
+  "residence_status",
+] as const;
+
+export function carryoverFields(
+  previous: SessionField[],
+  now: number,
+): SessionField[] {
+  return previous
+    .filter(
+      (f) =>
+        (CARRYOVER_KEYS as readonly string[]).includes(f.key) &&
+        f.confidence !== "low",
+    )
+    .map((f) => ({
+      key: f.key,
+      ...(f.label ? { label: f.label } : {}),
+      value: f.value,
+      confidence: "medium" as const,
+      updatedAt: now,
+      carried: true,
+    }));
 }

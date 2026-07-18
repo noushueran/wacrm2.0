@@ -1494,6 +1494,10 @@ export default defineSchema({
       value: v.string(),
       confidence: v.union(v.literal("high"), v.literal("medium"), v.literal("low")),
       updatedAt: v.number(),
+      // v3 multi-lead: true when this value was carried over from the
+      // contact's previous session — the assistant reconfirms it
+      // casually instead of re-asking (or treating it as brand new).
+      carried: v.optional(v.boolean()),
     })),
     score: v.optional(v.number()),
     scoreBreakdown: v.optional(v.array(v.object({
