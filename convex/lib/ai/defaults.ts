@@ -8,6 +8,8 @@
 // settings-UI task can add it back when it actually has a caller.
 // ============================================================
 
+import { AD_LANDING_PROMPT_CONTENT_MAX, type AdContext } from "./adContext";
+
 /**
  * Sentinel the model is instructed to emit (in auto-reply mode) when it
  * can't confidently help and a human should take over. Parsed and
@@ -76,8 +78,14 @@ export function buildSystemPrompt(args: {
     collected: { label: string; value: string }[];
     nextQuestion: string | null;
   };
+  /** Click-to-WhatsApp lead source (spec 2026-07-18): the ad the
+   *  customer clicked + the extracted landing page behind its link.
+   *  Supplied by `aiReply`'s `loadAdContext` when the conversation
+   *  carries an `adReferral`; absent → prompt is byte-identical to
+   *  before. */
+  adContext?: AdContext;
 }): string {
-  const { userPrompt, mode, knowledge, qualification } = args;
+  const { userPrompt, mode, knowledge, qualification, adContext } = args;
   const parts: string[] = [
     "You are a customer-messaging assistant for a business that uses a WhatsApp CRM. " +
       "You are shown the recent WhatsApp conversation between the business (assistant) and a customer (user). " +
@@ -100,6 +108,33 @@ export function buildSystemPrompt(args: {
 
   if (userPrompt && userPrompt.trim()) {
     parts.push(`Business context and instructions:\n${userPrompt.trim()}`);
+  }
+
+  if (adContext) {
+    const lines: string[] = [];
+    if (adContext.headline) lines.push(`Ad headline: ${adContext.headline}`);
+    if (adContext.body) lines.push(`Ad text: ${adContext.body}`);
+    if (adContext.sourceUrl) lines.push(`Ad link: ${adContext.sourceUrl}`);
+    if (adContext.landingTitle) lines.push(`Linked page title: ${adContext.landingTitle}`);
+    if (adContext.landingDescription) {
+      lines.push(`Linked page description: ${adContext.landingDescription}`);
+    }
+    if (adContext.landingContent) {
+      lines.push(
+        "Linked page content (extracted):\n" +
+          adContext.landingContent.slice(0, AD_LANDING_PROMPT_CONTENT_MAX),
+      );
+    }
+    if (lines.length > 0) {
+      parts.push(
+        "Lead source — this customer opened the chat by clicking one of the business's ads " +
+          '(Click-to-WhatsApp), so you already know what caught their interest even when their first message is just a greeting like "Hi". ' +
+          "What the ad and the page it links to say:\n" +
+          lines.join("\n") +
+          "\n\nUse this naturally: acknowledge the specific offer/destination from the ad by name and continue the conversation about it, answering whatever the customer actually asked first. " +
+          "Do not mention the ad \"attachment\" or that you were given this context, do not recite the ad word-for-word, and never state prices, dates, or details that are not in this prompt.",
+      );
+    }
   }
 
   if (mode === "auto_reply" && qualification) {
