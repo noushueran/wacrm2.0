@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from 'convex/react';
-import { BarChart3, Bot, ClipboardCheck, PencilLine, Tag } from 'lucide-react';
+import { BarChart3, Bot, ClipboardCheck, ListChecks, PencilLine, Tag } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 import {
@@ -42,6 +42,7 @@ interface UsageResponse {
     draft: { calls: number; tokens: number };
     classify: { calls: number; tokens: number };
     qualify: { calls: number; tokens: number };
+    checklist: { calls: number; tokens: number };
   };
   by_model: {
     model: string;
@@ -98,6 +99,7 @@ export function AiUsageCard() {
       draft: { calls: 0, tokens: 0 },
       classify: { calls: 0, tokens: 0 },
       qualify: { calls: 0, tokens: 0 },
+      checklist: { calls: 0, tokens: 0 },
     };
     const modelMap = new Map<
       string,
@@ -196,7 +198,7 @@ export function AiUsageCard() {
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-7">
               <Stat label="Total tokens" value={formatCompactNumber(data.totals.total_tokens)} />
               <Stat label="LLM calls" value={String(data.totals.calls)} />
               <Stat
@@ -218,6 +220,11 @@ export function AiUsageCard() {
                 label={t('qualifyLabel')}
                 value={formatCompactNumber(data.by_mode.qualify.tokens)}
                 icon={ClipboardCheck}
+              />
+              <Stat
+                label={t('checklistLabel')}
+                value={formatCompactNumber(data.by_mode.checklist.tokens)}
+                icon={ListChecks}
               />
             </div>
 

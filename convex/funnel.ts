@@ -119,7 +119,10 @@ export async function applyStageTransition(
           accountId: args.accountId,
           conversationId,
           contactId: conversation.contactId,
-          stage,
+          // `lost` can never reach here (resolveEventName returns null for
+          // it, so the eventName guard above filters it) — the narrow cast
+          // records that invariant instead of widening the events schema.
+          stage: stage as Exclude<FunnelStageKey, "lost">,
           lane: attribution.lane,
           backend: backendForLane(attribution.lane),
           eventName,

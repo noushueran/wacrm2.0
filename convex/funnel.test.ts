@@ -302,7 +302,7 @@ test("setStage lost records the reason on the audit row + checklist outcome + co
 
   // Terminal + internal-only: no Meta event even though attributed.
   const evs = await eventsFor(t, conversationId);
-  expect(evs.some((e) => e.stage === "lost")).toBe(false);
+  expect(evs.map((e) => e.stage as string)).not.toContain("lost");
 
   const checklist = await t.run((ctx) => ctx.db.get(checklistId!));
   expect(checklist?.outcome?.result).toBe("lost");

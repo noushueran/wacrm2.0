@@ -10,6 +10,7 @@ import {
   Copy,
   ExternalLink,
   Globe,
+  ListChecks,
   Megaphone,
   MessageCircle,
   Search,
@@ -21,14 +22,22 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { LeadChecklist, type LeadChecklistData } from '@/components/leads/lead-checklist';
+import {
+  LeadsPipelineView,
+  type StageChangeExtras,
+} from '@/components/leads/leads-pipeline-view';
+import type { PipelineStageKey } from '@/lib/leads/pipeline';
 import { cn } from '@/lib/utils';
 
 // ============================================================
 // LeadsBoardView — the presentational Leads workspace (v5 visual
 // upgrade): status filter pills + service filter + search, score rings,
 // assignee front-and-center, offer/feedback trail in the detail panel.
-// Pure view over the `leadsBoard` payload so it can be rendered with
-// mock data for visual verification.
+// v6 adds the List | Pipeline toggle (deals kanban over the funnel) and
+// the per-lead sales checklist. Pure view over the `leadsBoard` payload
+// so it can be rendered with mock data for visual verification —
+// mutations arrive as props from the page.
 // ============================================================
 
 export interface LeadRow {
@@ -58,7 +67,14 @@ export interface LeadRow {
     lastFeedback: string | null;
     lastFeedbackAt: number | null;
   };
+  funnelStage: string | null;
+  funnelStageUpdatedAt: number | null;
+  saleValue: number | null;
+  saleCurrency: string | null;
+  checklist: LeadChecklistData | null;
 }
+
+export type LeadsView = 'list' | 'pipeline';
 
 export interface LeadsBoardData {
   summary: {
@@ -139,9 +155,34 @@ function Stat({ label, value, accent }: { label: string; value: string | number;
   );
 }
 
-function LeadDetail({ lead, t }: { lead: LeadRow; t: ReturnType<typeof useTranslations> }) {
+function LeadDetail({
+  lead,
+  t,
+  canEdit,
+  onCompleteItem,
+  onReopenItem,
+  bare,
+}: {
+  lead: LeadRow;
+  t: ReturnType<typeof useTranslations>;
+  canEdit: boolean;
+  onCompleteItem: (lead: LeadRow, itemKey: string, note: string) => Promise<void>;
+  onReopenItem: (lead: LeadRow, itemKey: string) => Promise<void>;
+  /** true inside the pipeline card dialog (no top border needed). */
+  bare?: boolean;
+}) {
   return (
-    <div className="grid gap-5 border-t border-border pt-4 lg:grid-cols-3">
+    <div className={cn(!bare && 'border-t border-border pt-4')}>
+      {lead.status === 'qualified' || lead.checklist ? (
+        <LeadChecklist
+          checklist={lead.checklist}
+          canEdit={canEdit}
+          onCompleteItem={(itemKey, note) => onCompleteItem(lead, itemKey, note)}
+          onReopenItem={(itemKey) => onReopenItem(lead, itemKey)}
+          className="mb-5"
+        />
+      ) : null}
+      <div className="grid gap-5 lg:grid-cols-3">
       <div>
         <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           {t('detail.answers')}
@@ -244,12 +285,36 @@ function LeadDetail({ lead, t }: { lead: LeadRow; t: ReturnType<typeof useTransl
           {lead.closedReason ? <span>{t(`closedReason.${lead.closedReason}` as never)}</span> : null}
         </div>
       </div>
+      </div>
     </div>
   );
 }
 
-export function LeadsBoardView({ board }: { board: LeadsBoardData }) {
+export interface LeadsBoardViewProps {
+  board: LeadsBoardData;
+  view: LeadsView;
+  onViewChange: (view: LeadsView) => void;
+  canEdit: boolean;
+  onCompleteItem: (lead: LeadRow, itemKey: string, note: string) => Promise<void>;
+  onReopenItem: (lead: LeadRow, itemKey: string) => Promise<void>;
+  onStageChange: (
+    lead: LeadRow,
+    stage: PipelineStageKey,
+    extras?: StageChangeExtras,
+  ) => Promise<boolean>;
+}
+
+export function LeadsBoardView({
+  board,
+  view,
+  onViewChange,
+  canEdit,
+  onCompleteItem,
+  onReopenItem,
+  onStageChange,
+}: LeadsBoardViewProps) {
   const t = useTranslations('Leads');
+  const tFunnel = useTranslations('Inbox.funnel');
   const [openId, setOpenId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [serviceFilter, setServiceFilter] = useState<string>('all');
@@ -291,16 +356,58 @@ export function LeadsBoardView({ board }: { board: LeadsBoardData }) {
     },
   ];
 
+  const viewPills: { id: LeadsView; label: string }[] = [
+    { id: 'list', label: t('view.list') },
+    { id: 'pipeline', label: t('view.pipeline') },
+  ];
+
   return (
     <div>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <ClipboardCheck className="h-6 w-6 text-primary" />
-        <div>
+        <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-bold tracking-tight text-foreground">{t('pageTitle')}</h1>
           <p className="mt-0.5 text-sm text-muted-foreground">{t('pageDesc')}</p>
         </div>
+        <div className="flex shrink-0 items-center rounded-full border border-border p-0.5">
+          {viewPills.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => onViewChange(p.id)}
+              className={cn(
+                'rounded-full px-3 py-1 text-xs font-medium transition-colors',
+                view === p.id
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
       </div>
 
+      {view === 'pipeline' ? (
+        <LeadsPipelineView
+          leads={board.leads}
+          canEdit={canEdit}
+          onStageChange={onStageChange}
+          inQualificationCount={board.summary.collecting}
+          onShowList={() => onViewChange('list')}
+          renderLeadDetail={(lead) => (
+            <LeadDetail
+              lead={lead}
+              t={t}
+              canEdit={canEdit}
+              onCompleteItem={onCompleteItem}
+              onReopenItem={onReopenItem}
+              bare
+            />
+          )}
+        />
+      ) : (
+        <>
       <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
         <Stat label={t('summary.qualified')} value={board.summary.qualified} accent />
         <Stat label={t('summary.collecting')} value={board.summary.collecting} />
@@ -384,6 +491,21 @@ export function LeadsBoardView({ board }: { board: LeadsBoardData }) {
                             {lead.status === 'qualified' ? <BadgeCheck className="h-3 w-3" /> : null}
                             {t(`status.${lead.status}` as never)}
                           </Badge>
+                          {lead.funnelStage && lead.funnelStage !== 'new_lead' ? (
+                            <Badge
+                              variant="outline"
+                              className={cn(
+                                'text-[10px]',
+                                lead.funnelStage === 'purchased'
+                                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-500'
+                                  : lead.funnelStage === 'lost'
+                                    ? 'border-red-500/40 bg-red-500/10 text-red-400'
+                                    : 'border-border text-muted-foreground',
+                              )}
+                            >
+                              {tFunnel(`stage.${lead.funnelStage}` as never)}
+                            </Badge>
+                          ) : null}
                         </span>
                         <span className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                           {lead.serviceName ? <span className="font-medium">{lead.serviceName}</span> : null}
@@ -395,6 +517,22 @@ export function LeadsBoardView({ board }: { board: LeadsBoardData }) {
                             <span className="tabular-nums">{lead.answeredCount}/{lead.expectedCount}</span>
                             <MiniBar value={lead.answeredCount} max={lead.expectedCount} className="w-12" />
                           </span>
+                          {lead.checklist ? (
+                            <span
+                              className={cn(
+                                'inline-flex items-center gap-1',
+                                lead.checklist.doneCount === lead.checklist.total &&
+                                  lead.checklist.total > 0 &&
+                                  'text-emerald-500',
+                              )}
+                              title={t('checklist.title')}
+                            >
+                              <ListChecks className="h-3 w-3" />
+                              <span className="tabular-nums">
+                                {lead.checklist.doneCount}/{lead.checklist.total}
+                              </span>
+                            </span>
+                          ) : null}
                           <span className={cn('inline-flex items-center gap-1', !lead.assigneeName && 'text-amber-500')}>
                             <UserRound className="h-3 w-3" />
                             {lead.assigneeName ?? t('detail.unassigned')}
@@ -422,13 +560,23 @@ export function LeadsBoardView({ board }: { board: LeadsBoardData }) {
                       </Link>
                     </div>
                   </div>
-                  {open ? <LeadDetail lead={lead} t={t} /> : null}
+                  {open ? (
+                    <LeadDetail
+                      lead={lead}
+                      t={t}
+                      canEdit={canEdit}
+                      onCompleteItem={onCompleteItem}
+                      onReopenItem={onReopenItem}
+                    />
+                  ) : null}
                 </CardContent>
               </Card>
             );
           })
         )}
       </div>
+        </>
+      )}
     </div>
   );
 }

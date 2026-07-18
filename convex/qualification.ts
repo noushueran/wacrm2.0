@@ -203,6 +203,7 @@ export const leadsBoard = accountQuery({
         lastFeedbackAt: number | null;
       };
       funnelStage: string | null;
+      funnelStageUpdatedAt: number | null;
       saleValue: number | null;
       saleCurrency: string | null;
       checklist: {
@@ -303,6 +304,7 @@ export const leadsBoard = accountQuery({
             lastFeedbackAt: accepted?.feedbackAt ?? null,
           },
           funnelStage: conversation.funnel?.stage ?? null,
+          funnelStageUpdatedAt: conversation.funnel?.stageUpdatedAt ?? null,
           saleValue: conversation.funnel?.saleValue ?? null,
           saleCurrency: conversation.funnel?.saleCurrency ?? null,
           checklist: checklistRow
