@@ -11,6 +11,54 @@ import { resolveEventName, backendForLane } from "./lib/funnel";
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
 
+/**
+ * Delay between each `deliverConversionEvent` the retry cron schedules. The
+ * cron pulls up to 100 rows every 15 minutes and every one of them is an
+ * external Graph POST; firing them all at `runAfter(0)` is a 100-call burst
+ * that draws 429s from the very backend we're delivering to. Mirrors
+ * `broadcasts.ts`'s `DELIVER_STAGGER_MS` — same reasoning, same ~10/s steady
+ * state: Convex's scheduler already IS the queue, so a flat per-row interval
+ * is all it takes.
+ */
+const DELIVER_STAGGER_MS = 100;
+
+/**
+ * A 429 or 5xx is the backend telling us to come back later — it says nothing
+ * about the row itself, so spending an attempt on it is what let a burst of
+ * our own making walk a live conversion to the terminal `"abandoned"` state.
+ * Carried as its own Error subclass rather than parsed back out of the message
+ * text, so the classification can't drift from the status that set it.
+ */
+class TransientDeliveryError extends Error {}
+
+/**
+ * Everything that isn't a 429/5xx (4xx, a malformed body, a network failure)
+ * is treated as the row's own fault: it bumps `attempts` and can legitimately
+ * exhaust the budget and give up.
+ */
+function deliveryError(status: number, message: string): Error {
+  return status === 429 || status >= 500
+    ? new TransientDeliveryError(message)
+    : new Error(message);
+}
+
+/**
+ * The `patchStatus` args a failed delivery attempt should write. Transient
+ * failures re-queue as `"error"` WITHOUT a bump, so they stay selectable by
+ * `getPendingToRetry` indefinitely and can never reach `MAX_DELIVER_ATTEMPTS`.
+ */
+function errorPatchFor(err: unknown): {
+  status: "error";
+  lastError: string;
+  bumpAttempts: boolean;
+} {
+  return {
+    status: "error",
+    lastError: err instanceof Error ? err.message : String(err),
+    bumpAttempts: !(err instanceof TransientDeliveryError),
+  };
+}
+
 export const getById = internalQuery({
   args: { conversionEventId: v.id("conversionEvents") },
   handler: async (ctx, args): Promise<Doc<"conversionEvents"> | null> =>
@@ -102,10 +150,12 @@ export const seedNewLead = internalMutation({
 /**
  * Advances a conversionEvents row after a delivery attempt. Conditional
  * spread (a field is only patched when supplied). `attempts` bumps only on
- * an explicit `bumpAttempts === true`. An `"error"` bump that reaches
- * `MAX_DELIVER_ATTEMPTS` is retired to the terminal `"abandoned"` state — the
- * single give-up point — so dead rows leave the retry cron's partitions
- * (mirrors `attribution.patchResult`).
+ * an explicit `bumpAttempts === true` — a transient failure passes `false`
+ * (see `errorPatchFor`) so it re-queues without spending budget. An
+ * `"error"` bump that reaches `MAX_DELIVER_ATTEMPTS` is retired to the
+ * terminal `"abandoned"` state — the single give-up point for a row that
+ * keeps failing on its own merits (mirrors `attribution.patchResult`).
+ * A row that can't be attempted at all is retired by `retireDormant` instead.
  */
 export const patchStatus = internalMutation({
   args: {
@@ -140,11 +190,42 @@ export const patchStatus = internalMutation({
 });
 
 /**
+ * Retires a row whose backend cannot be attempted at all (relevant env unset,
+ * or capi with no wabaId) to `"abandoned"` WITHOUT bumping `attempts`.
+ *
+ * Such rows used to be left `"pending"` with `attempts: 0`, which matches
+ * `getPendingToRetry`'s predicate forever: since that window is oldest-first
+ * and capped at 100, a dormant backlog permanently starved every newer row
+ * behind it (in prod the CAPI env is unset, so every CTWA ad lead seeds
+ * exactly such a row). Retiring to a status the window doesn't read is what
+ * keeps it reachable.
+ *
+ * `attempts < MAX_DELIVER_ATTEMPTS` is what marks a row dormant-retired
+ * rather than genuinely given-up — `patchStatus`'s give-up path can only
+ * land on `attempts >= MAX_DELIVER_ATTEMPTS` — and is exactly what
+ * `getDormantToSweep` re-reads once the backend is finally configured.
+ */
+export const retireDormant = internalMutation({
+  args: {
+    conversionEventId: v.id("conversionEvents"),
+    reason: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const row = await ctx.db.get(args.conversionEventId);
+    if (!row) return;
+    await ctx.db.patch(args.conversionEventId, {
+      status: "abandoned",
+      lastError: `dormant: ${args.reason}`,
+    });
+  },
+});
+
+/**
  * Delivers one conversion event to its backend. Never throws. Idempotent:
  * an already-`sent` row is skipped. Dormant (relevant env unset, or capi with
- * no wabaId) → leave the row `pending`, no bump, so the retry cron resends
- * once configured. We dedupe ourselves (one row per conversation×stage) —
- * Meta does not dedupe business-messaging events.
+ * no wabaId) → `retireDormant`, which the cron re-sweeps once the backend is
+ * configured. We dedupe ourselves (one row per conversation×stage) — Meta does
+ * not dedupe business-messaging events.
  */
 export const deliverConversionEvent = internalAction({
   args: { conversionEventId: v.id("conversionEvents") },
@@ -158,11 +239,27 @@ export const deliverConversionEvent = internalAction({
     if (row.backend === "capi") {
       const datasetId = process.env.META_CAPI_DATASET_ID;
       const token = process.env.META_CAPI_ACCESS_TOKEN;
-      if (!datasetId || !token) return; // dormant
+      if (!datasetId || !token) {
+        await ctx.runMutation(internal.conversionEvents.retireDormant, {
+          conversionEventId: args.conversionEventId,
+          reason: "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
+        });
+        return;
+      }
       const wabaId = await ctx.runQuery(internal.conversionEvents.getWabaId, {
         accountId: row.accountId,
       });
-      if (!wabaId) return; // dormant — no WABA configured
+      if (!wabaId) {
+        // Re-swept on every tick while the CAPI env is set (the sweep keys on
+        // env, which is configured here) — a no-op round-trip per row until
+        // the account connects a WABA, which is the price of not dropping the
+        // conversion the moment it does.
+        await ctx.runMutation(internal.conversionEvents.retireDormant, {
+          conversionEventId: args.conversionEventId,
+          reason: "no wabaId configured for account",
+        });
+        return;
+      }
       try {
         const event: Record<string, unknown> = {
           event_name: row.eventName,
@@ -191,7 +288,10 @@ export const deliverConversionEvent = internalAction({
         });
         if (!res.ok) {
           const text = await res.text();
-          throw new Error(`CAPI ${res.status}: ${text.slice(0, 200)}`);
+          throw deliveryError(
+            res.status,
+            `CAPI ${res.status}: ${text.slice(0, 200)}`,
+          );
         }
         const data = (await res.json().catch(() => ({}))) as {
           fbtrace_id?: string;
@@ -204,9 +304,7 @@ export const deliverConversionEvent = internalAction({
       } catch (err) {
         await ctx.runMutation(internal.conversionEvents.patchStatus, {
           conversionEventId: args.conversionEventId,
-          status: "error",
-          lastError: err instanceof Error ? err.message : String(err),
-          bumpAttempts: true,
+          ...errorPatchFor(err),
         });
       }
       return;
@@ -215,7 +313,13 @@ export const deliverConversionEvent = internalAction({
     // backend === "platformA" — website/code lane → Platform A web Pixel.
     const url = process.env.LANDING_CONVERSION_URL;
     const secret = process.env.WA_CONVERSION_SHARED_SECRET;
-    if (!url || !secret) return; // dormant
+    if (!url || !secret) {
+      await ctx.runMutation(internal.conversionEvents.retireDormant, {
+        conversionEventId: args.conversionEventId,
+        reason: "LANDING_CONVERSION_URL/WA_CONVERSION_SHARED_SECRET unset",
+      });
+      return;
+    }
     try {
       const body: Record<string, unknown> = {
         code: row.identifier,
@@ -235,7 +339,9 @@ export const deliverConversionEvent = internalAction({
         },
         body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error(`Platform A responded ${res.status}`);
+      if (!res.ok) {
+        throw deliveryError(res.status, `Platform A responded ${res.status}`);
+      }
       const data = (await res.json()) as {
         matched?: boolean;
         firedAt?: number;
@@ -257,19 +363,24 @@ export const deliverConversionEvent = internalAction({
     } catch (err) {
       await ctx.runMutation(internal.conversionEvents.patchStatus, {
         conversionEventId: args.conversionEventId,
-        status: "error",
-        lastError: err instanceof Error ? err.message : String(err),
-        bumpAttempts: true,
+        ...errorPatchFor(err),
       });
     }
   },
 });
 
 /**
- * Retry candidates: `error` OR `pending` with `attempts < MAX`, capped at
- * 100 total. `pending` covers dormant rows (env not yet set) so they send
- * once configured. Queried through `by_status` (never a full scan), each
- * `.take(100)`, combined and re-capped. Mirrors `attribution.getPendingToRetry`.
+ * Live retry candidates: `error` OR `pending` with `attempts < MAX`, capped at
+ * 100 total. Queried through `by_status` (never a full scan), each `.take(100)`,
+ * combined and re-capped. Mirrors `attribution.getPendingToRetry`.
+ *
+ * Both partitions drain: an `error` row either succeeds or bumps its way to
+ * `"abandoned"`, and a `pending` row is delivered the moment it's seeded. A row
+ * whose backend isn't configured never got either treatment and so used to sit
+ * in `pending` permanently — since this window is oldest-first, that backlog
+ * starved every newer row behind it. Those rows are now retired by
+ * `retireDormant` to a status neither partition reads, and come back through
+ * `getDormantToSweep` instead.
  */
 export const getPendingToRetry = internalQuery({
   args: {},
@@ -288,16 +399,80 @@ export const getPendingToRetry = internalQuery({
   },
 });
 
+/**
+ * Dormant-retired rows (see `retireDormant`) for the backends whose env is NOW
+ * configured — the path that gets a conversion delivered after its backend is
+ * finally wired up, rather than losing it for having arrived too early.
+ *
+ * The `backends` arg is why this is separate from `getPendingToRetry`: only an
+ * action can read `process.env`, so the caller decides what's configured and
+ * asks for nothing while nothing is — otherwise an undeliverable backlog would
+ * churn the scheduler every 15 minutes for as long as the env stayed unset.
+ * `attempts < MAX_DELIVER_ATTEMPTS` excludes rows that reached `"abandoned"`
+ * the honest way, through `patchStatus`'s give-up.
+ *
+ * Dormant-retired and genuinely-given-up rows share the `"abandoned"`
+ * partition, so that `attempts` bound is a post-index `.filter()` rather than
+ * a partition of its own. It would be cleaner as a distinct `"dormant"` status
+ * (its own `by_status` range, no scanning past dead rows to reach live ones —
+ * the principle `getPendingToRetry` above is built on), but that needs a new
+ * literal in `conversionEvents.status` in `convex/schema.ts`. The two only mix
+ * when an account both fails deliveries permanently AND has undeliverable
+ * rows, which needs the env configured and unconfigured at once, so the scan
+ * stays short in practice.
+ */
+export const getDormantToSweep = internalQuery({
+  args: {
+    backends: v.array(v.union(v.literal("platformA"), v.literal("capi"))),
+  },
+  handler: async (ctx, args): Promise<Doc<"conversionEvents">[]> => {
+    if (args.backends.length === 0) return [];
+    return await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_status", (q) => q.eq("status", "abandoned"))
+      .filter((q) =>
+        q.and(
+          q.lt(q.field("attempts"), MAX_DELIVER_ATTEMPTS),
+          q.or(...args.backends.map((b) => q.eq(q.field("backend"), b))),
+        ),
+      )
+      .take(100);
+  },
+});
+
+/**
+ * Cron entry point (`convex/crons.ts`, every 15 minutes): pulls the live retry
+ * batch plus any dormant rows whose backend has since been configured, and
+ * re-schedules `deliverConversionEvent` for each, `DELIVER_STAGGER_MS` apart.
+ * Tiny by design — every delivery decision (dormant, idempotent,
+ * transient-vs-permanent) lives in `deliverConversionEvent` itself.
+ */
 export const retryConversionEvents = internalAction({
   args: {},
   handler: async (ctx): Promise<void> => {
-    const rows = await ctx.runQuery(
-      internal.conversionEvents.getPendingToRetry,
-      {},
-    );
-    for (const row of rows) {
+    const backends: Array<"platformA" | "capi"> = [];
+    if (process.env.META_CAPI_DATASET_ID && process.env.META_CAPI_ACCESS_TOKEN) {
+      backends.push("capi");
+    }
+    if (
+      process.env.LANDING_CONVERSION_URL &&
+      process.env.WA_CONVERSION_SHARED_SECRET
+    ) {
+      backends.push("platformA");
+    }
+
+    const [live, dormant] = await Promise.all([
+      ctx.runQuery(internal.conversionEvents.getPendingToRetry, {}),
+      ctx.runQuery(internal.conversionEvents.getDormantToSweep, { backends }),
+    ]);
+
+    // Live rows first: a dormant backlog must never crowd them out of the
+    // 100-row budget — the same ordering rule `getPendingToRetry` applies
+    // between its own two partitions.
+    const batch = [...live, ...dormant].slice(0, 100);
+    for (const [i, row] of batch.entries()) {
       await ctx.scheduler.runAfter(
-        0,
+        i * DELIVER_STAGGER_MS,
         internal.conversionEvents.deliverConversionEvent,
         { conversionEventId: row._id },
       );
