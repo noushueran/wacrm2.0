@@ -1455,6 +1455,12 @@ export default defineSchema({
     // and downstream AI analysis (category from a fixed list + free text).
     lossCategory: v.optional(v.string()),
     lossDetail: v.optional(v.string()),
+    // Captured on the transition that carried a sale amount (normally
+    // `purchased`) — this append-only row is the durable system of record
+    // for the amount; `conversation.funnel.saleValue` is only a denorm and
+    // can be replaced/dropped by later stage moves (Task B1).
+    saleValue: v.optional(v.number()),
+    saleCurrency: v.optional(v.string()),
   })
     .index("by_conversation", ["conversationId"])
     // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics

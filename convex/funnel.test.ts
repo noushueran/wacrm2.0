@@ -432,3 +432,41 @@ test("getState for an organic conversation reports attributed:false", async () =
   expect(state.currentStage).toBe("qualified");
   expect(Object.keys(state.metaStatus)).toHaveLength(0);
 });
+
+// B1: sale value must survive a stage move off `purchased` — the
+// `funnelTransitions` log is the system of record, and the denormalized
+// `conversation.funnel` value should carry forward rather than vanish.
+test("setStage purchased records saleValue/saleCurrency on the funnelTransitions audit row", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Sam", email: "sam@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { lane: "ctwa", identifier: "clid-sv1", assignedToUserId: userId });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "purchased", saleValue: 4200 });
+
+  const trans = await transitionsFor(t, conversationId);
+  const purchaseTr = trans.find((x) => x.stage === "purchased");
+  expect(purchaseTr?.saleValue).toBe(4200);
+  expect(purchaseTr?.saleCurrency).toBe("AED"); // account defaultCurrency
+});
+
+test("moving a purchased conversation to another stage PRESERVES funnel.saleValue (merge, don't drop)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, { name: "Tia", email: "tia@example.com", role: "agent" });
+  const { conversationId } = await seedConv(t, accountId, { assignedToUserId: userId });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "purchased", saleValue: 3000 });
+  // Reopen to a working stage — no saleValue supplied this time.
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "price_quoted" });
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("price_quoted");
+  expect(conv?.funnel?.saleValue).toBe(3000); // preserved, not dropped
+  expect(conv?.funnel?.saleCurrency).toBe("AED");
+
+  // The original purchase transition row remains the durable record of the
+  // amount, unaffected by the later stage move.
+  const trans = await transitionsFor(t, conversationId);
+  const purchaseTr = trans.find((x) => x.stage === "purchased");
+  expect(purchaseTr?.saleValue).toBe(3000);
+  expect(purchaseTr?.saleCurrency).toBe("AED");
+});
