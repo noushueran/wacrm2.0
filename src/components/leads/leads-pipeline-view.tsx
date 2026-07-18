@@ -111,10 +111,18 @@ export function LeadsPipelineView<L extends PipelineLead>({
 
   const [dragId, setDragId] = useState<string | null>(null);
   const [overStage, setOverStage] = useState<PipelineStageKey | null>(null);
-  const [openLead, setOpenLead] = useState<L | null>(null);
+  // The open-card dialog tracks the lead's ID, not the object — the board
+  // payload refreshes reactively after every mutation, and the dialog must
+  // re-render from the FRESH row (a stored snapshot would go stale the
+  // moment a checklist item is ticked).
+  const [openLeadId, setOpenLeadId] = useState<string | null>(null);
   const [lossFor, setLossFor] = useState<L | null>(null);
   const [valueFor, setValueFor] = useState<L | null>(null);
   const [valueText, setValueText] = useState('');
+  const openLead = useMemo(
+    () => (openLeadId ? (leads.find((l) => l.sessionId === openLeadId) ?? null) : null),
+    [leads, openLeadId],
+  );
 
   const grouped = useMemo(() => groupLeadsByStage(leads), [leads]);
   const deals = useMemo(
@@ -246,7 +254,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
                               'group cursor-pointer whitespace-normal rounded-lg border border-border bg-card p-2.5 shadow-sm transition-shadow hover:shadow',
                               dragId === lead.sessionId && 'opacity-50',
                             )}
-                            onClick={() => setOpenLead(lead)}
+                            onClick={() => setOpenLeadId(lead.sessionId)}
                           >
                             <div className="flex items-start gap-2">
                               {canEdit ? (
@@ -358,7 +366,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
       )}
 
       {/* Card dialog: the full lead detail + checklist. */}
-      <Dialog open={openLead !== null} onOpenChange={(next) => !next && setOpenLead(null)}>
+      <Dialog open={openLead !== null} onOpenChange={(next) => !next && setOpenLeadId(null)}>
         <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-3xl">
           {openLead ? (
             <>
