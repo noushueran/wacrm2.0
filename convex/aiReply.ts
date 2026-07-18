@@ -1,4 +1,10 @@
-import { action, internalAction, internalMutation, internalQuery } from "./_generated/server";
+import {
+  action,
+  internalAction,
+  internalMutation,
+  internalQuery,
+  type ActionCtx,
+} from "./_generated/server";
 import { internal } from "./_generated/api";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
@@ -6,6 +12,7 @@ import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
+import { landingUrlKey, type AdContext } from "./lib/ai/adContext";
 import { latestUserMessage } from "./lib/ai/query";
 import {
   AI_VISIBLE_MEDIA_TYPES,
@@ -436,6 +443,50 @@ export const markMessageAiGenerated = internalMutation({
   },
 });
 
+/**
+ * Ad-aware context for a conversation that began from a Click-to-
+ * WhatsApp ad: the `conversation.adReferral` denorm (headline / ad text
+ * / link) plus the cached landing-page extraction behind that link
+ * (`adLandingPages`). Ensures the cache lazily — ingest already warms it
+ * for new ad clicks, but threads that predate the prefetch hook (or a
+ * lost race) get their fetch here, bounded by `ensureFresh`'s own
+ * timeout. Best-effort by contract: any failure just means the reply
+ * goes out without ad grounding, exactly as before this feature.
+ * `undefined` on a non-ad conversation — zero extra reads, prompt
+ * byte-identical to pre-feature behaviour.
+ */
+async function loadAdContext(
+  ctx: ActionCtx,
+  accountId: Id<"accounts">,
+  conversation: Doc<"conversations">,
+): Promise<AdContext | undefined> {
+  const ref = conversation.adReferral;
+  if (!ref || (!ref.headline && !ref.body && !ref.sourceUrl)) return undefined;
+  const adContext: AdContext = {
+    headline: ref.headline,
+    body: ref.body,
+    sourceUrl: ref.sourceUrl,
+  };
+  const urlKey = ref.sourceUrl ? landingUrlKey(ref.sourceUrl) : null;
+  if (ref.sourceUrl && urlKey) {
+    try {
+      await ctx.runAction(internal.adLanding.ensureFresh, {
+        accountId,
+        url: ref.sourceUrl,
+      });
+      const landing = await ctx.runQuery(internal.adLanding.get, { accountId, urlKey });
+      if (landing) {
+        adContext.landingTitle = landing.title;
+        adContext.landingDescription = landing.description;
+        adContext.landingContent = landing.content;
+      }
+    } catch (err) {
+      console.warn("[ai reply] ad landing context failed:", err);
+    }
+  }
+  return adContext;
+}
+
 // ------------------------------------------------------------
 // Dispatch — the public entry point.
 // ------------------------------------------------------------
@@ -631,11 +682,17 @@ export const dispatchInbound = internalAction({
       );
       if (teamAnswers.notes.length > 0) knowledge = [...knowledge, ...teamAnswers.notes];
 
+      // Ad-aware grounding (CTWA): what the customer clicked + what the
+      // ad links to — so the FIRST reply can greet with the actual
+      // package instead of a blind "how can I help?".
+      const adContext = await loadAdContext(ctx, args.accountId, conversation);
+
       const systemPrompt = buildSystemPrompt({
         userPrompt: config.systemPrompt ?? null,
         mode: "auto_reply",
         knowledge,
         qualification: qualification ?? undefined,
+        adContext,
       });
 
       const generation: GenerateResult = isDryRun()
@@ -967,10 +1024,15 @@ export const draft = action({
       knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, { accountId, queryText });
     }
 
+    // Same ad-aware grounding the auto-reply gets — an agent drafting
+    // the first reply to an ad lead wants the package context too.
+    const adContext = await loadAdContext(ctx, accountId, conversation);
+
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt ?? null,
       mode: "draft",
       knowledge,
+      adContext,
     });
 
     let generation: GenerateResult;

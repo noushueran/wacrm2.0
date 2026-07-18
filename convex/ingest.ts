@@ -632,6 +632,23 @@ export const processInbound = internalAction({
       });
     }
 
+    // ---- Ad landing-page prefetch (ad-aware AI replies) ----
+    // The referral's `source_url` is the page the ad linked out to — the
+    // thing that actually names the package the customer clicked. Warm
+    // `adLandingPages` now so the AI dispatch (one debounce away) finds
+    // the extraction ready and the FIRST reply can greet with the actual
+    // offer. Scheduled, not awaited — ingest latency stays flat, and the
+    // dispatch side re-ensures lazily anyway if this loses the race.
+    const adLandingUrl = message.referral?.sourceUrl;
+    if (adLandingUrl) {
+      await runBestEffort("adLanding.ensureFresh", () =>
+        ctx.scheduler.runAfter(0, internal.adLanding.ensureFresh, {
+          accountId,
+          url: adLandingUrl,
+        }),
+      );
+    }
+
     // ---- Qualification session tracking (P0 — spec §6). Every
     // non-duplicate inbound counts as customer activity: upsert the
     // session and bump the 24h/72h clocks BEFORE the reply engines run,

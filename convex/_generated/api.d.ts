@@ -9,6 +9,7 @@
  */
 
 import type * as accounts from "../accounts.js";
+import type * as adLanding from "../adLanding.js";
 import type * as adReferrals from "../adReferrals.js";
 import type * as aiConfig from "../aiConfig.js";
 import type * as aiKnowledge from "../aiKnowledge.js";
@@ -40,6 +41,7 @@ import type * as http from "../http.js";
 import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
 import type * as leadCharges from "../leadCharges.js";
+import type * as lib_ai_adContext from "../lib/ai/adContext.js";
 import type * as lib_ai_chunk from "../lib/ai/chunk.js";
 import type * as lib_ai_classify from "../lib/ai/classify.js";
 import type * as lib_ai_context from "../lib/ai/context.js";
@@ -117,6 +119,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   accounts: typeof accounts;
+  adLanding: typeof adLanding;
   adReferrals: typeof adReferrals;
   aiConfig: typeof aiConfig;
   aiKnowledge: typeof aiKnowledge;
@@ -148,6 +151,7 @@ declare const fullApi: ApiFromModules<{
   ingest: typeof ingest;
   invitations: typeof invitations;
   leadCharges: typeof leadCharges;
+  "lib/ai/adContext": typeof lib_ai_adContext;
   "lib/ai/chunk": typeof lib_ai_chunk;
   "lib/ai/classify": typeof lib_ai_classify;
   "lib/ai/context": typeof lib_ai_context;

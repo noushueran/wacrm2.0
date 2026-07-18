@@ -1054,3 +1054,93 @@ test("draft allows an agent on an unassigned (pool) conversation", async () => {
   const result = await asCarl.action(api.aiReply.draft, { conversationId });
   expect(result).toMatchObject({ code: "ai_not_configured" });
 });
+
+// ============================================================
+// Ad-aware replies (CTWA lead-source grounding)
+// ============================================================
+
+// End-to-end through `dispatchInbound`: an ad-lead conversation (the
+// `adReferral` denorm ingest writes) still replies normally AND lazily
+// warms the `adLandingPages` cache for the ad's link — the observable
+// half of `loadAdContext`. The prompt-side rendering is asserted in
+// `lib/ai/adContext.test.ts`; the fetch itself is `CONVEX_AI_DRY_RUN`-
+// synthetic here (see `adLanding.ts`).
+test("an ad-lead conversation replies AND warms the landing cache lazily", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Ada",
+    email: "ada@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551230000",
+    messageText: "Hi",
+  });
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversationId, {
+      adReferral: {
+        headline: "Georgia Summer Package",
+        body: "5 nights from AED 1299",
+        sourceUrl: "https://holidayys.co/packages/georgia-summer?fbclid=click-1",
+        sourceType: "ad" as const,
+        startedAt: Date.now(),
+      },
+    });
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0]!.contentText).toBeTruthy();
+
+  const landingRows = await t.run((ctx) =>
+    ctx.db
+      .query("adLandingPages")
+      .withIndex("by_account_url", (q) =>
+        q
+          .eq("accountId", accountId)
+          .eq("urlKey", "https://holidayys.co/packages/georgia-summer"),
+      )
+      .collect(),
+  );
+  expect(landingRows).toHaveLength(1);
+  expect(landingRows[0]!.status).toBe("ok");
+}, 15_000);
+
+// A referral WITHOUT a usable link still replies (context is just the
+// ad text) and never touches the landing cache.
+test("an ad-lead conversation with no source_url replies without a landing row", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Ben",
+    email: "ben@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551231111",
+    messageText: "Hi",
+  });
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversationId, {
+      adReferral: {
+        headline: "Georgia Summer Package",
+        sourceType: "ad" as const,
+        startedAt: Date.now(),
+      },
+    });
+  });
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  const landingRows = await t.run((ctx) => ctx.db.query("adLandingPages").collect());
+  expect(landingRows).toHaveLength(0);
+});

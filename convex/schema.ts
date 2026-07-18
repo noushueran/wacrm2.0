@@ -1515,6 +1515,28 @@ export default defineSchema({
     .index("by_contact", ["contactId"])
     .index("by_wamid", ["waMessageId"]),
 
+  // Landing-page context cache for ad-aware AI replies: one row per
+  // (account, normalized ad `source_url`). Warmed from ingest when a
+  // CTWA referral carries a link; read (and lazily re-warmed) by
+  // `aiReply`'s `loadAdContext` so the assistant's first reply can name
+  // the actual offer behind the ad. Content fields hold the LAST GOOD
+  // extraction — a failed refresh flips `status` to "error" but keeps
+  // them, so a temporarily-down page doesn't blank context the
+  // assistant already had. Never user-facing.
+  adLandingPages: defineTable({
+    accountId: v.id("accounts"),
+    urlKey: v.string(), // normalized url — lib/ai/adContext.ts's `landingUrlKey`
+    url: v.string(), // original source_url as last fetched
+    status: v.union(v.literal("pending"), v.literal("ok"), v.literal("error")),
+    title: v.optional(v.string()),
+    description: v.optional(v.string()),
+    content: v.optional(v.string()), // extracted text, ≤ LANDING_CONTENT_MAX
+    finalUrl: v.optional(v.string()), // post-redirect URL actually parsed
+    error: v.optional(v.string()), // last failure, for ops eyeballing
+    fetchStartedAt: v.number(), // claim clock — `claimFetch` takeover gate
+    fetchedAt: v.optional(v.number()), // completion clock — freshness gate
+  }).index("by_account_url", ["accountId", "urlKey"]),
+
   // Resolution cache: one row per (account, adId). Names change rarely.
   // Written `pending` at capture; resolved via Marketing API in `resolveAd`.
   campaignAds: defineTable({
