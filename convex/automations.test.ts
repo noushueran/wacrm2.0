@@ -1020,3 +1020,58 @@ test("logs respects the limit argument", async () => {
   const limited = await asUser.query(api.automations.logs, { limit: 2 });
   expect(limited).toHaveLength(2);
 });
+
+/**
+ * Seeds three logs for `A` (oldest → newest) plus one for `B` that must never
+ * appear in A's results. Shared by the two filtered-branch tests below, which
+ * pin the ordering and the limit of the `automationId`-filtered read — neither
+ * was covered, and both are contracts the `by_account_automation` index has to
+ * preserve. Note the older sibling test asserts "newest-first" in its name but
+ * `.sort()`s both sides, so it does not actually constrain order; these do.
+ */
+async function seedFilteredLogFixture(t: ReturnType<typeof convexTest>) {
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const automationA = await asUser.mutation(api.automations.create, {
+    name: "A",
+    triggerType: "new_message_received",
+  });
+  const automationB = await asUser.mutation(api.automations.create, {
+    name: "B",
+    triggerType: "new_message_received",
+  });
+  const oldest = await seedLog(t, { accountId, automationId: automationA });
+  const middle = await seedLog(t, { accountId, automationId: automationA });
+  const newest = await seedLog(t, { accountId, automationId: automationA });
+  await seedLog(t, { accountId, automationId: automationB });
+
+  return { asUser, automationA, oldest, middle, newest };
+}
+
+test("logs returns the automationId-filtered branch newest-first", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, automationA, oldest, middle, newest } =
+    await seedFilteredLogFixture(t);
+
+  const rows = await asUser.query(api.automations.logs, {
+    automationId: automationA,
+  });
+
+  expect(rows.map((l) => l._id)).toEqual([newest, middle, oldest]);
+});
+
+test("logs applies the limit to the automationId-filtered branch", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, automationA, middle, newest } =
+    await seedFilteredLogFixture(t);
+
+  const rows = await asUser.query(api.automations.logs, {
+    automationId: automationA,
+    limit: 2,
+  });
+
+  expect(rows.map((l) => l._id)).toEqual([newest, middle]);
+});

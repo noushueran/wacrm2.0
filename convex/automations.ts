@@ -514,10 +514,18 @@ export const remove = accountMutation({
       await ctx.db.delete(step._id);
     }
 
+    // Ranged on `by_account_automation` rather than filtering an account-wide
+    // scan: `.filter()` applies after the index scan, so the old form read
+    // every log row in the account to find this automation's. Still unbounded
+    // in the number of logs THIS automation produced — an automation with more
+    // rows than Convex's per-transaction write limit cannot be deleted at all.
+    // Draining that in scheduled batches is a separate change; the read bound
+    // is what this one fixes.
     const logs = await ctx.db
       .query("automationLogs")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .filter((q) => q.eq(q.field("automationId"), args.automationId))
+      .withIndex("by_account_automation", (q) =>
+        q.eq("accountId", ctx.accountId).eq("automationId", args.automationId),
+      )
       .collect();
     for (const log of logs) {
       await ctx.db.delete(log._id);
@@ -562,6 +570,25 @@ export const duplicate = accountMutation({
   },
 });
 
+/**
+ * Newest-first log history for the account, optionally narrowed to one
+ * automation.
+ *
+ * `limit` bounds the READ, not just the payload. The previous form collected
+ * the whole account partition and then `.slice(0, limit)`d it in JS, so the
+ * argument capped what was returned while the query still read every log row
+ * the account had ever written — the same "the cap is on the payload, not the
+ * scan" mistake that took `/settings?tab=cron` down (143d66c). `.take(limit)`
+ * on an unfiltered range is a true read bound: exactly that many documents.
+ *
+ * The filtered branch ranges `automationId` on `by_account_automation` instead
+ * of testing it in a `.filter()`, which would not have narrowed the scan — and
+ * with `.take()` in front of it would have been strictly worse than the old
+ * `.collect()`, since `.take(n)` stops after n *matches* and would walk the
+ * whole partition whenever an automation had fewer than `limit` logs. Both
+ * branches keep `accountId` as the index prefix, so tenancy stays enforced by
+ * the index rather than by a post-scan predicate.
+ */
 export const logs = accountQuery({
   args: {
     automationId: v.optional(v.id("automations")),
@@ -569,16 +596,22 @@ export const logs = accountQuery({
   },
   handler: async (ctx, args) => {
     const limit = args.limit ?? 100;
-    const base = ctx.db
+    const { automationId } = args;
+
+    if (automationId !== undefined) {
+      return await ctx.db
+        .query("automationLogs")
+        .withIndex("by_account_automation", (q) =>
+          q.eq("accountId", ctx.accountId).eq("automationId", automationId),
+        )
+        .order("desc")
+        .take(limit);
+    }
+
+    return await ctx.db
       .query("automationLogs")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
-      .order("desc");
-
-    const rows =
-      args.automationId !== undefined
-        ? await base.filter((q) => q.eq(q.field("automationId"), args.automationId)).collect()
-        : await base.collect();
-
-    return rows.slice(0, limit);
+      .order("desc")
+      .take(limit);
   },
 });

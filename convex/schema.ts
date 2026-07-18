@@ -876,7 +876,18 @@ export default defineSchema({
       v.literal("failed"),
     ),
     errorMessage: v.optional(v.string()),
-  }).index("by_account", ["accountId"]),
+  })
+    .index("by_account", ["accountId"])
+    // `logs` (filtered by automation) and `remove`'s cascade both want one
+    // automation's rows. On `by_account` alone that is a scan of the
+    // account's ENTIRE log history with an `automationId` `.filter()`
+    // applied afterwards — and a Convex `.filter()` does not narrow what is
+    // read. This table grows with every automation execution, so it is the
+    // fastest-growing per-account table once automations see real use.
+    // Keeping `accountId` as the prefix leaves tenancy enforced by the index
+    // itself rather than by a post-scan predicate, so a foreign
+    // `automationId` still yields nothing.
+    .index("by_account_automation", ["accountId", "automationId"]),
 
   // A queued resume point created when a running automation hits a
   // `wait` step. The cron endpoint (`/api/automations/cron`) drains
