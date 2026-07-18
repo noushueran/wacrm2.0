@@ -272,6 +272,200 @@ test("remove throws NOT_FOUND (not a silent no-op) for a different account's tem
 });
 
 // ============================================================
+// removeWithMeta — authed PUBLIC action (Task B8): a template with a
+// metaTemplateId must be deleted on Meta FIRST; a Meta failure must
+// leave the local row in place (no orphaned-but-hidden state). A
+// local-only template (no metaTemplateId) skips the Meta call entirely
+// — same outcome as calling `remove` directly.
+// ============================================================
+
+test("removeWithMeta throws UNAUTHENTICATED when there is no identity", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, baseTemplate);
+
+  await expect(
+    t.action(api.templates.removeWithMeta, { templateId }),
+  ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+test("removeWithMeta throws FORBIDDEN for an agent (below the supervisor floor — same as remove)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const templateId = await t.run((ctx) =>
+    ctx.db.insert("messageTemplates", {
+      accountId,
+      ...baseTemplate,
+      status: "DRAFT",
+      updatedAt: Date.now(),
+    }),
+  );
+
+  await expect(
+    asUser.action(api.templates.removeWithMeta, { templateId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("removeWithMeta throws NOT_FOUND for a different account's template, and leaves it in place", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "admin",
+  });
+  const templateId = await asAlice.mutation(api.templates.upsert, baseTemplate);
+
+  await expect(
+    asBob.action(api.templates.removeWithMeta, { templateId }),
+  ).rejects.toMatchObject({
+    data: { code: "NOT_FOUND", entity: "messageTemplate" },
+  });
+  expect(await t.run((ctx) => ctx.db.get(templateId))).not.toBeNull();
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("removeWithMeta deletes a local-only template (no metaTemplateId) without attempting a Meta call", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "DRAFT",
+  });
+
+  const fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await asUser.action(api.templates.removeWithMeta, { templateId });
+
+  expect(result).toEqual({ dryRun: false });
+  expect(await t.run((ctx) => ctx.db.get(templateId))).toBeNull();
+  expect(fetchMock).not.toHaveBeenCalled();
+
+  vi.unstubAllGlobals();
+});
+
+test("removeWithMeta in DRY-RUN deletes the local row and returns dryRun: true for a Meta-backed template", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  const result = await asUser.action(api.templates.removeWithMeta, { templateId });
+
+  expect(result).toEqual({ dryRun: true });
+  expect(await t.run((ctx) => ctx.db.get(templateId))).toBeNull();
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("removeWithMeta calls Meta by name (not the local id) before deleting a Meta-backed template locally", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(url).toBe(
+      `https://graph.facebook.com/v21.0/waba-1/message_templates?name=${baseTemplate.name}`,
+    );
+    expect(init?.method).toBe("DELETE");
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await asUser.action(api.templates.removeWithMeta, { templateId });
+
+  expect(result).toEqual({ dryRun: false });
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(await t.run((ctx) => ctx.db.get(templateId))).toBeNull();
+
+  vi.unstubAllGlobals();
+});
+
+test("removeWithMeta does NOT delete the local row when Meta rejects the delete — no orphaned-but-hidden state", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+  const templateId = await asUser.mutation(api.templates.upsert, {
+    ...baseTemplate,
+    status: "APPROVED",
+    metaTemplateId: "meta-1",
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Template not found on Meta" } }),
+          { status: 400 },
+        ),
+    ),
+  );
+
+  await expect(
+    asUser.action(api.templates.removeWithMeta, { templateId }),
+  ).rejects.toThrow(/Template not found on Meta/);
+
+  // Still live locally — never orphaned-but-hidden.
+  expect(await t.run((ctx) => ctx.db.get(templateId))).not.toBeNull();
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
 // updateStatusByMetaId
 // ============================================================
 

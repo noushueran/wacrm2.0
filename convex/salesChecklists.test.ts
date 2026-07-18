@@ -221,7 +221,7 @@ test("generateForSession with an active AI config (dry-run) posts the KB-generat
   const { accountId, asUser } = await seedAccountMember(t, { name: "Fay", email: "fay@x.com", role: "admin" });
   await asUser.mutation(api.aiConfig.upsert, {
     provider: "openai", model: "gpt-4o-mini", apiKey: "sk-test-key",
-    isActive: true, autoReplyEnabled: false, autoReplyMaxPerConversation: 3,
+    isActive: true, autoReplyEnabled: false,
   });
   const { sessionId } = await seedLead(t, { accountId });
 

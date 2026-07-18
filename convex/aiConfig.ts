@@ -64,8 +64,6 @@ export const get = accountQuery({
       systemPrompt: config.systemPrompt,
       isActive: config.isActive,
       autoReplyEnabled: config.autoReplyEnabled,
-      autoReplyMaxPerConversation: config.autoReplyMaxPerConversation,
-      handoffAgentId: config.handoffAgentId,
       hasKey: !!config.apiKey,
       hasEmbeddingsKey: !!config.embeddingsApiKey,
     };
@@ -76,12 +74,11 @@ export const get = accountQuery({
  * Admin+ creates-or-updates the caller's own account's single AI config
  * row (find via `by_account`, patch if found else insert — same idiom
  * as `whatsappConfig.upsert`/`templates.upsert`). `provider`/`model`/
- * `isActive`/`autoReplyEnabled`/`autoReplyMaxPerConversation` are
- * required on every call and always overwritten (the settings form
- * resubmits the whole state, like the POST route's own `shared` object);
- * `systemPrompt`/`handoffAgentId` are patched only when actually
- * supplied, leaving a previous value untouched when omitted (the
- * `whatsappConfig.upsert`/`templates.upsert` "omitted optional arg
+ * `isActive`/`autoReplyEnabled` are required on every call and always
+ * overwritten (the settings form resubmits the whole state, like the
+ * POST route's own `shared` object); `systemPrompt` is patched only when
+ * actually supplied, leaving a previous value untouched when omitted
+ * (the `whatsappConfig.upsert`/`templates.upsert` "omitted optional arg
  * carries no key at all" idiom — NOT the POST route's own "always
  * resend or it's cleared" behaviour, which is an HTTP-form artifact
  * this Convex counterpart doesn't need to replicate).
@@ -99,6 +96,12 @@ export const get = accountQuery({
  * a non-empty `apiKey: v.string()`, so that combination throws
  * `API_KEY_REQUIRED`, mirroring the POST route's own `return
  * bad('api_key is required')`.
+ *
+ * `autoReplyMaxPerConversation`/`handoffAgentId` are NOT accepted here
+ * (Task B7 removed the deprecated reply-cap/handoff plumbing — nothing
+ * enforced or read either anymore); both stay optional in `aiConfigs`
+ * only because old rows may still carry a value and dropping a
+ * schema field with data present fails deploy validation.
  */
 export const upsert = accountMutation({
   args: {
@@ -107,10 +110,6 @@ export const upsert = accountMutation({
     systemPrompt: v.optional(v.string()),
     isActive: v.boolean(),
     autoReplyEnabled: v.boolean(),
-    // DEPRECATED — no reply cap anymore (see schema.ts). Still accepted
-    // so an older client bundle mid-deploy can't hit a validator error.
-    autoReplyMaxPerConversation: v.optional(v.number()),
-    handoffAgentId: v.optional(v.id("users")),
     apiKey: v.optional(v.string()),
     embeddingsApiKey: v.optional(v.string()),
   },
@@ -165,10 +164,9 @@ export const upsert = accountMutation({
  * `apiKeys.lookupByHash`. Port of `loadAiConfig`'s decrypt logic
  * (`src/lib/ai/config.ts`), but WITHOUT that function's `requireActive`
  * gate: callers here (the auto-reply dispatch action) need to inspect
- * `isActive`/`autoReplyEnabled`/`autoReplyMaxPerConversation` themselves
- * to decide whether to proceed, exactly like the source's own Playground
- * path (`requireActive: false`) does — so this always returns the row
- * as configured, active or not.
+ * `isActive`/`autoReplyEnabled` themselves to decide whether to proceed,
+ * exactly like the source's own Playground path (`requireActive: false`)
+ * does — so this always returns the row as configured, active or not.
  *
  * Returns `null` when there's no config row for the account.
  * `embeddingsApiKey` decrypt failure is swallowed to `null` (a
@@ -209,8 +207,6 @@ export const loadDecrypted = internalQuery({
       systemPrompt: config.systemPrompt,
       isActive: config.isActive,
       autoReplyEnabled: config.autoReplyEnabled,
-      autoReplyMaxPerConversation: config.autoReplyMaxPerConversation,
-      handoffAgentId: config.handoffAgentId,
       embeddingsApiKey,
     };
   },

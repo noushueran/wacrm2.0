@@ -4,7 +4,7 @@ import { useMemo } from 'react';
 import { useQuery } from 'convex/react';
 import { useTranslations } from 'next-intl';
 import { format } from 'date-fns';
-import { Check, Loader2, Target } from 'lucide-react';
+import { Loader2, Target } from 'lucide-react';
 
 import { RequireRole } from '@/components/auth/require-role';
 import { useAuth } from '@/hooks/use-auth';
@@ -18,24 +18,27 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { formatCurrency } from '@/lib/currency';
 import { SettingsPanelHead } from './settings-panel-head';
 
 import { api } from '../../../convex/_generated/api';
+import type { Doc } from '../../../convex/_generated/dataModel';
 
 // ============================================================
-// ConversionsTab — Settings → Conversions (Task B7b)
+// ConversionsTab — Settings → Conversions (Task B4)
 //
-// Read-only admin view over `api.attribution.listConversions`
-// (Task B7a): every inbound WhatsApp signal this account has POSTed
-// to Platform A, tallied by match result (the "funnel"), plus the
-// matched rows themselves — each one a lead whose WhatsApp message
-// carried an attribution identifier Platform A confirmed against a
-// real booking. Newest-`firedAt`-first, capped at 200 server-side.
+// Read-only admin view over `api.conversionEvents.listRecent`: the most
+// recent rows of the live funnel conversion outbox (Meta CAPI / Platform A
+// pixel), newest first, capped server-side. Replaces the old
+// `api.attribution.listConversions` view over `attributionSignals` — a
+// table with NO remaining writers (the pipeline moved to
+// `conversionEvents` when the funnel shipped, Task B5 deletes the dead
+// write path) — which showed frozen historical rows forever.
 //
 // The query is `ctx.requireRole("admin")`-gated (it returns raw lead
-// phone numbers), so this tab mirrors the same admin+ gate on two
-// layers, exactly like `members-tab.tsx` / `whatsapp-config.tsx` /
-// `api-keys-settings.tsx`:
+// phone numbers, same as the query it replaces), so this tab mirrors the
+// same admin+ gate on two layers, exactly like `members-tab.tsx` /
+// `whatsapp-config.tsx` / `api-keys-settings.tsx`:
 //   1. Page-level: `'conversions'` is in `CRITICAL_SECTIONS`
 //      (`src/lib/auth/roles.ts`), so `canAccessSettingsSection`
 //      redirects anyone below admin away from `?tab=conversions`
@@ -52,55 +55,46 @@ const LANE_BADGE_CLASS: Record<'code' | 'ctwa', string> = {
   ctwa: 'border-primary/40 bg-primary/10 text-primary',
 };
 
-const EMPTY_COUNTS = {
-  total: 0,
-  matched: 0,
-  pending: 0,
-  unmatched: 0,
-  error: 0,
-  // Kept in shape-parity with `listConversions`'s server-side `counts`
-  // (which tallies retired signals) so the `?? EMPTY_COUNTS` fallback
-  // type matches. Not surfaced as its own funnel tile today.
-  abandoned: 0,
+// Exhaustive over `conversionEvents.status` (not `Record<string, ...>`), so
+// adding a literal to the schema union is a compile error here rather than a
+// blank badge — exactly how the 6th member (`"dormant"`, the backend-env-
+// unconfigured parking state) was caught when it landed.
+type ConversionEventStatus = Doc<'conversionEvents'>['status'];
+const STATUS_BADGE_CLASS: Record<ConversionEventStatus, string> = {
+  sent: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400',
+  pending: 'border-amber-500/40 bg-amber-500/10 text-amber-400',
+  unmatched: 'border-slate-500/40 bg-slate-500/10 text-slate-400',
+  error: 'border-destructive/40 bg-destructive/10 text-destructive',
+  abandoned: 'border-muted-foreground/30 bg-muted text-muted-foreground',
+  dormant: 'border-indigo-500/40 bg-indigo-500/10 text-indigo-400',
 };
 
 function fmtDateTime(ms: number): string {
   // Extends the "MMM d" short-month style `fmtDate` helpers use
-  // elsewhere in settings (members-tab.tsx, api-keys-settings.tsx)
-  // with a time-of-day component, via date-fns, since `firedAt` is a
+  // elsewhere in settings (members-tab.tsx, api-keys-settings.tsx) with
+  // a time-of-day component, via date-fns, since `createdAt` is a
   // precise event rather than just a day.
   return format(new Date(ms), 'MMM d, yyyy · HH:mm');
 }
 
 export function ConversionsTab() {
   const t = useTranslations('Settings.conversions');
+  // Reuses the funnel stage labels the inbox stepper already carries
+  // (`Inbox.funnel.stage.*`) rather than duplicating them here —
+  // `conversionEvents.stage` is the same 7-stage union minus `lost`
+  // (a lost deal is never reported to Meta).
+  const tFunnel = useTranslations('Inbox.funnel');
   const { canEditCriticalSettings } = useAuth();
 
   // Admin+ only — same "skip client-side rather than round-trip into
   // a guaranteed FORBIDDEN" pattern `members-tab.tsx` uses for
   // `api.invitations.list`.
-  const result = useQuery(
-    api.attribution.listConversions,
+  const rows = useQuery(
+    api.conversionEvents.listRecent,
     canEditCriticalSettings ? {} : 'skip',
   );
-  const loading = result === undefined;
-
-  const counts = result?.counts ?? EMPTY_COUNTS;
-  const conversions = result?.conversions ?? [];
-  const matchRate =
-    counts.total > 0 ? Math.round((counts.matched / counts.total) * 100) : 0;
-
-  const stats = useMemo(
-    () => [
-      { key: 'sent' as const, value: counts.total.toLocaleString() },
-      { key: 'matched' as const, value: counts.matched.toLocaleString() },
-      { key: 'matchRate' as const, value: `${matchRate}%` },
-      { key: 'pending' as const, value: counts.pending.toLocaleString() },
-      { key: 'unmatched' as const, value: counts.unmatched.toLocaleString() },
-      { key: 'error' as const, value: counts.error.toLocaleString() },
-    ],
-    [counts, matchRate],
-  );
+  const loading = rows === undefined;
+  const events = useMemo(() => rows ?? [], [rows]);
 
   return (
     <RequireRole min="admin">
@@ -111,93 +105,69 @@ export function ConversionsTab() {
           <div className="flex items-center justify-center py-12">
             <Loader2 className="size-6 animate-spin text-primary" />
           </div>
+        ) : events.length === 0 ? (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-10 text-center">
+              <Target className="size-6 text-muted-foreground" />
+              <p className="mt-2 text-sm text-muted-foreground">{t('empty')}</p>
+            </CardContent>
+          </Card>
         ) : (
-          <>
-            {/* Funnel / summary */}
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-              {stats.map((stat) => (
-                <div
-                  key={stat.key}
-                  className="rounded-xl border border-border bg-card p-4"
-                >
-                  <p className="text-xs font-medium text-muted-foreground">
-                    {t(`funnel.${stat.key}`)}
-                  </p>
-                  <p className="mt-1.5 text-2xl leading-none font-bold tabular-nums text-foreground">
-                    {stat.value}
-                  </p>
-                </div>
-              ))}
-            </div>
-
-            {/* Table */}
-            {conversions.length === 0 ? (
-              <Card>
-                <CardContent className="flex flex-col items-center justify-center py-10 text-center">
-                  <Target className="size-6 text-muted-foreground" />
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    {t('empty')}
-                  </p>
-                </CardContent>
-              </Card>
-            ) : (
-              <Card>
-                <CardContent className="p-0">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>{t('columns.phone')}</TableHead>
-                        <TableHead>{t('columns.identifier')}</TableHead>
-                        <TableHead>{t('columns.lane')}</TableHead>
-                        <TableHead>{t('columns.offer')}</TableHead>
-                        <TableHead>{t('columns.time')}</TableHead>
-                        <TableHead className="text-center">
-                          {t('columns.fired')}
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {conversions.map((row) => (
-                        <TableRow key={row.id}>
-                          <TableCell className="font-medium text-foreground">
-                            +{row.phone}
-                          </TableCell>
-                          <TableCell className="text-muted-foreground">
-                            <span
-                              className="block max-w-[220px] truncate"
-                              title={row.identifier}
-                            >
-                              {row.identifier}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <Badge
-                              variant="outline"
-                              className={LANE_BADGE_CLASS[row.lane]}
-                            >
-                              {t(`lane.${row.lane}`)}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="text-muted-foreground">
-                            {row.offerSlug ?? '—'}
-                          </TableCell>
-                          <TableCell className="text-muted-foreground">
-                            {fmtDateTime(row.firedAt ?? row.firstMessageAt)}
-                          </TableCell>
-                          <TableCell className="text-center">
-                            <Check
-                              className="mx-auto size-4 text-emerald-500"
-                              aria-label={t('columns.fired')}
-                            />
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </CardContent>
-              </Card>
-            )}
-          </>
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{t('columns.contact')}</TableHead>
+                    <TableHead>{t('columns.lane')}</TableHead>
+                    <TableHead>{t('columns.stage')}</TableHead>
+                    <TableHead>{t('columns.eventName')}</TableHead>
+                    <TableHead>{t('columns.status')}</TableHead>
+                    <TableHead className="text-center">{t('columns.attempts')}</TableHead>
+                    <TableHead className="text-right">{t('columns.value')}</TableHead>
+                    <TableHead>{t('columns.createdAt')}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {events.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell className="font-medium text-foreground">
+                        <div className="max-w-[200px] truncate">{row.contactName ?? '—'}</div>
+                        <div className="text-xs font-normal text-muted-foreground">+{row.phone}</div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className={LANE_BADGE_CLASS[row.lane]}>
+                          {t(`lane.${row.lane}`)}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {tFunnel(`stage.${row.stage}`)}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        <span className="block max-w-[160px] truncate" title={row.eventName}>
+                          {row.eventName}
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className={STATUS_BADGE_CLASS[row.status]}>
+                          {t(`status.${row.status}`)}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-center tabular-nums text-muted-foreground">
+                        {row.attempts}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums text-foreground">
+                        {row.value !== undefined ? formatCurrency(row.value, row.currency) : '—'}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {fmtDateTime(row.createdAt)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
         )}
       </section>
     </RequireRole>

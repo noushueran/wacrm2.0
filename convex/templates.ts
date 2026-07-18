@@ -308,6 +308,78 @@ export const remove = accountMutation({
   },
 });
 
+/**
+ * Server-only, id-scoped delete for `removeWithMeta`'s two "safe to
+ * delete now" paths (Meta call succeeded, or there was never one to
+ * make) — mirrors `getInternal`'s own "internal, no auth, caller already
+ * checked" convention, same shape as `applyEditSuccessInternal`/
+ * `applyEditFailureInternal` for the edit path.
+ */
+export const removeInternal = internalMutation({
+  args: { templateId: v.id("messageTemplates") },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.templateId);
+  },
+});
+
+/**
+ * Delete a template — Meta-first when it has a `metaTemplateId` (Task
+ * B8: `confirmDelete`'s old TODO only ever removed the local row,
+ * leaving a Meta-submitted template live on Meta forever). No source
+ * route to port from — the pre-Convex app never had a delete-on-Meta
+ * path either (the same gap this task closes).
+ *
+ * Auth + "supervisor" role (same floor as `remove`) → load the target
+ * row and assert the caller's own account owns it → if it has a
+ * `metaTemplateId`, call `metaTemplates.deleteOnMeta` FIRST, by `name`
+ * (Meta's delete-by-name endpoint removes every language variant in one
+ * call — there's no per-language delete to scope by the row's own
+ * language) → ON FAILURE the Meta error propagates and `removeInternal`
+ * is never called, so the row stays exactly as it was: still visible
+ * locally, still live on Meta — better that than a delete that vanishes
+ * the local row while the template keeps sending on Meta (orphaned but
+ * hidden). Only once Meta confirms (or DRY-RUN, or there was no
+ * `metaTemplateId` to begin with — the "local-only templates keep the
+ * current direct path" case) does `removeInternal` run.
+ */
+export const removeWithMeta = action({
+  args: { templateId: v.id("messageTemplates") },
+  handler: async (ctx, args): Promise<{ dryRun: boolean }> => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new ConvexError({ code: "UNAUTHENTICATED" });
+
+    const context = await ctx.runQuery(internal.accounts.accountContextForUser, {
+      userId,
+    });
+    if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
+    if (!hasMinRole(context.role, "supervisor")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "supervisor" });
+    }
+    const { accountId } = context;
+
+    const template = await ctx.runQuery(internal.templates.getInternal, {
+      templateId: args.templateId,
+    });
+    if (!template || template.accountId !== accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "messageTemplate" });
+    }
+
+    let dryRun = false;
+    if (template.metaTemplateId) {
+      const meta = await ctx.runAction(internal.metaTemplates.deleteOnMeta, {
+        accountId,
+        name: template.name,
+      });
+      dryRun = meta.dryRun;
+    }
+
+    await ctx.runMutation(internal.templates.removeInternal, {
+      templateId: args.templateId,
+    });
+    return { dryRun };
+  },
+});
+
 type TemplateStatus = NonNullable<Doc<"messageTemplates">["status"]>;
 
 const TEMPLATE_STATUS_VALUES: ReadonlySet<string> = new Set([

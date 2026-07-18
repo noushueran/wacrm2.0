@@ -7,6 +7,7 @@ import { decrypt } from "./lib/whatsappEncryption";
 import {
   submitMessageTemplate,
   editMessageTemplate,
+  deleteMessageTemplate,
   listMessageTemplates,
   type MetaTemplateButtonRaw,
   type MetaTemplateComponentRaw,
@@ -21,25 +22,29 @@ import { normalizeTemplateStatus } from "./templates";
 // ============================================================
 // Meta TEMPLATE management (Phase 8, Task 4) — create a message
 // template on the WABA (`submitToMeta`), list every template already on
-// the WABA (`syncFromMeta`), and edit an already-submitted template by
-// its `metaTemplateId`/hsm_id (`editOnMeta`, template-EDIT task). Each
-// is its own Graph API surface: `POST /{waba-id}/message_templates`
-// (create), `GET /{waba-id}/message_templates` (list), and
-// `POST /{message_template_id}` (edit) — vs. `convex/metaSend.ts`'s
-// `/{phone-number-id}/messages`. All three mirror that file's own "load
-// config, decrypt, POST/GET — unless CONVEX_META_DRY_RUN, then a
-// synthetic result" shape. Convex port of `src/app/api/whatsapp/
-// templates/{submit,sync}/route.ts` and `.../templates/[id]/route.ts`'s
-// PATCH handler.
+// the WABA (`syncFromMeta`), edit an already-submitted template by its
+// `metaTemplateId`/hsm_id (`editOnMeta`, template-EDIT task), and delete
+// one by name (`deleteOnMeta`, Task B8). Each is its own Graph API
+// surface: `POST /{waba-id}/message_templates` (create),
+// `GET /{waba-id}/message_templates` (list),
+// `POST /{message_template_id}` (edit), and
+// `DELETE /{waba-id}/message_templates?name={name}` (delete) — vs.
+// `convex/metaSend.ts`'s `/{phone-number-id}/messages`. All four mirror
+// that file's own "load config, decrypt, POST/GET/DELETE — unless
+// CONVEX_META_DRY_RUN, then a synthetic result" shape. Convex port of
+// `src/app/api/whatsapp/templates/{submit,sync}/route.ts` and
+// `.../templates/[id]/route.ts`'s PATCH handler (delete had no source
+// route to port — see `templates.ts`'s `removeWithMeta` docstring).
 //
 // Every action here is an `internalAction`: it takes a caller-supplied
 // `accountId` (no user session) and does nothing but talk to Meta — the
 // public, authed wrappers (`templates.submit`/`templates.syncFromMeta`/
-// `templates.editSubmit` in `convex/templates.ts`) derive + role-check
-// the caller's account first, then persist the result via
-// `templates.upsertInternal` (create/sync) or `templates
-// .applyEditSuccessInternal`/`applyEditFailureInternal` (edit). This
-// module never touches `ctx.db`.
+// `templates.editSubmit`/`templates.removeWithMeta` in `convex/
+// templates.ts`) derive + role-check the caller's account first, then
+// persist the result via `templates.upsertInternal` (create/sync),
+// `templates.applyEditSuccessInternal`/`applyEditFailureInternal`
+// (edit), or `templates.removeInternal` (delete). This module never
+// touches `ctx.db`.
 // ============================================================
 
 function isDryRun(): boolean {
@@ -237,6 +242,36 @@ export const editOnMeta = internalAction({
       accessToken,
       components: payload.components,
     });
+    return { dryRun: false };
+  },
+});
+
+// ============================================================
+// deleteOnMeta — delete a message template (Task B8: template delete
+// must delete on Meta too). Convex counterpart to
+// `templates.removeWithMeta`'s Meta-call half.
+// ============================================================
+
+/**
+ * Delete every language variant of a message template from Meta by
+ * `name` — a WABA-scoped call (`DELETE /{waba_id}/message_templates
+ * ?name={name}`), unlike `editOnMeta`'s id-scoped
+ * `POST /{message_template_id}`, so this needs `loadWabaConfig`
+ * (wabaId + token), not just the access token. DRY-RUN
+ * (`CONVEX_META_DRY_RUN`) skips the network call entirely, mirroring
+ * `submitToMeta`/`editOnMeta`'s own short-circuit — lets
+ * `templates.removeWithMeta`'s tests (and local dev) exercise the full
+ * delete-on-Meta-then-delete-locally flow without a live Meta app.
+ */
+export const deleteOnMeta = internalAction({
+  args: { accountId: v.id("accounts"), name: v.string() },
+  handler: async (ctx, args): Promise<{ dryRun: boolean }> => {
+    if (isDryRun()) {
+      return { dryRun: true };
+    }
+
+    const { wabaId, accessToken } = await loadWabaConfig(ctx, args.accountId);
+    await deleteMessageTemplate({ wabaId, accessToken, name: args.name });
     return { dryRun: false };
   },
 });

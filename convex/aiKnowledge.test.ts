@@ -145,7 +145,6 @@ const BASE_AI_CONFIG_ARGS = {
   model: "gpt-4o-mini",
   isActive: true,
   autoReplyEnabled: false,
-  autoReplyMaxPerConversation: 3,
 };
 
 /** Configures the caller's account with BOTH a chat key and an

@@ -689,16 +689,15 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
  *  is the server-only DECRYPTED shape with a plaintext `apiKey`, the
  *  wrong shape entirely for a UI adapter to even reference — so, like
  *  `ApiKeyView` above, this UI-facing type is declared here instead.
- *  `handoffAgentId` is narrowed to a plain `string` (not `Id<"users">`)
- *  to match every other adapter's convention of exposing id fields as
- *  plain strings on their UI-facing type (e.g. `Contact.user_id`). */
+ *  `autoReplyMaxPerConversation`/`handoffAgentId` are NOT part of this
+ *  view (Task B7 removed the deprecated reply-cap/handoff plumbing —
+ *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`). */
 export interface AiConfigView {
   provider: "openai" | "anthropic";
   model: string;
   systemPrompt: string | null;
   isActive: boolean;
   autoReplyEnabled: boolean;
-  handoffAgentId: string | null;
   hasKey: boolean;
   hasEmbeddingsKey: boolean;
 }
@@ -709,8 +708,6 @@ export function toUiAiConfig(config: {
   systemPrompt: string | undefined;
   isActive: boolean;
   autoReplyEnabled: boolean;
-  autoReplyMaxPerConversation: number | undefined;
-  handoffAgentId: Id<"users"> | undefined;
   hasKey: boolean;
   hasEmbeddingsKey: boolean;
 }): AiConfigView {
@@ -720,7 +717,6 @@ export function toUiAiConfig(config: {
     systemPrompt: config.systemPrompt ?? null,
     isActive: config.isActive,
     autoReplyEnabled: config.autoReplyEnabled,
-    handoffAgentId: config.handoffAgentId ?? null,
     hasKey: config.hasKey,
     hasEmbeddingsKey: config.hasEmbeddingsKey,
   };

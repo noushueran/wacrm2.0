@@ -1,6 +1,6 @@
 import { accountQuery } from "./lib/auth";
 import { FUNNEL_STAGE_KEYS } from "./lib/funnel";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 
 // Rolling window for the funnel-analytics rollup. `overview` scans the
 // account's `funnelTransitions` + `conversionEvents`; bounding both to a
@@ -16,16 +16,23 @@ const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 /**
  * Funnel performance overview for the admin dashboard. Admin+ only (exposes
  * account-wide conversion/revenue aggregates — same gate as
- * `attribution.listConversions`). Read-only. Two account-scoped, window-
+ * `conversionEvents.listRecent`). Read-only. Two account-scoped, window-
  * bounded index scans (was 2×7 per-stage scans) bucketed in memory:
  *  - per-stage funnel counts (distinct conversations reaching each stage)
  *    from `funnelTransitions.by_account`,
- *  - Meta delivery status counts + total purchase value from
- *    `conversionEvents.by_account`.
+ *  - Meta delivery status counts from `conversionEvents.by_account`.
  *
- * `purchase.totalValue` is the sum of every purchased event's value in the
- * window, regardless of Meta delivery `status` — the card is labelled a
- * total, not "reported to Meta" (delivery may be dormant/pending).
+ * `purchase.totalValue` is read off `funnelTransitions`' own `saleValue`
+ * (Task B1), NOT `conversionEvents` — `conversionEvents` rows exist ONLY for
+ * ATTRIBUTED (ad/website) conversations, while `funnelTransitions` rows
+ * exist for every conversation including organic ones. Summing from events
+ * silently zeroed every organic purchase's contribution even though
+ * `purchase.count` (transitions-derived) counted it. A transition written
+ * before Task B1 carries no `saleValue`; it falls back to the value on its
+ * matching `conversionEvents` row (joined on the same `conversationId:stage`
+ * key that row's own dedup `eventId` uses) — the only place a legacy
+ * amount lives. "Recorded value", not "reported to Meta" (delivery may be
+ * dormant/pending, and organic conversations are never reported at all).
  */
 export const overview = accountQuery({
   args: {},
@@ -67,21 +74,45 @@ export const overview = accountQuery({
     }));
     const purchaseCount = convosByStage.get("purchased")?.size ?? 0;
 
-    // Meta delivery status counts + total purchase value.
-    const meta: Record<string, number> = { sent: 0, pending: 0, unmatched: 0, error: 0, abandoned: 0, total: 0 };
-    let totalValue = 0;
+    // Meta delivery status counts (events-derived; unrelated to value).
+    // Exhaustive over `conversionEvents.status` (not `Record<string, ...>`),
+    // so adding a literal to the schema union is a compile error here rather
+    // than a row that counts toward `total` while landing in no named bucket
+    // — exactly how the 6th member (`"dormant"`, the backend-env-unconfigured
+    // parking state) briefly behaved when it landed. Every event lands in
+    // exactly one named bucket, so the buckets always sum to `total`.
+    const meta: Record<Doc<"conversionEvents">["status"] | "total", number> = {
+      sent: 0, pending: 0, dormant: 0, unmatched: 0, error: 0, abandoned: 0, total: 0,
+    };
     for (const ev of events) {
-      if (ev.status in meta) meta[ev.status] += 1;
+      meta[ev.status] += 1;
       meta.total += 1;
-      if (ev.stage === "purchased" && ev.value !== undefined) totalValue += ev.value;
     }
+
+    // Purchase revenue: transitions' own saleValue, falling back to the
+    // matching legacy conversionEvents value for a pre-B1 row. One value
+    // per conversation (last transition into `purchased` wins), consistent
+    // with `purchaseCount`'s distinct-conversations semantics above.
+    const eventValueByKey = new Map<string, number>();
+    for (const ev of events) {
+      if (ev.value !== undefined) eventValueByKey.set(`${ev.conversationId}:${ev.stage}`, ev.value);
+    }
+    const purchaseValueByConversation = new Map<Id<"conversations">, number>();
+    for (const tr of transitions) {
+      if (tr.stage !== "purchased") continue;
+      const value = tr.saleValue ?? eventValueByKey.get(`${tr.conversationId}:${tr.stage}`);
+      if (value !== undefined) purchaseValueByConversation.set(tr.conversationId, value);
+    }
+    let totalValue = 0;
+    for (const value of purchaseValueByConversation.values()) totalValue += value;
 
     return {
       funnel,
       purchase: { count: purchaseCount, totalValue, currency },
       meta: {
-        sent: meta.sent, pending: meta.pending, unmatched: meta.unmatched,
-        error: meta.error, abandoned: meta.abandoned, total: meta.total,
+        sent: meta.sent, pending: meta.pending, dormant: meta.dormant,
+        unmatched: meta.unmatched, error: meta.error, abandoned: meta.abandoned,
+        total: meta.total,
       },
       windowDays: WINDOW_DAYS,
     };

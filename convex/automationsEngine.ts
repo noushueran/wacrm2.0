@@ -21,8 +21,9 @@ import { chargeLeadIfAgent } from "./lib/leadCharge";
 // INSERTs an `automation_pending_executions` row for a cron job to
 // later poll (`by_status_runat`) — it calls
 // `ctx.scheduler.runAfter(waitMs, internal.automationsEngine.resume, {...})`
-// directly. There is no cron, and `automationPendingExecutions` (still
-// in `schema.ts` for now, unused) is never written to by this engine.
+// directly. There is no cron, and the Convex `automationPendingExecutions`
+// table this engine never wrote to was dropped from `schema.ts` entirely
+// (Task B7) — confirmed zero non-schema references before removal.
 //
 // Both public entry points are `internalAction`s (never exposed to any
 // client) because they may need to send over the network (Meta sends,

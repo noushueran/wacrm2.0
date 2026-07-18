@@ -428,9 +428,10 @@ export default defineSchema({
     .index("by_pipeline", ["pipelineId"])
     .index("by_stage", ["stageId"])
     .index("by_contact", ["contactId"])
-    // `dashboard.metrics` and `dashboard.pipelineDonut` both want the
-    // account's OPEN deals. Filtering `status` after a `by_account` scan
-    // read every deal the account had ever closed to find the ones still
+    // `dashboard.metrics` wants the account's OPEN deals (its former
+    // sibling reader, `dashboard.pipelineDonut`, was deleted as orphaned
+    // in Task B6). Filtering `status` after a `by_account` scan read
+    // every deal the account had ever closed to find the ones still
     // live. The open set tracks current workload and is roughly
     // steady-state; the closed set only ever grows — so ranging `status`
     // converts a read that grows forever into one that does not.
@@ -837,15 +838,16 @@ export default defineSchema({
   // 1/2's own precedent of late migrations touching tables outside
   // their named source list. Two real findings from that sweep:
   //   - Migration 017 added `account_id` (NOT NULL) to `automations`,
-  //     `automationLogs`, `automationPendingExecutions`, `flows`, and
-  //     `flowRuns` — but NOT to `automationSteps`, `flowNodes`, or
-  //     `flowRunEvents` in Postgres, which stayed tenant-scoped only
-  //     transitively via their parent FK (same pattern as
-  //     `pipelineStages`/`contactCustomValues` in Task 1). The Phase 1
-  //     final review denormalizes `accountId` onto all five of those
-  //     tables in Convex anyway (see each table below), matching the
-  //     direct-index treatment already given to `messages`/`contactTags`/
-  //     `broadcastRecipients`. Migration 017 also swapped `flowRuns`'s
+  //     `automationLogs`, `flows`, `flowRuns`, and the pending-execution
+  //     queue table (whose Convex counterpart, `automationPendingExecutions`,
+  //     was never written by any code path and was dropped in Task B7) —
+  //     but NOT to `automationSteps`, `flowNodes`, or `flowRunEvents` in
+  //     Postgres, which stayed tenant-scoped only transitively via their
+  //     parent FK (same pattern as `pipelineStages`/`contactCustomValues`
+  //     in Task 1). The Phase 1 final review denormalizes `accountId` onto
+  //     the surviving tables of that set in Convex (see each table below),
+  //     matching the direct-index treatment already given to `messages`/
+  //     `contactTags`/`broadcastRecipients`. Migration 017 also swapped `flowRuns`'s
   //     "one active run per contact" partial unique index from
   //     `(user_id, contact_id)` to `(account_id, contact_id)`.
   //   - Migration 016 widened `flow_nodes.node_type`'s CHECK to add
@@ -950,37 +952,6 @@ export default defineSchema({
     // itself rather than by a post-scan predicate, so a foreign
     // `automationId` still yields nothing.
     .index("by_account_automation", ["accountId", "automationId"]),
-
-  // A queued resume point created when a running automation hits a
-  // `wait` step. The cron endpoint (`/api/automations/cron`) drains
-  // rows where `status === "pending"` and `runAt <= now`, via the
-  // `by_status_runat` index below — this is the row this Phase 1 plan
-  // explicitly foreshadows for `ctx.scheduler` in a later
-  // function-phase. `runAt` is `NOT NULL` with no default in Postgres
-  // (the engine always supplies it when scheduling the wait), so
-  // unlike most other domain timestamps in this file it's a required
-  // `v.number()`, not optional — same treatment Task 2 gave
-  // `accountInvitations.expiresAt`.
-  automationPendingExecutions: defineTable({
-    accountId: v.id("accounts"),
-    createdByUserId: v.optional(v.id("users")),
-    automationId: v.id("automations"),
-    contactId: v.optional(v.id("contacts")),
-    logId: v.optional(v.id("automationLogs")),
-    parentStepId: v.optional(v.id("automationSteps")),
-    branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
-    nextStepPosition: v.number(),
-    context: v.optional(v.any()),
-    status: v.union(
-      v.literal("pending"),
-      v.literal("running"),
-      v.literal("done"),
-      v.literal("failed"),
-    ),
-    runAt: v.number(),
-  })
-    .index("by_account", ["accountId"])
-    .index("by_status_runat", ["status", "runAt"]),
 
   // The definition envelope for one conversational flow (bot). Mirrors
   // `automations` above but for the graph-based engine. `entryNodeId`
@@ -1182,17 +1153,24 @@ export default defineSchema({
     systemPrompt: v.optional(v.string()),
     isActive: v.boolean(),
     autoReplyEnabled: v.boolean(),
-    // DEPRECATED (owner decision 2026-07-18): there is NO reply cap —
-    // the bot answers every message until a human takes the chat from
-    // the dashboard. Optional so existing rows stay valid; nothing
-    // reads it anymore.
+    // legacy, unread (owner decision 2026-07-18; plumbing removed Task
+    // B7) — there is NO reply cap anymore, the bot answers every message
+    // until a human takes the chat from the dashboard. Kept optional
+    // in-schema only because dropping a field with data present fails
+    // deploy validation; old rows may still carry a value here, but
+    // `aiConfig.ts` no longer reads or writes it.
     autoReplyMaxPerConversation: v.optional(v.number()),
     // Migration 030: optional OpenAI-compatible embeddings key —
     // encrypted like `apiKey`; its presence turns on semantic KB
     // retrieval (else lexical-only).
     embeddingsApiKey: v.optional(v.string()),
-    // Migration 033: where auto-reply hands a conversation off when the
-    // model bails. Unset/null leaves it unassigned (shared queue).
+    // legacy, unread (Migration 033; plumbing removed Task B7) — used to
+    // be where auto-reply would hand a conversation off when the model
+    // bailed; nothing enforces/reads it anymore (v3 kept the assistant on
+    // the conversation instead — see qualificationEngine.ts's
+    // completeQualification comment). Kept optional in-schema only
+    // because dropping a field with data present fails deploy
+    // validation; old rows may still carry a value here.
     handoffAgentId: v.optional(v.id("users")),
     updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
@@ -1326,18 +1304,22 @@ export default defineSchema({
     .index("by_account", ["accountId"]),
 
   // ============================================================
-  // WA conversion attribution (Task B3). One row per detected
-  // attribution identifier (an `HY-XXXXXX` ref code or a Meta
-  // `ctwa_clid`) seen on an inbound WhatsApp message — written by
-  // `attribution.recordSignal` and later updated by the outbound
-  // partner-signal action as it lands. `by_account_identifier` backs
-  // `recordSignal`'s own idempotent first-occurrence-only insert (one
-  // row per account+identifier, ever); `by_account_result` supports a
-  // future dashboard filtering by landing outcome; `by_result` (Task
-  // B6) is the GLOBAL (non-account-scoped) counterpart that backs the
-  // retry cron's `getPendingToRetry` — it has no account context, so it
-  // needs a `landingResult`-only index to find retry candidates across
-  // every account without a full table scan.
+  // WA conversion attribution — HISTORICAL DATA ONLY (Task B5). One row
+  // per detected attribution identifier (an `HY-XXXXXX` ref code or a
+  // Meta `ctwa_clid`) seen on an inbound WhatsApp message, written by the
+  // old `convex/attribution.ts`'s `recordSignal` and updated by its
+  // outbound partner-signal action as it landed. That whole module
+  // (recordSignal/getSignal/patchResult/sendSignal/getPendingToRetry/
+  // retryPending/listConversions) was DELETED in Task B5 — ingest was
+  // rewired to `conversionEvents` (funnel Phase 1) and the retry cron
+  // was removed, leaving this table with NO remaining writers. Its rows
+  // stay queryable for historical reference only; nothing in the app
+  // reads or writes it anymore. The table itself is kept (not dropped)
+  // because Convex schema validation rejects removing a table that
+  // still holds prod data — drop it after a prod purge of these rows.
+  // The pure `extractRefCode`/`extractCtwaClid`/`decodeHidden` helpers
+  // that used to live alongside this table moved to
+  // `convex/lib/attribution.ts` (still used by `ingest.ts`).
   // ============================================================
   attributionSignals: defineTable({
     accountId: v.id("accounts"),
@@ -1354,9 +1336,9 @@ export default defineSchema({
       v.literal("unmatched"),
       v.literal("error"),
       // Terminal give-up state: a row whose retries hit `attempts` ==
-      // `MAX_ATTEMPTS` is retired here (by `attribution.patchResult`) so
-      // it leaves the `"error"` partition the retry cron's
-      // `getPendingToRetry` scans — see that function's own comment.
+      // `MAX_ATTEMPTS` was retired here by the old (now-deleted)
+      // `attribution.patchResult`, so it left the `"error"` partition
+      // the old retry cron's `getPendingToRetry` scanned.
       v.literal("abandoned"),
     ),
     offerSlug: v.optional(v.string()),
@@ -1467,6 +1449,12 @@ export default defineSchema({
     // and downstream AI analysis (category from a fixed list + free text).
     lossCategory: v.optional(v.string()),
     lossDetail: v.optional(v.string()),
+    // Captured on the transition that carried a sale amount (normally
+    // `purchased`) — this append-only row is the durable system of record
+    // for the amount; `conversation.funnel.saleValue` is only a denorm and
+    // can be replaced/dropped by later stage moves (Task B1).
+    saleValue: v.optional(v.number()),
+    saleCurrency: v.optional(v.string()),
   })
     .index("by_conversation", ["conversationId"])
     // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics

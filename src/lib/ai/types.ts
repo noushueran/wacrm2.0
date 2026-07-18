@@ -20,12 +20,6 @@ export interface AiConfig {
   systemPrompt: string | null
   isActive: boolean
   autoReplyEnabled: boolean
-  /** DEPRECATED — no reply cap anymore; kept optional for old rows. */
-  autoReplyMaxPerConversation?: number
-  /** Where auto-reply hands a conversation off when the model bails: an
-   *  agent's `auth.users.id`, or null to leave it unassigned (drop into
-   *  the shared queue). */
-  handoffAgentId: string | null
   /** Optional OpenAI-compatible key for embeddings. When set, the
    *  knowledge base is embedded and semantic retrieval turns on; when
    *  null, retrieval falls back to lexical full-text search. */

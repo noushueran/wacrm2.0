@@ -79,12 +79,22 @@ export async function applyStageTransition(
   const now = Date.now();
   const currency = args.saleCurrency ?? args.defaultCurrency;
 
+  // The transition log (`funnelTransitions`) is the system of record for a
+  // sale amount; `conversation.funnel` is only a denorm. A stage move that
+  // doesn't carry its own value (e.g. reopening a purchased deal to
+  // price_quoted) must PRESERVE whatever was last entered rather than drop
+  // it — merge, don't replace (Task B1).
+  const finalValue = hasValue ? args.saleValue : conversation.funnel?.saleValue;
+  const finalCurrency = hasValue ? currency : conversation.funnel?.saleCurrency;
+
   await ctx.db.patch(conversationId, {
     funnel: {
       stage,
       stageUpdatedAt: now,
       ...(args.byUserId ? { stageUpdatedByUserId: args.byUserId } : {}),
-      ...(hasValue ? { saleValue: args.saleValue, saleCurrency: currency } : {}),
+      ...(finalValue !== undefined
+        ? { saleValue: finalValue, saleCurrency: finalCurrency }
+        : {}),
     },
     updatedAt: now,
   });
@@ -154,6 +164,9 @@ export async function applyStageTransition(
     ...(conversionEventId ? { conversionEventId } : {}),
     ...(args.lossCategory ? { lossCategory: args.lossCategory } : {}),
     ...(args.lossDetail ? { lossDetail: args.lossDetail } : {}),
+    // Durable record of the amount on the transition that carried it (this
+    // append-only row never gets replaced by a later stage move — Task B1).
+    ...(hasValue ? { saleValue: args.saleValue, saleCurrency: currency } : {}),
   });
 
   return { applied: true };

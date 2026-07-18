@@ -67,8 +67,10 @@ export default function CampaignsPage() {
       {!loading && data && (
         <div className="rounded-xl border border-border bg-card p-5">
           <h2 className="mb-3 text-sm font-medium text-foreground">{t('metaTitle')}</h2>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            {(['sent', 'pending', 'unmatched', 'error', 'abandoned', 'total'] as const).map((k) => (
+          {/* lg:grid-cols-7 so all 7 tiles sit on one desktop row — with 6
+              columns the dormant tile would hang alone on a second row. */}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
+            {(['sent', 'pending', 'dormant', 'unmatched', 'error', 'abandoned', 'total'] as const).map((k) => (
               <div key={k} className="rounded-lg border border-border bg-background p-3">
                 <p className="text-xs text-muted-foreground">{t(`meta.${k}`)}</p>
                 <p className="mt-1 text-lg font-semibold tabular-nums text-foreground">{data.meta[k]}</p>

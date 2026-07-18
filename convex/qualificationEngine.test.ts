@@ -58,7 +58,6 @@ async function configureAi(
     model: "gpt-4o-mini",
     isActive: true,
     autoReplyEnabled: true,
-    autoReplyMaxPerConversation: 3,
     apiKey: "sk-test-key",
   });
 }

@@ -4,11 +4,11 @@
 // ported helpers (`generate.ts`, `providers/*`) actually need — the
 // source's `AiConfig` interface (the account's whole settings row) has
 // no direct counterpart here: `convex/aiConfig.ts`'s `loadDecrypted`
-// already returns a Convex-shaped decrypted config (`Id<"users">` for
-// `handoffAgentId`, optional rather than nullable strings), and
-// `generateReply` below only ever reads three of its fields, so
-// `GenerateArgs` (in `generate.ts`) lists `provider`/`model`/`apiKey`
-// directly instead of nesting a whole second config type in here.
+// already returns a Convex-shaped decrypted config (optional rather
+// than nullable strings), and `generateReply` below only ever reads
+// three of its fields, so `GenerateArgs` (in `generate.ts`) lists
+// `provider`/`model`/`apiKey` directly instead of nesting a whole
+// second config type in here.
 // ============================================================
 
 export type AiProvider = "openai" | "anthropic";

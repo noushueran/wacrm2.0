@@ -64,10 +64,9 @@ async function seedAccountMember(
   return { userId, accountId, asUser };
 }
 
-/** Adds a second membership row to an *existing* account — for the
- *  configured `handoffAgentId` target (defaults to "agent") and, with an
- *  explicit `role`, for role-gating tests (matches `conversations.test
- *  .ts`'s own parametrized `seedTeammate`). */
+/** Adds a second membership row to an *existing* account — for
+ *  role-gating tests via an explicit `role` (matches `conversations.test
+ *  .ts`'s own parametrized `seedTeammate`; defaults to "agent"). */
 async function seedTeammate(
   t: TestConvex<typeof schema>,
   opts: { accountId: Id<"accounts">; name: string; email: string; role?: AccountRole },
@@ -93,11 +92,10 @@ const BASE_AI_CONFIG_ARGS = {
 };
 
 /** Admin+ upsert of the caller's AI config — active + auto-reply on by
- *  default; override any field (e.g. `isActive: false`, a
- *  `handoffAgentId`) per test. */
+ *  default; override any field (e.g. `isActive: false`) per test. */
 async function configureAi(
   asUser: Awaited<ReturnType<typeof seedAccountMember>>["asUser"],
-  overrides: Partial<typeof BASE_AI_CONFIG_ARGS & { handoffAgentId: Id<"users"> }> = {},
+  overrides: Partial<typeof BASE_AI_CONFIG_ARGS> = {},
 ) {
   await asUser.mutation(api.aiConfig.upsert, {
     ...BASE_AI_CONFIG_ARGS,

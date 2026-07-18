@@ -360,6 +360,171 @@ test("editOnMeta surfaces Meta's own error message when the edit call fails", as
 });
 
 // ============================================================
+// deleteOnMeta — DRY-RUN (Task B8: template delete must delete on Meta)
+// ============================================================
+
+test("deleteOnMeta in DRY-RUN returns dryRun: true without a whatsappConfig row or a network call", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  const result = await t.action(internal.metaTemplates.deleteOnMeta, {
+    accountId,
+    name: "welcome",
+  });
+
+  expect(result).toEqual({ dryRun: true });
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
+// deleteOnMeta — config gating (non-DRY-RUN)
+// ============================================================
+
+test("deleteOnMeta throws 'WhatsApp not configured' when DRY-RUN is off and no whatsappConfig row exists", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    t.action(internal.metaTemplates.deleteOnMeta, { accountId, name: "welcome" }),
+  ).rejects.toThrow(/WhatsApp not configured/);
+});
+
+test("deleteOnMeta throws a WABA-id-missing error when the config has no wabaId (delete-by-name is WABA-scoped, like submitToMeta's create)", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  await expect(
+    t.action(internal.metaTemplates.deleteOnMeta, { accountId, name: "welcome" }),
+  ).rejects.toThrow(/WABA/);
+});
+
+// ============================================================
+// deleteOnMeta — real Meta call (fetch mocked)
+// ============================================================
+
+test("deleteOnMeta DELETEs /{wabaId}/message_templates?name={name}", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(url).toBe(
+      "https://graph.facebook.com/v21.0/waba-1/message_templates?name=welcome",
+    );
+    expect(init?.method).toBe("DELETE");
+    expect(init?.headers).toMatchObject({ Authorization: "Bearer plaintext-token" });
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await t.action(internal.metaTemplates.deleteOnMeta, {
+    accountId,
+    name: "welcome",
+  });
+
+  expect(result).toEqual({ dryRun: false });
+  expect(fetchMock).toHaveBeenCalledOnce();
+
+  vi.unstubAllGlobals();
+});
+
+test("deleteOnMeta URL-encodes a template name with special characters", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  const fetchMock = vi.fn(async (url: string) => {
+    expect(url).toBe(
+      "https://graph.facebook.com/v21.0/waba-1/message_templates?name=order%20update",
+    );
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await t.action(internal.metaTemplates.deleteOnMeta, {
+    accountId,
+    name: "order update",
+  });
+  expect(fetchMock).toHaveBeenCalledOnce();
+
+  vi.unstubAllGlobals();
+});
+
+test("deleteOnMeta surfaces Meta's own error message when the delete call fails", async () => {
+  delete process.env.CONVEX_META_DRY_RUN;
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asUser.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "Template not found" } }),
+          { status: 400 },
+        ),
+    ),
+  );
+
+  await expect(
+    t.action(internal.metaTemplates.deleteOnMeta, { accountId, name: "welcome" }),
+  ).rejects.toThrow(/Template not found/);
+
+  vi.unstubAllGlobals();
+});
+
+// ============================================================
 // syncFromMeta — DRY-RUN
 // ============================================================
 

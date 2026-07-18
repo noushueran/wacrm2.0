@@ -197,7 +197,7 @@ const PERSONAL_SECTIONS: SettingsSectionKey[] = [
   "appearance",
   "notifications",
 ];
-// `conversions` renders `api.attribution.listConversions`, which is
+// `conversions` renders `api.conversionEvents.listRecent`, which is
 // itself `ctx.requireRole("admin")`-gated (it exposes raw lead phone
 // numbers) — same threshold as `whatsapp`/`api`/`members`, so it joins
 // them here rather than being reachable by a supervisor.

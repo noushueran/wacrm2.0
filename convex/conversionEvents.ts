@@ -7,6 +7,8 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { resolveEventName, backendForLane } from "./lib/funnel";
+import { applyStageTransition } from "./funnel";
+import { accountQuery } from "./lib/auth";
 
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
@@ -90,6 +92,15 @@ export const getWabaId = internalQuery({
  * schedules delivery), or `null` for an organic message (no identifier) or a
  * conversation whose `new_lead` was already seeded. Replaces the old
  * `attribution.recordSignal` first-touch write.
+ *
+ * Also advances `conversation.funnel`/`funnelTransitions` to `new_lead`
+ * (Task B3) via `funnel.ts`'s engine-path helper — same `auto` +
+ * `neverDowngrade` calling convention as `qualificationEngine.ts`'s
+ * `completeQualification` — so a fresh attributed lead is immediately
+ * visible in the stepper instead of showing "no stage yet" until an agent
+ * acts. `neverDowngrade` makes this a no-op when the conversation already
+ * sits at or past `new_lead` (its lowest stage), so it can never pull an
+ * already-progressed conversation backward.
  */
 export const seedNewLead = internalMutation({
   args: {
@@ -146,6 +157,25 @@ export const seedNewLead = internalMutation({
       status: "pending",
       attempts: 0,
     });
+
+    // Funnel visibility (Task B3). Re-read so `applyStageTransition` sees
+    // the attribution patch just above (if this call is what set it); its
+    // own `by_event_id` lookup for this same `eventId` finds the row just
+    // inserted, so it links `conversionEventId` onto the transition rather
+    // than creating a second event or re-scheduling delivery.
+    const withAttribution = await ctx.db.get(conversationId);
+    if (withAttribution) {
+      const account = await ctx.db.get(accountId);
+      await applyStageTransition(ctx, {
+        accountId,
+        conversation: withAttribution,
+        stage: "new_lead",
+        auto: true,
+        neverDowngrade: true,
+        defaultCurrency: account?.defaultCurrency ?? "USD",
+      });
+    }
+
     return { conversionEventId };
   },
 });
@@ -530,5 +560,55 @@ export const retryConversionEvents = internalAction({
         { conversionEventId: row._id },
       );
     }
+  },
+});
+
+const LIST_RECENT_DEFAULT_LIMIT = 50;
+const LIST_RECENT_CAP = 100;
+
+/**
+ * Recent conversion events for the Settings → Conversions admin view (Task
+ * B4). Replaces `attribution.listConversions`, which read `attributionSignals`
+ * — a table with no remaining writers, so that tab showed frozen historical
+ * rows forever; this is the live pipeline. Admin+ only, same gate as the
+ * query it replaces (`ctx.requireRole("admin")` — the tab exposes raw lead
+ * phone numbers, and the old query wasn't masked either, so this doesn't
+ * introduce a new exposure). Newest-first off `by_account` (the same index
+ * `campaigns.overview` range-scans), bounded to a caller-supplied limit
+ * clamped to [1, 100] so no click can request an unbounded payload — this
+ * is a live admin list, not a paginated export.
+ */
+export const listRecent = accountQuery({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    ctx.requireRole("admin");
+    const limit = Number.isFinite(args.limit)
+      ? Math.min(LIST_RECENT_CAP, Math.max(1, Math.floor(args.limit as number)))
+      : LIST_RECENT_DEFAULT_LIMIT;
+
+    const rows = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .order("desc")
+      .take(limit);
+
+    return await Promise.all(
+      rows.map(async (row) => {
+        const contact = await ctx.db.get(row.contactId);
+        return {
+          id: row._id,
+          lane: row.lane,
+          stage: row.stage,
+          eventName: row.eventName,
+          status: row.status,
+          attempts: row.attempts,
+          value: row.value,
+          currency: row.currency,
+          createdAt: row._creationTime,
+          contactName: contact?.name ?? null,
+          phone: row.phone,
+        };
+      }),
+    );
   },
 });

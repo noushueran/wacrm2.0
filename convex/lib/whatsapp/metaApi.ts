@@ -8,11 +8,11 @@
  * codebase's `convex/` convention); behavior otherwise unchanged for
  * everything kept.
  *
- * NOT ported (out of scope — template-header media handles and the
- * delete side of template management, neither touched by the
- * connect-flow regression fix, Phase 8 Task 4's template management, or
- * the template-EDIT task that ported `editMessageTemplate` below):
- * `uploadResumableMedia`, `deleteMessageTemplate`.
+ * NOT ported (out of scope — template-header media handles, untouched
+ * by the connect-flow regression fix, Phase 8 Task 4's template
+ * management, or the template-EDIT/DELETE tasks): `uploadResumableMedia`.
+ * `deleteMessageTemplate` WAS ported (Task B8 — template delete must
+ * delete on Meta too) for `convex/metaTemplates.ts`'s `deleteOnMeta`.
  *
  * `verifyPhoneNumber`/`getSubscribedApps` WERE ported (AI/WhatsApp
  * backend gap-fill task) — `convex/whatsappConfig.ts`'s
@@ -1126,6 +1126,53 @@ export async function editMessageTemplate(
       Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  return { success: data?.success !== false };
+}
+
+export interface DeleteMessageTemplateArgs {
+  wabaId: string;
+  accessToken: string;
+  /**
+   * Deletes EVERY language variant of this template name — Meta's
+   * delete-by-name endpoint has no separate per-language call (unlike
+   * edit, which targets one language's hsm_id directly).
+   */
+  name: string;
+}
+
+export interface DeleteMessageTemplateResult {
+  success: boolean;
+}
+
+/**
+ * Delete a message template (all languages) from the WABA. Task B8
+ * (template delete must delete on Meta too) — `src/lib/whatsapp/
+ * meta-api.ts` never had this (see this file's own header comment);
+ * follows `submitMessageTemplate`/`editMessageTemplate`'s established
+ * fetch/error conventions (`throwMetaError` on `!response.ok`, a
+ * best-effort `{success}` parse otherwise, mirroring
+ * `editMessageTemplate`'s own `data?.success !== false` — Meta's DELETE
+ * response is just `{"success": true}`, no id/status to return).
+ *
+ * `DELETE /{waba_id}/message_templates?name={name}` — a WABA-scoped
+ * call keyed on `name` (like `submitMessageTemplate`'s create), NOT
+ * `editMessageTemplate`'s id-scoped `/{message_template_id}` — Meta has
+ * no per-language delete, so this always removes every language variant
+ * sharing that name in one call.
+ */
+export async function deleteMessageTemplate(
+  args: DeleteMessageTemplateArgs,
+): Promise<DeleteMessageTemplateResult> {
+  const { wabaId, accessToken, name } = args;
+  const url = `${META_API_BASE}/${wabaId}/message_templates?name=${encodeURIComponent(name)}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`);

@@ -7,16 +7,25 @@ import type { MutationCtx } from "./_generated/server";
 // Notifications — in-app alerts for one agent (`convex/schema.ts`'s
 // `notifications`). Convex counterpart to migration 027_notifications.sql:
 // `list`/`markRead`/`markAllRead` are the recipient-facing read/ack
-// side; `create` is the account-scoped, agent+ write side; `conversations
-// .assign` (in `convex/conversations.ts`) also creates a notification —
-// the "you were assigned a conversation" case migration 027's own
-// `notify_conversation_assigned` trigger handled automatically.
+// side; `create` is the account-scoped, agent+ write side for the one
+// type it accepts (below).
 //
-// `type` is typed as the single literal the schema itself allows today
-// (`convex/schema.ts`'s `notifications.type` is
-// `v.union(v.literal("conversation_assigned"))`) rather than a bare
-// string, so a second notification type later is a visible, typed
-// change in both places at once, not a silent widening.
+// `notifications.type` (`convex/schema.ts`) is a 3-literal union, not a
+// bare string — `"conversation_assigned"` (migration 027's own
+// `notify_conversation_assigned` trigger, now `conversations.assign` and
+// the lead-offer-accept path in `qualificationEngine.ts`),
+// `"lead_qualified"` (a lead crosses the qualification threshold, or a
+// lead offer needs supervisor escalation — both in
+// `qualificationEngine.ts`), and `"sla_alert"` (an assigned chat's
+// reply-SLA breaches, targeting supervisors+ — `ingest.ts` and
+// `aiReply.ts`). Every insert goes through `insertNotification` below —
+// never a caller's own `ctx.db.insert` — so all four call sites (`create`
+// here, plus those three) can never drift out of shape with the schema
+// or each other; a fourth type would still be a visible, typed change in
+// both places at once, not a silent widening. `create` itself stays
+// scoped to `v.literal("conversation_assigned")` only — the other two
+// types are system/engine-triggered (qualification, SLA breach), not
+// something an agent explicitly creates via this generic mutation.
 // ============================================================
 
 /**

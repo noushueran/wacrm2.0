@@ -11,7 +11,7 @@ import {
   insertMessageAndUpdateConversation,
   type AppendMessageArgs,
 } from "./messages";
-import { extractRefCode, extractCtwaClid } from "./attribution";
+import { extractRefCode, extractCtwaClid } from "./lib/attribution";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
