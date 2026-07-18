@@ -663,7 +663,18 @@ export default defineSchema({
     updatedAt: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
-    .index("by_phone_number_id", ["phoneNumberId"]),
+    .index("by_phone_number_id", ["phoneNumberId"])
+    // `matchVerifyToken` runs on every Meta webhook GET handshake and used
+    // to scan this whole table. Indexable precisely BECAUSE `verifyToken` is
+    // stored as plain text (see `upsert` — only `accessToken` is encrypted),
+    // so the value arriving in `hub.verify_token` is the stored key itself.
+    // The index therefore holds no secret the document did not already hold
+    // in the clear. If `verifyToken` is ever encrypted to match
+    // `accessToken` — the open question `matchVerifyToken`'s own comment
+    // raises — this index stops working and the lookup has to move to a
+    // stored hash of the token, not ciphertext (which is per-row salted and
+    // so not equality-comparable).
+    .index("by_verify_token", ["verifyToken"]),
 
   // One outstanding invite link. `tokenHash` is a SHA-256 digest, never
   // the plaintext token (same pattern as `apiKeys.keyHash` below).
