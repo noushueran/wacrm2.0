@@ -98,7 +98,8 @@ export const getSessionForConversation = accountQuery({
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
-      .unique();
+      .order("desc")
+      .first();
     if (!session || session.accountId !== ctx.accountId) return null;
 
     // Tooltip hint: the next thing the engine wants to know.

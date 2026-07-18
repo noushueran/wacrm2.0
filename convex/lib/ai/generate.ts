@@ -70,6 +70,17 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
  */
 export function parseGeneration(raw: string, usage: AiUsage | null = null): GenerateResult {
   const handoff = raw.includes(HANDOFF_SENTINEL);
-  const text = raw.split(HANDOFF_SENTINEL).join("").trim();
-  return { text, handoff, usage };
+  // Ask-admin marker (qualification v3): `[[ASK_ADMIN: <question>]]` —
+  // extracted and stripped like the handoff sentinel. Handoff wins when
+  // both appear (the model bailing outranks it wanting information).
+  let askAdmin: string | null = null;
+  const withoutMarker = raw.replace(
+    /\[\[ASK_ADMIN:([\s\S]*?)\]\]/g,
+    (_match, question: string) => {
+      if (!askAdmin && question.trim()) askAdmin = question.trim();
+      return "";
+    },
+  );
+  const text = withoutMarker.split(HANDOFF_SENTINEL).join("").trim();
+  return { text, handoff, askAdmin: handoff ? null : askAdmin, usage };
 }

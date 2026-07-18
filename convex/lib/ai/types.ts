@@ -39,10 +39,13 @@ export interface ProviderResult {
 
 /** Outcome of a generation call. */
 export interface GenerateResult {
-  /** The reply text, with any handoff sentinel stripped. */
+  /** The reply text, with any handoff/ask-admin sentinel stripped. */
   text: string;
   /** True when the model asked to hand off to a human (auto-reply mode). */
   handoff: boolean;
+  /** The question the model wants the admin/team to answer (qualification
+   *  v3 "ask the admin" protocol), or null. Ignored when `handoff`. */
+  askAdmin: string | null;
   /** Provider token usage for this call, or null when unavailable. */
   usage: AiUsage | null;
 }

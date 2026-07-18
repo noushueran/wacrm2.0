@@ -631,6 +631,20 @@ export const processInbound = internalAction({
       }),
     );
 
+    // ---- Ask-admin relay (v3): an inbound from a configured admin
+    // number is the team ANSWERING the assistant's latest question —
+    // record it and schedule the customer-facing relay. Self-guarding
+    // (non-admin numbers exit on one indexed read); best-effort.
+    if ((message.text ?? "").trim()) {
+      await runBestEffort("qualificationEngine.onAdminInbound", () =>
+        ctx.runMutation(internal.qualificationEngine.onAdminInbound, {
+          accountId,
+          phoneNormalized: normalizePhone(from),
+          text: message.text ?? "",
+        }),
+      );
+    }
+
     // ---- Flows FIRST (route.ts:729-749). Awaited: the `consumed`
     // result gates the content-level automation triggers + AI reply
     // below, so it must be known before either dispatches.

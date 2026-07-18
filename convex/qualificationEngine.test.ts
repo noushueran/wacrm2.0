@@ -369,7 +369,10 @@ test("readiness completes the lead: session qualified, funnel auto-advanced, Met
 
   const conversation = await t.run((ctx) => ctx.db.get(conversationId));
   expect(conversation?.funnel?.stage).toBe("qualified");
-  expect(conversation?.aiAutoreplyDisabled).toBe(true);
+  // v3 change: the assistant KEEPS replying after qualification — only a
+  // real human takeover (assign / pause) silences it.
+  expect(conversation?.aiAutoreplyDisabled).toBeFalsy();
+  expect(conversation?.assignedToUserId).toBeUndefined();
   expect(conversation?.status).toBe("pending");
   expect(conversation?.aiHandoffSummary).toContain("Qualified lead");
 
@@ -727,4 +730,178 @@ test("REVIEW-6: updateConfig rejects wrong-typed and invalid values cleanly, and
   const config = await asUser.query(api.qualification.getConfig, {});
   expect(config.enabled).toBe(true);
   expect((config as Record<string, unknown>).bogusKey).toBeUndefined();
+});
+
+// ---- v3: ask-admin relay ----
+
+test("V3-B: unknown info → holding reply to customer + question relayed to admin as plain text", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await configureAi(base.asUser);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[NEEDINFO:Is Georgia visa on arrival for Indian nationals?]]");
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  // customer got the holding reply
+  const customerMsgs = await messagesFor(t, base.conversationId);
+  const bot = customerMsgs.filter((m) => m.senderType === "bot");
+  expect(bot).toHaveLength(1);
+  expect(bot[0].contentText).toContain("check with my team");
+  expect(bot[0].contentText).not.toContain("ASK_ADMIN"); // marker stripped
+  // inquiry recorded pending (relay action is scheduled; run it directly)
+  let inquiries = await t.run((ctx) =>
+    ctx.db.query("adminInquiries")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .collect());
+  expect(inquiries).toHaveLength(0); // not yet — scheduler didn't run in test
+  await t.action(internal.qualificationEngine.relayQuestionToAdmin, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    contactId: base.contactId, question: "Is Georgia visa on arrival for Indian nationals?",
+  });
+  inquiries = await t.run((ctx) =>
+    ctx.db.query("adminInquiries")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .collect());
+  expect(inquiries).toHaveLength(1);
+  expect(inquiries[0].status).toBe("pending");
+  // the admin conversation got a PLAIN TEXT question (no template)
+  const adminContact = await t.run((ctx) =>
+    ctx.db.query("contacts")
+      .withIndex("by_account_phone", (q) =>
+        q.eq("accountId", base.accountId).eq("phoneNormalized", "971559998888"))
+      .unique());
+  const adminConversation = await t.run((ctx) =>
+    ctx.db.query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", adminContact!._id))
+      .first());
+  const adminMsgs = await messagesFor(t, adminConversation!._id);
+  expect(adminMsgs).toHaveLength(1);
+  expect(adminMsgs[0].contentType).toBe("text");
+  expect(adminMsgs[0].contentText).toContain("Georgia visa");
+});
+
+test("V3-B: admin reply answers the latest pending inquiry and is relayed to the customer", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await configureAi(base.asUser);
+  const inquiryId = await t.run((ctx) =>
+    ctx.db.insert("adminInquiries", {
+      accountId: base.accountId, conversationId: base.conversationId,
+      contactId: base.contactId, question: "Is Georgia visa on arrival for Indians?",
+      customerName: "Ravi", customerPhone: "+971500000001",
+      status: "pending", askedAt: Date.now(),
+    }));
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971559998888",
+    text: "Yes — visa on arrival, 30 days, roughly 90 AED",
+  });
+  let inquiry = await t.run((ctx) => ctx.db.get(inquiryId));
+  expect(inquiry?.status).toBe("answered");
+  expect(inquiry?.answer).toContain("visa on arrival");
+  // scheduled relay → run directly in test
+  await t.action(internal.qualificationEngine.relayAnswerToCustomer, { inquiryId });
+  const customerMsgs = await messagesFor(t, base.conversationId);
+  expect(customerMsgs).toHaveLength(1);
+  expect(customerMsgs[0].senderType).toBe("bot");
+  expect(customerMsgs[0].contentText).toContain("visa on arrival");
+  inquiry = await t.run((ctx) => ctx.db.get(inquiryId));
+  expect(inquiry?.status).toBe("delivered");
+});
+
+test("V3-B: a human-owned thread stops the auto-relay; non-admin numbers never answer inquiries", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await configureAi(base.asUser);
+  const inquiryId = await t.run(async (ctx) => {
+    await ctx.db.patch(base.conversationId, { assignedToUserId: base.userId });
+    return await ctx.db.insert("adminInquiries", {
+      accountId: base.accountId, conversationId: base.conversationId,
+      contactId: base.contactId, question: "Q?",
+      customerName: "Ravi", customerPhone: "+971500000001",
+      status: "answered", answer: "A", askedAt: 1, answeredAt: Date.now(),
+    });
+  });
+  await t.action(internal.qualificationEngine.relayAnswerToCustomer, { inquiryId });
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  expect((await t.run((ctx) => ctx.db.get(inquiryId)))?.status).toBe("answered");
+
+  // a random customer's message never claims a pending inquiry
+  const other = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await t.run((ctx) =>
+    ctx.db.insert("adminInquiries", {
+      accountId: other.accountId, conversationId: other.conversationId,
+      contactId: other.contactId, question: "Q2?",
+      customerName: "X", customerPhone: "+971500000001",
+      status: "pending", askedAt: Date.now(),
+    }));
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: other.accountId, phoneNormalized: "971500000001", text: "not an admin",
+  });
+  const stillPending = await t.run((ctx) =>
+    ctx.db.query("adminInquiries")
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", other.accountId).eq("status", "pending"))
+      .collect());
+  expect(stillPending).toHaveLength(1);
+});
+
+// ---- v3: multiple leads per contact ----
+
+test("V3-C: a new service inquiry after a qualified lead opens a SECOND session with carried profile fields", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  // first lead: qualified, with profile fields worth carrying
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "Dubai Holiday Packages",
+      fields: [
+        { key: "nationality", label: "Nationality", value: "Indian", confidence: "high", updatedAt: 1 },
+        { key: "email", label: "Email", value: "ravi@x.com", confidence: "high", updatedAt: 1 },
+        { key: "travel_dates", label: "Travel dates", value: "August", confidence: "high", updatedAt: 1 },
+      ],
+      expectedCount: 4, answeredCount: 3, score: 80, qualifiedAt: 5,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[NEW]] field:destination_country=Georgia; score:30");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  const sessions = await sessionsFor(t, base.conversationId);
+  expect(sessions).toHaveLength(2);
+  const fresh = sessions.find((s) => s.status === "collecting")!;
+  expect(fresh).toBeTruthy();
+  const byKey = Object.fromEntries(fresh.fields.map((f) => [f.key, f]));
+  expect(byKey.destination_country.value).toBe("Georgia"); // new extraction
+  expect(byKey.nationality.value).toBe("Indian"); // carried over
+  expect(byKey.nationality.confidence).toBe("medium"); // verify-not-reask
+  expect(byKey.nationality.carried).toBe(true);
+  expect(byKey.email.carried).toBe(true);
+  expect(byKey.travel_dates).toBeUndefined(); // trip-specific — never carried
+  // the chip/board surface the NEW session
+  const chip = await base.asUser.query(api.qualification.getSessionForConversation, {
+    conversationId: base.conversationId,
+  });
+  expect(chip?.status).toBe("collecting");
+});
+
+test("V3-C: post-qualification chit-chat does NOT open a new lead", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await configureAi(base.asUser);
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "Dubai Holiday Packages",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 80, qualifiedAt: 5,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "thanks a lot!");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(1);
 });

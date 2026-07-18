@@ -40,6 +40,7 @@ describe("parseGeneration", () => {
     expect(parseGeneration("Hello there")).toEqual({
       text: "Hello there",
       handoff: false,
+      askAdmin: null,
       usage: null,
     });
   });
@@ -48,11 +49,13 @@ describe("parseGeneration", () => {
     expect(parseGeneration("[[HANDOFF]]")).toEqual({
       text: "",
       handoff: true,
+      askAdmin: null,
       usage: null,
     });
     expect(parseGeneration("Let me get a human [[HANDOFF]]")).toEqual({
       text: "Let me get a human",
       handoff: true,
+      askAdmin: null,
       usage: null,
     });
   });
@@ -62,6 +65,7 @@ describe("parseGeneration", () => {
     expect(parseGeneration("Hi", usage)).toEqual({
       text: "Hi",
       handoff: false,
+      askAdmin: null,
       usage,
     });
   });
@@ -82,6 +86,7 @@ describe("generateReply — OpenAI", () => {
     expect(res).toEqual({
       text: "Sure — happy to help!",
       handoff: false,
+      askAdmin: null,
       usage: { promptTokens: 42, completionTokens: 8, totalTokens: 50 },
     });
     const [url, opts] = fetchMock.mock.calls[0];
@@ -126,6 +131,7 @@ describe("generateReply — Anthropic", () => {
     expect(res).toEqual({
       text: "Hi there!",
       handoff: false,
+      askAdmin: null,
       usage: { promptTokens: 30, completionTokens: 6, totalTokens: 36 },
     });
     const [url, opts] = fetchMock.mock.calls[0];
@@ -163,5 +169,25 @@ describe("generateReply — Anthropic", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.messages[0].role).toBe("user");
     expect(body.messages).toHaveLength(1);
+  });
+});
+
+// ---- qualification v3: ask-admin marker ----
+
+describe("parseGeneration ask-admin marker", () => {
+  it("extracts the ASK_ADMIN question and strips the marker", () => {
+    const out = parseGeneration(
+      "Let me check with my team and get back to you shortly! [[ASK_ADMIN: What is the Georgia visa fee for Indian nationals?]]",
+    );
+    expect(out.askAdmin).toBe("What is the Georgia visa fee for Indian nationals?");
+    expect(out.text).toBe("Let me check with my team and get back to you shortly!");
+    expect(out.handoff).toBe(false);
+  });
+
+  it("handoff wins over ask-admin; absent marker yields null", () => {
+    const both = parseGeneration("[[HANDOFF]] [[ASK_ADMIN: x?]]");
+    expect(both.handoff).toBe(true);
+    expect(both.askAdmin).toBeNull();
+    expect(parseGeneration("plain reply").askAdmin).toBeNull();
   });
 });

@@ -67,7 +67,8 @@ export async function ensureSession(
     .withIndex("by_conversation", (q) =>
       q.eq("conversationId", args.conversationId),
     )
-    .unique();
+    .order("desc")
+    .first();
   if (existing) return existing._id;
   return await ctx.db.insert("qualificationSessions", {
     accountId: args.accountId,
