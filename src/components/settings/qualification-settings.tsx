@@ -46,7 +46,15 @@ export function QualificationSettings() {
     api.templates.list,
     canEditCriticalSettings ? {} : 'skip',
   );
+  const tags = useQuery(api.tags.list, canEditCriticalSettings ? {} : 'skip');
+  const members = useQuery(api.members.list, canEditCriticalSettings ? {} : 'skip');
+  const memberTagLinks = useQuery(
+    api.memberTags.list,
+    canEditCriticalSettings ? {} : 'skip',
+  );
+  const setForTag = useMutation(api.memberTags.setForTag);
   const updateConfig = useMutation(api.qualification.updateConfig);
+  const [routingSavingTag, setRoutingSavingTag] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [alertsSaving, setAlertsSaving] = useState(false);
   const [alertsError, setAlertsError] = useState<string | null>(null);
@@ -55,6 +63,7 @@ export function QualificationSettings() {
   // Alerts & templates form state, hydrated from the stored config once.
   const [phonesInput, setPhonesInput] = useState('');
   const [alertsEnabled, setAlertsEnabled] = useState(false);
+  const [autoAssign, setAutoAssign] = useState(true);
   const [reengagementName, setReengagementName] = useState('');
   const [alertTemplateName, setAlertTemplateName] = useState('');
   const [hydrated, setHydrated] = useState(false);
@@ -62,6 +71,7 @@ export function QualificationSettings() {
     if (!config || hydrated) return;
     setPhonesInput(config.adminAlertPhones.join(', '));
     setAlertsEnabled(config.adminAlertEnabled);
+    setAutoAssign(config.autoAssignEnabled !== false);
     setReengagementName(config.reengagementTemplateName ?? '');
     setAlertTemplateName(config.adminAlertTemplateName ?? '');
     setHydrated(true);
@@ -87,6 +97,7 @@ export function QualificationSettings() {
       await updateConfig({
         patch: {
           adminAlertEnabled: alertsEnabled,
+          autoAssignEnabled: autoAssign,
           adminAlertPhones: phonesInput
             .split(/[,\n]/)
             .map((p) => p.trim())
@@ -147,6 +158,10 @@ export function QualificationSettings() {
                   <p className="text-muted-foreground">{t('alerts.enableLabel')}</p>
                   <Switch checked={alertsEnabled} onCheckedChange={setAlertsEnabled} />
                 </div>
+                <div className="flex items-center justify-between gap-4">
+                  <p className="text-muted-foreground">{t('alerts.autoAssignLabel')}</p>
+                  <Switch checked={autoAssign} onCheckedChange={setAutoAssign} />
+                </div>
                 <div className="space-y-1.5">
                   <p className="text-muted-foreground">{t('alerts.phonesLabel')}</p>
                   <Input
@@ -202,6 +217,66 @@ export function QualificationSettings() {
                     <span className="text-xs text-red-400">{alertsError}</span>
                   ) : null}
                 </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="space-y-4 pt-6 text-sm">
+                <p className="font-medium text-foreground">{t('routing.title')}</p>
+                <p className="text-muted-foreground">{t('routing.desc')}</p>
+                {(tags ?? []).length === 0 ? (
+                  <p className="text-xs text-muted-foreground">{t('routing.noTags')}</p>
+                ) : (
+                  <div className="space-y-3">
+                    {(tags ?? []).map((tag) => {
+                      const linked = new Set(
+                        (memberTagLinks ?? [])
+                          .filter((l) => l.tagId === tag._id)
+                          .map((l) => l.userId),
+                      );
+                      const eligible = (members ?? []).filter(
+                        (m) => m.role === 'agent' || m.role === 'supervisor',
+                      );
+                      return (
+                        <div key={tag._id} className="rounded-lg border border-border p-3">
+                          <p className="mb-2 font-medium text-foreground">{tag.name}</p>
+                          {eligible.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">{t('routing.noAgents')}</p>
+                          ) : (
+                            <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                              {eligible.map((m) => (
+                                <label key={m.userId} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                  <input
+                                    type="checkbox"
+                                    checked={linked.has(m.userId)}
+                                    disabled={routingSavingTag === tag._id}
+                                    onChange={async (e) => {
+                                      setRoutingSavingTag(tag._id);
+                                      try {
+                                        const next = new Set(linked);
+                                        if (e.target.checked) next.add(m.userId);
+                                        else next.delete(m.userId);
+                                        await setForTag({
+                                          tagId: tag._id,
+                                          userIds: [...next] as never,
+                                        });
+                                      } finally {
+                                        setRoutingSavingTag(null);
+                                      }
+                                    }}
+                                  />
+                                  {m.fullName || m.email}
+                                  {m.phone ? ' 📱' : (
+                                    <span className="text-amber-500">{t('routing.noPhone')}</span>
+                                  )}
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </CardContent>
             </Card>
             <Card>

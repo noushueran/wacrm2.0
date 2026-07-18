@@ -34,4 +34,23 @@ crons.interval(
   {},
 );
 
+// P6: expire lead offers past their consent window (default 10 min) and
+// move to the next eligible agent. No-op with no offered rows.
+crons.interval(
+  "qualification-lead-offers",
+  { minutes: 5 },
+  internal.qualificationEngine.sweepLeadOffers,
+  {},
+);
+
+// P6: hourly staff loops — assigned-lead feedback reminders (4h → daily,
+// supervisor escalation after 2 quiet days) + daily staff window
+// keepalive (plain nudge in-window, staff_checkin template once closed).
+crons.interval(
+  "qualification-staff-loops",
+  { minutes: 60 },
+  internal.qualificationEngine.runStaffLoops,
+  {},
+);
+
 export default crons;

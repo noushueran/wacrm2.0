@@ -1085,3 +1085,284 @@ test("V4: cleanupDuplicateLeads retires same-service qualified duplicates within
   expect(sessions.filter((s) => s.status === "qualified")).toHaveLength(2);
   expect(sessions.filter((s) => s.closedReason === "duplicate")).toHaveLength(2);
 });
+
+// ---- P6: staff channel generalization + contact card ----
+
+test("P6: a MEMBER's own number is staff — no sessions open on it (inbound or outbound)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t); // contact phone +971500000001
+  await t.run(async (ctx) => {
+    // make the seeded contact's number a MEMBER phone (agent's own)
+    const uid = await ctx.db.insert("users", { name: "Agent P", email: "ap@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId: base.accountId, role: "agent",
+      fullName: "Agent P", email: "ap@example.com", phone: "+971 50 000 0001",
+    });
+  });
+  await t.mutation(internal.qualificationEngine.onInbound, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    contactId: base.contactId, phoneNormalized: "971500000001",
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(0);
+  await t.mutation(internal.messages.appendInternal, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    senderType: "bot", contentType: "text", contentText: "offer msg",
+  });
+  expect(await sessionsFor(t, base.conversationId)).toHaveLength(0);
+});
+
+test("P6: sendContactCard persists a readable card row (dry-run)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await t.action(internal.metaSend.sendContactCard, {
+    accountId: base.accountId, conversationId: base.conversationId,
+    to: "+971500000001", cardName: "Agent P", cardPhone: "+971 55 123 4567",
+  });
+  const msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].senderType).toBe("bot");
+  expect(msgs[0].contentText).toContain("Agent P");
+  expect(msgs[0].contentText).toContain("+971 55 123 4567");
+});
+
+// ---- P6: consent-based lead offers ----
+
+async function seedAgentWithTag(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  opts: { name: string; phone: string; tagName: string },
+) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: opts.name, email: `${opts.name}@example.com` });
+    await ctx.db.insert("memberships", {
+      userId, accountId, role: "agent", fullName: opts.name,
+      email: `${opts.name}@example.com`, phone: opts.phone,
+    });
+    const tags = await ctx.db.query("tags")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId)).collect();
+    let tag = tags.find((x) => x.name === opts.tagName);
+    if (!tag) {
+      const tagId = await ctx.db.insert("tags", { accountId, name: opts.tagName, color: "#0ea5e9" });
+      tag = (await ctx.db.get(tagId))!;
+    }
+    await ctx.db.insert("memberTags", { accountId, userId, tagId: tag._id });
+    return { userId };
+  });
+}
+
+async function offersFor(t: TestConvex<typeof schema>, sessionId: Id<"qualificationSessions">) {
+  return t.run((ctx) =>
+    ctx.db.query("leadOffers")
+      .withIndex("by_session", (q) => q.eq("sessionId", sessionId)).collect());
+}
+
+test("P6: qualification offers the lead to a matching agent; YES assigns, announces and sends the contact card", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const agent = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:85 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  const [session] = (await sessionsFor(t, base.conversationId)).filter((s) => s.status === "qualified");
+  // scheduler doesn't auto-run — drive the offer directly
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  let offers = await offersFor(t, session._id);
+  expect(offers).toHaveLength(1);
+  expect(offers[0].status).toBe("offered");
+  expect(offers[0].agentUserId).toBe(agent.userId);
+
+  // the agent's staff chat received the YES/NO offer
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971557008899")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  const staffMsgs = await messagesFor(t, staffConversation!._id);
+  expect(staffMsgs.some((m) => m.contentText?.includes("Reply YES"))).toBe(true);
+
+  // the agent replies YES
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971557008899", text: "yes",
+  });
+  offers = await offersFor(t, session._id);
+  expect(offers[0].status).toBe("accepted");
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.assignedToUserId).toBe(agent.userId);
+
+  // announcement (scheduled) — run directly: customer gets the intro + card
+  await t.action(internal.qualificationEngine.announceAssignment, { offerId: offers[0]._id });
+  const customerMsgs = await messagesFor(t, base.conversationId);
+  const bots = customerMsgs.filter((m) => m.senderType === "bot");
+  expect(bots.some((m) => m.contentText?.includes("Sara"))).toBe(true);
+  expect(bots.some((m) => m.contentText?.includes("📇"))).toBe(true);
+});
+
+test("P6: NO passes the lead to the next agent (fewest recent accepts first); timeout sweep does the same", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const a1 = await seedAgentWithTag(t, base.accountId, { name: "A1", phone: "+971551110001", tagName: "UAE visa" });
+  const a2 = await seedAgentWithTag(t, base.accountId, { name: "A2", phone: "+971551110002", tagName: "UAE visa" });
+  // a1 has a recent accept → a2 should be offered FIRST
+  await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId: base.accountId, phone: "+971509999990", phoneNormalized: "971509999990",
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId: base.accountId, contactId, status: "open", unreadCount: 0,
+    });
+    const sessionId = await ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId, contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+    await ctx.db.insert("leadOffers", {
+      accountId: base.accountId, sessionId, conversationId, contactId,
+      agentUserId: a1.userId, agentPhone: "+971551110001",
+      status: "accepted", offeredAt: Date.now() - 1000, respondedAt: Date.now() - 500,
+    });
+  });
+  const sessionId = await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, score: 80, qualifiedAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId,
+  });
+  let offers = await offersFor(t, sessionId);
+  expect(offers).toHaveLength(1);
+  expect(offers[0].agentUserId).toBe(a2.userId); // fewest recent accepts
+
+  // a2 declines → a1 gets the offer next
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971551110002", text: "no",
+  });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId,
+  });
+  offers = await offersFor(t, sessionId);
+  expect(offers).toHaveLength(2);
+  const second = offers.find((o) => o.status === "offered")!;
+  expect(second.agentUserId).toBe(a1.userId);
+
+  // timeout sweep expires it (force the clock) and there's nobody left
+  await t.run((ctx) => ctx.db.patch(second._id, { offeredAt: Date.now() - 11 * 60_000 }));
+  await t.action(internal.qualificationEngine.sweepLeadOffers, {});
+  offers = await offersFor(t, sessionId);
+  expect(offers.find((o) => o._id === second._id)?.status).toBe("timed_out");
+});
+
+test("P6: agent feedback on an accepted lead lands as a contact note and resets the reminder clock", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const agent = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971551110003", tagName: "UAE visa",
+  });
+  const sessionId = await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+  const offerId = await t.run((ctx) =>
+    ctx.db.insert("leadOffers", {
+      accountId: base.accountId, sessionId, conversationId: base.conversationId,
+      contactId: base.contactId, agentUserId: agent.userId, agentPhone: "+971551110003",
+      status: "accepted", offeredAt: Date.now() - 5000, respondedAt: Date.now() - 4000,
+    }));
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971551110003",
+    text: "Spoke to the customer, sending the quote tomorrow morning",
+  });
+  const offer = await t.run((ctx) => ctx.db.get(offerId));
+  expect(offer?.feedback).toContain("quote tomorrow");
+  const notes = await t.run((ctx) =>
+    ctx.db.query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", base.contactId)).collect());
+  expect(notes).toHaveLength(1);
+  expect(notes[0].noteText).toContain("Sara");
+});
+
+// ---- P6: staff loops (reminders + keepalive) ----
+
+test("P6: a silent assigned lead gets a reminder after 4 working-hours; the second quiet-day escalates to supervisors", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t); // 24/7 hours so the test never skips
+  const agent = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971551110004", tagName: "UAE visa",
+  });
+  const sessionId = await t.run(async (ctx) => {
+    await ctx.db.patch(base.conversationId, { assignedToUserId: agent.userId });
+    return await ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "qualified", origin: "inbound", serviceName: "UAE visa",
+      fields: [], expectedCount: 4, answeredCount: 4, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const offerId = await t.run((ctx) =>
+    ctx.db.insert("leadOffers", {
+      accountId: base.accountId, sessionId, conversationId: base.conversationId,
+      contactId: base.contactId, agentUserId: agent.userId, agentPhone: "+971551110004",
+      status: "accepted", offeredAt: Date.now() - 50 * 3_600_000,
+      respondedAt: Date.now() - 49 * 3_600_000, // quiet for 49h → escalation due
+    }));
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  const offer = await t.run((ctx) => ctx.db.get(offerId));
+  expect(offer?.remindersSent).toBe(1);
+  expect(offer?.escalatedAt).toBeGreaterThan(0);
+  // supervisor pool (the seeded admin) got the escalation bell
+  const bells = await t.run((ctx) =>
+    ctx.db.query("notifications")
+      .withIndex("by_user", (q) => q.eq("userId", base.userId)).collect());
+  expect(bells.some((n) => n.title.includes("needs attention"))).toBe(true);
+  // the agent got the WhatsApp reminder
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971551110004")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  const msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs.some((m) => m.contentText?.includes("Quick reminder"))).toBe(true);
+
+  // running again immediately does NOT double-remind (daily repeat)
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  expect((await t.run((ctx) => ctx.db.get(offerId)))?.remindersSent).toBe(1);
+});
+
+test("P6: staff keepalive — closed window gets the template, and never twice in 20h", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971551110005", tagName: "UAE visa",
+  });
+  // no prior inbound from Sara at all → window closed → template path
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971551110005")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  let msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].contentType).toBe("template");
+  expect(msgs[0].templateName).toBe("staff_checkin");
+
+  // second run within 20h → no repeat
+  await t.action(internal.qualificationEngine.runStaffLoops, {});
+  msgs = await messagesFor(t, staffConversation!._id);
+  expect(msgs).toHaveLength(1);
+});

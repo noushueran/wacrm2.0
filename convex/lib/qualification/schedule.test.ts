@@ -94,3 +94,19 @@ test("pickFollowUpText rotates pendingQuestion + alternates, falling back to bas
   );
   expect(config.basicFields[1].phrasings).toContain(fallback.text); // travel_dates variant
 });
+
+// ---- P6: staff reply parsing ----
+import { parseStaffReply } from "./staffReply";
+
+test("parseStaffReply: conservative accept/decline detection", () => {
+  expect(parseStaffReply("YES")).toBe("accept");
+  expect(parseStaffReply("ok")).toBe("accept");
+  expect(parseStaffReply("Yes, taking it")).toBe("accept");
+  expect(parseStaffReply("👍")).toBe("accept");
+  expect(parseStaffReply("no")).toBe("decline");
+  expect(parseStaffReply("busy")).toBe("decline");
+  expect(parseStaffReply("No, offer it to Sara")).toBe("decline");
+  expect(parseStaffReply("yes we spoke yesterday about the other customer and it went well")).toBe("other");
+  expect(parseStaffReply("The customer confirmed the August dates")).toBe("other");
+  expect(parseStaffReply("")).toBe("other");
+});

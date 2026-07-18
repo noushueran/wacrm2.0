@@ -1436,6 +1436,11 @@ export default defineSchema({
     adminAlertPhones: v.array(v.string()),
     adminAlertTemplateName: v.optional(v.string()),
     adminAlertTemplateLanguage: v.optional(v.string()),
+    // Phase 6 — consent-based auto-assignment + staff keepalive.
+    autoAssignEnabled: v.optional(v.boolean()),      // default true
+    offerTimeoutMinutes: v.optional(v.number()),     // default 10
+    staffCheckinTemplateName: v.optional(v.string()),
+    staffCheckinTemplateLanguage: v.optional(v.string()),
     outboundNudgesEnabled: v.boolean(),
     updatedAt: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
@@ -1468,6 +1473,64 @@ export default defineSchema({
   })
     .index("by_account_status", ["accountId", "status"])
     .index("by_conversation", ["conversationId"]),
+
+  // ============================================================
+  // Phase 6 — agent orchestration over WhatsApp.
+  // ============================================================
+
+  // One consent-based lead offer to one agent. The offer engine walks
+  // eligible agents (memberTags ∩ the lead's service tag, fewest recent
+  // accepts first): offered → accepted (assign + announce + contact
+  // card) | declined | timed_out (10 min default → next agent) |
+  // cancelled (someone assigned manually meanwhile). Accepted offers
+  // also carry the feedback-reminder state for the assigned lead.
+  leadOffers: defineTable({
+    accountId: v.id("accounts"),
+    sessionId: v.id("qualificationSessions"),
+    conversationId: v.id("conversations"), // the CUSTOMER thread
+    contactId: v.id("contacts"),
+    agentUserId: v.id("users"),
+    agentPhone: v.string(),
+    status: v.union(
+      v.literal("offered"),
+      v.literal("accepted"),
+      v.literal("declined"),
+      v.literal("timed_out"),
+      v.literal("cancelled"),
+    ),
+    offeredAt: v.number(),
+    respondedAt: v.optional(v.number()),
+    // Feedback loop (accepted offers only)
+    feedback: v.optional(v.string()),
+    feedbackAt: v.optional(v.number()),
+    lastReminderAt: v.optional(v.number()),
+    remindersSent: v.optional(v.number()),
+    escalatedAt: v.optional(v.number()),
+  })
+    .index("by_session", ["sessionId"])
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_agent_status", ["agentUserId", "status"])
+    .index("by_status_offered", ["status", "offeredAt"]),
+
+  // Service routing: which members can work which service tag. One row
+  // per (member, tag) link; the Settings → Services card manages them.
+  memberTags: defineTable({
+    accountId: v.id("accounts"),
+    userId: v.id("users"),
+    tagId: v.id("tags"),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_user", ["userId"])
+    .index("by_account_tag", ["accountId", "tagId"]),
+
+  // Staff window keepalive state, one row per staff phone (admin alert
+  // numbers + member numbers). Tracks when we last nudged so the daily
+  // check-in never spams.
+  staffCheckins: defineTable({
+    accountId: v.id("accounts"),
+    phoneNormalized: v.string(),
+    lastCheckinSentAt: v.number(),
+  }).index("by_account_phone", ["accountId", "phoneNormalized"]),
 
   // One qualification session per conversation — this row IS the lead
   // the sales team works from (spec §5; no separate leads table).

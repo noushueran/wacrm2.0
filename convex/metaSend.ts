@@ -6,6 +6,7 @@ import type { Id } from "./_generated/dataModel";
 import { decrypt } from "./lib/whatsappEncryption";
 import {
   sendTextMessage,
+  sendContactsMessage,
   sendMediaMessage,
   sendTemplateMessage,
   sendInteractiveButtons,
@@ -407,6 +408,50 @@ export const sendReaction = internalAction({
       whatsappMessageId = result.messageId;
     }
 
+    return { whatsappMessageId };
+  },
+});
+
+/**
+ * Phase 6: send a WhatsApp CONTACT CARD (Cloud API `type: "contacts"`)
+ * — used when a lead is assigned so the customer can save the agent's
+ * number. Persists a readable text row locally (the messages schema has
+ * no dedicated contacts contentType; the bubble shows the card info).
+ */
+export const sendContactCard = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    to: v.string(),
+    cardName: v.string(),
+    cardPhone: v.string(),
+  },
+  handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
+    let whatsappMessageId: string;
+    if (isDryRun()) {
+      whatsappMessageId = dryRunWamid();
+    } else {
+      const { phoneNumberId, accessToken } = await loadDecryptedConfig(
+        ctx,
+        args.accountId,
+      );
+      const result = await sendContactsMessage({
+        phoneNumberId,
+        accessToken,
+        to: args.to,
+        contactName: args.cardName,
+        contactPhone: args.cardPhone,
+      });
+      whatsappMessageId = result.messageId;
+    }
+    await ctx.runMutation(internal.messages.appendInternal, {
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      senderType: "bot",
+      contentType: "text",
+      contentText: `📇 ${args.cardName}\n${args.cardPhone}\n(save this contact for future reference)`,
+      messageId: whatsappMessageId,
+    });
     return { whatsappMessageId };
   },
 });

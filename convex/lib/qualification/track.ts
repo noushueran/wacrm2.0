@@ -134,8 +134,11 @@ export async function recordOutboundSend(
   if (!conversation || conversation.accountId !== args.accountId) return;
   if (conversation.status === "closed") return; // mirror onInbound (review fix)
   const contact = await ctx.db.get(conversation.contactId);
-  if (contact && isAdminAlertNumber(args.config, contact.phoneNormalized)) {
-    return; // loop guard (spec §9)
+  if (contact) {
+    const staff = await loadStaffPhoneSet(ctx, args.accountId, args.config);
+    if (isStaffNumber(staff, contact.phoneNormalized)) {
+      return; // loop guard (spec §9; P6: all staff numbers)
+    }
   }
   const sessionId = await ensureSession(ctx, {
     accountId: args.accountId,
@@ -150,4 +153,36 @@ export async function recordOutboundSend(
       await ctx.db.patch(sessionId, { humanTouchedAt: args.now });
     }
   }
+}
+
+/**
+ * Phase 6: the full STAFF phone set — admin alert numbers PLUS every
+ * member's own WhatsApp number. All engine loop guards key off this set
+ * (a staff chat must never become a lead), and the offer/keepalive
+ * machinery messages exactly these numbers. One indexed collect over the
+ * account's memberships (small) per call.
+ */
+export async function loadStaffPhoneSet(
+  ctx: DbReadCtx,
+  accountId: Id<"accounts">,
+  config: Doc<"qualificationConfigs">,
+): Promise<Set<string>> {
+  const set = new Set<string>(
+    config.adminAlertPhones.map((p) => normalizePhone(p)).filter(Boolean),
+  );
+  const members = await ctx.db
+    .query("memberships")
+    .withIndex("by_account", (q) => q.eq("accountId", accountId))
+    .collect();
+  for (const m of members) {
+    if (m.phone) {
+      const digits = normalizePhone(m.phone);
+      if (digits) set.add(digits);
+    }
+  }
+  return set;
+}
+
+export function isStaffNumber(staff: Set<string>, phoneNormalized: string): boolean {
+  return staff.has(phoneNormalized);
 }

@@ -45,12 +45,24 @@ test("schema accepts qualificationConfigs, qualificationSessions and lead_qualif
       closingMessage: "Thank you! Our travel expert will contact you shortly.",
       adminAlertEnabled: false, adminAlertPhones: [], outboundNudgesEnabled: false,
     });
+    await ctx.db.insert("memberTags", {
+      accountId, userId,
+      tagId: await ctx.db.insert("tags", { accountId, name: "UAE visa", color: "#0ea5e9" }),
+    });
+    await ctx.db.insert("staffCheckins", {
+      accountId, phoneNormalized: "971551234567", lastCheckinSentAt: 1,
+    });
     const sessionId = await ctx.db.insert("qualificationSessions", {
       accountId, conversationId, contactId,
       status: "collecting", origin: "inbound",
       fields: [], expectedCount: 0, answeredCount: 0,
       checklistSatisfiedAt: 123,
       followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+    await ctx.db.insert("leadOffers", {
+      accountId, sessionId, conversationId, contactId,
+      agentUserId: userId, agentPhone: "+971551234567",
+      status: "offered", offeredAt: 1,
     });
     await ctx.db.insert("notifications", {
       accountId, userId, type: "lead_qualified", title: "New qualified lead",
@@ -232,4 +244,34 @@ test("V4 RBAC: agents see ONLY their own assigned leads; supervisors see all wit
   const adminBoard = await admin.as.query(api.qualification.leadsBoard, {});
   expect(adminBoard.leads).toHaveLength(2);
   expect(adminBoard.leads.some((l) => l.assigneeName === "Agent A")).toBe(true);
+});
+
+test("P6: memberTags.setForTag replaces routing links, admin-gated", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const { tagId, u1, u2 } = await t.run(async (ctx) => {
+    const tagId = await ctx.db.insert("tags", {
+      accountId: admin.accountId, name: "UAE visa", color: "#0ea5e9",
+    });
+    const mk = async (name: string) => {
+      const uid = await ctx.db.insert("users", { name, email: `${name}@example.com` });
+      await ctx.db.insert("memberships", {
+        userId: uid, accountId: admin.accountId, role: "agent", fullName: name, email: `${name}@example.com`,
+      });
+      return uid;
+    };
+    return { tagId, u1: await mk("R1"), u2: await mk("R2") };
+  });
+  await admin.as.mutation(api.memberTags.setForTag, { tagId, userIds: [u1, u2] });
+  let links = await admin.as.query(api.memberTags.list, {});
+  expect(links).toHaveLength(2);
+  await admin.as.mutation(api.memberTags.setForTag, { tagId, userIds: [u2] });
+  links = await admin.as.query(api.memberTags.list, {});
+  expect(links).toHaveLength(1);
+  expect(links[0].userId).toBe(u2);
+
+  const agent = await seedMember(t, "agent");
+  await expect(
+    agent.as.mutation(api.memberTags.setForTag, { tagId, userIds: [] }),
+  ).rejects.toThrow();
 });

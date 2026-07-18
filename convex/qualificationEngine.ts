@@ -4,6 +4,8 @@ import { v } from "convex/values";
 import {
   loadEnabledConfig,
   isAdminAlertNumber,
+  loadStaffPhoneSet,
+  isStaffNumber,
   recordInboundActivity,
   ensureSession,
 } from "./lib/qualification/track";
@@ -28,9 +30,11 @@ import {
   pickFollowUpText,
 } from "./lib/qualification/schedule";
 import { insertNotification } from "./notifications";
+import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import type { AccountRole } from "./lib/roles";
 import { normalizePhone } from "./lib/phone";
+import { parseStaffReply } from "./lib/qualification/staffReply";
 import { allocateContactCode } from "./contacts";
 import type { Doc, Id } from "./_generated/dataModel";
 
@@ -63,7 +67,8 @@ export const onInbound = internalMutation({
   handler: async (ctx, args): Promise<void> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return; // dormant
-    if (isAdminAlertNumber(config, args.phoneNormalized)) return; // loop guard
+    const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+    if (isStaffNumber(staff, args.phoneNormalized)) return; // loop guard (P6: all staff)
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
     if (conversation.status === "closed") return;
@@ -192,7 +197,10 @@ export const loadAnalysisContext = internalQuery({
     // session (the alert text itself contains qualifying answers, so
     // the model could "qualify" the staff thread and echo fresh alerts).
     const contact = await ctx.db.get(conversation.contactId);
-    if (contact && isAdminAlertNumber(config, contact.phoneNormalized)) return null;
+    if (contact) {
+      const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+      if (isStaffNumber(staff, contact.phoneNormalized)) return null;
+    }
     // v3 multi-lead: the LATEST session is the live one; older terminal
     // rows are history. A terminal latest no longer bails — the analysis
     // decides whether this message starts a NEW inquiry.
@@ -295,8 +303,9 @@ export const applyAnalysis = internalMutation({
     // filters, but this mutation creates sessions and is independently
     // callable — it must never open one on the alert channel).
     const guardContact = await ctx.db.get(args.contactId);
-    if (guardContact && isAdminAlertNumber(config, guardContact.phoneNormalized)) {
-      return none;
+    if (guardContact) {
+      const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+      if (isStaffNumber(staff, guardContact.phoneNormalized)) return none;
     }
     const now = Date.now();
     const analysis = args.analysis as AnalysisResult;
@@ -745,6 +754,15 @@ export const completeQualification = internalMutation({
       accountId: args.accountId,
       conversationId: args.conversationId,
     });
+    // P6: consent-based auto-assignment — offer the lead to a matching
+    // agent over WhatsApp (no-ops when disabled, already assigned, or
+    // nobody routes for this service).
+    if (config.autoAssignEnabled !== false && !conversation.assignedToUserId) {
+      await ctx.scheduler.runAfter(0, internal.qualificationEngine.startLeadOffer, {
+        accountId: args.accountId,
+        sessionId: session._id,
+      });
+    }
   },
 });
 
@@ -1400,23 +1418,182 @@ export const onAdminInbound = internalMutation({
       .query("qualificationConfigs")
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .unique();
-    if (!config || !isAdminAlertNumber(config, args.phoneNormalized)) return;
-    const pending = await ctx.db
-      .query("adminInquiries")
-      .withIndex("by_account_status", (q) =>
-        q.eq("accountId", args.accountId).eq("status", "pending"),
-      )
-      .order("desc")
-      .first();
-    if (!pending) return;
-    await ctx.db.patch(pending._id, {
-      status: "answered",
-      answer: args.text.trim(),
-      answeredAt: Date.now(),
-    });
-    await ctx.scheduler.runAfter(0, internal.qualificationEngine.relayAnswerToCustomer, {
-      inquiryId: pending._id,
-    });
+    if (!config) return;
+
+    // P6 routing precedence for a STAFF inbound:
+    //   1. a member with a live lead OFFER → interpret YES/NO consent;
+    //   2. an admin-alert number with a pending inquiry → team answer;
+    //   3. a member with an accepted lead → status update (logged as a
+    //      contact note + on the offer, resetting the reminder clock);
+    //   4. anything else → ignore (free chat).
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    const member = memberships.find(
+      (m) => m.phone && normalizePhone(m.phone) === args.phoneNormalized,
+    );
+
+    if (member) {
+      const offered = await ctx.db
+        .query("leadOffers")
+        .withIndex("by_agent_status", (q) =>
+          q.eq("agentUserId", member.userId).eq("status", "offered"),
+        )
+        .order("desc")
+        .first();
+      if (offered && offered.accountId === args.accountId) {
+        const verdict = parseStaffReply(args.text);
+        if (verdict === "accept") {
+          const result = await ctx.db.get(offered._id); // freshness via OCC
+          void result;
+          const outcome = await acceptOfferCore(ctx, offered._id);
+          if (outcome.ok) {
+            await ctx.scheduler.runAfter(0, internal.qualificationEngine.announceAssignment, {
+              offerId: offered._id,
+            });
+          } else if (outcome.alreadyAssigned) {
+            await ctx.scheduler.runAfter(0, internal.qualificationEngine.notifyStaffText, {
+              accountId: args.accountId,
+              phone: offered.agentPhone,
+              text: "Someone already took that lead — I'll send you the next one! 🙌",
+            });
+          }
+          return;
+        }
+        if (verdict === "decline") {
+          const closed = await markOfferClosedCore(ctx, offered._id, "declined");
+          if (closed) {
+            await ctx.scheduler.runAfter(0, internal.qualificationEngine.startLeadOffer, {
+              accountId: args.accountId,
+              sessionId: closed.sessionId,
+            });
+            await ctx.scheduler.runAfter(0, internal.qualificationEngine.notifyStaffText, {
+              accountId: args.accountId,
+              phone: offered.agentPhone,
+              text: "No problem 👍 I'll offer it to someone else.",
+            });
+          }
+          return;
+        }
+        // ambiguous while an offer is pending → leave the offer open,
+        // fall through to inquiry/feedback handling below.
+      }
+    }
+
+    if (isAdminAlertNumber(config, args.phoneNormalized)) {
+      const pending = await ctx.db
+        .query("adminInquiries")
+        .withIndex("by_account_status", (q) =>
+          q.eq("accountId", args.accountId).eq("status", "pending"),
+        )
+        .order("desc")
+        .first();
+      if (pending) {
+        await ctx.db.patch(pending._id, {
+          status: "answered",
+          answer: args.text.trim(),
+          answeredAt: Date.now(),
+        });
+        await ctx.scheduler.runAfter(0, internal.qualificationEngine.relayAnswerToCustomer, {
+          inquiryId: pending._id,
+        });
+        return;
+      }
+    }
+
+    // 3. feedback from an agent on their most recent accepted lead
+    if (member) {
+      const accepted = await ctx.db
+        .query("leadOffers")
+        .withIndex("by_agent_status", (q) =>
+          q.eq("agentUserId", member.userId).eq("status", "accepted"),
+        )
+        .order("desc")
+        .first();
+      if (
+        accepted &&
+        accepted.accountId === args.accountId &&
+        Date.now() - (accepted.respondedAt ?? 0) < 14 * 24 * 3_600_000
+      ) {
+        const now = Date.now();
+        await ctx.db.patch(accepted._id, {
+          feedback: args.text.trim(),
+          feedbackAt: now,
+          lastReminderAt: now,
+        });
+        await ctx.db.insert("contactNotes", {
+          accountId: args.accountId,
+          contactId: accepted.contactId,
+          createdByUserId: member.userId,
+          noteText: `📋 WhatsApp update from ${member.fullName ?? member.email ?? "agent"}: ${args.text.trim()}`,
+        });
+      }
+    }
+  },
+});
+
+/** Shared cores so the router (a mutation) can act without runMutation. */
+async function acceptOfferCore(
+  ctx: { db: import("./_generated/server").MutationCtx["db"] },
+  offerId: Id<"leadOffers">,
+): Promise<{ ok: boolean; alreadyAssigned?: boolean }> {
+  const offer = await ctx.db.get(offerId);
+  if (!offer || offer.status !== "offered") return { ok: false };
+  const conversation = await ctx.db.get(offer.conversationId);
+  if (!conversation) return { ok: false };
+  if (conversation.assignedToUserId) {
+    await ctx.db.patch(offerId, { status: "cancelled", respondedAt: Date.now() });
+    return { ok: false, alreadyAssigned: true };
+  }
+  const now = Date.now();
+  await ctx.db.patch(offerId, { status: "accepted", respondedAt: now });
+  await ctx.db.patch(offer.conversationId, {
+    assignedToUserId: offer.agentUserId,
+    updatedAt: now,
+  });
+  await chargeLeadIfAgent(ctx, offer.accountId, offer.agentUserId, offer.conversationId);
+  await insertNotification(ctx, {
+    accountId: offer.accountId,
+    userId: offer.agentUserId,
+    type: "conversation_assigned",
+    conversationId: offer.conversationId,
+    contactId: offer.contactId,
+    title: "Lead assigned to you",
+    body: "You accepted a qualified lead over WhatsApp.",
+  });
+  return { ok: true };
+}
+
+async function markOfferClosedCore(
+  ctx: { db: import("./_generated/server").MutationCtx["db"] },
+  offerId: Id<"leadOffers">,
+  status: "declined" | "timed_out",
+): Promise<{ sessionId: Id<"qualificationSessions"> } | null> {
+  const offer = await ctx.db.get(offerId);
+  if (!offer || offer.status !== "offered") return null;
+  await ctx.db.patch(offerId, { status, respondedAt: Date.now() });
+  return { sessionId: offer.sessionId };
+}
+
+/** Tiny helper action: plain text to a staff phone. */
+export const notifyStaffText = internalAction({
+  args: { accountId: v.id("accounts"), phone: v.string(), text: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const target = await ctx.runMutation(
+        internal.qualificationEngine.ensureAdminConversation,
+        { accountId: args.accountId, phone: args.phone },
+      );
+      await ctx.runAction(internal.metaSend.sendText, {
+        accountId: args.accountId,
+        conversationId: target.conversationId,
+        to: target.to,
+        text: args.text,
+      });
+    } catch (err) {
+      console.error("[qualification] notifyStaffText failed:", err);
+    }
   },
 });
 
@@ -1609,5 +1786,545 @@ export const cleanupDuplicateLeads = internalMutation({
       }
     }
     return { removed };
+  },
+});
+
+// ============================================================
+// P6 — consent-based lead offers. On qualification (auto-assign on,
+// conversation unassigned) the engine walks eligible agents — members
+// whose memberTags include the lead's service tag AND who have their
+// own WhatsApp number — fewest recent accepts first, offering each a
+// 10-minute (configurable) YES/NO window over WhatsApp. Accept →
+// assign + charge + tell the customer + send the agent's contact card.
+// Decline/timeout → next agent. Nobody left → the lead stays in the
+// shared queue exactly as before (supervisors were already notified).
+// ============================================================
+
+/** Picks the next eligible agent for a session's offer, or null. */
+export const offerContext = internalQuery({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "qualified" || !session.serviceName) return null;
+    const config = await loadEnabledConfig(ctx, session.accountId);
+    if (!config || config.autoAssignEnabled === false) return null;
+    const conversation = await ctx.db.get(session.conversationId);
+    if (!conversation || conversation.assignedToUserId) return null; // taken already
+    // one live offer at a time per session
+    const offers = await ctx.db
+      .query("leadOffers")
+      .withIndex("by_session", (q) => q.eq("sessionId", args.sessionId))
+      .collect();
+    if (offers.some((o) => o.status === "offered" || o.status === "accepted")) return null;
+    const alreadyTried = new Set(offers.map((o) => o.agentUserId));
+
+    // the service tag (auto-created at completion)
+    const tags = await ctx.db
+      .query("tags")
+      .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
+      .collect();
+    const serviceTag = tags.find(
+      (t) => t.name.trim().toLowerCase() === session.serviceName!.trim().toLowerCase(),
+    );
+    if (!serviceTag) return null;
+
+    const links = await ctx.db
+      .query("memberTags")
+      .withIndex("by_account_tag", (q) =>
+        q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
+      )
+      .collect();
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
+      .collect();
+    const byUser = new Map(memberships.map((m) => [m.userId, m]));
+
+    const candidates: { userId: Id<"users">; phone: string; name: string; recent: number }[] = [];
+    for (const link of links) {
+      if (alreadyTried.has(link.userId)) continue;
+      const m = byUser.get(link.userId);
+      if (!m || !m.phone) continue;
+      if (m.role !== "agent" && m.role !== "supervisor") continue;
+      const recentAccepts = await ctx.db
+        .query("leadOffers")
+        .withIndex("by_agent_status", (q) =>
+          q.eq("agentUserId", link.userId).eq("status", "accepted"),
+        )
+        .order("desc")
+        .take(10);
+      const cutoff = Date.now() - 72 * 3_600_000;
+      candidates.push({
+        userId: link.userId,
+        phone: m.phone,
+        name: m.fullName ?? m.email ?? "Team member",
+        recent: recentAccepts.filter((o) => (o.respondedAt ?? 0) > cutoff).length,
+      });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.recent - b.recent);
+    const pick = candidates[0];
+
+    const contact = await ctx.db.get(session.contactId);
+    return {
+      accountId: session.accountId,
+      conversationId: session.conversationId,
+      contactId: session.contactId,
+      agent: pick,
+      serviceName: session.serviceName,
+      score: session.score ?? null,
+      summary: session.summary ?? null,
+      customerName: contact?.name?.trim() || contact?.phone || "a customer",
+    };
+  },
+});
+
+export const createOffer = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    sessionId: v.id("qualificationSessions"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    agentUserId: v.id("users"),
+    agentPhone: v.string(),
+  },
+  handler: async (ctx, args): Promise<Id<"leadOffers"> | null> => {
+    const existing = await ctx.db
+      .query("leadOffers")
+      .withIndex("by_session", (q) => q.eq("sessionId", args.sessionId))
+      .collect();
+    if (existing.some((o) => o.status === "offered" || o.status === "accepted")) {
+      return null; // race: someone else already offering/accepted
+    }
+    return await ctx.db.insert("leadOffers", {
+      ...args,
+      status: "offered",
+      offeredAt: Date.now(),
+    });
+  },
+});
+
+export const startLeadOffer = internalAction({
+  args: { accountId: v.id("accounts"), sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const context = await ctx.runQuery(internal.qualificationEngine.offerContext, {
+        sessionId: args.sessionId,
+      });
+      if (!context) return;
+      const offerId = await ctx.runMutation(internal.qualificationEngine.createOffer, {
+        accountId: context.accountId,
+        sessionId: args.sessionId,
+        conversationId: context.conversationId,
+        contactId: context.contactId,
+        agentUserId: context.agent.userId,
+        agentPhone: context.agent.phone,
+      });
+      if (!offerId) return;
+      const target = await ctx.runMutation(
+        internal.qualificationEngine.ensureAdminConversation,
+        { accountId: context.accountId, phone: context.agent.phone },
+      );
+      await ctx.runAction(internal.metaSend.sendText, {
+        accountId: context.accountId,
+        conversationId: target.conversationId,
+        to: target.to,
+        text:
+          `🆕 New qualified lead: ${context.serviceName}` +
+          (context.score !== null ? ` · score ${context.score}/100` : "") +
+          (context.summary ? `\n${context.summary}` : "") +
+          `\nCustomer: ${context.customerName}` +
+          "\n\nAre you available to take it? Reply YES to accept or NO to pass.",
+      });
+    } catch (err) {
+      console.error("[qualification] startLeadOffer failed:", err);
+    }
+  },
+});
+
+export const acceptOffer = internalMutation({
+  args: { offerId: v.id("leadOffers") },
+  handler: async (ctx, args) => acceptOfferCore(ctx, args.offerId),
+});
+
+export const markOfferClosed = internalMutation({
+  args: {
+    offerId: v.id("leadOffers"),
+    status: v.union(v.literal("declined"), v.literal("timed_out")),
+  },
+  handler: async (ctx, args) => markOfferClosedCore(ctx, args.offerId, args.status),
+});
+
+/** Tells the customer who's coming + sends the agent's contact card,
+ *  and confirms to the agent. Best-effort, after `acceptOffer`. */
+export const announceAssignment = internalAction({
+  args: { offerId: v.id("leadOffers") },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const data = await ctx.runQuery(internal.qualificationEngine.announceContext, {
+        offerId: args.offerId,
+      });
+      if (!data) return;
+      await ctx.runAction(internal.metaSend.sendText, {
+        accountId: data.accountId,
+        conversationId: data.customerConversationId,
+        to: data.customerPhone,
+        text:
+          `Great news — ${data.agentName} from our team will contact you shortly to take this forward! 🎉\n` +
+          "Meanwhile, here's their contact — feel free to save it in case you'd like to call.",
+      });
+      await ctx.runAction(internal.metaSend.sendContactCard, {
+        accountId: data.accountId,
+        conversationId: data.customerConversationId,
+        to: data.customerPhone,
+        cardName: data.agentName,
+        cardPhone: data.agentPhone,
+      });
+      const staff = await ctx.runMutation(
+        internal.qualificationEngine.ensureAdminConversation,
+        { accountId: data.accountId, phone: data.agentPhone },
+      );
+      await ctx.runAction(internal.metaSend.sendText, {
+        accountId: data.accountId,
+        conversationId: staff.conversationId,
+        to: staff.to,
+        text:
+          `✅ It's yours — ${data.customerName} (${data.customerPhone}).\n` +
+          "I've told them you'll be in touch. Reply here anytime with an update and I'll log it on the lead.",
+      });
+    } catch (err) {
+      console.error("[qualification] announceAssignment failed:", err);
+    }
+  },
+});
+
+export const announceContext = internalQuery({
+  args: { offerId: v.id("leadOffers") },
+  handler: async (ctx, args) => {
+    const offer = await ctx.db.get(args.offerId);
+    if (!offer || offer.status !== "accepted") return null;
+    const contact = await ctx.db.get(offer.contactId);
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", offer.agentUserId).eq("accountId", offer.accountId),
+      )
+      .first();
+    if (!contact || !membership) return null;
+    return {
+      accountId: offer.accountId,
+      customerConversationId: offer.conversationId,
+      customerPhone: contact.phone,
+      customerName: contact.name?.trim() || contact.phone,
+      agentName: membership.fullName ?? membership.email ?? "our travel expert",
+      agentPhone: offer.agentPhone,
+    };
+  },
+});
+
+/** Cron: expire offers past the consent window and move to the next agent. */
+export const sweepLeadOffers = internalAction({
+  args: {},
+  handler: async (ctx): Promise<void> => {
+    const due = await ctx.runQuery(internal.qualificationEngine.getExpiredOffers, {});
+    for (const offer of due) {
+      const closed = await ctx.runMutation(internal.qualificationEngine.markOfferClosed, {
+        offerId: offer._id,
+        status: "timed_out",
+      });
+      if (closed) {
+        await ctx.scheduler.runAfter(0, internal.qualificationEngine.startLeadOffer, {
+          accountId: offer.accountId,
+          sessionId: closed.sessionId,
+        });
+      }
+    }
+  },
+});
+
+export const getExpiredOffers = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Doc<"leadOffers">[]> => {
+    const now = Date.now();
+    const offered = await ctx.db
+      .query("leadOffers")
+      .withIndex("by_status_offered", (q) => q.eq("status", "offered").lte("offeredAt", now))
+      .take(100);
+    const out: Doc<"leadOffers">[] = [];
+    for (const offer of offered) {
+      const config = await ctx.db
+        .query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+        .unique();
+      const timeoutMs = (config?.offerTimeoutMinutes ?? 10) * 60_000;
+      if (now - offer.offeredAt >= timeoutMs) out.push(offer);
+    }
+    return out;
+  },
+});
+
+// ============================================================
+// P6 — staff loops cron (hourly): (a) feedback reminders for assigned
+// leads that haven't moved (first nudge 4 working-hours after accept,
+// then daily, supervisor escalation after 48 quiet hours); (b) daily
+// window keepalive for every staff number (plain reminder while the
+// 24h window is open, the approved staff_checkin template once closed).
+// ============================================================
+
+const REMINDER_FIRST_MS = 4 * 3_600_000;
+const REMINDER_REPEAT_MS = 24 * 3_600_000;
+const ESCALATE_AFTER_MS = 48 * 3_600_000;
+const CHECKIN_EVERY_MS = 20 * 3_600_000;
+
+export const staffLoopsDue = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const reminders: {
+      offerId: Id<"leadOffers">;
+      accountId: Id<"accounts">;
+      agentPhone: string;
+      customerName: string;
+      escalate: boolean;
+    }[] = [];
+    const accepted = await ctx.db
+      .query("leadOffers")
+      .withIndex("by_status_offered", (q) => q.eq("status", "accepted"))
+      .take(200);
+    for (const offer of accepted) {
+      const config = await ctx.db
+        .query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+        .unique();
+      if (!config?.enabled) continue;
+      // outside working hours → skip this pass (the hourly cron retries)
+      if (clampToWorkingHours(now, config) !== now) continue;
+      const conversation = await ctx.db.get(offer.conversationId);
+      if (!conversation) continue;
+      if (conversation.assignedToUserId !== offer.agentUserId) continue; // re-assigned
+      if (conversation.status === "closed") continue; // done
+      if (conversation.funnel?.stage && conversation.funnel.stage !== "qualified") {
+        continue; // the agent moved the funnel — no nagging
+      }
+      const anchor = Math.max(
+        offer.respondedAt ?? 0,
+        offer.feedbackAt ?? 0,
+        offer.lastReminderAt ?? 0,
+      );
+      const firstReminder = !offer.lastReminderAt && !offer.feedbackAt;
+      const wait = firstReminder ? REMINDER_FIRST_MS : REMINDER_REPEAT_MS;
+      if (now - anchor < wait) continue;
+      const contact = await ctx.db.get(offer.contactId);
+      const quietSince = Math.max(offer.respondedAt ?? 0, offer.feedbackAt ?? 0);
+      reminders.push({
+        offerId: offer._id,
+        accountId: offer.accountId,
+        agentPhone: offer.agentPhone,
+        customerName: contact?.name?.trim() || contact?.phone || "the customer",
+        escalate: !offer.escalatedAt && now - quietSince > ESCALATE_AFTER_MS,
+      });
+    }
+    return reminders;
+  },
+});
+
+export const recordReminderSent = internalMutation({
+  args: { offerId: v.id("leadOffers"), escalated: v.boolean() },
+  handler: async (ctx, args): Promise<void> => {
+    const offer = await ctx.db.get(args.offerId);
+    if (!offer) return;
+    const now = Date.now();
+    await ctx.db.patch(args.offerId, {
+      lastReminderAt: now,
+      remindersSent: (offer.remindersSent ?? 0) + 1,
+      ...(args.escalated ? { escalatedAt: now } : {}),
+    });
+    if (args.escalated) {
+      const members = await ctx.db
+        .query("memberships")
+        .withIndex("by_account", (q) => q.eq("accountId", offer.accountId))
+        .collect();
+      const recipients = recipientsForInbound({
+        assignedToUserId: null, // escalation goes to the whole supervisor pool
+        members: members.map((m) => ({ userId: m.userId, role: m.role as AccountRole })),
+      });
+      const agent = members.find((m) => m.userId === offer.agentUserId);
+      for (const userId of recipients) {
+        await insertNotification(ctx, {
+          accountId: offer.accountId,
+          userId,
+          type: "lead_qualified",
+          conversationId: offer.conversationId,
+          contactId: offer.contactId,
+          title: "Assigned lead needs attention",
+          body: `${agent?.fullName ?? "An agent"} hasn't updated this lead in 2 days.`,
+        });
+      }
+    }
+  },
+});
+
+export const staffCheckinsDue = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const out: {
+      accountId: Id<"accounts">;
+      phone: string;
+      phoneNormalized: string;
+      windowOpen: boolean;
+      templateName: string | null;
+      templateLanguage: string | null;
+    }[] = [];
+    // every enabled config = one account's staff set
+    const configs = await ctx.db.query("qualificationConfigs").collect();
+    for (const config of configs) {
+      if (!config.enabled) continue;
+      const staff = await loadStaffPhoneSet(ctx, config.accountId, config);
+      for (const phoneNormalized of staff) {
+        const checkin = await ctx.db
+          .query("staffCheckins")
+          .withIndex("by_account_phone", (q) =>
+            q.eq("accountId", config.accountId).eq("phoneNormalized", phoneNormalized),
+          )
+          .unique();
+        if (checkin && now - checkin.lastCheckinSentAt < CHECKIN_EVERY_MS) continue;
+        // last inbound FROM this staff number = their staff conversation's
+        // latest customer-sender message
+        const contact = await ctx.db
+          .query("contacts")
+          .withIndex("by_account_phone", (q) =>
+            q.eq("accountId", config.accountId).eq("phoneNormalized", phoneNormalized),
+          )
+          .unique();
+        let lastInbound = 0;
+        let phone = "+" + phoneNormalized;
+        if (contact) {
+          phone = contact.phone;
+          const conversation = await ctx.db
+            .query("conversations")
+            .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+            .first();
+          if (conversation) {
+            const lastMsg = await ctx.db
+              .query("messages")
+              .withIndex("by_conversation", (q) =>
+                q.eq("conversationId", conversation._id),
+              )
+              .order("desc")
+              .filter((q) => q.eq(q.field("senderType"), "customer"))
+              .first();
+            lastInbound = lastMsg?._creationTime ?? 0;
+          }
+        }
+        // fresh chatter (<20h) needs nothing today
+        if (now - lastInbound < CHECKIN_EVERY_MS) continue;
+        out.push({
+          accountId: config.accountId,
+          phone,
+          phoneNormalized,
+          windowOpen: now - lastInbound < 24 * 3_600_000 && lastInbound > 0,
+          templateName: config.staffCheckinTemplateName ?? null,
+          templateLanguage: config.staffCheckinTemplateLanguage ?? null,
+        });
+      }
+    }
+    return out;
+  },
+});
+
+export const recordCheckinSent = internalMutation({
+  args: { accountId: v.id("accounts"), phoneNormalized: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    const existing = await ctx.db
+      .query("staffCheckins")
+      .withIndex("by_account_phone", (q) =>
+        q.eq("accountId", args.accountId).eq("phoneNormalized", args.phoneNormalized),
+      )
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, { lastCheckinSentAt: Date.now() });
+    } else {
+      await ctx.db.insert("staffCheckins", {
+        accountId: args.accountId,
+        phoneNormalized: args.phoneNormalized,
+        lastCheckinSentAt: Date.now(),
+      });
+    }
+  },
+});
+
+export const runStaffLoops = internalAction({
+  args: {},
+  handler: async (ctx): Promise<void> => {
+    // (a) assigned-lead feedback reminders
+    try {
+      const reminders = await ctx.runQuery(internal.qualificationEngine.staffLoopsDue, {});
+      for (const r of reminders) {
+        try {
+          const target = await ctx.runMutation(
+            internal.qualificationEngine.ensureAdminConversation,
+            { accountId: r.accountId, phone: r.agentPhone },
+          );
+          await ctx.runAction(internal.metaSend.sendText, {
+            accountId: r.accountId,
+            conversationId: target.conversationId,
+            to: target.to,
+            text:
+              `⏰ Quick reminder about your lead ${r.customerName} — any progress? ` +
+              "Reply here with an update (I'll log it), and please keep the CRM lead status current.",
+          });
+          await ctx.runMutation(internal.qualificationEngine.recordReminderSent, {
+            offerId: r.offerId,
+            escalated: r.escalate,
+          });
+        } catch (err) {
+          console.error("[qualification] reminder failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] reminders sweep failed:", err);
+    }
+    // (b) staff window keepalive
+    try {
+      const checkins = await ctx.runQuery(internal.qualificationEngine.staffCheckinsDue, {});
+      for (const c of checkins) {
+        try {
+          const target = await ctx.runMutation(
+            internal.qualificationEngine.ensureAdminConversation,
+            { accountId: c.accountId, phone: c.phone },
+          );
+          if (c.windowOpen || !c.templateName) {
+            await ctx.runAction(internal.metaSend.sendText, {
+              accountId: c.accountId,
+              conversationId: target.conversationId,
+              to: target.to,
+              text:
+                "👋 Daily check-in! Reply anything to this message once a day so our chat window stays open — " +
+                "that way I can reach you instantly with new leads and customer questions.",
+            });
+          } else {
+            await ctx.runAction(internal.metaSend.sendTemplate, {
+              accountId: c.accountId,
+              conversationId: target.conversationId,
+              to: c.phone,
+              templateName: c.templateName,
+              language: c.templateLanguage ?? undefined,
+              params: [],
+              contentText:
+                "👋 Our chat window closed — please reply to this message so I can reach you again with leads and updates.",
+            });
+          }
+          await ctx.runMutation(internal.qualificationEngine.recordCheckinSent, {
+            accountId: c.accountId,
+            phoneNormalized: c.phoneNormalized,
+          });
+        } catch (err) {
+          console.error("[qualification] checkin failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] checkin sweep failed:", err);
+    }
   },
 });
