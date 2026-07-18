@@ -587,10 +587,20 @@ async function maybeFinalizeBroadcast(
   ctx: { db: MutationCtx["db"] },
   broadcastId: Id<"broadcasts">,
 ): Promise<void> {
+  // Ranges `status` on the index rather than post-filtering a
+  // `by_broadcast` scan. This runs once per delivered recipient, and
+  // `.filter()` applies *after* the index scan — so the old form walked
+  // past every already-resolved recipient to find the first pending
+  // one, scanning further on each successive call as resolved rows
+  // accumulated at the front of the range. That made finalizing an
+  // N-recipient broadcast O(N^2) reads overall (and risked tripping
+  // Convex's per-transaction read limit on a large send). Binding
+  // `status` makes each probe O(1).
   const stillPending = await ctx.db
     .query("broadcastRecipients")
-    .withIndex("by_broadcast", (q) => q.eq("broadcastId", broadcastId))
-    .filter((q) => q.eq(q.field("status"), "pending"))
+    .withIndex("by_broadcast_status", (q) =>
+      q.eq("broadcastId", broadcastId).eq("status", "pending"),
+    )
     .first();
   if (stillPending) return;
 
@@ -680,10 +690,16 @@ export const startSendingInternal = internalMutation({
       updatedAt: Date.now(),
     });
 
+    // Same `by_broadcast_status` range as `maybeFinalizeBroadcast` — the
+    // `pending` set is bound by the index instead of filtered out of a
+    // full recipient scan. (This collect is still unbounded in the
+    // number of *pending* recipients, which a very large broadcast
+    // should page rather than materialize; that is a separate fix.)
     const pending = await ctx.db
       .query("broadcastRecipients")
-      .withIndex("by_broadcast", (q) => q.eq("broadcastId", args.broadcastId))
-      .filter((q) => q.eq(q.field("status"), "pending"))
+      .withIndex("by_broadcast_status", (q) =>
+        q.eq("broadcastId", args.broadcastId).eq("status", "pending"),
+      )
       .collect();
 
     if (pending.length === 0) {

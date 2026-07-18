@@ -200,24 +200,35 @@ export const getByContact = accountQuery({
  * Count of the account's conversations with `unreadCount > 0` — the
  * sidebar's unread nav badge (Phase 8/9 stragglers: the Convex
  * counterpart to `src/hooks/use-total-unread.ts`, which currently sums
- * this client-side from a Supabase realtime subscription). Ranges over
- * `by_account` (not `by_account_last_message`, which `list` uses)
- * since ordering is irrelevant to a count; the `> 0` test has no index
- * boundary to range on, so it's a JS filter over the account's full
- * conversation set rather than an index-level range — matching this
- * account's conversation volume being small enough that this isn't a
- * concern (same assumption `list`'s own pagination already leans on).
+ * this client-side from a Supabase realtime subscription).
+ *
+ * Ranges over `by_account_unread` (`["accountId", "unreadCount"]`) so
+ * the `> 0` test is an index-level range bound, not a JS filter over
+ * the account's full conversation set. That matters for more than the
+ * read cost: this query is subscribed app-wide by the sidebar, and a
+ * Convex subscription re-runs whenever any document it *read* changes.
+ * Ranging on `unreadCount` keeps already-read conversations out of the
+ * read set entirely, so the routine `lastMessageAt` patch that every
+ * message writes (`messages.ts`'s `insertMessageAndUpdateConversation`)
+ * no longer invalidates this badge for every connected client. Ordering
+ * is irrelevant to a count, so `by_account_last_message` (which `list`
+ * uses) is still the wrong index here.
+ *
+ * The role scope stays a JS filter — it's an OR across two fields for
+ * `own_and_pool`, which no single index range expresses — but it now
+ * runs over only the unread rows rather than the whole account.
  */
 export const unreadTotal = accountQuery({
   args: {},
   handler: async (ctx) => {
     const scope = conversationScope(ctx.role);
-    const conversations = await ctx.db
+    const unread = await ctx.db
       .query("conversations")
-      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .withIndex("by_account_unread", (q) =>
+        q.eq("accountId", ctx.accountId).gt("unreadCount", 0),
+      )
       .collect();
-    return conversations.filter((c) => {
-      if (c.unreadCount <= 0) return false;
+    return unread.filter((c) => {
       if (scope === "all") return true;
       if (scope === "own_and_pool")
         return c.assignedToUserId === ctx.userId || c.assignedToUserId === undefined;
