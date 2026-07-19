@@ -1350,4 +1350,62 @@ test("hasKnowledgeChunks is true for EITHER pool alone and false with neither", 
   expect(
     await t.query(internal.aiReply.hasKnowledgeChunks, { accountId: empty }),
   ).toBe(false);
+// Instant acknowledgement (ackInbound) — blue tick + "typing…" the
+// moment the inbound lands, independent of the debounced dispatch.
+// ============================================================
+
+test("ackInbound is a no-op when auto-reply is switched off", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-ack-off@example.com",
+  });
+  await configureAi(asUser, { autoReplyEnabled: false });
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000101",
+    messageText: "hi",
+  });
+
+  // Must resolve without throwing and without reaching Meta. A throw
+  // here would surface as an unhandled scheduled-function failure.
+  // `ackInbound` is typed `Promise<void>`, but Convex serializes an
+  // `undefined` handler return as `null` over the wire — `t.action`
+  // surfaces that same `null`, not `undefined` (see
+  // `webhookDelivery.test.ts`'s identical `dispatch` case).
+  await expect(
+    t.action(internal.aiReply.ackInbound, {
+      accountId,
+      conversationId,
+      contactId,
+      triggerWamid: "wamid.TEST_ACK_OFF",
+    }),
+  ).resolves.toBeNull();
+});
+
+test("ackInbound is a no-op once a human owns the thread", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-ack-assigned@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000102",
+    messageText: "hi",
+  });
+
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversationId, { assignedToUserId: userId });
+  });
+
+  await expect(
+    t.action(internal.aiReply.ackInbound, {
+      accountId,
+      conversationId,
+      contactId,
+      triggerWamid: "wamid.TEST_ACK_ASSIGNED",
+    }),
+  ).resolves.toBeNull();
 });

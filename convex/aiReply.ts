@@ -525,6 +525,61 @@ async function loadAdContext(
 // ------------------------------------------------------------
 
 /**
+ * Blue-tick the inbound and show "typing…" as soon as it lands, rather
+ * than after the debounce elapses. Scheduled at `runAfter(0)` from
+ * `ingest.ts` in parallel with the (delayed) dispatch.
+ *
+ * This exists because the customer used to sit in total silence for the
+ * whole debounce window, which reads as being ignored. Acknowledging
+ * first makes the wait legible, so the wait itself no longer has to be
+ * short to feel human.
+ *
+ * Gates mirror `dispatchInbound`'s first four (config live, auto-reply
+ * on, account owns the thread, no human in charge) but deliberately
+ * NOT its debounce-token check: re-acking on every message of a burst
+ * is correct — a human reading along would keep the receipt current.
+ *
+ * Best-effort throughout. A failure here costs a read receipt, never a
+ * reply, so it must never throw into the scheduler.
+ */
+export const ackInbound = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    triggerWamid: v.string(),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!config || !config.isActive || !config.autoReplyEnabled) return;
+
+      const dispatchContext: { conversation: Doc<"conversations">; to: string } | null =
+        await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          contactId: args.contactId,
+        });
+      if (!dispatchContext) return;
+
+      const { conversation } = dispatchContext;
+      if (conversation.assignedToUserId) return; // a human owns this thread
+      if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
+
+      await ctx.runAction(internal.metaSend.markRead, {
+        accountId: args.accountId,
+        whatsappMessageId: args.triggerWamid,
+        typingIndicator: true,
+      });
+    } catch (err) {
+      console.warn("[ai auto-reply] ack failed:", err);
+    }
+  },
+});
+
+/**
  * AI auto-reply for a freshly-arrived inbound message. Never throws
  * into the caller (own top-level try/catch, mirrors the source and
  * every other engine's dispatch entry point in this codebase) — a
@@ -548,12 +603,14 @@ export const dispatchInbound = internalAction({
     // 1-based retry counter (absent = first attempt). Only the retry
     // scheduled from the catch below ever passes it.
     attempt: v.optional(v.number()),
-    // Meta wamid of the inbound message that triggered this dispatch —
-    // lets the bot mark it read (blue ticks) + show "typing…" while the
-    // reply generates. Optional: older callers simply skip the receipt.
+    // Meta wamid of the inbound message that triggered this dispatch.
+    // The initial blue-tick + "typing…" now fires immediately via
+    // `ackInbound` (scheduled separately from `ingest.ts`); this is kept
+    // only so a scheduled retry can carry it forward unchanged. Optional:
+    // older callers simply skip it.
     triggerWamid: v.optional(v.string()),
     // Row id of that same inbound message — the debounce token. The
-    // ingest layer schedules dispatch `aiReplyDebounceMs()` after each
+    // ingest layer schedules dispatch `debounceMsForText()` after each
     // inbound; at fire time only the dispatch whose trigger is still
     // the newest customer message replies, so a burst of quick
     // fragments gets ONE reply. Optional: direct callers (tests, a
@@ -600,22 +657,6 @@ export const dispatchInbound = internalAction({
       // assignment / autoreply-pause (the two gates above) are the ONLY
       // stops. `aiReplyCount` is still counted after each send, purely
       // as a metric.
-
-      // Every gate passed — we intend to reply. Blue-tick the triggering
-      // message and show "typing…" for the LLM's think time (Meta
-      // auto-dismisses it on our send). Polish, never load-bearing: a
-      // failure here must not cost the customer their reply.
-      if (args.triggerWamid) {
-        try {
-          await ctx.runAction(internal.metaSend.markRead, {
-            accountId: args.accountId,
-            whatsappMessageId: args.triggerWamid,
-            typingIndicator: true,
-          });
-        } catch (err) {
-          console.warn("[ai auto-reply] mark-read failed:", err);
-        }
-      }
 
       // Voice notes & images: transcribe / describe BEFORE building the
       // transcript, so the reply addresses the actual content (owner

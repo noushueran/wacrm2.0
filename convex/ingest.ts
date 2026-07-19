@@ -788,6 +788,15 @@ export const processInbound = internalAction({
         ) {
           return;
         }
+        // Acknowledge instantly — blue tick + "typing…" within a second,
+        // rather than after the debounce. Separate from the dispatch
+        // because the whole point is that it does NOT wait.
+        await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
+          accountId,
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+          triggerWamid: message.wamid,
+        });
         // Debounced, not inline: WhatsApp users fragment one thought
         // across quick messages, and one racy dispatch per fragment
         // used to produce multiple partial replies. Each inbound
@@ -803,8 +812,9 @@ export const processInbound = internalAction({
             conversationId: res.conversationId,
             contactId: res.contactId,
             triggerMessageId: res.messageId,
-            // Lets the bot blue-tick the customer's message + show
-            // "typing…" while the reply generates.
+            // Carried through only so a scheduled retry can resend it —
+            // the initial blue-tick + "typing…" already fired above via
+            // `ackInbound`.
             triggerWamid: message.wamid,
           },
         );
