@@ -26,6 +26,9 @@ export function lintServiceInput(args: {
     issues.push(err("key_taken", `A service with key "${args.key}" already exists.`));
   }
   if (!args.name.trim()) issues.push(err("name_required", "Display name is required."));
+  // Only the first blank alias and first duplicate alias are reported, not
+  // every occurrence — the caller just needs to know aliases are invalid;
+  // hasLintErrors() blocks the save regardless of how many are wrong.
   const seen = new Set<string>();
   let blankFlagged = false;
   let dupFlagged = false;
@@ -80,6 +83,9 @@ export function lintOpsBlock(block: OpsBlockInput): LintIssue[] {
     if (!item.label.trim()) issues.push(err("label_required", "Every item needs a label."));
     if (keys.has(item.key)) {
       issues.push(err("key_duplicate", `Item key "${item.key}" is repeated.`));
+      // Stop at the first duplicate key — later items (including their own
+      // label_required checks) are not scanned. This is a "what to fix next"
+      // list, not an exhaustive audit; hasLintErrors() blocks the save either way.
       break;
     }
     keys.add(item.key);

@@ -22,6 +22,14 @@ describe("lintServiceInput", () => {
     });
     expect(issues.map((i) => i.code)).toEqual(["key_taken"]);
   });
+  test("repeated duplicate aliases report only one alias_duplicate issue", () => {
+    const issues = lintServiceInput({
+      key: "uae-visas", name: "UAE Visa Services",
+      aliases: ["visa", "visa", "tour", "tour"], existingKeys: [],
+    });
+    expect(issues.map((i) => i.code)).toEqual(["alias_duplicate"]);
+    expect(issues[0].message).toContain("visa");
+  });
 });
 
 describe("lintEntryInput", () => {
@@ -46,6 +54,18 @@ describe("lintEntryInput", () => {
       scope: "company", title: "Thresholds", body: "budget >= AED 3000",
       audience: "internal",
     })).toEqual([]);
+  });
+  test("blank title triggers title_required", () => {
+    const issues = lintEntryInput({
+      scope: "company", title: "   ", body: "Valid body text", audience: "internal",
+    });
+    expect(issues.map((i) => i.code)).toEqual(["title_required"]);
+  });
+  test("blank body triggers body_required", () => {
+    const issues = lintEntryInput({
+      scope: "company", title: "Valid title", body: "   ", audience: "internal",
+    });
+    expect(issues.map((i) => i.code)).toEqual(["body_required"]);
   });
 });
 
@@ -83,5 +103,33 @@ describe("lintOpsBlock", () => {
       conditions: [{ key: "budget", label: "Budget >= AED 3000/person" }],
       reportValue: -5, currency: "dirham",
     }).map((i) => i.code).sort()).toEqual(["currency_format", "report_value_positive"]);
+  });
+  test("blank item label triggers label_required", () => {
+    const issues = lintOpsBlock({
+      kind: "sales",
+      steps: [{ key: "call", label: "   " }],
+    });
+    expect(issues.map((i) => i.code)).toEqual(["label_required"]);
+  });
+  test("marks_sum is skipped when any criterion is missing marks, even if given marks don't total 100", () => {
+    const issues = lintOpsBlock({
+      kind: "qualification",
+      criteria: [
+        { key: "dates", label: "Travel dates", marks: 50 },
+        { key: "budget", label: "Budget" },
+      ],
+    });
+    expect(issues.map((i) => i.code)).toEqual([]);
+  });
+  test("item after a key_duplicate is not checked for label_required", () => {
+    const issues = lintOpsBlock({
+      kind: "sales",
+      steps: [
+        { key: "a", label: "X" },
+        { key: "a", label: "Y" },
+        { key: "b", label: "" },
+      ],
+    });
+    expect(issues.map((i) => i.code)).toEqual(["key_duplicate"]);
   });
 });
