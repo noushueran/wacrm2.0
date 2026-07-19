@@ -48,7 +48,7 @@ to feed the assistant.
 |---|---|
 | `src/types/index.ts` | `Message` gains `ai_transcription?: string` |
 | `src/lib/convex/adapters.ts` | `toUiMessage` maps `doc.aiTranscription` |
-| `messages/en.json` | three keys under `Inbox.bubble` (label, show-more, show-less) |
+| `messages/en.json` | four keys under `Inbox.bubble` (label, hover title, show-more, show-less) |
 
 There is **one** locale file, `messages/en.json`; the bubble's namespace is
 `Inbox.bubble` (`message-bubble.tsx:392`).
@@ -61,7 +61,8 @@ The column already exists and is already populated.
 `src/components/inbox/voice-transcript.tsx` — purely presentational:
 
 ```
-{ text: string; label: string; moreLabel: string; lessLabel: string }
+{ text: string; label: string; labelTitle: string;
+  moreLabel: string; lessLabel: string }
 ```
 
 Renders a `Sparkles` marker, the label, and the transcript text: `line-clamp-3`
