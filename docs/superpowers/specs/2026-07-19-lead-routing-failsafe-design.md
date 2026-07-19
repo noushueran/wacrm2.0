@@ -1,22 +1,42 @@
 # Lead-routing failsafe — design
 
 **Date:** 2026-07-19
-**Status:** approved, implementation plan pending
+**Status:** implemented; corrected post-implementation (see "Corrections" below)
 **Branch:** `fix/lead-routing-failsafe` (from `origin/main` @ 878eee3)
+
+> **Corrections after the final whole-branch review.** Three claims in the
+> original draft of this document were wrong, and are fixed in place below.
+> They are listed here because each one caused real work:
+> 1. The problem statement said "no notification to anyone." **Overstated** —
+>    in-app `lead_qualified` notifications (`:759-769`), push (`:780`) and the
+>    `pending` conversation state (`:724`) all still fire. What is actually
+>    lost is **auto-assignment and the WhatsApp nudge**. The bug is real and
+>    worth fixing; it is not total invisibility.
+> 2. The condition enumeration was **incomplete**: it began at "auto-assign
+>    disabled" and never accounted for `offerContext`'s *first* guard, which
+>    also swallows a qualified session with no `serviceName`. That gap shipped
+>    into the implementation as a surviving permanent silent drop and was
+>    caught only by the final review. It is now condition 8.
+> 3. "No dedupe on the misconfiguration alert" was justified with per-lead
+>    reasoning, but the code fires **per offer attempt** — up to one alert per
+>    eligible team member for a single lead. The justification was
+>    arithmetically wrong; the design now dedupes.
 
 ## Problem
 
-A lead the AI has fully qualified can be dropped permanently, with no error,
-no log, and no notification to anyone.
+A lead the AI has fully qualified can be dropped permanently: never
+auto-assigned, never offered to an agent over WhatsApp, and with no error, no
+log, and no alert to an administrator. (In-app and push notifications do still
+fire — see correction 1 above.)
 
 `offerContext` (`convex/qualificationEngine.ts:2255`) returns a bare `null` for
-**seven** distinct conditions. Three are benign no-ops:
+**eight** distinct conditions. Three are benign no-ops:
 
 1. auto-assign disabled, or no enabled config
 2. the conversation is already assigned
 3. a live `offered`/`accepted` offer already exists
 
-Four are genuine routing failures:
+Five are genuine routing failures:
 
 4. no `tags` row whose name matches `session.serviceName` (exact string,
    case-insensitive + trimmed — so "Dubai visa" ≠ "UAE visa")
@@ -24,6 +44,13 @@ Four are genuine routing failures:
    **created manually**, while the service tag itself is auto-created by the AI
 6. links exist but no linked member is an `agent`/`supervisor` with a phone
 7. every candidate has already been offered the lead and declined or timed out
+8. **the session qualified with no `serviceName` at all.** Added post-review —
+   see correction 2. `serviceName` is only written when the analysis returns
+   one, and neither the readiness gate (`:403`, `:422`) nor
+   `completeQualification` (`:681`) consults it, so a session can reach
+   `qualified` without one while `startLeadOffer` is still scheduled (`:793`).
+   No test could reach this through the natural path, because the dry-run
+   analysis stub hardcodes `service: "UAE visa"` — it needs a direct insert.
 
 `startLeadOffer` (`:2358`) receives one undifferentiated `null` and does
 `if (!context) return;` (`:2365`) — treating all seven identically. The
@@ -70,10 +97,30 @@ the silent-loss channel stays open. Fixes the common case and leaves the bug.
 
 | `kind` | Meaning | Fields |
 |---|---|---|
-| `offer` | Route to this agent | existing payload + `usedFallback: boolean` |
-| `noop` | Benign — cases 1–3 | — |
-| `exhausted` | Candidates empty, `alreadyTried` non-empty (case 7) | — |
+| `offer` | Route to this agent | existing payload + `cause: FallbackCause \| null` + `firstAttempt: boolean` |
+| `noop` | Benign — cases 1–3 only | — |
+| `exhausted` | Candidates empty, `alreadyTried` non-empty (case 7) | `scope: "linked" \| "team"` |
 | `unroutable` | Candidates empty, nobody ever tried | `reason: "no_agents"` |
+
+`FallbackCause` distinguishes *why* the tag could not route the lead, because
+the remedy differs and the admin alert must name the right one:
+
+| cause | Meaning | Remedy the alert prescribes |
+|---|---|---|
+| `tag_unlinked` | tag exists, zero links (case 5) | link agents to that tag |
+| `links_ineligible` | linked, but nobody has the role + a phone (case 6) | add a phone / fix the role |
+| `tag_missing` | no tag row at all (case 4) | the tag itself does not exist |
+| `no_service_name` | qualified with no service (case 8) | route manually; the AI named no service |
+
+The original draft used a single `usedFallback: boolean` here. The final review
+rejected it: one boolean collapsed three causes whose remedies differ, so the
+alert told an admin to "link agents to the tag" even when agents *were* linked
+and the real problem was a missing phone number, or when no such tag existed.
+
+`scope` on `exhausted` exists for the same reason — "everyone eligible has
+passed" is false on the linked path, where the rest of the team was never
+asked, by design (see Candidate selection). `firstAttempt` gates the fallback
+alert to one message per lead rather than one per offer attempt.
 
 ### Candidate selection
 
@@ -85,11 +132,12 @@ member *at all*. Precisely:
 
 1. Compute `eligibleLinked` — linked members with role `agent`/`supervisor` and
    a non-empty phone — **before** subtracting `alreadyTried`.
-2. If `eligibleLinked` is empty (cases 4, 5, 6): fall back to every account
-   membership with role `agent`/`supervisor` and a non-empty phone, set
-   `usedFallback: true`, then subtract `alreadyTried`.
-3. Otherwise: candidates are `eligibleLinked` minus `alreadyTried`, and
-   `usedFallback` stays `false`.
+2. If `eligibleLinked` is empty (cases 4, 5, 6) — or the session has no
+   `serviceName` to match a tag against at all (case 8) — fall back to every
+   account membership with role `agent`/`supervisor` and a non-empty phone, set
+   `cause` to whichever of the four applies, then subtract `alreadyTried`.
+3. Otherwise: candidates are `eligibleLinked` minus `alreadyTried`, and `cause`
+   stays `null`.
 
 This distinction is deliberate. An empty link set means **no routing intent was
 ever expressed**, so widening to the whole team is strictly better than losing
@@ -105,11 +153,18 @@ accepts in the last 72h) is unchanged in every branch.
 
 ### `startLeadOffer` behaviour
 
-- **`offer`** — send the WhatsApp offer exactly as today. If `usedFallback`,
-  additionally alert admins that no agent is linked for *&lt;service&gt;* and the
-  lead was offered to the whole team.
+- **`offer`** — send the WhatsApp offer first, exactly as today. Then, if
+  `cause` is non-null **and** `firstAttempt`, alert admins — with the message
+  chosen by `cause`, so it names the remedy that actually applies. The alert is
+  strictly supplementary and must never precede or block the offer itself: an
+  earlier draft awaited it first, which meant a failure in the alert leg could
+  suppress the agent send while leaving an `offered` row behind, stranding the
+  lead permanently. The alert action swallows its own errors for the same
+  reason.
 - **`exhausted`** — alert admins that the lead is stranded, naming customer and
-  service, so a human can assign it manually.
+  service, and wording it by `scope`: on `linked`, say that only the agents
+  linked to that service were asked (the rest of the team was deliberately not),
+  since an admin told "everyone has passed" would wrongly deprioritise it.
 - **`unroutable`** — alert admins that no eligible agent exists in the account.
 - **`noop`** — return silently, as today.
 
@@ -133,8 +188,14 @@ is required.
 
 ## Deliberate omissions
 
-- **No dedupe on the misconfiguration alert.** Each alert names a real lead that
-  took the wrong path, and the volume is self-limiting: fixing the link stops it.
+- ~~**No dedupe on the misconfiguration alert.**~~ **Reversed — see correction 3.**
+  The original reasoning was per-lead ("each alert names a real lead that took
+  the wrong path, and the volume is self-limiting"). But the alert fires per
+  *offer attempt*, so one lead on a six-person team could send six identical
+  messages plus a seventh when the cycle exhausted — ungated WhatsApp messages
+  to the owner's phone, on the very channel the failsafe depends on. The design
+  now fires the fallback alert only on the first attempt for a session
+  (`firstAttempt`, derived from `alreadyTried.size === 0`).
   Revisit only if lead volume per unlinked service makes this noisy.
 - **No fuzzy or semantic service matching.** Once a missed match falls back to
   the whole team plus an alert, a name mismatch costs routing *precision*, not
@@ -159,11 +220,15 @@ is required.
 
 Unit tests, one per result kind:
 
-- service tag missing → `offer` with `usedFallback`, misconfiguration alert sent
-- tag present but zero links → `offer` with `usedFallback`, alert sent
+- service tag missing → `offer` with cause `tag_missing`, alert sent
+- tag present but zero links → `offer` with cause `tag_unlinked`, alert sent
 - links present but no eligible member (no phone / wrong role) → `offer` with
-  `usedFallback`
+  cause `links_ineligible`, and the alert names the *right* remedy
+- **session qualified with no `serviceName` → `offer` with cause
+  `no_service_name`, alert sent** (case 8; needs a direct session insert — the
+  dry-run stub always supplies a service, so the natural path cannot reach it)
 - account has no agent or supervisor at all → `unroutable`, alert sent
+- fallback alert fires **once per lead**, not once per offer attempt
 - **eligible linked members exist but all already tried → `exhausted`, and the
   whole team is *not* offered** (guards the intent rule above)
 - fallback pool itself exhausted → `exhausted`, alert sent
