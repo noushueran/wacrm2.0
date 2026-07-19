@@ -2438,17 +2438,33 @@ export const routingAlertPhones = internalQuery({
  * ("your routing is broken", "this lead is stranded") that someone who
  * muted routine lead alerts still needs to see. With no admin numbers
  * configured there is no channel at all, so this no-ops.
+ *
+ * Best-effort, mirroring `sendAdminAlerts` above: this alert is
+ * supplementary, never the thing that actually routes the lead, so a
+ * failure here (say, `.unique()` tripping over a misconfigured account
+ * with more than one `qualificationConfigs` row) is logged and swallowed
+ * rather than propagated to the caller. `startLeadOffer` also always
+ * fires the primary, agent-facing send before calling this for a used
+ * fallback, precisely so this alert can never sit on the critical path.
  */
 export const alertRoutingFailure = internalAction({
   args: { accountId: v.id("accounts"), text: v.string() },
   handler: async (ctx, args): Promise<void> => {
-    const phones = await ctx.runQuery(internal.qualificationEngine.routingAlertPhones, {
-      accountId: args.accountId,
-    });
-    for (const phone of phones) {
-      await ctx.runAction(internal.qualificationEngine.notifyStaffText, {
-        accountId: args.accountId, phone, text: args.text,
+    try {
+      const phones = await ctx.runQuery(internal.qualificationEngine.routingAlertPhones, {
+        accountId: args.accountId,
       });
+      for (const phone of phones) {
+        try {
+          await ctx.runAction(internal.qualificationEngine.notifyStaffText, {
+            accountId: args.accountId, phone, text: args.text,
+          });
+        } catch (err) {
+          console.error("[qualification] routing failure alert failed:", err);
+        }
+      }
+    } catch (err) {
+      console.error("[qualification] routing failure alerts failed:", err);
     }
   },
 });
@@ -2490,15 +2506,15 @@ export const startLeadOffer = internalAction({
         agentPhone: context.agent.phone,
       });
       if (!offerId) return;
-      if (context.usedFallback) {
-        await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
-          accountId: args.accountId,
-          text:
-            `⚠️ Routing not configured\nNo agent is linked to the tag "${context.serviceName}", ` +
-            `so ${context.customerName}'s lead was offered to the whole team.\n` +
-            "Link the right agents to that tag in Settings → Team to route it properly.",
-        });
-      }
+      // Primary, agent-facing send FIRST — this is what actually routes
+      // the lead, so it must never sit behind the supplementary fallback
+      // alert below. If `alertRoutingFailure` threw ahead of this, the
+      // offer row would already say "offered" and `offerContext`'s own
+      // live-offer guard would mean the sweep cron could never retry it
+      // — a silently stranded lead, exactly what this file exists to
+      // prevent. (`alertRoutingFailure` also now catches its own
+      // failures, so this ordering is belt-and-suspenders, not the only
+      // guard.)
       const target = await ctx.runMutation(
         internal.qualificationEngine.ensureAdminConversation,
         { accountId: context.accountId, phone: context.agent.phone },
@@ -2514,6 +2530,15 @@ export const startLeadOffer = internalAction({
           `\nCustomer: ${context.customerName}` +
           "\n\nAre you available to take it? Reply YES to accept or NO to pass.",
       });
+      if (context.usedFallback) {
+        await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
+          accountId: args.accountId,
+          text:
+            `⚠️ Routing not configured\nNo agent is linked to the tag "${context.serviceName}", ` +
+            `so ${context.customerName}'s lead was offered to the whole team.\n` +
+            "Link the right agents to that tag in Settings → Team to route it properly.",
+        });
+      }
     } catch (err) {
       console.error("[qualification] startLeadOffer failed:", err);
     }
