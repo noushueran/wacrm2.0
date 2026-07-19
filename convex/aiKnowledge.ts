@@ -63,7 +63,7 @@ import { embedTexts, EMBEDDING_DIMENSIONS } from "./lib/ai/embeddings";
 // rather than only ever testing the lexical fallback.
 // ============================================================
 
-function isDryRun(): boolean {
+export function isDryRun(): boolean {
   return !!process.env.CONVEX_AI_DRY_RUN;
 }
 
@@ -100,7 +100,7 @@ export function syntheticEmbedding(text: string): number[] {
   return out;
 }
 
-function syntheticEmbeddings(texts: string[]): number[][] {
+export function syntheticEmbeddings(texts: string[]): number[][] {
   return texts.map(syntheticEmbedding);
 }
 
