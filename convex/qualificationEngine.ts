@@ -2251,23 +2251,57 @@ export const cleanupDuplicateLeads = internalMutation({
 // shared queue exactly as before (supervisors were already notified).
 // ============================================================
 
-/** Picks the next eligible agent for a session's offer, or null. */
+type OfferCandidate = { userId: Id<"users">; phone: string; name: string; recent: number };
+
+/**
+ * What the engine decided to do about a session's lead offer.
+ *
+ * This is a discriminated union rather than `T | null` on purpose. It
+ * previously returned a bare `null` for seven distinct conditions —
+ * three benign, four genuine routing failures — and the single caller
+ * could not tell them apart, so every failure was swallowed as "nothing
+ * to do". Because no `leadOffers` row is written in the failure cases,
+ * `sweepLeadOffers` (which finds work via `by_status_offered`) could
+ * never retry them either, and the lead was orphaned permanently.
+ */
+export type OfferDecision =
+  | { kind: "noop" }
+  | { kind: "unroutable"; reason: "no_agents"; serviceName: string; customerName: string }
+  | { kind: "exhausted"; serviceName: string; customerName: string }
+  | {
+      kind: "offer";
+      usedFallback: boolean;
+      accountId: Id<"accounts">;
+      conversationId: Id<"conversations">;
+      contactId: Id<"contacts">;
+      agent: OfferCandidate;
+      serviceName: string;
+      score: number | null;
+      summary: string | null;
+      customerName: string;
+    };
+
+/** Decides who to offer a session's lead to, and why not when nobody. */
 export const offerContext = internalQuery({
   args: { sessionId: v.id("qualificationSessions") },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<OfferDecision> => {
     const session = await ctx.db.get(args.sessionId);
-    if (!session || session.status !== "qualified" || !session.serviceName) return null;
+    if (!session || session.status !== "qualified" || !session.serviceName) return { kind: "noop" };
     const config = await loadEnabledConfig(ctx, session.accountId);
-    if (!config || config.autoAssignEnabled === false) return null;
+    if (!config || config.autoAssignEnabled === false) return { kind: "noop" };
     const conversation = await ctx.db.get(session.conversationId);
-    if (!conversation || conversation.assignedToUserId) return null; // taken already
+    if (!conversation || conversation.assignedToUserId) return { kind: "noop" }; // taken already
     // one live offer at a time per session
     const offers = await ctx.db
       .query("leadOffers")
       .withIndex("by_session", (q) => q.eq("sessionId", args.sessionId))
       .collect();
-    if (offers.some((o) => o.status === "offered" || o.status === "accepted")) return null;
+    if (offers.some((o) => o.status === "offered" || o.status === "accepted")) return { kind: "noop" };
     const alreadyTried = new Set(offers.map((o) => o.agentUserId));
+
+    const serviceName = session.serviceName;
+    const contact = await ctx.db.get(session.contactId);
+    const customerName = contact?.name?.trim() || contact?.phone || "a customer";
 
     // the service tag (auto-created at completion)
     const tags = await ctx.db
@@ -2275,57 +2309,85 @@ export const offerContext = internalQuery({
       .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
       .collect();
     const serviceTag = tags.find(
-      (t) => t.name.trim().toLowerCase() === session.serviceName!.trim().toLowerCase(),
+      (t) => t.name.trim().toLowerCase() === serviceName.trim().toLowerCase(),
     );
-    if (!serviceTag) return null;
 
-    const links = await ctx.db
-      .query("memberTags")
-      .withIndex("by_account_tag", (q) =>
-        q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
-      )
-      .collect();
     const memberships = await ctx.db
       .query("memberships")
       .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
       .collect();
-    const byUser = new Map(memberships.map((m) => [m.userId, m]));
-
-    const candidates: { userId: Id<"users">; phone: string; name: string; recent: number }[] = [];
-    for (const link of links) {
-      if (alreadyTried.has(link.userId)) continue;
-      const m = byUser.get(link.userId);
-      if (!m || !m.phone) continue;
+    // Everyone who could take a lead at all: right role, reachable.
+    const eligibleById = new Map<Id<"users">, { phone: string; name: string }>();
+    for (const m of memberships) {
+      if (!m.phone) continue;
       if (m.role !== "agent" && m.role !== "supervisor") continue;
+      eligibleById.set(m.userId, {
+        phone: m.phone,
+        name: m.fullName ?? m.email ?? "Team member",
+      });
+    }
+
+    // Who the service tag routes to, computed BEFORE subtracting anyone
+    // already tried — an empty set here means no routing intent was ever
+    // expressed, which is what licenses the whole-team fallback.
+    let poolIds: Id<"users">[] = [];
+    if (serviceTag) {
+      const links = await ctx.db
+        .query("memberTags")
+        .withIndex("by_account_tag", (q) =>
+          q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
+        )
+        .collect();
+      poolIds = links.map((l) => l.userId).filter((id) => eligibleById.has(id));
+    }
+
+    // No tag, or a tag nobody eligible is linked to: widen to the whole
+    // team rather than lose the lead. Note this is deliberately NOT the
+    // "linked people exist but have all passed" case — there the intent
+    // was expressed and honoured, so we fall through to `exhausted` and
+    // let a human decide instead of silently overriding the routing.
+    const usedFallback = poolIds.length === 0;
+    if (usedFallback) poolIds = Array.from(eligibleById.keys());
+
+    const pool = poolIds.filter((id) => !alreadyTried.has(id));
+    if (pool.length === 0) {
+      return alreadyTried.size > 0
+        ? { kind: "exhausted", serviceName, customerName }
+        : { kind: "unroutable", reason: "no_agents", serviceName, customerName };
+    }
+
+    const cutoff = Date.now() - 72 * 3_600_000;
+    const candidates: OfferCandidate[] = [];
+    for (const userId of pool) {
+      const m = eligibleById.get(userId);
+      if (!m) continue;
       const recentAccepts = await ctx.db
         .query("leadOffers")
         .withIndex("by_agent_status", (q) =>
-          q.eq("agentUserId", link.userId).eq("status", "accepted"),
+          q.eq("agentUserId", userId).eq("status", "accepted"),
         )
         .order("desc")
         .take(10);
-      const cutoff = Date.now() - 72 * 3_600_000;
       candidates.push({
-        userId: link.userId,
+        userId,
         phone: m.phone,
-        name: m.fullName ?? m.email ?? "Team member",
+        name: m.name,
         recent: recentAccepts.filter((o) => (o.respondedAt ?? 0) > cutoff).length,
       });
     }
-    if (candidates.length === 0) return null;
     candidates.sort((a, b) => a.recent - b.recent);
-    const pick = candidates[0];
 
-    const contact = await ctx.db.get(session.contactId);
     return {
+      kind: "offer",
+      usedFallback,
       accountId: session.accountId,
       conversationId: session.conversationId,
       contactId: session.contactId,
-      agent: pick,
-      serviceName: session.serviceName,
+      agent: candidates[0],
+      serviceName,
       score: session.score ?? null,
       summary: session.summary ?? null,
-      customerName: contact?.name?.trim() || contact?.phone || "a customer",
+      customerName,
     };
   },
 });
@@ -2359,10 +2421,13 @@ export const startLeadOffer = internalAction({
   args: { accountId: v.id("accounts"), sessionId: v.id("qualificationSessions") },
   handler: async (ctx, args): Promise<void> => {
     try {
-      const context = await ctx.runQuery(internal.qualificationEngine.offerContext, {
+      const decision = await ctx.runQuery(internal.qualificationEngine.offerContext, {
         sessionId: args.sessionId,
       });
-      if (!context) return;
+      // Task 2 replaces this with per-kind handling; for now every
+      // non-offer outcome behaves exactly as the old `null` did.
+      if (decision.kind !== "offer") return;
+      const context = decision;
       const offerId = await ctx.runMutation(internal.qualificationEngine.createOffer, {
         accountId: context.accountId,
         sessionId: args.sessionId,

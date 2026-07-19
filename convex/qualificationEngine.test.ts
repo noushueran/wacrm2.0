@@ -2109,3 +2109,173 @@ test("PS: leadsBoard and getSessionForConversation expose the purchase verdict",
   expect(chip?.purchase?.status).toBe("sent");
   expect(chip?.purchase?.confidence).toBe(90);
 });
+
+// ============================================================
+// Routing failsafe — `offerContext` used to return a bare `null` for
+// seven different conditions, three benign and four genuine routing
+// failures, and `startLeadOffer` treated all seven as "nothing to do".
+// Because no `leadOffers` row was written in the failure cases, the
+// `sweepLeadOffers` cron (which finds work via `by_status_offered`)
+// could never retry them, so the lead was orphaned permanently.
+// ============================================================
+
+/** Drives a conversation to a qualified session and returns it. */
+async function qualifyLead(t: TestConvex<typeof schema>, base: Awaited<ReturnType<typeof seedAttributed>>) {
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:85 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  const [session] = (await sessionsFor(t, base.conversationId)).filter((s) => s.status === "qualified");
+  return session;
+}
+
+test("failsafe: a service nobody is linked to still reaches the team, flagged as fallback", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // Sara is a perfectly good agent — she is just linked to a DIFFERENT
+  // service than the synthetic "UAE visa" this lead qualifies for, so
+  // the "UAE visa" tag ends up with zero memberTags links.
+  const sara = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "Georgia tours",
+  });
+  const session = await qualifyLead(t, base);
+
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision.kind).toBe("offer");
+  if (decision.kind !== "offer") throw new Error("unreachable");
+  expect(decision.usedFallback).toBe(true);
+  expect(decision.agent.userId).toBe(sara.userId);
+
+  // and it really is offered, not just classified
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  const offers = await offersFor(t, session._id);
+  expect(offers).toHaveLength(1);
+  expect(offers[0].agentUserId).toBe(sara.userId);
+
+  // once the fallback pool itself is spent, that is exhaustion too
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971557008899", text: "no",
+  });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
+    .toMatchObject({ kind: "exhausted" });
+});
+
+test("failsafe: a tag linked only to unreachable members falls back to the team", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const omar = await seedAgentWithTag(t, base.accountId, {
+    name: "Omar", phone: "+971551110002", tagName: "Georgia tours",
+  });
+  const session = await qualifyLead(t, base);
+
+  // Nadia IS linked to the lead's own service, but has no WhatsApp
+  // number, so she can never actually receive an offer — the link
+  // exists on paper only. Added after qualification so it attaches to
+  // the service tag the engine itself created.
+  const tagId = await t.run(async (ctx) => {
+    const tag = (await ctx.db.query("tags")
+      .withIndex("by_account", (q) => q.eq("accountId", base.accountId)).collect())
+      .find((x) => x.name === "UAE visa");
+    if (!tag) return null;
+    const userId = await ctx.db.insert("users", { name: "Nadia", email: "nadia@example.com" });
+    await ctx.db.insert("memberships", {
+      userId, accountId: base.accountId, role: "agent",
+      fullName: "Nadia", email: "nadia@example.com", // deliberately no phone
+    });
+    await ctx.db.insert("memberTags", { accountId: base.accountId, userId, tagId: tag._id });
+    return tag._id;
+  });
+  expect(tagId).not.toBeNull(); // the premise: the engine made the service tag
+
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision.kind).toBe("offer");
+  if (decision.kind !== "offer") throw new Error("unreachable");
+  expect(decision.usedFallback).toBe(true);
+  expect(decision.agent.userId).toBe(omar.userId);
+});
+
+test("failsafe: an account with no agent at all is unroutable, not silent", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const session = await qualifyLead(t, base);
+
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision).toMatchObject({ kind: "unroutable", reason: "no_agents", serviceName: "UAE visa" });
+});
+
+test("failsafe: linked agents who have all passed mean exhausted — the team is NOT widened to", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // Linked to the real service: routing intent WAS expressed for Lina.
+  const lina = await seedAgentWithTag(t, base.accountId, {
+    name: "Lina", phone: "+971551110001", tagName: "UAE visa",
+  });
+  // Omar is eligible but deliberately NOT linked to "UAE visa".
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Omar", phone: "+971551110002", tagName: "Georgia tours",
+  });
+  const session = await qualifyLead(t, base);
+
+  // Lina is offered first, then declines.
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  expect((await offersFor(t, session._id))[0].agentUserId).toBe(lina.userId);
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971551110001", text: "no",
+  });
+
+  // Intent was expressed and honoured, so this is exhausted — Omar must
+  // NOT be pulled in behind Lina's back.
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision).toMatchObject({ kind: "exhausted", serviceName: "UAE visa" });
+  expect(await offersFor(t, session._id)).toHaveLength(1);
+});
+
+test("failsafe: the three benign cases stay noop", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  const session = await qualifyLead(t, base);
+
+  const patchConfig = async (patch: { autoAssignEnabled: boolean }) => {
+    await t.run(async (ctx) => {
+      const config = await ctx.db.query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", base.accountId)).unique();
+      if (config) await ctx.db.patch(config._id, patch);
+    });
+  };
+
+  // (a) already assigned
+  await t.run((ctx) => ctx.db.patch(base.conversationId, { assignedToUserId: base.userId }));
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
+    .toEqual({ kind: "noop" });
+  await t.run((ctx) => ctx.db.patch(base.conversationId, { assignedToUserId: undefined }));
+
+  // (b) auto-assign turned off — checked BEFORE any offer exists, so a
+  // pass here cannot be the live-offer guard passing by coincidence
+  await patchConfig({ autoAssignEnabled: false });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
+    .toEqual({ kind: "noop" });
+  await patchConfig({ autoAssignEnabled: true });
+
+  // (c) a live offer already exists
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
+    .toEqual({ kind: "noop" });
+});
