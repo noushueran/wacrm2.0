@@ -431,6 +431,11 @@ export interface MessageTemplate {
   header_content?: string;
   header_handle?: string;
   header_media_url?: string;
+  /** R2 object key for the header media — the durable replacement for
+   *  `header_media_url` (Task 5 of the R2 migration: dual-read). Readers
+   *  resolve `header_media_key ?? header_media_url` (see
+   *  `src/lib/storage/media-url.ts`). */
+  header_media_key?: string;
   body_text: string;
   footer_text?: string;
   buttons?: TemplateButton[];

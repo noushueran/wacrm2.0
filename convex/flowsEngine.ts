@@ -5,6 +5,8 @@ import type { ActionCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { decideFallback, resolveFallbackPolicy } from "./lib/flows/fallback";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 import type {
   CollectInputNodeConfig,
   ConditionNodeConfig,
@@ -682,12 +684,31 @@ async function advanceFromNodeKey(
       const cfg = node.config as SendMediaNodeConfig;
       try {
         if (!to || !run.conversationId) throw new Error("no send target for this run");
+        // `resolveMediaUrlLazy` only builds the R2 config (which throws
+        // when R2 env vars are unset) when `cfg.media_key` is actually
+        // present, so an existing `media_url`-only node keeps working
+        // unchanged on a deployment where R2 isn't configured yet — see
+        // `convex/lib/r2/url.ts`'s doc comment on `resolveMediaUrlLazy`.
+        // A thrown config error still lands in the catch below exactly
+        // like any other send failure, which is the intended
+        // best-effort behavior for a hot path this deep in an action.
+        const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+          key: cfg.media_key,
+          url: cfg.media_url,
+        });
+        if (!link) {
+          // Explicit, readable failure instead of letting `runAction`
+          // reject on Convex's own (opaque) `link: v.string()` argument
+          // validation — same "throw a clear message here rather than
+          // downstream" rationale as `send.ts`'s media guard.
+          throw new Error("no media_key or media_url on send_media node");
+        }
         const { whatsappMessageId } = await ctx.runAction(internal.metaSend.sendMedia, {
           accountId: run.accountId,
           conversationId: run.conversationId,
           to,
           kind: cfg.media_type,
-          link: cfg.media_url,
+          link,
           caption: cfg.caption ? interpolateVars(cfg.caption, run.vars ?? {}) : undefined,
           filename: cfg.filename,
         });

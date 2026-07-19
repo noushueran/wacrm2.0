@@ -4,6 +4,8 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
 import { canAccessConversation, hasMinRole } from "./lib/roles";
 import type { Id } from "./_generated/dataModel";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
 // `send` — the authed, PUBLIC entrypoint the Inbox + contact-detail
@@ -50,6 +52,11 @@ export const send = action({
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
+    // R2 object key for a staged outbound upload — the durable
+    // replacement for `mediaUrl` (Task 5 of the R2 migration: dual-read).
+    // `resolveMediaUrlLazy` below prefers this over `mediaUrl` when both
+    // are present.
+    mediaKey: v.optional(v.string()),
     filename: v.optional(v.string()),
     templateName: v.optional(v.string()),
     templateLanguage: v.optional(v.string()),
@@ -140,15 +147,28 @@ export const send = action({
       case "video":
       case "document":
       case "audio": {
-        if (!args.mediaUrl) {
-          throw new Error(`mediaUrl is required for ${args.messageType} messages`);
+        // `resolveMediaUrlLazy` only builds the R2 config (which throws
+        // when R2 env vars are unset — `lib/r2/config.ts`) when
+        // `args.mediaKey` is actually present, so a plain `mediaUrl` send
+        // on a deployment where R2 isn't configured yet behaves exactly
+        // as before — see `convex/lib/r2/url.ts`'s doc comment on
+        // `resolveMediaUrlLazy` for why an eager
+        // `resolveMediaUrl(r2ConfigFromEnv(), ...)` here would be unsafe.
+        const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+          key: args.mediaKey,
+          url: args.mediaUrl,
+        });
+        if (!link) {
+          throw new Error(
+            `mediaKey or mediaUrl is required for ${args.messageType} messages`,
+          );
         }
         return await ctx.runAction(internal.metaSend.sendMedia, {
           accountId,
           conversationId,
           to,
           kind: args.messageType,
-          link: args.mediaUrl,
+          link,
           caption: args.contentText,
           filename: args.filename,
           contextMessageId,

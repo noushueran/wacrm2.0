@@ -446,6 +446,100 @@ test("a condition node (tag presence) branches to the correct child", async () =
 });
 
 // ============================================================
+// 3b. send_media node resolves media_key to a public R2 URL (Task 5 of
+// the R2 migration: dual-read). Not renumbered into the sequence above
+// to keep this diff scoped to the addition.
+// ============================================================
+
+test("a send_media node resolves config.media_key to a public R2 URL for Meta", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
+
+  const flowId = await seedFlow(t, { accountId, triggerType: "keyword", triggerConfig: { keywords: ["photo"] }, entryNodeId: "start" });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "send_photo" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "send_photo",
+    nodeType: "send_media",
+    config: { media_type: "image", media_key: "acc1/outbound/brochure.png", next_node_key: "end1" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const result = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "photo", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+
+  expect(result.consumed).toBe(true);
+  expect(result.outcome).toBe("completed");
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages).toHaveLength(1);
+  expect(messages[0]!.contentType).toBe("image");
+  expect(messages[0]!.mediaUrl).toBe(
+    "https://objs.holidayys.co/acc1/outbound/brochure.png",
+  );
+
+  const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
+  expect(run!.status).toBe("completed");
+  expect(run!.endReason).toBe("end_node");
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("a send_media node with neither media_key nor media_url ends the run failed (send_media_failed), not a raw throw", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
+
+  const flowId = await seedFlow(t, { accountId, triggerType: "keyword", triggerConfig: { keywords: ["photo"] }, entryNodeId: "start" });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "send_photo" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "send_photo",
+    nodeType: "send_media",
+    config: { media_type: "image", next_node_key: "end1" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const result = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "photo", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+
+  expect(result.consumed).toBe(true);
+  expect(result.outcome).toBe("completed");
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages).toHaveLength(0);
+
+  const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
+  expect(run!.status).toBe("failed");
+  expect(run!.endReason).toBe("send_media_failed");
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
 // 4. handoff node assigns the conversation + ends the run.
 // ============================================================
 

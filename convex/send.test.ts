@@ -516,6 +516,93 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
   delete process.env.CONVEX_META_DRY_RUN;
 });
 
+test("send resolves a message's mediaKey to a public R2 URL for Meta", async () => {
+  // Arrange an outbound media send whose staged object is identified by
+  // key, not by legacy URL, and assert the `link` handed to Meta is the
+  // objs.holidayys.co URL rather than a Convex storage URL.
+  //
+  // Same arrangement as "send routes a media messageType (image) to
+  // metaSend.sendMedia" above (DRY-RUN + account/conversation seeding).
+  // There is no `metaSend.sendMedia` argument-interception pattern
+  // anywhere in this file or in `metaSend.test.ts` — every existing test
+  // in both files goes through DRY-RUN and asserts on the PERSISTED row
+  // instead. That's a faithful proxy here too:
+  // `metaSend.sendMedia`'s handler (`convex/metaSend.ts:358`) persists
+  // `mediaUrl: args.link` unconditionally, even in DRY-RUN (only
+  // `whatsappMessageId` is synthetic) — so the persisted row's
+  // `mediaUrl` IS the exact `link` value that would have been handed to
+  // Meta's Graph API on a real send.
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await asUser.action(api.send.send, {
+    conversationId,
+    messageType: "image",
+    mediaKey: "acc1/outbound/photo.png",
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+  const capturedLink = messages[0]!.mediaUrl;
+  expect(capturedLink).toBe(
+    "https://objs.holidayys.co/acc1/outbound/photo.png",
+  );
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("send still requires a mediaUrl or mediaKey for media messages (both absent throws)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await expect(
+    asUser.action(api.send.send, { conversationId, messageType: "image" }),
+  ).rejects.toThrow(/mediaKey or mediaUrl is required/);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
 // ============================================================
 // send — reply threading (replyToMessageId -> Meta contextMessageId)
 // ============================================================

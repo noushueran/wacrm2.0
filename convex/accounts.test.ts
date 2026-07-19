@@ -188,6 +188,60 @@ test("updateProfile updates the caller's own fullName and avatarUrl", async () =
   expect(profile!.avatarUrl).toBe("https://example.com/sarah.png");
 });
 
+test("me exposes the membership's avatarKey alongside avatarUrl (Task 5 of the R2 migration: dual-read)", async () => {
+  // `updateProfile` has no `avatarKey` argument yet — nothing writes this
+  // field until a later task, so it's seeded directly. `me` is a Convex
+  // `query`, and this codebase's convention (see
+  // `conversionEvents.ts`/`campaignAds.ts`'s own "only an action can
+  // read process.env" comments) is that only an action reads deployment
+  // env — so `me` does NOT resolve `avatarKey` to a URL itself; it just
+  // exposes the raw key alongside the existing `avatarUrl` fallback
+  // chain, and the CLIENT (`src/hooks/use-auth.tsx`) resolves it via
+  // `resolveMediaUrl` the same way `adapters.ts` does for every other
+  // client-facing avatar/media field.
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const membership = await t.run((ctx) =>
+    ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first(),
+  );
+  await t.run((ctx) =>
+    ctx.db.patch(membership!._id, {
+      avatarUrl: "https://convex-api.holidayys.co/api/storage/old",
+      avatarKey: "acc1/avatars/sarah.png",
+    }),
+  );
+
+  const profile = await asSarah.query(api.accounts.me, {});
+  expect(profile!.avatarKey).toBe("acc1/avatars/sarah.png");
+  // Unresolved on purpose (see comment above) — still the raw fallback
+  // chain `me` has always returned.
+  expect(profile!.avatarUrl).toBe(
+    "https://convex-api.holidayys.co/api/storage/old",
+  );
+});
+
+test("me exposes avatarKey as null (not undefined) when the membership has none", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const profile = await asSarah.query(api.accounts.me, {});
+  expect(profile!.avatarKey).toBeNull();
+});
+
 test("updateProfile only patches the caller's own membership, not a teammate's in the same account", async () => {
   const t = convexTest(schema, modules);
   const userId = await insertUser(t, {

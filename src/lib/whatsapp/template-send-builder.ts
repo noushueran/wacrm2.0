@@ -32,6 +32,7 @@
 
 import type { MessageTemplate, TemplateButton } from '@/types';
 import { extractVariableIndices } from './template-validators';
+import { resolveMediaUrl } from '@/lib/storage/media-url';
 
 export interface SendTimeParams {
   /** Values for body {{1}}, {{2}}, … indexed by variable position. */
@@ -96,14 +97,25 @@ function buildHeaderComponent(
 
   // image / video / document — Meta requires the media component on
   // every send. Prefer the caller's explicit override; fall back to the
-  // template's stored public URL.
+  // template's stored media, resolving `header_media_key` over
+  // `header_media_url` (Task 5 of the R2 migration: dual-read).
+  // Independent of `adapters.ts`'s `toUiTemplate`, which already resolves
+  // `header_media_url` the same way for display — this is a defensive
+  // second resolution so a `MessageTemplate` built any other way (this
+  // file's own tests construct one by hand) still prefers the key.
   //
   // NOTE: `template.header_handle` is intentionally NOT used here. It's a
   // Resumable-Upload handle that's only valid as the *creation-time*
   // sample (`example.header_handle`); it is NOT a reusable send-time
   // media id, and passing it as `{ id }` makes Meta reject the send. Only
   // an explicit `headerMediaId` (a real /media upload id) is honored.
-  const link = params.headerMediaUrl ?? template.header_media_url;
+  const link =
+    params.headerMediaUrl ??
+    resolveMediaUrl({
+      key: template.header_media_key,
+      url: template.header_media_url,
+    }) ??
+    undefined; // `resolveMediaUrl` returns `string | null`; downstream `mediaPayload` wants `string | undefined`.
   const id = params.headerMediaId;
   if (!link && !id) {
     throw new Error(

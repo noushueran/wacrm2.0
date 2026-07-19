@@ -1,5 +1,6 @@
 import { ConvexError } from "convex/values";
 import type { Doc, Id } from "../../../convex/_generated/dataModel";
+import { resolveMediaUrl } from "@/lib/storage/media-url";
 import type {
   AccountInvitation,
   AccountMember,
@@ -231,7 +232,10 @@ export function toUiMember(
     user_id: doc.userId,
     full_name: doc.fullName ?? doc.email ?? "",
     email: doc.email ?? null,
-    avatar_url: doc.avatarUrl ?? null,
+    // `avatarKey` over the legacy `avatarUrl` (Task 5 of the R2
+    // migration: dual-read) — `AccountMember.avatar_url` is already
+    // `string | null`, matching `resolveMediaUrl`'s return exactly.
+    avatar_url: resolveMediaUrl({ key: doc.avatarKey, url: doc.avatarUrl }),
     role: doc.role,
     joined_at: new Date(doc._creationTime).toISOString(),
     phone: doc.phone ?? null,
@@ -343,7 +347,12 @@ export function toUiMessage(doc: Doc<"messages">): Message {
     sender_id: doc.senderId,
     content_type: doc.contentType,
     content_text: doc.contentText,
-    media_url: doc.mediaUrl,
+    // `mediaKey` over the legacy `mediaUrl` (Task 5 of the R2 migration:
+    // dual-read). `Message.media_url` is `string | undefined` (see
+    // `src/types/index.ts`), so `resolveMediaUrl`'s `string | null`
+    // return is coerced back to `undefined` here — same convention as
+    // every other optional-string UI field in this file.
+    media_url: resolveMediaUrl({ key: doc.mediaKey, url: doc.mediaUrl }) ?? undefined,
     template_name: doc.templateName,
     // Meta wamid — the UI type names this `message_id` (there is no
     // separate `whatsapp_message_id` field on `Message`; checked
@@ -374,7 +383,17 @@ export function toUiMessage(doc: Doc<"messages">): Message {
           image_url: doc.referral.imageUrl,
           video_url: doc.referral.videoUrl,
           thumbnail_url: doc.referral.thumbnailUrl,
-          stored_image_url: doc.referral.storedImageUrl,
+          // `storedImageKey` over the legacy `storedImageUrl` (Task 5 of
+          // the R2 migration: dual-read) — unlike `image_url`/
+          // `video_url`/`thumbnail_url` above (Meta's raw ad-creative
+          // CDN urls, which have no key counterpart in the schema and
+          // are correctly left untouched), this field DOES have one
+          // (`messages.referral.storedImageKey`, schema.ts).
+          stored_image_url:
+            resolveMediaUrl({
+              key: doc.referral.storedImageKey,
+              url: doc.referral.storedImageUrl,
+            }) ?? undefined,
         }
       : undefined,
   };
@@ -561,7 +580,16 @@ export function toUiTemplate(doc: Doc<"messageTemplates">): MessageTemplate {
     header_type: doc.headerType,
     header_content: doc.headerContent,
     header_handle: doc.headerHandle,
-    header_media_url: doc.headerMediaUrl,
+    // `headerMediaKey` over the legacy `headerMediaUrl` (Task 5 of the
+    // R2 migration: dual-read) — resolved here so every display
+    // consumer (template-manager.tsx's preview, broadcasts/
+    // step3-personalize.tsx) gets the right URL without each needing to
+    // know about the key; `template-send-builder.ts` ALSO resolves
+    // independently at send time as a defensive second layer (see that
+    // file's own comment).
+    header_media_url:
+      resolveMediaUrl({ key: doc.headerMediaKey, url: doc.headerMediaUrl }) ??
+      undefined,
     body_text: doc.bodyText,
     footer_text: doc.footerText,
     buttons: doc.buttons as TemplateButton[] | undefined,

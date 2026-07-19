@@ -99,6 +99,20 @@ export const me = query({
       name: membership.fullName ?? user?.name ?? null,
       email: membership.email ?? user?.email ?? null,
       avatarUrl: membership.avatarUrl ?? user?.image ?? null,
+      // R2 object key for this member's avatar (Task 5 of the R2
+      // migration: dual-read) — the durable replacement for `avatarUrl`
+      // above, which is left UNCHANGED here on purpose. `me` is a Convex
+      // `query`, and this codebase's convention (see
+      // `conversionEvents.ts`/`campaignAds.ts`'s own "only an action can
+      // read process.env" comments) is that only an action reads
+      // deployment env, so resolving `avatarKey` into a public R2 URL
+      // here would need `r2ConfigFromEnv()`/`resolveMediaUrl`
+      // (`convex/lib/r2/*`) inside a query, which this file avoids.
+      // `src/hooks/use-auth.tsx` resolves `avatarKey ?? avatarUrl`
+      // client-side instead, via `src/lib/storage/media-url.ts` — same
+      // pattern `adapters.ts` already uses for every other client-facing
+      // avatar/media field.
+      avatarKey: membership.avatarKey ?? null,
       accountId: membership.accountId,
       accountRole: membership.role,
       account: {
