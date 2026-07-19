@@ -2207,5 +2207,19 @@
       "qualifyLabel": "Qualification",
       "checklistLabel": "Checklists"
     }
+  },
+  "Knowledge": {
+    "tab": "Knowledge",
+    "title": "Knowledge base",
+    "subtitle": "The structured knowledge your AI agent uses to describe services, qualify leads, and report purchases.",
+    "legacy": {
+      "sectionTitle": "Legacy documents",
+      "sectionHint": "Free-text documents from the old knowledge base. Still searched by the assistant. These will be retired once their content is migrated."
+    },
+    "empty": {
+      "title": "No services yet",
+      "body": "Add a service to start building structured knowledge your AI agent can use.",
+      "action": "Add your first service"
+    }
   }
 }

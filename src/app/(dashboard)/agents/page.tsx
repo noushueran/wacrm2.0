@@ -2,11 +2,14 @@
 
 import { useState } from 'react';
 import dynamic from 'next/dynamic';
+import { useSearchParams } from 'next/navigation';
+import { useTranslations } from 'next-intl';
 import { useQuery } from '@/lib/convex/cached';
-import { Bot, Sparkles, Settings2, BarChart3, Loader2 } from 'lucide-react';
+import { Bot, Sparkles, Settings2, BarChart3, BookOpen, Loader2 } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { AiPlayground } from '@/components/agents/ai-playground';
 import { AiConfig } from '@/components/settings/ai-config';
+import { KnowledgeStudio } from '@/components/knowledge/knowledge-studio';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 
@@ -31,12 +34,15 @@ const AiUsageCard = dynamic(
   },
 );
 
-type Tab = 'playground' | 'setup' | 'usage';
+type Tab = 'playground' | 'knowledge' | 'setup' | 'usage';
 
 export default function AgentsPage() {
   const { accountRole } = useAuth();
   const canViewUsage = accountRole ? canEditSettings(accountRole) : false;
-  const [tab, setTab] = useState<Tab>('playground');
+  const tKnowledge = useTranslations('Knowledge');
+  const searchParams = useSearchParams();
+  const urlTab = searchParams.get('tab') as Tab | null;
+  const [tab, setTab] = useState<Tab>(urlTab ?? 'playground');
   const [decided, setDecided] = useState(false);
 
   const configDoc = useQuery(api.aiConfig.get);
@@ -47,11 +53,26 @@ export default function AgentsPage() {
   // rather than a `useEffect`: `!decided` guards it from ever firing
   // again once true, so finishing Setup (which makes `configDoc` go
   // non-null) can't yank the user back to Playground out from under
-  // them.
+  // them. Now yields to an explicit `?tab=` deep link, which must never
+  // be overridden.
   if (!decided && configDoc !== undefined) {
     setDecided(true);
-    setTab(configDoc ? 'playground' : 'setup');
+    if (!urlTab) setTab(configDoc ? 'playground' : 'setup');
   }
+
+  // Shallow URL sync so the active tab is deep-linkable/shareable. Uses
+  // the native History API directly rather than a router method — per
+  // node_modules/next/dist/docs/01-app/02-guides/single-page-applications.md
+  // ("Shallow routing on the client"), `window.history.replaceState`
+  // integrates with `useSearchParams` without remounting the page, and
+  // is the same pattern already used for the inbox's chat selection
+  // (src/app/(dashboard)/inbox/page.tsx).
+  const selectTab = (next: Tab) => {
+    setTab(next);
+    const params = new URLSearchParams(window.location.search);
+    params.set('tab', next);
+    window.history.replaceState(null, '', `${window.location.pathname}?${params}`);
+  };
 
   return (
     <div>
@@ -69,13 +90,18 @@ export default function AgentsPage() {
       {decided && (
         <Tabs
           value={tab}
-          onValueChange={(v) => setTab(v as Tab)}
+          onValueChange={(v) => selectTab(v as Tab)}
           className="mt-6"
         >
           <TabsList>
             <TabsTrigger value="playground">
               <Sparkles className="mr-1.5 h-4 w-4" /> Playground
             </TabsTrigger>
+            {canViewUsage && (
+              <TabsTrigger value="knowledge">
+                <BookOpen className="mr-1.5 h-4 w-4" /> {tKnowledge('tab')}
+              </TabsTrigger>
+            )}
             <TabsTrigger value="setup">
               <Settings2 className="mr-1.5 h-4 w-4" /> Setup
             </TabsTrigger>
@@ -87,8 +113,14 @@ export default function AgentsPage() {
           </TabsList>
 
           <TabsContent value="playground" className="mt-4">
-            <AiPlayground onGoToSetup={() => setTab('setup')} />
+            <AiPlayground onGoToSetup={() => selectTab('setup')} />
           </TabsContent>
+
+          {canViewUsage && (
+            <TabsContent value="knowledge" className="mt-4">
+              <KnowledgeStudio />
+            </TabsContent>
+          )}
 
           <TabsContent value="setup" className="mt-4">
             <AiConfig />

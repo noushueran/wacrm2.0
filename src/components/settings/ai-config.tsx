@@ -25,7 +25,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { SettingsPanelHead } from './settings-panel-head';
-import { AiKnowledgeCard } from './ai-knowledge';
 import { AI_PROVIDER_DEFAULT_MODEL } from '@/lib/ai/defaults';
 import type { AiProvider } from '@/lib/ai/types';
 import { toUiAiConfig, isConvexErrorCode } from '@/lib/convex/adapters';
@@ -410,17 +409,6 @@ export function AiConfig() {
 
           </CardContent>
         </Card>
-
-        {canEdit && (
-          <AiKnowledgeCard
-            canEdit={canEdit}
-            hasEmbeddingsKey={
-              embeddingsKeyEdited
-                ? embeddingsKey.trim().length > 0
-                : hasStoredEmbeddingsKey
-            }
-          />
-        )}
 
         <div className="flex justify-end">
           <Button onClick={handleSave} disabled={disabled}>
