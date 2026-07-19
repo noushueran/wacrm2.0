@@ -1955,3 +1955,49 @@ test("resolveInboundMedia downloads Meta media into R2 and returns its key (not 
   delete process.env.R2_SECRET_ACCESS_KEY;
   delete process.env.R2_PUBLIC_HOST;
 });
+
+// ============================================================
+// connectionState — member-safe connection state query
+// ============================================================
+
+test("connectionState exposes only status and configured-ness", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "123456789",
+    wabaId: "987654321",
+    accessToken: "EAA-secret-token",
+    status: "connected",
+  });
+
+  const viewerId = await seedTeammate(t, {
+    accountId,
+    name: "Vee",
+    email: "vee@example.com",
+    role: "viewer",
+  });
+  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vee` });
+
+  const state = await asViewer.query(api.whatsappConfig.connectionState, {});
+  expect(state).toEqual({ status: "connected", isConfigured: true });
+  // The identifiers the raw row carries must not ride along.
+  expect(state).not.toHaveProperty("phoneNumberId");
+  expect(state).not.toHaveProperty("wabaId");
+  expect(state).not.toHaveProperty("accessToken");
+});
+
+test("connectionState reports an unconfigured account without throwing", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+
+  const state = await asOwner.query(api.whatsappConfig.connectionState, {});
+  expect(state).toEqual({ status: null, isConfigured: false });
+});

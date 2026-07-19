@@ -77,6 +77,31 @@ export const get = accountQuery({
 });
 
 /**
+ * Member-safe connection state. `get` above returns the FULL raw row —
+ * phone number id, WABA id, verify token, encrypted access token — which
+ * is far more than the two non-admin surfaces that read it actually
+ * need: the inbox wants "are we connected?", and the settings overview
+ * tile wants "is this set up at all?".
+ *
+ * Those two booleans are what this returns, so `get` can be gated to
+ * admin without breaking either surface. Never throws for an
+ * unconfigured account — absence is a legitimate state to render.
+ */
+export const connectionState = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    const config = await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .first();
+    return {
+      status: config?.status ?? null,
+      isConfigured: !!config?.phoneNumberId,
+    };
+  },
+});
+
+/**
  * Admin+ creates-or-updates the caller's own account's single WhatsApp
  * config row (find via `by_account`, patch if found else insert —
  * mirrors `templates.ts`'s `upsert` find-or-patch-else-insert idiom,
