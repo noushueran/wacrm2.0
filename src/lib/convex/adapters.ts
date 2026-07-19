@@ -343,6 +343,7 @@ export function toUiMessage(doc: Doc<"messages">): Message {
     sender_id: doc.senderId,
     content_type: doc.contentType,
     content_text: doc.contentText,
+    ai_transcription: doc.aiTranscription,
     media_url: doc.mediaUrl,
     template_name: doc.templateName,
     // Meta wamid — the UI type names this `message_id` (there is no
