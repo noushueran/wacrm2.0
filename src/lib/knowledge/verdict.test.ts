@@ -73,4 +73,11 @@ describe('serviceVerdict', () => {
       'blocked'
     );
   });
+
+  test('blocked when qualification marks are complete but the block is still a draft', () => {
+    expect(serviceVerdict({
+      ...ready,
+      qualification: { state: 'draft', marksTotal: 100 },
+    })).toBe('blocked');
+  });
 });
