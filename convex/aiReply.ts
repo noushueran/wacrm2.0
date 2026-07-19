@@ -768,28 +768,26 @@ export const dispatchInbound = internalAction({
 
       const queryText = latestUserMessage(messages);
 
-      // Ground the reply in the account's knowledge base (best-effort;
-      // skipped entirely when there's nothing to retrieve — see
-      // `hasKnowledgeChunks`'s own doc comment).
-      let knowledge: string[] = [];
-      const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
-        accountId: args.accountId,
-      });
-      if (hasKb) {
-        knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, {
+      // Independent of each other — the knowledge lookup makes a network
+      // call for embeddings, so overlapping them saves real wall-clock
+      // inside a window the customer is now watching.
+      const [knowledgeResult, qualification] = await Promise.all([
+        (async (): Promise<string[]> => {
+          const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
+            accountId: args.accountId,
+          });
+          if (!hasKb) return [];
+          return await ctx.runAction(internal.aiKnowledge.retrieve, {
+            accountId: args.accountId,
+            queryText,
+          });
+        })(),
+        ctx.runQuery(internal.qualificationEngine.getObjectives, {
           accountId: args.accountId,
-          queryText,
-        });
-      }
-
-      // Lead-qualification steering (spec §7): tell the assistant which
-      // answers exist (never re-ask) and the ONE question to weave in.
-      // Null when the feature is dormant / session terminal — prompt is
-      // then byte-identical to pre-qualification behaviour.
-      const qualification = await ctx.runQuery(
-        internal.qualificationEngine.getObjectives,
-        { accountId: args.accountId, conversationId: args.conversationId },
-      );
+          conversationId: args.conversationId,
+        }),
+      ]);
+      let knowledge: string[] = knowledgeResult;
       // v4: on the turn a lead just qualified, the closing message IS
       // the reply — a second assistant message here double-texted and
       // could re-ask already-given details.

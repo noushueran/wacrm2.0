@@ -17,9 +17,14 @@ import { AD_LANDING_PROMPT_CONTENT_MAX, type AdContext } from "./adContext";
  */
 export const HANDOFF_SENTINEL = "[[HANDOFF]]";
 
-/** Cap on generated reply length — keeps WhatsApp replies short and
- *  bounds token spend on the caller's own key. */
-export const MAX_OUTPUT_TOKENS = 1024;
+/** Cap on generated reply length — keeps WhatsApp replies short, bounds
+ *  token spend on the caller's own key, and bounds worst-case generation
+ *  time (which now sits inside a customer-visible typing window).
+ *  WhatsApp replies run 60-120 tokens; 320 leaves real headroom.
+ *
+ *  Deliberately NOT changed in `src/lib/ai/defaults.ts` — that constant
+ *  serves the human-reviewed draft-reply route, which may run longer. */
+export const MAX_OUTPUT_TOKENS = 320;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20;
