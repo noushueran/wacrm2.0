@@ -6,11 +6,13 @@ import { useTranslations } from 'next-intl';
 import { format, formatDistanceToNow } from 'date-fns';
 import {
   BadgeCheck,
+  BadgeDollarSign,
   ClipboardCheck,
   Copy,
   ExternalLink,
   Globe,
   ListChecks,
+  Loader2,
   Megaphone,
   MessageCircle,
   Search,
@@ -20,7 +22,7 @@ import {
 
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
-import { buttonVariants } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { LeadChecklist, type LeadChecklistData } from '@/components/leads/lead-checklist';
 import {
@@ -71,6 +73,15 @@ export interface LeadRow {
   funnelStageUpdatedAt: number | null;
   saleValue: number | null;
   saleCurrency: string | null;
+  purchase: {
+    status: 'sent' | 'not_met';
+    confidence: number;
+    reasons: string[];
+    value: number | null;
+    currency: string | null;
+    sentAt: number | null;
+    manual: boolean;
+  } | null;
   checklist: LeadChecklistData | null;
 }
 
@@ -155,19 +166,100 @@ function Stat({ label, value, accent }: { label: string; value: string | number;
   );
 }
 
+/** The purchase-signal verdict card (spec 2026-07-19-purchase-signals):
+ *  what the judge decided, and the supervisor+ manual-fire escape hatch
+ *  for case-by-case calls the criteria text didn't anticipate. */
+function PurchaseSignalCard({
+  lead,
+  t,
+  canSendPurchase,
+  onSendPurchaseSignal,
+}: {
+  lead: LeadRow;
+  t: ReturnType<typeof useTranslations>;
+  canSendPurchase: boolean;
+  onSendPurchaseSignal: (lead: LeadRow) => Promise<void>;
+}) {
+  const [sending, setSending] = useState(false);
+  if (lead.status !== 'qualified') return null;
+  const p = lead.purchase;
+  const canFire = canSendPurchase && p?.status !== 'sent' && lead.source !== 'organic';
+  if (!p && !canFire) return null;
+  return (
+    <div className="space-y-1.5 rounded-lg border border-border p-3 text-sm">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {t('purchase.title')}
+      </p>
+      {p?.status === 'sent' ? (
+        <>
+          <p className="flex items-center gap-1.5 font-medium text-emerald-500">
+            <BadgeDollarSign className="h-3.5 w-3.5" />
+            {t('purchase.sent')}
+            {p.manual ? (
+              <span className="text-[10px] font-normal text-muted-foreground">
+                {t('purchase.manual')}
+              </span>
+            ) : null}
+          </p>
+          {p.value !== null ? (
+            <p className="text-xs text-muted-foreground">
+              {t('purchase.reportedValue', { value: p.value, currency: p.currency ?? '' })}
+            </p>
+          ) : null}
+        </>
+      ) : p ? (
+        <p className="font-medium text-muted-foreground">
+          {t('purchase.notMet', { confidence: p.confidence })}
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground">{t('purchase.notEvaluated')}</p>
+      )}
+      {p && p.reasons.length > 0 ? (
+        <ul className="space-y-0.5 text-xs text-muted-foreground">
+          {p.reasons.slice(0, 4).map((reason, i) => (
+            <li key={i}>• {reason}</li>
+          ))}
+        </ul>
+      ) : null}
+      {canFire ? (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={sending}
+          onClick={async () => {
+            setSending(true);
+            try {
+              await onSendPurchaseSignal(lead);
+            } finally {
+              setSending(false);
+            }
+          }}
+        >
+          {sending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+          {t('purchase.send')}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 function LeadDetail({
   lead,
   t,
   canEdit,
+  canSendPurchase,
   onCompleteItem,
   onReopenItem,
+  onSendPurchaseSignal,
   bare,
 }: {
   lead: LeadRow;
   t: ReturnType<typeof useTranslations>;
   canEdit: boolean;
+  canSendPurchase: boolean;
   onCompleteItem: (lead: LeadRow, itemKey: string, note: string) => Promise<void>;
   onReopenItem: (lead: LeadRow, itemKey: string) => Promise<void>;
+  onSendPurchaseSignal: (lead: LeadRow) => Promise<void>;
   /** true inside the pipeline card dialog (no top border needed). */
   bare?: boolean;
 }) {
@@ -271,6 +363,13 @@ function LeadDetail({
             <p className="mt-1 text-sm text-foreground">{lead.assignment.lastFeedback}</p>
           </div>
         ) : null}
+        <PurchaseSignalCard
+          lead={lead}
+          t={t}
+          canSendPurchase={canSendPurchase}
+          onSendPurchaseSignal={onSendPurchaseSignal}
+        />
+
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>{t('detail.followUps', { count: lead.followUpsSent })}</span>
           {lead.nextFollowUpAt ? (
@@ -295,8 +394,11 @@ export interface LeadsBoardViewProps {
   view: LeadsView;
   onViewChange: (view: LeadsView) => void;
   canEdit: boolean;
+  /** supervisor+ — shows the manual "send purchase signal" action. */
+  canSendPurchase: boolean;
   onCompleteItem: (lead: LeadRow, itemKey: string, note: string) => Promise<void>;
   onReopenItem: (lead: LeadRow, itemKey: string) => Promise<void>;
+  onSendPurchaseSignal: (lead: LeadRow) => Promise<void>;
   onStageChange: (
     lead: LeadRow,
     stage: PipelineStageKey,
@@ -309,8 +411,10 @@ export function LeadsBoardView({
   view,
   onViewChange,
   canEdit,
+  canSendPurchase,
   onCompleteItem,
   onReopenItem,
+  onSendPurchaseSignal,
   onStageChange,
 }: LeadsBoardViewProps) {
   const t = useTranslations('Leads');
@@ -400,8 +504,10 @@ export function LeadsBoardView({
               lead={lead}
               t={t}
               canEdit={canEdit}
+              canSendPurchase={canSendPurchase}
               onCompleteItem={onCompleteItem}
               onReopenItem={onReopenItem}
+              onSendPurchaseSignal={onSendPurchaseSignal}
               bare
             />
           )}
@@ -506,6 +612,16 @@ export function LeadsBoardView({
                               {tFunnel(`stage.${lead.funnelStage}` as never)}
                             </Badge>
                           ) : null}
+                          {lead.purchase?.status === 'sent' ? (
+                            <Badge
+                              variant="outline"
+                              className="gap-1 border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-500"
+                              title={t('purchase.sentTooltip')}
+                            >
+                              <BadgeDollarSign className="h-3 w-3" />
+                              {t('purchase.sentBadge')}
+                            </Badge>
+                          ) : null}
                         </span>
                         <span className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                           {lead.serviceName ? <span className="font-medium">{lead.serviceName}</span> : null}
@@ -565,8 +681,10 @@ export function LeadsBoardView({
                       lead={lead}
                       t={t}
                       canEdit={canEdit}
+                      canSendPurchase={canSendPurchase}
                       onCompleteItem={onCompleteItem}
                       onReopenItem={onReopenItem}
+                      onSendPurchaseSignal={onSendPurchaseSignal}
                     />
                   ) : null}
                 </CardContent>
