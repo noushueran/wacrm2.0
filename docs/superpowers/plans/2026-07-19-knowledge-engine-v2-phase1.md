@@ -45,7 +45,7 @@
 - Consumes: nothing.
 - Produces: tables `kbServices`, `kbEntries`, `kbOpsBlocks`, `kbChunks` with the exact validators and index names below. Every later task depends on these names verbatim.
 
-- [ ] **Step 1: Write the failing smoke test**
+- [x] **Step 1: Write the failing smoke test**
 
 ```ts
 /// <reference types="vite/client" />
@@ -95,12 +95,12 @@ test("kb tables accept a minimal row each", async () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx vitest run convex/kbSchema.test.ts`
 Expected: FAIL — `kbServices` not in schema (validator error).
 
-- [ ] **Step 3: Append the four tables to `convex/schema.ts`**
+- [x] **Step 3: Append the four tables to `convex/schema.ts`**
 
 ```ts
   // ============ Knowledge Engine v2 (Phase 1) ============
@@ -205,12 +205,12 @@ Expected: FAIL — `kbServices` not in schema (validator error).
     }),
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx vitest run convex/kbSchema.test.ts convex/schema.test.ts`
 Expected: PASS both (if `schema.test.ts` enumerates tables and fails, add the four new table names to its expectation list — that is the only permitted edit there).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/schema.ts convex/kbSchema.test.ts convex/schema.test.ts
@@ -232,7 +232,7 @@ git commit -m "feat(kb): knowledge-engine v2 schema — kbServices/kbEntries/kbO
   - `types.ts`: `OpsKind`, `QualCriterion { key; label; question?; marks? }`, `SalesStep { key; label; description? }`, `PurchaseCondition { key; label }`, `OpsBlockInput { kind; criteria?; steps?; conditions?; reportValue?; currency? }`, `LintIssue { level: "error" | "warning"; code: string; message: string }`.
   - `lint.ts`: `lintServiceInput(args: { key: string; name: string; aliases: string[]; existingKeys: string[] }): LintIssue[]`, `lintEntryInput(args: { scope: "company" | "service" | "package"; serviceKey?: string; title: string; body: string; audience: "customer" | "internal" }): LintIssue[]`, `lintOpsBlock(block: OpsBlockInput): LintIssue[]`, `hasLintErrors(issues: LintIssue[]): boolean`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 import { describe, expect, test } from "vitest";
@@ -324,12 +324,12 @@ describe("lintOpsBlock", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx vitest run convex/lib/kb/lint.test.ts`
 Expected: FAIL — cannot resolve `./lint`.
 
-- [ ] **Step 3: Implement `types.ts` then `lint.ts`**
+- [x] **Step 3: Implement `types.ts` then `lint.ts`**
 
 ```ts
 // convex/lib/kb/types.ts
@@ -457,12 +457,12 @@ export function lintOpsBlock(block: OpsBlockInput): LintIssue[] {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx vitest run convex/lib/kb/lint.test.ts`
 Expected: PASS (9 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/lib/kb/types.ts convex/lib/kb/lint.ts convex/lib/kb/lint.test.ts
@@ -486,7 +486,7 @@ git commit -m "feat(kb): pure lint library for services, entries, and ops blocks
   - `parseChecklistLines(raw: string): { label: string; marks?: number }[]`
   - `parseReportValue(raw: string): { reportValue?: number; currency?: string }`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 import { describe, expect, test } from "vitest";
@@ -577,12 +577,12 @@ test("parseChecklistLines + parseReportValue", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx vitest run convex/lib/kb/sentinel.test.ts`
 Expected: FAIL — cannot resolve `./sentinel`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```ts
 // convex/lib/kb/sentinel.ts
@@ -666,12 +666,12 @@ export function parseReportValue(raw: string): { reportValue?: number; currency?
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx vitest run convex/lib/kb/sentinel.test.ts`
 Expected: PASS (7 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/lib/kb/sentinel.ts convex/lib/kb/sentinel.test.ts
@@ -690,7 +690,7 @@ git commit -m "feat(kb): sentinel render + legacy-document parser"
 - Consumes: `chunkText` from `../ai/chunk`, `renderOpsSentinel` from `./sentinel`, `OpsBlockInput` from `./types`.
 - Produces: `ChunkPlan = { chunkIndex: number; content: string }`; `planEntryChunks(args: { serviceName: string | null; title: string; body: string }): ChunkPlan[]`; `planOpsChunks(serviceName: string, block: OpsBlockInput): ChunkPlan[]` (always 0 or 1 chunk — a checklist must never split).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 import { expect, test } from "vitest";
@@ -743,12 +743,12 @@ test("empty body/ops produce no chunks", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx vitest run convex/lib/kb/compilePure.test.ts`
 Expected: FAIL — cannot resolve `./compilePure`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```ts
 // convex/lib/kb/compilePure.ts
@@ -787,12 +787,12 @@ export function planOpsChunks(serviceName: string, block: OpsBlockInput): ChunkP
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx vitest run convex/lib/kb/compilePure.test.ts`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/lib/kb/compilePure.ts convex/lib/kb/compilePure.test.ts
@@ -815,7 +815,7 @@ git commit -m "feat(kb): chunk planning — header-prefixed entry chunks, unspli
   - `api.kbServices.upsert` — admin. Args `{ key, name, aliases, routingTagName?, relatedServiceKeys?, status?, sortOrder? }`. Creates when `key` is new; patches when it exists (key itself immutable — it IS the identity). Lint errors → `ConvexError({ code: "BAD_REQUEST", issues })`.
   - `api.kbServices.remove` — admin. Refuses with `ConvexError({ code: "BAD_REQUEST", reason: "service_in_use" })` while any `kbEntries` or `kbOpsBlocks` row references the key.
 
-- [ ] **Step 1: Write the failing tests** (copy `seedAccountMember` + the `modules` glob + DRY-RUN `beforeEach/afterEach` verbatim from `convex/aiKnowledge.test.ts:16-70`)
+- [x] **Step 1: Write the failing tests** (copy `seedAccountMember` + the `modules` glob + DRY-RUN `beforeEach/afterEach` verbatim from `convex/aiKnowledge.test.ts:16-70`)
 
 ```ts
 test("admin creates, edits, lists; key is immutable identity", async () => {
@@ -868,12 +868,12 @@ test("remove refuses while entries reference the service", async () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx vitest run convex/kbServices.test.ts`
 Expected: FAIL — `api.kbServices` undefined.
 
-- [ ] **Step 3: Implement `convex/kbServices.ts`**
+- [x] **Step 3: Implement `convex/kbServices.ts`**
 
 ```ts
 import { accountMutation, accountQuery } from "./lib/auth";
@@ -965,12 +965,12 @@ export const remove = accountMutation({
 });
 ```
 
-- [ ] **Step 4: Hand-edit `convex/_generated/api.d.ts`** (import + record entry for `kbServices`), then run tests
+- [x] **Step 4: Hand-edit `convex/_generated/api.d.ts`** (import + record entry for `kbServices`), then run tests
 
 Run: `npx vitest run convex/kbServices.test.ts && npx tsc --noEmit`
 Expected: PASS (4 tests), tsc clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/kbServices.ts convex/kbServices.test.ts convex/_generated/api.d.ts
@@ -995,7 +995,7 @@ git commit -m "feat(kb): kbServices registry CRUD (admin-gated, lint-guarded)"
   - `api.kbEntries.unpublish` — admin. Sets draft; schedules `compileEntry` (which deletes chunks for non-published rows).
   - `api.kbEntries.remove` — admin. Deletes the row, then deletes its `kbChunks` via `by_entry` inline (a deleted row can't be compiled).
 
-- [ ] **Step 1: Write the failing tests** (same suite scaffolding as Task 5)
+- [x] **Step 1: Write the failing tests** (same suite scaffolding as Task 5)
 
 ```ts
 test("save creates a draft; edit bumps version and demotes to draft", async () => {
@@ -1051,9 +1051,9 @@ test("lint error (blank body) rejects; remove deletes row + chunks", async () =>
 });
 ```
 
-- [ ] **Step 2: Run to verify failure** — `npx vitest run convex/kbEntries.test.ts` → FAIL (`api.kbEntries` undefined).
+- [x] **Step 2: Run to verify failure** — `npx vitest run convex/kbEntries.test.ts` → FAIL (`api.kbEntries` undefined).
 
-- [ ] **Step 3: Implement `convex/kbEntries.ts`**
+- [x] **Step 3: Implement `convex/kbEntries.ts`**
 
 ```ts
 import { accountMutation, accountQuery } from "./lib/auth";
@@ -1184,9 +1184,9 @@ export const remove = accountMutation({
 });
 ```
 
-- [ ] **Step 4: Run** — `npx vitest run convex/kbEntries.test.ts && npx tsc --noEmit` → PASS after adding `kbEntries` to `api.d.ts`. Note: the publish test schedules `compileEntry`, which doesn't exist until Task 8 — convex-test only resolves scheduled refs when timers advance, so it passes; if it errors on resolution instead, stub `convex/kbCompile.ts` now with an empty `compileEntry = internalAction({ args: { entryId: v.id("kbEntries") }, handler: async () => {} })` and register it in `api.d.ts` (Task 8 replaces the body).
+- [x] **Step 4: Run** — `npx vitest run convex/kbEntries.test.ts && npx tsc --noEmit` → PASS after adding `kbEntries` to `api.d.ts`. Note: the publish test schedules `compileEntry`, which doesn't exist until Task 8 — convex-test only resolves scheduled refs when timers advance, so it passes; if it errors on resolution instead, stub `convex/kbCompile.ts` now with an empty `compileEntry = internalAction({ args: { entryId: v.id("kbEntries") }, handler: async () => {} })` and register it in `api.d.ts` (Task 8 replaces the body).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/kbEntries.ts convex/kbEntries.test.ts convex/_generated/api.d.ts convex/kbCompile.ts
@@ -1211,7 +1211,7 @@ git commit -m "feat(kb): kbEntries CRUD + draft/publish lifecycle"
   - `api.kbOps.publish` — admin. Full `lintOpsBlock` gate (all errors block). Sets published + schedules `internal.kbCompile.compileOps { opsBlockId }`.
   - `api.kbOps.unpublish` — admin. Demotes + schedules `compileOps` (deletes chunks).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 test("save upserts a draft; publish enforces marks_sum; unpublish demotes", async () => {
@@ -1254,9 +1254,9 @@ test("save against a missing service is NOT_FOUND; agent role rejected", async (
 });
 ```
 
-- [ ] **Step 2: Run to verify failure** — `npx vitest run convex/kbOps.test.ts` → FAIL.
+- [x] **Step 2: Run to verify failure** — `npx vitest run convex/kbOps.test.ts` → FAIL.
 
-- [ ] **Step 3: Implement `convex/kbOps.ts`**
+- [x] **Step 3: Implement `convex/kbOps.ts`**
 
 ```ts
 import { accountMutation, accountQuery } from "./lib/auth";
@@ -1399,9 +1399,9 @@ export const unpublish = accountMutation({
 });
 ```
 
-- [ ] **Step 4: Run** — `npx vitest run convex/kbOps.test.ts && npx tsc --noEmit` → PASS (with `kbOps` in `api.d.ts`; stub `compileOps` in `convex/kbCompile.ts` alongside Task 6's stub if needed).
+- [x] **Step 4: Run** — `npx vitest run convex/kbOps.test.ts && npx tsc --noEmit` → PASS (with `kbOps` in `api.d.ts`; stub `compileOps` in `convex/kbCompile.ts` alongside Task 6's stub if needed).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/kbOps.ts convex/kbOps.test.ts convex/_generated/api.d.ts convex/kbCompile.ts
@@ -1428,7 +1428,7 @@ git commit -m "feat(kb): kbOps structured checklist/criteria blocks with publish
   - `internal.kbCompile.compileEntry` — internalAction `{ entryId }`: row missing or not published → replace with `[]` (cleanup) and return; else plan chunks → best-effort embed (identical semantics to `ingest` lines 285-318: dry-run → synthetic; failure → insert lexical-only then rethrow) → replace.
   - `internal.kbCompile.compileOps` — internalAction `{ opsBlockId }`: same shape.
 
-- [ ] **Step 1: Write the failing tests** (suite scaffolding as before; `CONVEX_AI_DRY_RUN` already set in `beforeEach`)
+- [x] **Step 1: Write the failing tests** (suite scaffolding as before; `CONVEX_AI_DRY_RUN` already set in `beforeEach`)
 
 ```ts
 test("publishing an entry compiles header-prefixed chunks with metadata", async () => {
@@ -1487,9 +1487,9 @@ test("publishing an ops block compiles ONE internal sentinel chunk; unpublish cl
 });
 ```
 
-- [ ] **Step 2: Run to verify failure** — `npx vitest run convex/kbCompile.test.ts` → FAIL (stub compiles nothing).
+- [x] **Step 2: Run to verify failure** — `npx vitest run convex/kbCompile.test.ts` → FAIL (stub compiles nothing).
 
-- [ ] **Step 3: Implement `convex/kbCompile.ts`**
+- [x] **Step 3: Implement `convex/kbCompile.ts`**
 
 ```ts
 import { internalAction, internalMutation, internalQuery } from "./_generated/server";
@@ -1681,9 +1681,9 @@ export const compileOps = internalAction({
 
 (Type `embedPlans`'s ctx/accountId properly: `Pick<ActionCtx, "runQuery">` and `Id<"accounts">` — mirror how `aiKnowledge.ts` types its action helpers. `kbOps.publish`/`unpublish` from Task 7 must pass `{ opsBlockId: row._id }` when scheduling.)
 
-- [ ] **Step 4: Run** — `npx vitest run convex/kbCompile.test.ts convex/kbEntries.test.ts convex/kbOps.test.ts && npx tsc --noEmit` → PASS.
+- [x] **Step 4: Run** — `npx vitest run convex/kbCompile.test.ts convex/kbEntries.test.ts convex/kbOps.test.ts && npx tsc --noEmit` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/kbCompile.ts convex/kbCompile.test.ts convex/aiKnowledge.ts convex/_generated/api.d.ts
@@ -1702,7 +1702,7 @@ git commit -m "feat(kb): publish-time compiler — entry chunks + internal senti
 - Consumes: `kbChunks` indexes from Task 1.
 - Produces: `internal.aiKnowledge.retrieve` — args gain `audience: v.optional(v.literal("customer"))`. Return type unchanged (`string[]`). New internal queries `getKbChunksByIds { accountId, ids: Id<"kbChunks">[] }` and `searchKbChunks { accountId, queryText, limit, audience? }`. Phase 3 will pass `audience: "customer"` from `aiReply`; **no caller changes in this phase**.
 
-- [ ] **Step 1: Write the failing tests** (inside the existing suite, reusing its helpers; seed compiled chunks via `t.run` inserts with `syntheticEmbedding(content)` embeddings, mirroring how the existing retrieve tests seed `aiKnowledgeChunks`)
+- [x] **Step 1: Write the failing tests** (inside the existing suite, reusing its helpers; seed compiled chunks via `t.run` inserts with `syntheticEmbedding(content)` embeddings, mirroring how the existing retrieve tests seed `aiKnowledgeChunks`)
 
 ```ts
 describe("retrieve merge", () => {
@@ -1791,9 +1791,9 @@ describe("retrieve merge", () => {
 
 (If the existing suite has no `seedEmbeddingsKey`-style helper, follow whatever its current semantic-path test does to configure an embeddings key via `api.aiConfig` and reuse that snippet verbatim.)
 
-- [ ] **Step 2: Run to verify failure** — `npx vitest run convex/aiKnowledge.test.ts -t "retrieve merge"` → FAIL (audience arg rejected / ordering wrong).
+- [x] **Step 2: Run to verify failure** — `npx vitest run convex/aiKnowledge.test.ts -t "retrieve merge"` → FAIL (audience arg rejected / ordering wrong).
 
-- [ ] **Step 3: Modify `retrieve`** — keep the existing function intact as the "legacy pool" stage and add a compiled stage before it:
+- [x] **Step 3: Modify `retrieve`** — keep the existing function intact as the "legacy pool" stage and add a compiled stage before it:
 
 ```ts
 export const getKbChunksByIds = internalQuery({
@@ -1874,9 +1874,9 @@ Inside `retrieve` (same best-effort try/catch discipline as the existing stages)
 
 Restructure the function so the query embedding is computed ONCE up top (hoist the existing `loadDecrypted` + embed block above both passes; `queryEmbedding` is `null` when there's no key), then let the existing legacy semantic + lexical stages fill the remaining slots through the same `push()` (replace their `picked` Map writes with `push(content)`), and end with `return pickedContents;`. The three existing behaviors that must survive verbatim: blank-query early return, every stage individually try/caught, and `k` respected exactly.
 
-- [ ] **Step 4: Run the full aiKnowledge suite** — `npx vitest run convex/aiKnowledge.test.ts && npx tsc --noEmit` → PASS including every pre-existing test (that's the byte-compatibility proof).
+- [x] **Step 4: Run the full aiKnowledge suite** — `npx vitest run convex/aiKnowledge.test.ts && npx tsc --noEmit` → PASS including every pre-existing test (that's the byte-compatibility proof).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/aiKnowledge.ts convex/aiKnowledge.test.ts
@@ -1902,7 +1902,7 @@ git commit -m "feat(kb): retrieve merges compiled kbChunks first, optional custo
   2. `SALES CHECKLIST — X`: if `slugify(X)` is a known/created service → sales ops draft; else (e.g. "All Services") → company entry, type `process`, audience `internal`, title `SALES CHECKLIST — X`, body = raw section.
   3. Doc prose → entry: scope `service` if the doc contains exactly one qualification section (use its service), else `company`; type `overview`; audience `internal` if `/sales process/i.test(doc.title)`, else `customer`; title = doc title; body = prose. Skip when prose is blank.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 const LEGACY_DOC = [
@@ -1969,9 +1969,9 @@ test("company-wide sales checklist becomes an internal process entry", async () 
 });
 ```
 
-- [ ] **Step 2: Run to verify failure** — `npx vitest run convex/kbImport.test.ts` → FAIL.
+- [x] **Step 2: Run to verify failure** — `npx vitest run convex/kbImport.test.ts` → FAIL.
 
-- [ ] **Step 3: Implement `convex/kbImport.ts`**
+- [x] **Step 3: Implement `convex/kbImport.ts`**
 
 ```ts
 import { accountMutation, accountQuery } from "./lib/auth";
@@ -2192,7 +2192,7 @@ export const apply = accountMutation({
 });
 ```
 
-- [ ] **Step 4: Run everything — the phase gate**
+- [x] **Step 4: Run everything — the phase gate**
 
 ```bash
 npm test
@@ -2206,7 +2206,7 @@ git diff --stat origin/main -- convex/qualificationEngine.ts convex/salesCheckli
 
 Expected: full suite green (~1900 baseline + all new kb tests), tsc clean, Next build green, **lint findings equal to the pre-Task-1 baseline** (no new ones — the repo has pre-existing debt, so "clean" is not the bar), and the final `git diff --stat` **EMPTY** — that empty diff is the proof the scope boundary held.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add convex/kbImport.ts convex/kbImport.test.ts convex/_generated/api.d.ts
