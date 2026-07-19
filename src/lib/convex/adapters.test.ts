@@ -14,11 +14,11 @@ function messageDoc(over: Partial<Doc<"messages">> = {}): Doc<"messages"> {
     _creationTime: 1_700_000_000_000,
     accountId: "a1" as Doc<"messages">["accountId"],
     conversationId: "c1" as Doc<"messages">["conversationId"],
-    senderType: "contact",
+    senderType: "customer",
     contentType: "audio",
     status: "delivered",
     ...over,
-  } as Doc<"messages">;
+  } satisfies Doc<"messages">;
 }
 
 describe("toUiMessage carries the AI transcription", () => {
