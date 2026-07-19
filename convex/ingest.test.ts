@@ -2221,6 +2221,19 @@ test("checkAgentReplySla anchors on the OLDEST unanswered message — rapid ping
 test("a bot reply before takeover satisfies the SLA — no false alarm after assignment", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  // The reply now lands via TWO nested scheduled hops instead of one —
+  // the debounced `dispatchInbound`, which itself schedules `deliverReply`
+  // after a length-proportional delay once it runs. Pin both hops' delays
+  // to a few ms so a small BOUNDED timer advance below can reliably drain
+  // both without reaching anywhere near the 10-min SLA check further down:
+  // `vi.runAllTimers()`/`t.finishAllScheduledFunctions(vi.runAllTimers)`
+  // would also fire (and consume) that far-future SLA timer prematurely,
+  // silently degrading the "no false alarm after assignment" check below
+  // into a vacuous one (nothing left to fire once assignment happens).
+  process.env.AI_REPLY_DEBOUNCE_FAST_MS = "50";
+  process.env.AI_TYPING_MIN_MS = "50";
+  process.env.AI_TYPING_MAX_MS = "100";
+  process.env.AI_TYPING_JITTER = "0";
   vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
@@ -2232,9 +2245,17 @@ test("a bot reply before takeover satisfies the SLA — no false alarm after ass
     from: "15551234567",
     message: { type: "text", text: "hello!", wamid: "wamid.SLA3" },
   });
-  // Let ONLY the debounced bot reply land (not the 10-min SLA check yet).
-  vi.advanceTimersByTime(15_000);
-  await t.finishInProgressScheduledFunctions();
+  // Bounded drain: several small steps comfortably cover both ~50-100ms
+  // hops (debounce, then delivery) while staying orders of magnitude
+  // under the 10-minute SLA window.
+  for (let i = 0; i < 5; i++) {
+    vi.advanceTimersByTime(500);
+    await t.finishInProgressScheduledFunctions();
+  }
+  delete process.env.AI_REPLY_DEBOUNCE_FAST_MS;
+  delete process.env.AI_TYPING_MIN_MS;
+  delete process.env.AI_TYPING_MAX_MS;
+  delete process.env.AI_TYPING_JITTER;
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
   );
