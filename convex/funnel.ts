@@ -39,6 +39,87 @@ const STAGE_VALIDATOR = v.union(
  * a conversation assigned to them; supervisor+ act on any).
  */
 /**
+ * Seeds the deduped `conversionEvents` outbox row for one (conversation,
+ * stage) and schedules Phase 1's dispatcher — extracted from
+ * `applyStageTransition` so the purchase-signal engine can fire the
+ * `purchased` Meta event WITHOUT moving the operational funnel stage
+ * (spec 2026-07-19-purchase-signals §3.3). Reuses the first-touch
+ * (new_lead) row as the anchor for the Platform A contract fields
+ * (phone/waMessageId/firstMessageAt). Returns the existing row's id on
+ * an eventId hit (never re-schedules delivery — the
+ * `${conversationId}:${stage}` dedup is what makes the proxy fire and a
+ * later real sale structurally unable to double-send), and `undefined`
+ * for unattributed conversations, unmapped stages, or a missing lane
+ * identifier.
+ */
+export async function seedStageConversionEvent(
+  ctx: { db: MutationCtx["db"]; scheduler: MutationCtx["scheduler"] },
+  args: {
+    accountId: Id<"accounts">;
+    conversation: Doc<"conversations">;
+    stage: FunnelStageKey;
+    value?: number;
+    currency?: string;
+  },
+): Promise<{ conversionEventId: Id<"conversionEvents"> | undefined }> {
+  const { conversation, stage } = args;
+  const conversationId = conversation._id;
+  const hasValue = args.value !== undefined && args.value > 0;
+
+  let conversionEventId: Id<"conversionEvents"> | undefined;
+  const attribution = conversation.attribution;
+  if (attribution) {
+    const eventName = resolveEventName(attribution.lane, stage);
+    const identifier =
+      attribution.lane === "code" ? attribution.code : attribution.ctwaClid;
+    if (eventName && identifier) {
+      const eventId = `${conversationId}:${stage}`;
+      const existing = await ctx.db
+        .query("conversionEvents")
+        .withIndex("by_event_id", (q) => q.eq("eventId", eventId))
+        .first();
+      if (existing) {
+        conversionEventId = existing._id;
+      } else {
+        const anchor = await ctx.db
+          .query("conversionEvents")
+          .withIndex("by_event_id", (q) =>
+            q.eq("eventId", `${conversationId}:new_lead`),
+          )
+          .first();
+        const contact = await ctx.db.get(conversation.contactId);
+        conversionEventId = await ctx.db.insert("conversionEvents", {
+          accountId: args.accountId,
+          conversationId,
+          contactId: conversation.contactId,
+          // `lost` can never reach here (resolveEventName returns null for
+          // it, so the eventName guard above filters it) — the narrow cast
+          // records that invariant instead of widening the events schema.
+          stage: stage as Exclude<FunnelStageKey, "lost">,
+          lane: attribution.lane,
+          backend: backendForLane(attribution.lane),
+          eventName,
+          identifier,
+          ...(hasValue ? { value: args.value, currency: args.currency } : {}),
+          phone: anchor?.phone ?? (contact ? normalizePhone(contact.phone) : ""),
+          waMessageId: anchor?.waMessageId ?? "",
+          firstMessageAt: anchor?.firstMessageAt ?? attribution.firstSeenAt,
+          eventId,
+          status: "pending",
+          attempts: 0,
+        });
+        await ctx.scheduler.runAfter(
+          0,
+          internal.conversionEvents.deliverConversionEvent,
+          { conversionEventId },
+        );
+      }
+    }
+  }
+  return { conversionEventId };
+}
+
+/**
  * The stage-advance core, shared by the authed `setStage` below and the
  * qualification engine's `completeQualification` (spec §9 — the
  * "internal stage-advance" the design calls for). Byte-identical
@@ -100,59 +181,13 @@ export async function applyStageTransition(
   });
 
   // Seed the mapped Meta conversion event when the conversation is
-  // attributed AND the stage maps to an event on its lane. Reuses the
-  // first-touch (new_lead) row as the anchor for the Platform A contract
-  // fields (phone/waMessageId/firstMessageAt).
-  let conversionEventId: Id<"conversionEvents"> | undefined;
-  const attribution = conversation.attribution;
-  if (attribution) {
-    const eventName = resolveEventName(attribution.lane, stage);
-    const identifier =
-      attribution.lane === "code" ? attribution.code : attribution.ctwaClid;
-    if (eventName && identifier) {
-      const eventId = `${conversationId}:${stage}`;
-      const existing = await ctx.db
-        .query("conversionEvents")
-        .withIndex("by_event_id", (q) => q.eq("eventId", eventId))
-        .first();
-      if (existing) {
-        conversionEventId = existing._id;
-      } else {
-        const anchor = await ctx.db
-          .query("conversionEvents")
-          .withIndex("by_event_id", (q) =>
-            q.eq("eventId", `${conversationId}:new_lead`),
-          )
-          .first();
-        const contact = await ctx.db.get(conversation.contactId);
-        conversionEventId = await ctx.db.insert("conversionEvents", {
-          accountId: args.accountId,
-          conversationId,
-          contactId: conversation.contactId,
-          // `lost` can never reach here (resolveEventName returns null for
-          // it, so the eventName guard above filters it) — the narrow cast
-          // records that invariant instead of widening the events schema.
-          stage: stage as Exclude<FunnelStageKey, "lost">,
-          lane: attribution.lane,
-          backend: backendForLane(attribution.lane),
-          eventName,
-          identifier,
-          ...(hasValue ? { value: args.saleValue, currency } : {}),
-          phone: anchor?.phone ?? (contact ? normalizePhone(contact.phone) : ""),
-          waMessageId: anchor?.waMessageId ?? "",
-          firstMessageAt: anchor?.firstMessageAt ?? attribution.firstSeenAt,
-          eventId,
-          status: "pending",
-          attempts: 0,
-        });
-        await ctx.scheduler.runAfter(
-          0,
-          internal.conversionEvents.deliverConversionEvent,
-          { conversionEventId },
-        );
-      }
-    }
-  }
+  // attributed AND the stage maps to an event on its lane.
+  const { conversionEventId } = await seedStageConversionEvent(ctx, {
+    accountId: args.accountId,
+    conversation,
+    stage,
+    ...(hasValue ? { value: args.saleValue, currency } : {}),
+  });
 
   await ctx.db.insert("funnelTransitions", {
     accountId: args.accountId,
