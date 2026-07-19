@@ -21,7 +21,15 @@ import { aiContextMessageLimit, buildSystemPrompt } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
 import { toChatMessages } from "./lib/ai/context";
 import { generateReply } from "./lib/ai/generate";
-import { applyStageTransition } from "./funnel";
+import { applyStageTransition, seedStageConversionEvent } from "./funnel";
+import {
+  buildPurchasePrompt,
+  parsePurchaseVerdict,
+  syntheticPurchaseRaw,
+  MIN_PURCHASE_CONFIDENCE,
+  PURCHASE_EVAL_WINDOW_MS,
+  PURCHASE_EVAL_DEBOUNCE_MS,
+} from "./lib/qualification/purchase";
 import {
   clampToWorkingHours,
   computeNextFollowUpAt,
@@ -98,6 +106,23 @@ export const onInbound = internalMutation({
         computeNextFollowUpAt(config, session.followUpsSent, now) ??
         now + config.sessionWindowHours * 3_600_000 + 60_000;
       await ctx.db.patch(session._id, { nextFollowUpAt: at });
+    }
+    // Purchase signals: a post-qualification inbound (text OR media —
+    // this hook sees both, unlike the text-only analysis pass) may
+    // complete the service's purchase criteria, e.g. the visa documents
+    // arriving as images. Cheap gate here; the judge re-checks in full.
+    if (
+      session &&
+      session.status === "qualified" &&
+      config.purchaseSignalsEnabled === true &&
+      session.purchase?.status !== "sent" &&
+      session.qualifiedAt !== undefined &&
+      now - session.qualifiedAt <= PURCHASE_EVAL_WINDOW_MS
+    ) {
+      await ctx.scheduler.runAfter(0, internal.qualificationEngine.evaluatePurchase, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+      });
     }
   },
 });
@@ -770,6 +795,366 @@ export const completeQualification = internalMutation({
         accountId: args.accountId,
         sessionId: session._id,
       });
+    }
+    // Purchase signals: the first evaluation rides completion itself —
+    // when the checklist conversation already covered the purchase bar
+    // (e.g. budget), the proxy Purchase fires with zero extra delay.
+    if (config.purchaseSignalsEnabled === true) {
+      await ctx.scheduler.runAfter(0, internal.qualificationEngine.evaluatePurchase, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+      });
+    }
+  },
+});
+
+// ============================================================
+// PURCHASE SIGNALS (spec docs/superpowers/specs/2026-07-19-purchase-
+// signals-design.md). A second, stricter judge that runs ONLY on
+// already-qualified sessions: does this lead also meet its service's
+// owner-editable `PURCHASE CRITERIA — <Service>` KB section? If yes,
+// seed the `purchased` conversionEvents row directly — WITHOUT moving
+// the operational funnel stage — so Meta's Sales-objective campaign
+// gets its Purchase the moment the lead is highly qualified, and the
+// later real sale (agent-marked `purchased`) links the same
+// `${conversationId}:purchased` row instead of double-sending.
+// ============================================================
+
+/**
+ * Everything the purchase judge needs in one read. Null = don't
+ * evaluate: feature/toggle dormant, conversation closed/organic/staff,
+ * latest session not `qualified`, signal already sent, outside the
+ * post-qualification window, or debounced (an evaluation just ran).
+ */
+export const loadPurchaseContext = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    serviceName: string | null;
+    fields: { key: string; label?: string; value: string }[];
+    score: number | null;
+    summary: string | null;
+    /** Previous inquiry's completion time — the judge must only see
+     *  messages after it (v4 transcript-boundary rule). */
+    boundary: number | null;
+  } | null> => {
+    const config = await loadEnabledConfig(ctx, args.accountId);
+    if (!config || config.purchaseSignalsEnabled !== true) return null;
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) return null;
+    if (conversation.status === "closed") return null;
+    // Only attributed conversations can carry a Meta event — an organic
+    // chat has nothing to fire, so the LLM spend is skipped entirely.
+    const attribution = conversation.attribution;
+    const identifier =
+      attribution &&
+      (attribution.lane === "code" ? attribution.code : attribution.ctwaClid);
+    if (!identifier) return null;
+    // Staff loop guard, same as the analysis path.
+    const contact = await ctx.db.get(conversation.contactId);
+    if (contact) {
+      const staff = await loadStaffPhoneSet(ctx, args.accountId, config);
+      if (isStaffNumber(staff, contact.phoneNormalized)) return null;
+    }
+    const rows = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .collect();
+    const session = rows[0];
+    if (!session || session.status !== "qualified") return null;
+    if (session.purchase?.status === "sent") return null;
+    const now = Date.now();
+    if (
+      session.qualifiedAt === undefined ||
+      now - session.qualifiedAt > PURCHASE_EVAL_WINDOW_MS
+    ) {
+      return null;
+    }
+    if (
+      session.purchase &&
+      now - session.purchase.evaluatedAt < PURCHASE_EVAL_DEBOUNCE_MS
+    ) {
+      return null;
+    }
+    // Multi-lead: when an OLDER terminal session exists, the judge only
+    // sees messages after it finished (same boundary the analysis uses).
+    const previous = rows[1];
+    const boundary = previous
+      ? (previous.qualifiedAt ??
+        previous.lastCustomerMessageAt ??
+        previous._creationTime)
+      : null;
+    return {
+      serviceName: session.serviceName ?? null,
+      fields: session.fields
+        .filter((f) => f.confidence !== "low")
+        .map((f) => ({
+          key: f.key,
+          ...(f.label ? { label: f.label } : {}),
+          value: f.value,
+        })),
+      score: session.score ?? null,
+      summary: session.summary ?? null,
+      boundary,
+    };
+  },
+});
+
+const purchaseVerdictValidator = v.object({
+  met: v.boolean(),
+  confidence: v.number(),
+  reasons: v.array(v.string()),
+  value: v.union(v.number(), v.null()),
+  currency: v.union(v.string(), v.null()),
+  criteriaFound: v.boolean(),
+});
+
+/**
+ * Applies one judge verdict transactionally. Re-checks every gate (the
+ * action's read ran outside this transaction), fires at most once per
+ * conversation (session `sent` status + the outbox's
+ * `${conversationId}:purchased` eventId dedup), and never touches
+ * `conversation.funnel` — the proxy is Meta-only, CRM stages stay
+ * operational truth. Not-met verdicts are stamped so /leads can show
+ * why, and the next inbound re-evaluates.
+ */
+export const applyPurchaseVerdict = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    verdict: purchaseVerdictValidator,
+  },
+  handler: async (ctx, args): Promise<{ fired: boolean }> => {
+    const none = { fired: false };
+    const config = await loadEnabledConfig(ctx, args.accountId);
+    if (!config || config.purchaseSignalsEnabled !== true) return none;
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) return none;
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .first();
+    if (!session || session.status !== "qualified") return none;
+    if (session.purchase?.status === "sent") return none;
+    const now = Date.now();
+    const verdict = args.verdict;
+
+    const fire =
+      verdict.met &&
+      verdict.criteriaFound &&
+      verdict.confidence >= MIN_PURCHASE_CONFIDENCE;
+    if (!fire) {
+      await ctx.db.patch(session._id, {
+        purchase: {
+          status: "not_met",
+          evaluatedAt: now,
+          confidence: verdict.confidence,
+          reasons: verdict.reasons,
+        },
+      });
+      return none;
+    }
+
+    const account = await ctx.db.get(args.accountId);
+    const value = verdict.value ?? undefined;
+    const currency =
+      value !== undefined
+        ? (verdict.currency ?? account?.defaultCurrency ?? "USD")
+        : undefined;
+    // Did a row already exist (agent marked the real sale first)? Decides
+    // whether this fire deserves its own notification.
+    const existing = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_event_id", (q) =>
+        q.eq("eventId", `${args.conversationId}:purchased`),
+      )
+      .first();
+    const { conversionEventId } = await seedStageConversionEvent(ctx, {
+      accountId: args.accountId,
+      conversation,
+      stage: "purchased",
+      ...(value !== undefined ? { value, currency } : {}),
+    });
+    if (!conversionEventId) {
+      // Attribution vanished between read and write (belt-and-braces) —
+      // record the miss instead of pretending the signal went out.
+      await ctx.db.patch(session._id, {
+        purchase: {
+          status: "not_met",
+          evaluatedAt: now,
+          confidence: verdict.confidence,
+          reasons: [...verdict.reasons, "conversation not attributed — no Meta lane"],
+        },
+      });
+      return none;
+    }
+
+    await ctx.db.patch(session._id, {
+      purchase: {
+        status: "sent",
+        evaluatedAt: now,
+        confidence: verdict.confidence,
+        reasons: verdict.reasons,
+        ...(value !== undefined ? { value, currency } : {}),
+        sentAt: now,
+        conversionEventId,
+      },
+    });
+
+    if (!existing) {
+      const members = await ctx.db
+        .query("memberships")
+        .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+        .collect();
+      const recipients = recipientsForInbound({
+        assignedToUserId: conversation.assignedToUserId ?? null,
+        members: members.map((m) => ({
+          userId: m.userId,
+          role: m.role as AccountRole,
+        })),
+      });
+      const body =
+        (session.serviceName ?? "Qualified lead") +
+        (value !== undefined ? ` · ~${value} ${currency}` : "") +
+        (verdict.reasons[0] ? ` — ${verdict.reasons[0]}` : "");
+      for (const userId of recipients) {
+        await insertNotification(ctx, {
+          accountId: args.accountId,
+          userId,
+          type: "purchase_signal",
+          conversationId: args.conversationId,
+          contactId: session.contactId,
+          title: "Purchase signal sent to Meta",
+          body,
+        });
+      }
+    }
+    return { fired: true };
+  },
+});
+
+/**
+ * The purchase-judge action — read → LLM → apply, the `analyzeInbound`
+ * shape (same dry-run gate, same best-effort usage log, same
+ * never-throw discipline). Scheduled by `completeQualification` and by
+ * `onInbound` on post-qualification messages — INCLUDING media, which
+ * the analysis pass skips: visa documents arrive as images/PDFs, and
+ * "all documents received" is exactly the kind of purchase criterion
+ * the owner writes.
+ */
+export const evaluatePurchase = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const context = await ctx.runQuery(
+        internal.qualificationEngine.loadPurchaseContext,
+        { accountId: args.accountId, conversationId: args.conversationId },
+      );
+      if (!context) return;
+
+      const aiCfg = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!aiCfg || !aiCfg.isActive) return;
+
+      let historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        limit: aiContextMessageLimit(),
+      });
+      if (context.boundary) {
+        const boundary = context.boundary;
+        historyRows = historyRows.filter(
+          (r) =>
+            (r as { createdAt?: number }).createdAt === undefined ||
+            (r as { createdAt?: number }).createdAt! > boundary,
+        );
+      }
+      const messages = toChatMessages(historyRows);
+      if (messages.length === 0) return;
+      const latest = latestUserMessage(messages);
+      // Deterministic docs-received signal: the transcript shows media
+      // placeholders, and this count makes "sent N documents" explicit.
+      const customerMediaCount = historyRows.filter(
+        (r) =>
+          r.senderType === "customer" &&
+          !!r.contentType &&
+          r.contentType !== "text",
+      ).length;
+
+      let criteriaExcerpts: string[] = [];
+      const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
+        accountId: args.accountId,
+      });
+      if (hasKb) {
+        criteriaExcerpts = await ctx.runAction(internal.aiKnowledge.retrieve, {
+          accountId: args.accountId,
+          queryText:
+            `PURCHASE CRITERIA ${context.serviceName ?? ""} ${latest}`.trim(),
+        });
+      }
+
+      const systemPrompt = buildPurchasePrompt({
+        criteriaExcerpts,
+        serviceName: context.serviceName,
+        fields: context.fields,
+        score: context.score,
+        summary: context.summary,
+        customerMediaCount,
+      });
+
+      let raw: string;
+      if (isAiDryRun()) {
+        raw = syntheticPurchaseRaw(latest);
+      } else {
+        const gen = await generateReply({
+          provider: aiCfg.provider,
+          model: aiCfg.model,
+          apiKey: aiCfg.apiKey,
+          systemPrompt,
+          messages,
+        });
+        raw = gen.text;
+        try {
+          await ctx.runMutation(internal.aiUsage.log, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            mode: "qualify",
+            provider: aiCfg.provider,
+            model: aiCfg.model,
+            promptTokens: gen.usage?.promptTokens ?? 0,
+            completionTokens: gen.usage?.completionTokens ?? 0,
+            totalTokens: gen.usage?.totalTokens ?? 0,
+          });
+        } catch (err) {
+          console.warn("[purchase signal] usage log failed:", err);
+        }
+      }
+
+      const verdict = parsePurchaseVerdict(raw);
+      if (!verdict) return; // malformed model output — next inbound retries
+
+      await ctx.runMutation(internal.qualificationEngine.applyPurchaseVerdict, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        verdict,
+      });
+    } catch (err) {
+      console.error("[purchase signal] evaluation failed:", err);
     }
   },
 });
