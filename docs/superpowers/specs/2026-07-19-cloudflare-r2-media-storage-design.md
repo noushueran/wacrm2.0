@@ -102,6 +102,7 @@ row-rewriting migration.
 | Account ID | `a80be7ba4a3283e02427058e9e477754` |
 | S3 endpoint | `https://a80be7ba4a3283e02427058e9e477754.r2.cloudflarestorage.com` |
 | Public custom domain | **`objs.holidayys.co`** |
+| CORS policy (on `wa-holidayys`) | 🚨 **REQUIRED, not R2's default** — must allow the CRM origin, method `PUT`, and header `content-type`. R2 buckets ship with NO CORS policy at all; without one, every browser upload (`presignPut`'s direct-to-R2 PUT — see `convex/lib/r2/client.ts`) fails its preflight `OPTIONS` request. See the write-path plan's Task 8 pre-deploy gate for the verification command and blast radius. |
 
 Convex deployment env vars (owner sets these directly — secrets are never
 pasted into a chat transcript or committed):

@@ -1529,7 +1529,42 @@ targets (Convex backend, Netlify frontend), and getting the gate wrong fails
 This gate is what prevents a silent production regression; do not skip or
 skim it.
 
-1. **All five Convex `R2_*` vars are set on the *production* Convex
+1. 🚨 **CORS is configured on the `wa-holidayys` R2 bucket for the CRM
+   origin — VERIFIED with a real preflight request, not just saved in
+   the Cloudflare dashboard.** `presignPut` (`convex/lib/r2/client.ts`)
+   signs against the S3 API endpoint
+   (`https://<acct>.r2.cloudflarestorage.com`), and the browser PUT
+   (`src/lib/storage/upload-media.ts`'s `uploadAccountMedia`) sends a
+   `Content-Type` header on that cross-origin request — a
+   non-safelisted header, which means the browser will not even
+   attempt the PUT without first sending a preflight `OPTIONS` request
+   and getting back a matching `Access-Control-Allow-Methods: PUT` /
+   `Access-Control-Allow-Headers: content-type` response. **R2 buckets
+   ship with NO CORS policy at all.** This is a NEW requirement this
+   migration introduces — the OLD flow POSTed to a Convex-issued
+   upload URL, which was already same-origin, so nothing before this
+   migration ever exercised a preflight here.
+   - **Blast radius if missed:** every BROWSER upload path fails its
+     preflight and throws — 100% failure, from the moment Netlify
+     ships, for composer attachments, agent voice notes, template
+     header images, flow `send_media` uploads, and avatar uploads in
+     Settings. Unlike the other items in this gate, there is no
+     degraded fallback here: once the new composer ships, there is no
+     legacy upload path left for a browser to fall back to.
+   - **Verify with a real preflight**, not the dashboard's saved-policy
+     view — a policy that *looks* saved but doesn't match the exact
+     origin/method/header combination below still fails this exact way:
+     ```bash
+     curl -i -X OPTIONS "https://<acct>.r2.cloudflarestorage.com/wa-holidayys/<any-key>" \
+       -H "Origin: https://<crm-origin>" \
+       -H "Access-Control-Request-Method: PUT" \
+       -H "Access-Control-Request-Headers: content-type"
+     ```
+     Confirm a 2xx/204 response that echoes `Access-Control-Allow-Origin`
+     (matching the CRM's real origin), `Access-Control-Allow-Methods`
+     including `PUT`, and `Access-Control-Allow-Headers` including
+     `content-type`.
+2. **All five Convex `R2_*` vars are set on the *production* Convex
    deployment AND VERIFIED live** — `R2_BUCKET`, `R2_ENDPOINT`,
    `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST`. "Verified"
    means confirmed on the deployment itself (e.g. `npx convex env list`
@@ -1548,10 +1583,10 @@ skim it.
      working. Check the inbox for a fresh inbound photo/voice note
      immediately after deploy, not just outbound sends (Step 4 covers
      this, but don't wait for it if this var check was skipped).
-2. **`NEXT_PUBLIC_R2_PUBLIC_HOST` is present in the Netlify *build*
+3. **`NEXT_PUBLIC_R2_PUBLIC_HOST` is present in the Netlify *build*
    environment** — see Step 1 below for the full detail on why this must
    be a verified, already-built value and what happens if it's missing.
-3. **Convex is deployed BEFORE Netlify. Never the reverse, and never
+4. **Convex is deployed BEFORE Netlify. Never the reverse, and never
    "close enough."** `files.generateUploadUrl` / `registerUpload` /
    `getUrl` are deleted in this change with **no deprecation window** —
    there is no version of the backend that serves both the old and new
@@ -1566,19 +1601,20 @@ skim it.
      own commands do this), *then* trigger the Netlify build — never
      both at once, never Netlify first.
 
-Only once all three are confirmed does Step 2 proceed.
+Only once all four are confirmed does Step 2 proceed.
 
 ---
 
 - [ ] **Step 1: Confirm owner prerequisites are done**
 
 - `objs.holidayys.co` bound to the `wa-holidayys` bucket as a **custom domain** (not `r2.dev`).
-- `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment — see gate item 1 above for the silent-failure consequence if this is skipped.
+- 🚨 **CORS configured on the `wa-holidayys` bucket for the CRM origin (method `PUT`, header `content-type`) — VERIFIED with the `curl -X OPTIONS` preflight in gate item 1 above, not just saved in the dashboard.** See gate item 1 for the full blast radius if this is skipped: every browser upload path (composer, voice notes, template headers, flow media, avatars) fails 100% of the time, with no fallback.
+- `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment — see gate item 2 above for the silent-failure consequence if this is skipped.
 - 🚨 **`NEXT_PUBLIC_R2_PUBLIC_HOST` must be set in the Netlify *build* environment BEFORE any writer is enabled** (i.e. before Step 2's `npx convex deploy`, and before any Task 6/7 write path can put a key into a row). This is a build-time Next.js public env var — setting it on Netlify *after* deploying a build does nothing until the next build runs. Verify it by checking the deployed build's environment, not just the Netlify UI's saved value.
   - **Consequence if it's missing when a key-bearing row is first read:** `src/lib/storage/media-url.ts`'s client resolver now degrades gracefully — it falls back to the legacy Convex-storage URL and logs a `console.error` naming the missing variable, rather than throwing. So a missing var no longer blanks the app. But the degraded behavior is still broken in its own way: **any media uploaded after the R2 cutover has no legacy URL to fall back to, so it will not load** (broken avatar / broken message attachment) until the var is set and the affected rows are re-read. Treat the `console.error` as a page-this-person signal, not background noise.
   - Before this fix (fixed in the Task 5 review pass), the same missing-var condition was worse: the resolver *threw* during render, which blanked the entire app (`AuthProvider`) or the entire message thread (`message-thread.tsx`) the instant one row carried a key — not just a missing image.
 
-- [ ] **Step 2: Owner deploys backend, then frontend — in that order, never reversed (gate item 3 above)**
+- [ ] **Step 2: Owner deploys backend, then frontend — in that order, never reversed (gate item 4 above)**
 
 🚨 **This step is run by the owner, not by an implementer subagent.** It is the
 only production push in this plan, and it must follow a clean whole-branch
@@ -1590,7 +1626,7 @@ git fetch origin && git merge origin/main
 npm test && npm run typecheck && npm run build   # all green before pushing
 npx convex deploy                                 # PRODUCTION — owner only, MUST complete and be confirmed live before the next line
 ```
-Only after `npx convex deploy` has completed AND been confirmed live (e.g. calling `api.files.startUpload` succeeds against production), let Netlify build. Do not trigger the Netlify build preemptively "to save time" — that is exactly gate item 3's reversed-order failure mode.
+Only after `npx convex deploy` has completed AND been confirmed live (e.g. calling `api.files.startUpload` succeeds against production), let Netlify build. Do not trigger the Netlify build preemptively "to save time" — that is exactly gate item 4's reversed-order failure mode.
 
 - [ ] **Step 3: Verify Meta can actually fetch from the custom domain**
 
