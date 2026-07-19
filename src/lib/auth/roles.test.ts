@@ -165,12 +165,54 @@ describe("capability predicates", () => {
     expect(canAccessNav("supervisor", "/settings")).toBe(true);
   });
 
-  it("canAccessNav gates /campaigns to admin+ only", () => {
-    expect(canAccessNav("owner", "/campaigns")).toBe(true);
-    expect(canAccessNav("admin", "/campaigns")).toBe(true);
-    expect(canAccessNav("supervisor", "/campaigns")).toBe(false);
+  it("canAccessNav confines supervisor to its allowlist", () => {
+    // Granted
+    expect(canAccessNav("supervisor", "/dashboard")).toBe(true);
+    expect(canAccessNav("supervisor", "/inbox")).toBe(true);
+    expect(canAccessNav("supervisor", "/leads")).toBe(true);
+    expect(canAccessNav("supervisor", "/contacts")).toBe(true);
+    expect(canAccessNav("supervisor", "/pipelines")).toBe(true);
+    expect(canAccessNav("supervisor", "/broadcasts")).toBe(true);
+    expect(canAccessNav("supervisor", "/campaigns")).toBe(true);
+    // Must stay granted: the sidebar filters the Settings link through
+    // canAccessNav, and the route guard uses canAccessRoute.
+    expect(canAccessNav("supervisor", "/settings")).toBe(true);
+    expect(canAccessNav("supervisor", "/notifications")).toBe(true);
+
+    // Denied
+    expect(canAccessNav("supervisor", "/agents")).toBe(false);
+    expect(canAccessNav("supervisor", "/automations")).toBe(false);
+    expect(canAccessNav("supervisor", "/flows")).toBe(false);
+  });
+
+  it("canAccessNav still admits admin and owner everywhere", () => {
+    for (const href of ["/agents", "/automations", "/flows", "/campaigns"]) {
+      expect(canAccessNav("admin", href)).toBe(true);
+      expect(canAccessNav("owner", href)).toBe(true);
+    }
+  });
+
+  it("canAccessNav leaves agent and viewer untouched", () => {
+    expect(canAccessNav("agent", "/inbox")).toBe(true);
+    expect(canAccessNav("agent", "/notifications")).toBe(true);
+    expect(canAccessNav("agent", "/leads")).toBe(true);
     expect(canAccessNav("agent", "/campaigns")).toBe(false);
+    expect(canAccessNav("agent", "/agents")).toBe(false);
+    expect(canAccessNav("viewer", "/inbox")).toBe(true);
     expect(canAccessNav("viewer", "/campaigns")).toBe(false);
+    expect(canAccessNav("viewer", "/agents")).toBe(false);
+  });
+
+  it("canAccessNav matches nested routes to their base section", () => {
+    expect(canAccessNav("supervisor", "/contacts/abc123")).toBe(true);
+    expect(canAccessNav("supervisor", "/agents/abc123")).toBe(false);
+  });
+
+  it("a new unlisted page is private to supervisors by default", () => {
+    // The whole point of the allowlist: adding a page must not silently
+    // grant it. If this ever fails, someone reintroduced a denylist.
+    expect(canAccessNav("supervisor", "/some-future-page")).toBe(false);
+    expect(canAccessNav("admin", "/some-future-page")).toBe(true);
   });
 
   it("canAccessSettingsSection: agent/viewer personal-only; supervisor no critical", () => {
@@ -179,8 +221,35 @@ describe("capability predicates", () => {
     expect(canAccessSettingsSection("agent", "templates")).toBe(false);
     expect(canAccessSettingsSection("supervisor", "templates")).toBe(true);
     expect(canAccessSettingsSection("supervisor", "whatsapp")).toBe(false);
-    expect(canAccessSettingsSection("supervisor", "members")).toBe(false);
+    expect(canAccessSettingsSection("supervisor", "members")).toBe(true);
     expect(canAccessSettingsSection("admin", "whatsapp")).toBe(true);
+  });
+
+  it("canAccessSettingsSection gives supervisor operational tabs only", () => {
+    // Granted
+    for (const section of [
+      "overview",
+      "profile",
+      "appearance",
+      "notifications",
+      "templates",
+      "quick-replies",
+      "fields",
+      "deals",
+      "members",
+    ] as const) {
+      expect(canAccessSettingsSection("supervisor", section)).toBe(true);
+    }
+    // Denied
+    for (const section of [
+      "whatsapp",
+      "api",
+      "conversions",
+      "qualification",
+      "cron",
+    ] as const) {
+      expect(canAccessSettingsSection("supervisor", section)).toBe(false);
+    }
   });
 
   it("defaultLandingPath: agent/viewer → /inbox, others → /dashboard", () => {

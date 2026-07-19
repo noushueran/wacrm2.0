@@ -149,17 +149,38 @@ export function canAssignToOthers(role: AccountRole): boolean {
 export const AGENT_NAV = ["/inbox", "/notifications", "/leads"] as const;
 export const VIEWER_NAV = ["/inbox"] as const;
 
-/** Sections gated to admin+ even though supervisors otherwise see all nav. */
-export const ADMIN_ONLY_NAV = ["/campaigns"] as const;
+/**
+ * Everything a supervisor may reach. This is an ALLOWLIST, deliberately
+ * — it used to be a denylist ("supervisor sees all except campaigns"),
+ * which meant every page added to the app became visible to supervisors
+ * the moment it shipped. Adding an entry here must be a conscious act.
+ *
+ * `/settings` and `/notifications` are load-bearing and must not be
+ * removed: `sidebar.tsx` filters the Settings link through
+ * `canAccessNav`, and `require-section.tsx` route-guards on
+ * `canAccessRoute`. Dropping them would cost supervisors their own
+ * profile page and their own notifications. The settings page gates its
+ * individual tabs separately via `canAccessSettingsSection`.
+ */
+export const SUPERVISOR_NAV = [
+  "/dashboard",
+  "/inbox",
+  "/notifications",
+  "/leads",
+  "/contacts",
+  "/pipelines",
+  "/broadcasts",
+  "/campaigns",
+  "/settings",
+] as const;
 
 export function canAccessNav(role: AccountRole, href: string): boolean {
   // Match the concrete href or a nested route under it.
   const base = "/" + (href.split("/")[1] ?? "");
-  // Admin-only sections (e.g. Campaigns) override the supervisor+ blanket.
-  if ((ADMIN_ONLY_NAV as readonly string[]).includes(base)) {
-    return hasMinRole(role, "admin");
+  if (hasMinRole(role, "admin")) return true; // admin/owner: all
+  if (role === "supervisor") {
+    return (SUPERVISOR_NAV as readonly string[]).includes(base);
   }
-  if (hasMinRole(role, "supervisor")) return true; // supervisor/admin/owner: all
   if (role === "agent") return (AGENT_NAV as readonly string[]).includes(base);
   if (role === "viewer") return (VIEWER_NAV as readonly string[]).includes(base);
   return false;
@@ -197,11 +218,18 @@ const PERSONAL_SECTIONS: SettingsSectionKey[] = [
   "appearance",
   "notifications",
 ];
-// `conversions` renders `api.conversionEvents.listRecent`, which is
-// itself `ctx.requireRole("admin")`-gated (it exposes raw lead phone
-// numbers) — same threshold as `whatsapp`/`api`/`members`, so it joins
-// them here rather than being reachable by a supervisor.
-const CRITICAL_SECTIONS: SettingsSectionKey[] = ["whatsapp", "api", "members", "conversions", "qualification", "cron"];
+// `members` is NOT here: a supervisor may see the roster, but every
+// members mutation is independently `requireRole("admin")`-gated, so
+// they cannot invite, remove, or change anyone's role.
+// `qualification` IS here — it configures the AI agent's question flow,
+// which supervisors are deliberately kept out of.
+const CRITICAL_SECTIONS: SettingsSectionKey[] = [
+  "whatsapp",
+  "api",
+  "conversions",
+  "qualification",
+  "cron",
+];
 
 export function canAccessSettingsSection(
   role: AccountRole,
