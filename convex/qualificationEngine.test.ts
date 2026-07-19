@@ -2146,7 +2146,10 @@ test("failsafe: a service nobody is linked to still reaches the team, flagged as
   });
   expect(decision.kind).toBe("offer");
   if (decision.kind !== "offer") throw new Error("unreachable");
-  expect(decision.usedFallback).toBe(true);
+  // the engine created the "UAE visa" tag at completion, so it exists
+  // with zero links — a stricter assertion than the old boolean, which
+  // could not tell this apart from the three other fallback causes
+  expect(decision.fallback).toBe("tag_unlinked");
   expect(decision.agent.userId).toBe(sara.userId);
 
   // and it really is offered, not just classified
@@ -2197,7 +2200,8 @@ test("failsafe: a tag linked only to unreachable members falls back to the team"
   });
   expect(decision.kind).toBe("offer");
   if (decision.kind !== "offer") throw new Error("unreachable");
-  expect(decision.usedFallback).toBe(true);
+  // Nadia IS linked, so the remedy is a phone number, not another link
+  expect(decision.fallback).toBe("links_ineligible");
   expect(decision.agent.userId).toBe(omar.userId);
 });
 
@@ -2405,4 +2409,240 @@ test("failsafe: an alert whose own config lookup throws is swallowed, never prop
   await expect(t.action(internal.qualificationEngine.alertRoutingFailure, {
     accountId: base.accountId, text: "⚠️ routing alert with a broken config",
   })).resolves.toBeNull();
+});
+
+/**
+ * Inserts a qualified session directly, bypassing the analysis path.
+ *
+ * Needed because the dry-run stub hardcodes `service: "UAE visa"`
+ * (`syntheticAnalysisRaw`) with no way to suppress it, so a session with
+ * no service name — or with a service no tag matches — is unreachable
+ * through `analyzeInbound`. Same direct-insert shape as the P6
+ * fewest-recent-accepts test above. `serviceName` is OMITTED rather than
+ * set to `null` because the schema field is `v.optional(v.string())`,
+ * which is exactly the state production leaves it in: the insert at
+ * `qualificationEngine.ts:381` never writes it and `patch.serviceName`
+ * is only set `if (analysis.serviceName)`.
+ */
+async function seedQualifiedSession(
+  t: TestConvex<typeof schema>,
+  base: Awaited<ReturnType<typeof seedAttributed>>,
+  opts: { serviceName?: string } = {},
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      status: "qualified",
+      origin: "inbound",
+      ...(opts.serviceName === undefined ? {} : { serviceName: opts.serviceName }),
+      fields: [], expectedCount: 4, answeredCount: 4, score: 80, qualifiedAt: Date.now(),
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }));
+}
+
+/** Messages sent to the admin alert number, as plain text. */
+async function alertTextsTo(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  phoneNormalized: string,
+) {
+  return (await staffMessagesTo(t, accountId, phoneNormalized))
+    .map((m) => m.contentText ?? "");
+}
+
+test("failsafe C1: a qualified lead with NO service name still reaches an agent, with an honest alert", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const sara = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  // The AI qualified the lead without ever naming a service. This is the
+  // state `analyzeInbound` leaves behind whenever the model returns no
+  // `service`, and the old guard (`|| !session.serviceName`) turned it
+  // into a `noop` — no offer row, so `sweepLeadOffers` was structurally
+  // blind to it and the lead was lost permanently and silently.
+  const sessionId = await seedQualifiedSession(t, base);
+
+  const decision = await t.query(internal.qualificationEngine.offerContext, { sessionId });
+  expect(decision.kind).toBe("offer"); // NOT noop — this is the whole finding
+  if (decision.kind !== "offer") throw new Error("unreachable");
+  expect(decision.fallback).toBe("no_service_name");
+  expect(decision.agent.userId).toBe(sara.userId);
+
+  // and it genuinely routes, not merely classifies
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId,
+  });
+  const offers = await offersFor(t, sessionId);
+  expect(offers).toHaveLength(1);
+  expect(offers[0].agentUserId).toBe(sara.userId);
+
+  // the agent's offer text uses the placeholder, never a bare "undefined"
+  const agentMsgs = await alertTextsTo(t, base.accountId, "971557008899");
+  expect(agentMsgs.some((m) => m.includes("Reply YES"))).toBe(true);
+  expect(agentMsgs.some((m) => m.includes("undefined"))).toBe(false);
+
+  // and the admin is told the real cause, not "link an agent to the tag"
+  const alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  const alert = alerts.find((m) => m.includes("Routing not configured"));
+  expect(alert).toBeDefined();
+  expect(alert).toContain("without the AI identifying a service");
+  expect(alert).not.toContain("No agent is linked to the tag");
+});
+
+test("failsafe T2-m2: the fallback alert fires once per LEAD, not once per offer attempt", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // Two eligible agents, neither linked to the lead's service, so the
+  // whole-team fallback walks both of them in turn.
+  await seedAgentWithTag(t, base.accountId, {
+    name: "A1", phone: "+971551110001", tagName: "Georgia tours",
+  });
+  await seedAgentWithTag(t, base.accountId, {
+    name: "A2", phone: "+971551110002", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  const session = await qualifyLead(t, base);
+
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  const first = (await offersFor(t, session._id))[0];
+  // whoever was picked declines, which re-triggers the offer for the next
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId,
+    phoneNormalized: first.agentPhone.replace(/\D/g, ""),
+    text: "no",
+  });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+
+  // the lead really did walk to a second agent...
+  const offers = await offersFor(t, session._id);
+  expect(offers).toHaveLength(2);
+  // ...but the owner's phone got exactly ONE misconfiguration alert.
+  const alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  expect(alerts.filter((m) => m.includes("Routing not configured"))).toHaveLength(1);
+});
+
+test("failsafe I1: the exhausted alert never claims the whole team passed when only linked agents were asked", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // Lina is linked to the real service; Omar is eligible but NOT linked,
+  // so he is deliberately never asked (the intent rule).
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Lina", phone: "+971551110001", tagName: "UAE visa",
+  });
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Omar", phone: "+971551110002", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  const session = await qualifyLead(t, base);
+
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971551110001", text: "no",
+  });
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision).toMatchObject({ kind: "exhausted", scope: "linked" });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+
+  const alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  const stranded = alerts.find((m) => m.includes("Lead not taken"));
+  expect(stranded).toBeDefined();
+  // Omar was never asked, so this claim would be false...
+  expect(stranded).not.toContain("Everyone eligible has passed");
+  // ...and the truthful version names the service and the unasked rest
+  expect(stranded).toContain('Every agent linked to "UAE visa"');
+  expect(stranded).toContain("nobody else was asked");
+});
+
+test("failsafe I1: a whole-team cycle that runs out DOES say everyone passed", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // Nobody is linked to the lead's service, so the fallback asked the
+  // entire team — here "everyone eligible" is literally true.
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  const session = await qualifyLead(t, base);
+
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971557008899", text: "no",
+  });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
+    .toMatchObject({ kind: "exhausted", scope: "team" });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+
+  const alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  const stranded = alerts.find((m) => m.includes("Lead not taken"));
+  expect(stranded).toContain("Everyone eligible has passed");
+});
+
+test("failsafe I2: each fallback cause names its own remedy", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+
+  // (a) the tag row is genuinely absent — reachable because the
+  // completion-time auto-tag is best-effort inside a try/catch. Telling
+  // an admin to "link agents to that tag" sends them hunting for a tag
+  // that does not exist.
+  const missing = await seedQualifiedSession(t, base, { serviceName: "Kenya safari" });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: missing }))
+    .toMatchObject({ kind: "offer", fallback: "tag_missing" });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: missing,
+  });
+  let alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  const absent = alerts.find((m) => m.includes("Kenya safari"));
+  expect(absent).toContain('No tag named "Kenya safari" exists');
+  expect(absent).toContain("Settings → Tags");
+
+  // (b) links exist but every linked member is unreachable — the remedy
+  // is a phone number or a role change, NOT another link.
+  const tagId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("tags", {
+      accountId: base.accountId, name: "Baku tours", color: "#0ea5e9",
+    });
+    const userId = await ctx.db.insert("users", { name: "Nadia", email: "nadia2@example.com" });
+    await ctx.db.insert("memberships", {
+      userId, accountId: base.accountId, role: "agent",
+      fullName: "Nadia", email: "nadia2@example.com", // deliberately no phone
+    });
+    await ctx.db.insert("memberTags", { accountId: base.accountId, userId, tagId: id });
+    return id;
+  });
+  expect(tagId).toBeDefined();
+  const ineligible = await seedQualifiedSession(t, base, { serviceName: "Baku tours" });
+  expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: ineligible }))
+    .toMatchObject({ kind: "offer", fallback: "links_ineligible" });
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: ineligible,
+  });
+  alerts = await alertTextsTo(t, base.accountId, "971559456999");
+  const unreachable = alerts.find((m) => m.includes("Baku tours"));
+  expect(unreachable).toContain("is unreachable");
+  expect(unreachable).toContain("missing a WhatsApp number");
+  // the false remedy from the old single message must NOT appear here
+  expect(unreachable).not.toContain("No agent is linked to the tag");
 });

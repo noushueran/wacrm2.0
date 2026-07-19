@@ -2254,6 +2254,31 @@ export const cleanupDuplicateLeads = internalMutation({
 type OfferCandidate = { userId: Id<"users">; phone: string; name: string; recent: number };
 
 /**
+ * Why a lead had to be offered to the whole team instead of the agents
+ * linked to its service tag.
+ *
+ * A plain `usedFallback: boolean` used to stand on the `offer` variant,
+ * which collapsed four genuinely different misconfigurations into a
+ * single admin message ("no agent is linked to that tag") that is only
+ * accurate for one of them. Each cause has a different remedy, and
+ * naming the wrong one costs an admin a pointless hunt — so each
+ * carries its own text. Listing them in one place also means a new
+ * fallback path cannot be added without choosing what to tell the admin.
+ */
+export type FallbackCause =
+  /** Qualified without the AI naming a service, so there was never a tag
+   *  to route by. Not a routing misconfiguration at all. */
+  | "no_service_name"
+  /** No `tags` row matches the service name. Remedy: create the tag. */
+  | "tag_missing"
+  /** The tag exists with zero `memberTags` links. Remedy: link agents. */
+  | "tag_unlinked"
+  /** Links exist, but no linked member can take a lead — each is missing
+   *  a phone or holds an `admin`/`viewer` role. Remedy: a phone number
+   *  or a role change, NOT another link. */
+  | "links_ineligible";
+
+/**
  * What the engine decided to do about a session's lead offer.
  *
  * This is a discriminated union rather than `T | null` on purpose. It
@@ -2267,10 +2292,30 @@ type OfferCandidate = { userId: Id<"users">; phone: string; name: string; recent
 export type OfferDecision =
   | { kind: "noop" }
   | { kind: "unroutable"; reason: "no_agents"; serviceName: string; customerName: string }
-  | { kind: "exhausted"; serviceName: string; customerName: string }
+  | {
+      kind: "exhausted";
+      /**
+       * Which pool was actually asked. `"linked"` means only the agents
+       * linked to the service tag were offered this lead and the rest of
+       * the team was deliberately never asked — so an admin must not be
+       * told "everyone eligible has passed", which would read as "the
+       * team is busy" and invite them to deprioritise a lead that one
+       * click would route.
+       */
+      scope: "linked" | "team";
+      serviceName: string;
+      customerName: string;
+    }
   | {
       kind: "offer";
-      usedFallback: boolean;
+      /** `null` on the happy path (routed by tag); otherwise why we widened. */
+      fallback: FallbackCause | null;
+      /**
+       * True only on the first offer attempt for this session. The
+       * fallback alert is ungated WhatsApp to the owner's phone, so it
+       * fires once per lead rather than once per agent walked.
+       */
+      firstAttempt: boolean;
       accountId: Id<"accounts">;
       conversationId: Id<"conversations">;
       contactId: Id<"contacts">;
@@ -2286,7 +2331,7 @@ export const offerContext = internalQuery({
   args: { sessionId: v.id("qualificationSessions") },
   handler: async (ctx, args): Promise<OfferDecision> => {
     const session = await ctx.db.get(args.sessionId);
-    if (!session || session.status !== "qualified" || !session.serviceName) return { kind: "noop" };
+    if (!session || session.status !== "qualified") return { kind: "noop" };
     const config = await loadEnabledConfig(ctx, session.accountId);
     if (!config || config.autoAssignEnabled === false) return { kind: "noop" };
     const conversation = await ctx.db.get(session.conversationId);
@@ -2299,18 +2344,22 @@ export const offerContext = internalQuery({
     if (offers.some((o) => o.status === "offered" || o.status === "accepted")) return { kind: "noop" };
     const alreadyTried = new Set(offers.map((o) => o.agentUserId));
 
-    const serviceName = session.serviceName;
+    // A missing service name is deliberately NOT a noop. `patch.serviceName`
+    // is only written `if (analysis.serviceName)`, and neither the readiness
+    // nor the completion gate consults it, so a session really can reach
+    // `qualified` with no service — and bailing here dropped that lead
+    // exactly the way the bare `null` used to: no `leadOffers` row, so
+    // `sweepLeadOffers` (which finds work on `by_status_offered`) could
+    // never retry it either. It has, by definition, no routing intent that
+    // COULD have been expressed, which is the same condition that licenses
+    // widening below, so it takes the fallback path under its own cause.
+    const serviceName = session.serviceName ?? null;
+    // Same placeholder convention as the handoff/notification/board copy
+    // above (`?? "New lead"` / `?? "Qualified lead"` / `?? "New inquiry"`),
+    // so no admin- or agent-facing text ever interpolates "undefined".
+    const serviceLabel = serviceName ?? "New inquiry";
     const contact = await ctx.db.get(session.contactId);
     const customerName = contact?.name?.trim() || contact?.phone || "a customer";
-
-    // the service tag (auto-created at completion)
-    const tags = await ctx.db
-      .query("tags")
-      .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
-      .collect();
-    const serviceTag = tags.find(
-      (t) => t.name.trim().toLowerCase() === serviceName.trim().toLowerCase(),
-    );
 
     const memberships = await ctx.db
       .query("memberships")
@@ -2329,32 +2378,60 @@ export const offerContext = internalQuery({
 
     // Who the service tag routes to, computed BEFORE subtracting anyone
     // already tried — an empty set here means no routing intent was ever
-    // expressed, which is what licenses the whole-team fallback.
+    // expressed, which is what licenses the whole-team fallback. This is
+    // deliberately NOT the "linked people exist but have all passed"
+    // case: there the intent WAS expressed and honoured, so we fall
+    // through to `exhausted` and let a human decide instead of silently
+    // overriding a deliberate configuration.
     let poolIds: Id<"users">[] = [];
-    if (serviceTag) {
-      const links = await ctx.db
-        .query("memberTags")
-        .withIndex("by_account_tag", (q) =>
-          q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
-        )
+    let fallback: FallbackCause | null = null;
+    if (!serviceName) {
+      fallback = "no_service_name";
+    } else {
+      // the service tag (auto-created at completion)
+      const tags = await ctx.db
+        .query("tags")
+        .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
         .collect();
-      poolIds = links.map((l) => l.userId).filter((id) => eligibleById.has(id));
+      const serviceTag = tags.find(
+        (t) => t.name.trim().toLowerCase() === serviceName.trim().toLowerCase(),
+      );
+      if (!serviceTag) {
+        // Reachable: `tagContactForService` runs best-effort inside a
+        // try/catch at completion, so the row can simply never exist.
+        fallback = "tag_missing";
+      } else {
+        const links = await ctx.db
+          .query("memberTags")
+          .withIndex("by_account_tag", (q) =>
+            q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
+          )
+          .collect();
+        poolIds = links.map((l) => l.userId).filter((id) => eligibleById.has(id));
+        // Someone linked but unreachable is a different problem, and a
+        // different remedy, from nobody linked at all.
+        if (poolIds.length === 0) {
+          fallback = links.length === 0 ? "tag_unlinked" : "links_ineligible";
+        }
+      }
     }
+    // Widen to the whole team rather than lose the lead.
+    if (fallback) poolIds = Array.from(eligibleById.keys());
 
-    // No tag, or a tag nobody eligible is linked to: widen to the whole
-    // team rather than lose the lead. Note this is deliberately NOT the
-    // "linked people exist but have all passed" case — there the intent
-    // was expressed and honoured, so we fall through to `exhausted` and
-    // let a human decide instead of silently overriding the routing.
-    const usedFallback = poolIds.length === 0;
-    if (usedFallback) poolIds = Array.from(eligibleById.keys());
+    // Both no-candidate exits below answer the same question; building it
+    // once is what keeps them from drifting apart.
+    const nobodyLeft = (): OfferDecision =>
+      alreadyTried.size > 0
+        ? {
+            kind: "exhausted",
+            scope: fallback ? "team" : "linked",
+            serviceName: serviceLabel,
+            customerName,
+          }
+        : { kind: "unroutable", reason: "no_agents", serviceName: serviceLabel, customerName };
 
     const pool = poolIds.filter((id) => !alreadyTried.has(id));
-    if (pool.length === 0) {
-      return alreadyTried.size > 0
-        ? { kind: "exhausted", serviceName, customerName }
-        : { kind: "unroutable", reason: "no_agents", serviceName, customerName };
-    }
+    if (pool.length === 0) return nobodyLeft();
 
     const cutoff = Date.now() - 72 * 3_600_000;
     const candidates: OfferCandidate[] = [];
@@ -2377,14 +2454,26 @@ export const offerContext = internalQuery({
     }
     candidates.sort((a, b) => a.recent - b.recent);
 
+    // Unreachable today — `pool ⊆ keys(eligibleById)`, so the loop above
+    // never actually skips. It is here because `noUncheckedIndexedAccess`
+    // is off in tsconfig, so `candidates[0]` types as `OfferCandidate`
+    // rather than `| undefined`: anyone later adding a filter inside that
+    // loop (an on-leave check, a rate limit) would type-check clean, hand
+    // `startLeadOffer` an `undefined` agent, throw on `agent.userId`, and
+    // land in the outer catch as one more silently dropped lead — the
+    // exact failure this file exists to prevent.
+    const agent = candidates[0];
+    if (!agent) return nobodyLeft();
+
     return {
       kind: "offer",
-      usedFallback,
+      fallback,
+      firstAttempt: alreadyTried.size === 0,
       accountId: session.accountId,
       conversationId: session.conversationId,
       contactId: session.contactId,
-      agent: candidates[0],
-      serviceName,
+      agent,
+      serviceName: serviceLabel,
       score: session.score ?? null,
       summary: session.summary ?? null,
       customerName,
@@ -2469,6 +2558,52 @@ export const alertRoutingFailure = internalAction({
   },
 });
 
+/**
+ * The admin-facing explanation for a whole-team fallback.
+ *
+ * Split per cause because the remedies genuinely differ. The single old
+ * message ("no agent is linked to that tag — link the right agents") is
+ * outright false when someone IS linked but has no WhatsApp number, and
+ * sends an admin hunting for a tag that does not exist when the tag row
+ * is simply absent.
+ */
+function fallbackAlertText(
+  cause: FallbackCause,
+  serviceName: string,
+  customerName: string,
+): string {
+  const head =
+    "⚠️ Routing not configured\n" +
+    `${customerName}'s lead was offered to the whole team.\n`;
+  switch (cause) {
+    case "no_service_name":
+      return (
+        head +
+        "The lead qualified without the AI identifying a service, so it could not be routed " +
+        "by tag. Nothing to fix in Settings — check the AI's checklist if this keeps happening."
+      );
+    case "tag_missing":
+      return (
+        head +
+        `No tag named "${serviceName}" exists, so there was nothing to route by. ` +
+        "Create it in Settings → Tags and link the right agents to it."
+      );
+    case "tag_unlinked":
+      return (
+        head +
+        `No agent is linked to the tag "${serviceName}". ` +
+        "Link the right agents to that tag in Settings → Team to route it properly."
+      );
+    case "links_ineligible":
+      return (
+        head +
+        `Everyone linked to "${serviceName}" is unreachable — each is either missing a ` +
+        "WhatsApp number or holds the admin or viewer role. Add a number, or change the " +
+        "role, in Settings → Team."
+      );
+  }
+}
+
 export const startLeadOffer = internalAction({
   args: { accountId: v.id("accounts"), sessionId: v.id("qualificationSessions") },
   handler: async (ctx, args): Promise<void> => {
@@ -2482,7 +2617,16 @@ export const startLeadOffer = internalAction({
           accountId: args.accountId,
           text:
             `⚠️ Lead not taken\n${decision.customerName} — ${decision.serviceName}\n` +
-            "Everyone eligible has passed or timed out. Please assign this lead manually.",
+            (decision.scope === "linked"
+              // Only the linked agents were ever asked, and the rest of
+              // the team was deliberately never offered this lead (see
+              // the intent rule in `offerContext`). Claiming "everyone
+              // eligible" here would tell an admin the team is busy and
+              // invite them to deprioritise, when in fact eligible
+              // colleagues were never asked and one click would route it.
+              ? `Every agent linked to "${decision.serviceName}" has passed or timed out, and ` +
+                "nobody else was asked. Assign this lead manually, or link more agents to that tag."
+              : "Everyone eligible has passed or timed out. Please assign this lead manually."),
         });
         return;
       }
@@ -2530,13 +2674,16 @@ export const startLeadOffer = internalAction({
           `\nCustomer: ${context.customerName}` +
           "\n\nAre you available to take it? Reply YES to accept or NO to pass.",
       });
-      if (context.usedFallback) {
+      // Once per LEAD, not once per offer attempt. On a whole-team
+      // fallback every decline re-enters this action for the next
+      // candidate, so an ungated alert here fired up to team-size
+      // identical "Routing not configured" messages at the owner's phone
+      // for a single lead — on the one channel this whole failsafe
+      // depends on. `firstAttempt` is `alreadyTried.size === 0`.
+      if (context.fallback && context.firstAttempt) {
         await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
           accountId: args.accountId,
-          text:
-            `⚠️ Routing not configured\nNo agent is linked to the tag "${context.serviceName}", ` +
-            `so ${context.customerName}'s lead was offered to the whole team.\n` +
-            "Link the right agents to that tag in Settings → Team to route it properly.",
+          text: fallbackAlertText(context.fallback, context.serviceName, context.customerName),
         });
       }
     } catch (err) {
