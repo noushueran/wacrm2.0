@@ -111,7 +111,7 @@ R2_BUCKET=wa-holidayys
 R2_ENDPOINT=https://a80be7ba4a3283e02427058e9e477754.r2.cloudflarestorage.com
 R2_ACCESS_KEY_ID=…
 R2_SECRET_ACCESS_KEY=…
-R2_TOKEN=…
+# (no R2_TOKEN — aws4fetch signs with the access key pair alone)
 R2_PUBLIC_HOST=https://objs.holidayys.co
 ```
 
@@ -134,6 +134,14 @@ e.g. `k57abc…/inbound/9f2a…-b1c3.ogg`. `kind` ∈ `inbound | outbound | temp
 Account-scoping the prefix restores something the opaque `Id<"_storage">` model
 never had: per-tenant listing, GC and storage accounting. The `accountId` in the
 path is an opaque Convex id, so it leaks no meaningful tenant information.
+
+### R2 access is confined to one module
+
+All S3/R2 interaction lives in a single internal module (`convex/lib/r2/`)
+exposing exactly three operations — `putObject`, `presignPut`, `deleteObject`
+— implemented with `aws4fetch` in Convex's **default** runtime (no
+`"use node"`; see Risk 1). Nothing else in the codebase talks to R2, so the
+transport is swappable without touching any caller.
 
 ### Byte flow
 
@@ -250,22 +258,43 @@ manual deploy from Netlify; merge `origin/main` before every `convex deploy`):
 
 ## Risks
 
-### 1. Convex component support on the self-hosted backend — UNVERIFIED
+### 1. ~~Convex component support~~ — RESOLVED by dropping the component
 
-The `@convex-dev/r2` component requires the backend to support components.
-`convex-api.holidayys.co/version` and `/instance_version` both return
-`unknown`, and no image tag is recorded in this repo, so this could not be
-resolved remotely. It cannot be tested without a push, because there is exactly
-one live self-hosted Convex and `convex dev` / `deploy` / `codegen` all target
-production.
+Originally this design assumed `@convex-dev/r2`, which requires the backend to
+support components — unverifiable remotely (`/version` and `/instance_version`
+both return `unknown`, no image tag recorded in this repo) and untestable
+without a production push, since there is exactly one live self-hosted Convex
+and `convex dev` / `deploy` / `codegen` all target it.
 
-**Resolution:** owner runs `docker ps --format '{{.Image}}'` on `convex-wd56`.
+**The component is dropped.** R2 is an S3-compatible endpoint, so it is reached
+directly with [`aws4fetch`](https://github.com/mhart/aws4fetch) — a 6.4 kB
+client that signs with `fetch` + `SubtleCrypto` and is
+[the approach Cloudflare itself documents for R2](https://developers.cloudflare.com/r2/examples/aws/aws4fetch/).
 
-**Fallback if unsupported:** sign S3 requests directly from a `"use node"`
-Convex action (`@aws-sdk/client-s3` + `s3-request-presigner`). Architecture,
-schema, key convention and migration are all identical; only the implementation
-of ~4 functions in `convex/files.ts` changes. This design is deliberately
-written so the component is an implementation detail.
+This is strictly better here:
+
+- **No backend-version dependency.** The blocker disappears entirely.
+- **Matches this codebase's documented convention.** `convex/lib/whatsappEncryption.ts:11`
+  states `"use node"` is a last resort and Web Crypto is preferred;
+  `convex/webhookDelivery.ts:177-184` already does HMAC-SHA256 via
+  `crypto.subtle.importKey` + `.sign`, which is exactly what SigV4 needs. The
+  AWS SDK would have forced `"use node"`, and `"use node"` files may only
+  export actions — a real structural constraint.
+- **We need three operations** (PUT, DELETE, presigned PUT). The component's
+  metadata table and pagination are redundant, since keys live in our own rows.
+
+**Contract that must be honored:** `Content-Type` is part of the presigned
+signature. Per Cloudflare's own example, the header is set on the `Request`
+passed to `sign()`, and **the upload fails if the client then sends a different
+`Content-Type` than the one signed**. So the client's MIME type must round-trip:
+browser reports `file.type` → server presigns with exactly that → browser PUTs
+with exactly that. `src/lib/storage/upload-media.ts:78` already sends
+`"Content-Type": file.type`, so this falls out naturally — but it means
+`presignPut` must take the content type as an argument and must not default it.
+
+Getting this right is also what makes the objects serve correctly: R2 stores the
+signed `Content-Type`, which is what lets `<img>`/`<audio>`/`<video>` and Meta's
+fetcher handle the object properly.
 
 ### 2. Cloudflare could block Meta's media fetcher
 
