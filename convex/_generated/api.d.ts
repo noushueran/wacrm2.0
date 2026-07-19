@@ -40,6 +40,8 @@ import type * as funnel from "../funnel.js";
 import type * as http from "../http.js";
 import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
+import type * as kbCompile from "../kbCompile.js";
+import type * as kbEntries from "../kbEntries.js";
 import type * as kbServices from "../kbServices.js";
 import type * as leadCharges from "../leadCharges.js";
 import type * as lib_ai_adContext from "../lib/ai/adContext.js";
@@ -152,6 +154,8 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   ingest: typeof ingest;
   invitations: typeof invitations;
+  kbCompile: typeof kbCompile;
+  kbEntries: typeof kbEntries;
   kbServices: typeof kbServices;
   leadCharges: typeof leadCharges;
   "lib/ai/adContext": typeof lib_ai_adContext;
