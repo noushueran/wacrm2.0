@@ -603,7 +603,7 @@ test("a persistent failure stops after the single retry — no reply, no endless
   expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
 }, 20_000);
 
-test("a provider failure's scheduled retry also re-acks (whole-branch review Fix F1): Meta's original typing indicator has expired by the time a 30s-later retry fires, so the retry must re-acknowledge, not run silent", async () => {
+test("a provider failure's scheduled retry also re-acks (whole-branch review Fix F1, re-opened): the ack's indicator must land WITH the retry, not die ~5s before it starts", async () => {
   vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
@@ -626,9 +626,8 @@ test("a provider failure's scheduled retry also re-acks (whole-branch review Fix
   });
 
   // Right after the first (failed) attempt: a retry AND a re-ack must
-  // both be scheduled — the ack at delay 0 (re-acking must not itself
-  // make the customer wait), carrying the SAME triggerWamid forward so
-  // it re-marks the SAME inbound as read/typing.
+  // both be scheduled, carrying the SAME triggerWamid forward so the ack
+  // re-marks the SAME inbound as read/typing.
   const scheduled = await t.run((ctx) =>
     ctx.db.system.query("_scheduled_functions").collect(),
   );
@@ -640,11 +639,30 @@ test("a provider failure's scheduled retry also re-acks (whole-branch review Fix
     contactId,
     triggerWamid: "wamid.RETRYACK",
   });
-  expect(ackRows[0]!.scheduledTime - before).toBeLessThan(1000);
 
   const dispatchRetryRows = scheduled.filter((s) => s.name === "aiReply:dispatchInbound");
   expect(dispatchRetryRows).toHaveLength(1);
   expect(dispatchRetryRows[0]!.args[0]).toMatchObject({ attempt: 2 });
+
+  // THE BUG this re-opened finding is about: Meta's typing indicator
+  // auto-dismisses ~25s after it's shown, with no refresh, and the retry
+  // above doesn't actually RUN until it fires — DISPATCH_RETRY_DELAY_MS
+  // (30s) after this catch block, not 0s after it. Scheduling the ack at
+  // delay 0 (the previous, incomplete fix) means its indicator is already
+  // dead by the time the retry starts. The correct fix schedules the ack
+  // at the SAME delay as the retry so the two land together — assert
+  // that relationship directly, rather than merely "an ack exists
+  // somewhere" (which is all the old assertion checked, and which is
+  // exactly what let the +0ms regression through the first time).
+  expect(
+    Math.abs(ackRows[0]!.scheduledTime - dispatchRetryRows[0]!.scheduledTime),
+  ).toBeLessThan(1000);
+  // Guards against a vacuous pass (e.g. both landing near `before` due to
+  // some other regression): the shared time must itself be a real delay,
+  // not immediate — comfortably below the real 30s retry delay so this
+  // doesn't hardcode DISPATCH_RETRY_DELAY_MS's exact value, but well
+  // above "basically now".
+  expect(ackRows[0]!.scheduledTime - before).toBeGreaterThan(20_000);
 
   // The transient failure clears before the retry fires — the reply
   // still lands normally, same as the existing (pre-F1) retry test above.
@@ -1660,3 +1678,212 @@ test("deliverReply stands down when auto-reply is paused on the conversation aft
   const messages = await messagesFor(t, conversationId);
   expect(messages.some((m) => m.senderType === "bot")).toBe(false);
 });
+
+test("deliverReply stands down when the account's AI kill switch is flipped off after dispatch already scheduled delivery (whole-branch review Fix F2, completed)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-killswitch@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000205",
+    messageText: "how much for the August package?",
+  });
+
+  // Simulates the owner hitting the account-wide emergency AI-off switch
+  // in Settings (e.g. right after watching the bot say something wrong)
+  // during the artificial typing delay `dispatchInbound` already
+  // scheduled this delivery behind. Before this fix, `deliverReply` had
+  // no way to see this at all — it re-checked per-conversation takeover/
+  // pause via `loadDispatchContext`, but that query never reads
+  // `aiConfig`, so the account-wide switch (the very FIRST gate
+  // `dispatchInbound` itself applies) went unchecked here.
+  await configureAi(asUser, { isActive: false });
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000205",
+    replyText: "must not send — AI was switched off account-wide",
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.some((m) => m.senderType === "bot")).toBe(false);
+  // No bookkeeping either — this send never happened.
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+});
+
+// ============================================================
+// deliverReply's own send-boundary retry (whole-branch review Fix F4 —
+// a newly authorised behaviour change). The branch's original plan never
+// retried anything inside `deliverReply`, on the theory that Meta send
+// rejections are "near-always non-retryable" — that theory is factually
+// wrong (the WhatsApp Cloud API returns retryable 429/500/503 responses),
+// so a transient failure right at the send call used to leave the
+// customer with a blue tick, "typing…", and then silence forever.
+//
+// `[[SENDFAIL]]` / `[[SENDFAIL_ALWAYS]]` / `[[POSTSENDFAIL]]` in
+// `replyText` are DRY-RUN-only synthetic hooks living in `aiReply.ts`
+// itself (see `SEND_FAILURE_SENTINEL`'s own comment there) — same
+// steering convention as `[[FAIL]]` above, adapted to the send boundary
+// because `metaSend.ts` is a file this phase leaves untouched and has no
+// failure hook of its own.
+// ============================================================
+
+test("a transient send failure triggers exactly one retry, at a short delay, and the message is eventually delivered", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-sendfail@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000206",
+    messageText: "how much for the August package?",
+  });
+
+  const before = Date.now();
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000206",
+    replyText: "[[SENDFAIL]] Yes, we have packages for August!",
+    inquiryIds: [],
+  });
+
+  // First attempt failed at the send boundary — nothing sent yet.
+  expect(
+    (await messagesFor(t, conversationId)).some((m) => m.senderType === "bot"),
+  ).toBe(false);
+
+  // Exactly one retry must be scheduled, carrying `sendAttempt: 2` and a
+  // SHORT delay — nowhere near the 30s dispatch-level retry delay (the
+  // customer already has a live typing indicator running; a 30s wait
+  // here would risk the exact dead-air failure Fix F1 closes).
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  const retryRows = scheduled.filter((s) => s.name === "aiReply:deliverReply");
+  expect(retryRows).toHaveLength(1);
+  expect(retryRows[0]!.args[0]).toMatchObject({ sendAttempt: 2 });
+  expect(retryRows[0]!.scheduledTime - before).toBeGreaterThan(0);
+  expect(retryRows[0]!.scheduledTime - before).toBeLessThan(10_000);
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  // `[[SENDFAIL]]` only throws on attempt 1 (same "transient failure
+  // clears by the next try" convention as the `[[FAIL]]` dispatch-retry
+  // tests above) — the retry's own send succeeds and the message goes
+  // out exactly once, never twice.
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+  expect((await getConversation(t, conversationId))!.aiReplyCount).toBe(1);
+}, 20_000);
+
+test("a persistent send failure stops after the single retry — no message, no endless rescheduling", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-sendfail-persist@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000207",
+    messageText: "how much for the August package?",
+  });
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000207",
+    replyText: "[[SENDFAIL_ALWAYS]] Yes, we have packages for August!",
+    inquiryIds: [],
+  });
+  // Drains the retry (sendAttempt 2), which fails again. If the code kept
+  // rescheduling, this drain would never terminate — the test timeout is
+  // the regression signal for that, same idiom as the sibling
+  // `dispatchInbound` "persistent failure" test above.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  expect(
+    (await messagesFor(t, conversationId)).some((m) => m.senderType === "bot"),
+  ).toBe(false);
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+  // `_scheduled_functions` retains history (completed rows keep their
+  // "success"/"failed" state rather than disappearing), so the ONE
+  // retry that legitimately got scheduled (sendAttempt 2) is still
+  // listed here having run — the real "did it loop?" question is
+  // whether anything is still PENDING/in-flight, which is what would
+  // grow without bound if the attempt cap were broken.
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  const deliverRows = scheduled.filter((s) => s.name === "aiReply:deliverReply");
+  expect(deliverRows).toHaveLength(1); // sendAttempt 2 only — no attempt 3
+  expect(deliverRows.filter((s) => s.state.kind === "pending")).toHaveLength(0);
+}, 20_000);
+
+test("a post-send failure does NOT retry — the customer already has the message, so a second send would double-text them", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-postsendfail@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000208",
+    messageText: "how much for the August package?",
+  });
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000208",
+    replyText: "[[POSTSENDFAIL]] Yes, we have packages for August!",
+    inquiryIds: [],
+  });
+
+  // The send itself succeeded (DRY-RUN `metaSend.sendText` persists the
+  // message before returning) — the sentinel only throws AFTER that, so
+  // exactly one bot message exists despite the logged failure.
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+
+  // No retry was scheduled — draining every timer must not add a second
+  // message. This is the assertion that actually distinguishes F4's
+  // send-only retry from a naive "retry on any catch": a pre-fix
+  // implementation that retried unconditionally would send TWICE here.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  expect(scheduled.filter((s) => s.name === "aiReply:deliverReply")).toHaveLength(0);
+  expect(
+    (await messagesFor(t, conversationId)).filter((m) => m.senderType === "bot"),
+  ).toHaveLength(1);
+  // The sentinel fires immediately after `sent = true`, before
+  // `bumpReplyCount` runs — so the metric is NOT bumped even though the
+  // message went out. That asymmetry is fine (it's a best-effort tally,
+  // not a delivery record) and is exactly what proves this is testing a
+  // genuine POST-send failure rather than accidentally re-hitting the
+  // pre-send sentinel: a pre-send failure leaves both the message AND
+  // the count at zero, which is not what happened here.
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+}, 20_000);

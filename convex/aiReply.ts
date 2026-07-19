@@ -106,10 +106,50 @@ const FALLBACK_REPLY_TEXT =
 const DISPATCH_MAX_ATTEMPTS = 2;
 const DISPATCH_RETRY_DELAY_MS = 30_000;
 
+// One scheduled retry for a SEND-boundary failure only (Fix F4 — see
+// `deliverReply`'s own doc comment for the full reasoning: the plan this
+// branch originally shipped with assumed Meta send rejections were
+// "near-always non-retryable," which is factually wrong — the WhatsApp
+// Cloud API returns retryable 429/500/503 responses same as any other
+// HTTP API). Deliberately its OWN budget, separate from
+// `DISPATCH_MAX_ATTEMPTS`/`DISPATCH_RETRY_DELAY_MS` above: by the time
+// `deliverReply` even runs, the typing indicator has already been ticking
+// for up to `deliveryDelayMs`'s ~20s ceiling, so this retry cannot afford
+// anywhere near the 30s dispatch-level delay without risking the same
+// dead-air failure Fix F1 exists to close, just one step further down the
+// pipeline — a few seconds is enough for a rate-limit blip to clear while
+// staying well inside that shrunken budget in the common (fast-
+// generation) case; one retry (never a loop) keeps the worst case bounded
+// even when it doesn't.
+const DELIVER_MAX_ATTEMPTS = 2;
+const DELIVER_RETRY_DELAY_MS = 3_000;
+
 /** `[[FAIL]]` in the triggering message steers the provider-failure
  *  branch in DRY-RUN tests — thrown from `syntheticGeneration`, exactly
  *  where a real `generateReply` network failure would surface. */
 const FAILURE_SENTINEL = "[[FAIL]]";
+
+/** DRY-RUN send-boundary failure sentinels for `deliverReply`'s own
+ *  retry tests (Fix F4) — same convention as `FAILURE_SENTINEL` above,
+ *  but `metaSend.ts` itself is a file this phase leaves untouched and has
+ *  no failure hook of its own, so the synthetic throw lives here instead,
+ *  positioned at the exact boundary each sentinel is meant to probe:
+ *    - `[[SENDFAIL]]` in `replyText` throws BEFORE the send call
+ *      resolves, and ONLY on the first attempt — so the retry (which
+ *      carries the same `replyText` forward unchanged) succeeds, same as
+ *      a real transient failure that clears by the next try. This is
+ *      exactly where a real Meta 429/500 rejection would surface.
+ *    - `[[SENDFAIL_ALWAYS]]` is the same, but on EVERY attempt — for
+ *      proving `DELIVER_MAX_ATTEMPTS` actually bounds the retry (a
+ *      config-shaped failure that never clears must not loop), the same
+ *      role `[[FAIL]]` plays for `dispatchInbound`'s own "persistent
+ *      failure stops" test.
+ *    - `[[POSTSENDFAIL]]` throws AFTER the send has already gone out,
+ *      simulating a downstream bookkeeping failure — must NOT retry.
+ */
+const SEND_FAILURE_SENTINEL = "[[SENDFAIL]]";
+const ALWAYS_SEND_FAILURE_SENTINEL = "[[SENDFAIL_ALWAYS]]";
+const POST_SEND_FAILURE_SENTINEL = "[[POSTSENDFAIL]]";
 
 /** DRY-RUN stand-in for a voice-note transcript / image description. */
 const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
@@ -925,29 +965,47 @@ export const dispatchInbound = internalAction({
               inboundAt: args.inboundAt,
             },
           );
-          // Re-ack on retry (whole-branch review Fix F1): Meta's typing
-          // indicator auto-dismisses after 25s with no documented refresh,
-          // so by the time this retry fires (DISPATCH_RETRY_DELAY_MS =
-          // 30s later) the ORIGINAL ack from `ingest.ts` has long since
-          // expired. Without this, a retry runs completely silent — the
-          // customer watches "typing…" die and then hears nothing for the
-          // whole retry window, exactly the failure this branch exists to
-          // eliminate. This is what makes `triggerWamid` a live argument
-          // (see its own declaration comment above) rather than dead
-          // weight only ever forwarded, never read.
+          // Re-ack on retry (whole-branch review Fix F1 — CORRECTED: the
+          // first attempt at this fix scheduled the re-ack at
+          // `runAfter(0)`, which is wrong and this comment exists so
+          // nobody repeats it). Both `runAfter` calls in this catch block
+          // are issued at the SAME instant — the moment attempt N's
+          // failure lands here — so their delays are directly comparable:
+          // an ack scheduled at `+0ms` starts its "typing…" indicator
+          // right now, and Meta auto-dismisses that indicator ~25s later
+          // with no documented way to refresh it. The retry above isn't
+          // scheduled to actually RUN until `+DISPATCH_RETRY_DELAY_MS`
+          // (30s) later. 30s > 25s: a `+0ms` ack is therefore GUARANTEED
+          // to expire roughly 5s before the retry even begins executing —
+          // and the retry then still needs its own generation time on top
+          // of that. The customer watches "typing…" die, then sits in
+          // silence; re-acking at +0 shrinks that silent gap, it does not
+          // eliminate it.
           //
-          // Scheduled AFTER the dispatch retry above (not before) and in
-          // its own try/catch: a failure acking must never cost the
-          // customer the retry itself — same reasoning as Fix F7's
-          // `ingest.ts` guard around the very same call.
+          // The fix: schedule the re-ack at the SAME delay as the retry
+          // itself (`DISPATCH_RETRY_DELAY_MS`), so its indicator becomes
+          // live at the moment the retry actually STARTS running, not at
+          // the moment it was merely scheduled. The two land together by
+          // design — see `aiReply.test.ts`'s own timing assertion on this
+          // exact relationship. This is what makes `triggerWamid` a live
+          // argument (see its own declaration comment above) rather than
+          // dead weight only ever forwarded, never read.
+          //
+          // Scheduled in its own try/catch: a failure acking must never
+          // cost the customer the retry itself — same reasoning as Fix
+          // F7's `ingest.ts` guard around the very same call.
           if (args.triggerWamid) {
             try {
-              await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
-                accountId: args.accountId,
-                conversationId: args.conversationId,
-                contactId: args.contactId,
-                triggerWamid: args.triggerWamid,
-              });
+              await ctx.scheduler.runAfter(
+                DISPATCH_RETRY_DELAY_MS,
+                internal.aiReply.ackInbound,
+                {
+                  accountId: args.accountId,
+                  conversationId: args.conversationId,
+                  contactId: args.contactId,
+                  triggerWamid: args.triggerWamid,
+                },
+              );
             } catch (ackErr) {
               console.warn("[ai auto-reply] retry re-ack scheduling failed:", ackErr);
             }
@@ -972,19 +1030,33 @@ export const dispatchInbound = internalAction({
  * every single reply (`DEFAULT_TYPING_MAX_MS` in `lib/ai/pacing.ts` —
  * the 12s flat debounce this replaced is gone).
  *
- * The debounce token is re-checked HERE, at the last possible moment —
- * more time has passed than at any earlier gate, so this is where a
- * newer customer message is most likely to have overtaken us.
+ * The debounce token, the account-wide AI kill switch, and per-
+ * conversation human takeover are ALL re-checked HERE, at the last
+ * possible moment — more time has passed than at any earlier gate, so
+ * this is where any of the three is most likely to have changed under us
+ * (whole-branch review Fixes F2 (conversation-level, then completed to
+ * also cover the account-level switch) and the debounce/takeover checks
+ * alongside it).
  *
- * Retry semantics deliberately differ from `dispatchInbound`'s own: once
- * this action is scheduled, `dispatchInbound` considers its work done
- * (`sent = true`) and will not retry regardless of what happens in here.
- * A failure inside this action (most likely a Meta send rejection) is
- * logged, not retried — Meta rejections are near-always non-retryable,
- * and retrying here would mean re-running this action's OWN body again,
- * which risks double-texting a customer who may already have received
- * the message on a partial failure (e.g. the send succeeded but a
- * downstream mutation threw).
+ * Retry semantics deliberately differ from `dispatchInbound`'s own, and
+ * are scoped to the SEND itself (Fix F4 — overriding this branch's
+ * original plan, which retried nothing here on the theory that "Meta
+ * send rejections were near-always non-retryable." That theory is
+ * factually wrong: the WhatsApp Cloud API returns retryable 429 (rate
+ * limit) and 500/503 (transient) responses same as any other HTTP API,
+ * so an un-retried 429 during a busy hour left the customer with a blue
+ * tick, "typing…", and then nothing, ever). `metaSend.sendText` is the
+ * first thing this action's try block actually DOES — everything before
+ * it is a re-check, not an effect — so `sent` flips true the instant that
+ * call resolves, and the catch below reschedules this action ONLY when
+ * `sent` is still false, i.e. only when the send itself never went out.
+ * A failure AFTER that point (a downstream mutation, the admin relay) is
+ * logged, never retried: the customer already has the message, and
+ * retrying would mean re-running this action's own body again, double-
+ * texting them. Bounded like `dispatchInbound`'s own retry (one retry,
+ * never a loop, its own `sendAttempt` counter so the two schemes can't be
+ * confused) but with its own much shorter delay — see
+ * `DELIVER_RETRY_DELAY_MS`'s own comment for why it must stay short.
  */
 export const deliverReply = internalAction({
   args: {
@@ -998,8 +1070,22 @@ export const deliverReply = internalAction({
     // Table name verified against `qualificationEngine.markAnswersDelivered`
     // (`convex/qualificationEngine.ts:1332`) — it is `adminInquiries`.
     inquiryIds: v.array(v.id("adminInquiries")),
+    // 1-based retry counter for a SEND-boundary failure only (Fix F4;
+    // absent = first attempt). Only ever set by this action's OWN catch
+    // block below when it reschedules itself — deliberately a separate
+    // field from `dispatchInbound`'s `attempt`, since the two are
+    // different retry scopes (generation vs. send) with different
+    // budgets and must never be conflated.
+    sendAttempt: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
+    // Flipped the instant `metaSend.sendText` resolves (Fix F4): nothing
+    // before this point is an externally-visible effect (they're re-
+    // checks), so a failure while `sent` is still false means the
+    // customer has NOT received anything yet and a retry is safe. Once
+    // `sent` is true, the catch below must never retry — see this
+    // action's own doc comment for the full reasoning.
+    let sent = false;
     try {
       if (args.triggerMessageId) {
         const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
@@ -1008,6 +1094,24 @@ export const deliverReply = internalAction({
         });
         if (latestNow && latestNow !== args.triggerMessageId) return;
       }
+
+      // Re-check the account-wide AI kill switch (whole-branch review Fix
+      // F2, completing the re-check below — this half was missing from
+      // the first attempt at this fix): `dispatchInbound` already gated
+      // on `config.isActive`/`config.autoReplyEnabled` — the very FIRST
+      // gate it applies — before ever scheduling this delivery, but that
+      // read is now stale by up to `deliveryDelayMs`'s max (~15s): long
+      // enough for the owner to flip the account-wide emergency AI-off
+      // switch in Settings (e.g. right after watching the bot say
+      // something wrong) and reasonably expect it to take effect
+      // immediately, not up to 15s later. Re-loading and re-checking it
+      // here, exactly like `ackInbound` does at its own execution time
+      // (see that action's handler), is what makes the switch actually
+      // immediate.
+      const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!config || !config.isActive || !config.autoReplyEnabled) return;
 
       // Re-check human takeover (whole-branch review Fix F2): delivery
       // can be scheduled up to `deliveryDelayMs`'s max (~15s) after
@@ -1028,12 +1132,35 @@ export const deliverReply = internalAction({
       if (dispatchContext.conversation.assignedToUserId) return;
       if (dispatchContext.conversation.aiAutoreplyDisabled) return;
 
+      // DRY-RUN send-boundary failure sentinels (Fix F4 tests) — see
+      // `SEND_FAILURE_SENTINEL`'s own comment. Positioned exactly where a
+      // real Meta send rejection would surface, i.e. BEFORE `sent` is
+      // ever set.
+      if (
+        isDryRun() &&
+        ((args.replyText.includes(SEND_FAILURE_SENTINEL) && (args.sendAttempt ?? 1) === 1) ||
+          args.replyText.includes(ALWAYS_SEND_FAILURE_SENTINEL))
+      ) {
+        throw new Error("DRY-RUN synthetic send failure");
+      }
+
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {
         accountId: args.accountId,
         conversationId: args.conversationId,
         to: args.to,
         text: args.replyText,
       });
+      // The customer now has the message — nothing past this point may
+      // ever cause a retry (see this handler's own `sent` declaration).
+      sent = true;
+
+      // DRY-RUN post-send failure sentinel (Fix F4 tests): proves a
+      // failure AFTER the send does NOT retry (retrying would double-text
+      // a customer who already has the message).
+      if (isDryRun() && args.replyText.includes(POST_SEND_FAILURE_SENTINEL)) {
+        throw new Error("DRY-RUN synthetic post-send failure");
+      }
+
       await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
         accountId: args.accountId,
         whatsappMessageId: sendResult.whatsappMessageId,
@@ -1061,10 +1188,45 @@ export const deliverReply = internalAction({
         });
       }
     } catch (err) {
-      // No retry: `dispatchInbound` already considers this reply handed
-      // off, and re-generating here would risk double-texting a customer
-      // who may already have received the message.
       console.error("[ai auto-reply] delivery failed:", err);
+      // Retry ONLY a send-boundary failure (Fix F4 — see this action's
+      // own doc comment for why "Meta rejections are non-retryable" was
+      // the wrong call): the WhatsApp Cloud API's 429/500/503 responses
+      // ARE retryable, so a failure reaching this catch while `sent` is
+      // still false must not leave the customer with a dead "typing…"
+      // indicator and permanent silence. A failure once `sent` is true
+      // (a downstream mutation, the admin relay) is logged only —
+      // `dispatchInbound` already considers this reply handed off, and
+      // re-running this action's OWN body again would double-text a
+      // customer who may already have received the message.
+      //
+      // Bounded exactly like `dispatchInbound`'s own retry (one retry,
+      // never a loop) but with a SHORT delay of its own
+      // (`DELIVER_RETRY_DELAY_MS`, its own comment explains why): the
+      // customer already has a live typing indicator running from
+      // `ackInbound`/the dispatch retry's re-ack by the time delivery
+      // even starts, so this cannot afford anywhere near
+      // `DISPATCH_RETRY_DELAY_MS` without risking the exact dead-air
+      // failure Fix F1 exists to close.
+      const attempt = args.sendAttempt ?? 1;
+      if (!sent && attempt < DELIVER_MAX_ATTEMPTS) {
+        try {
+          await ctx.scheduler.runAfter(DELIVER_RETRY_DELAY_MS, internal.aiReply.deliverReply, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+            to: args.to,
+            replyText: args.replyText,
+            triggerMessageId: args.triggerMessageId,
+            askAdmin: args.askAdmin,
+            inquiryIds: args.inquiryIds,
+            sendAttempt: attempt + 1,
+          });
+        } catch (schedErr) {
+          // Preserve this action's never-throws contract even here.
+          console.error("[ai auto-reply] delivery retry scheduling failed:", schedErr);
+        }
+      }
     }
   },
 });
