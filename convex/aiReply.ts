@@ -648,9 +648,11 @@ export const dispatchInbound = internalAction({
     inboundAt: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
-    // Flipped right after the Meta send succeeds: a failure AFTER this
-    // point must never retry (the customer already has the reply —
-    // re-dispatching would double-text them).
+    // Flipped right after delivery is successfully scheduled (before any
+    // real Meta send happens): a failure AFTER this point must not retry
+    // (delivery has been handed off, so this dispatch must not retry).
+    // The actual send may still fail inside deliverReply, which logs
+    // rather than retries, deliberately avoiding double-texts.
     let sent = false;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
@@ -904,6 +906,11 @@ export const dispatchInbound = internalAction({
               // Keeps the debounce gate honest on the retry too: if a
               // newer inbound arrived meanwhile, its dispatch replies.
               triggerMessageId: args.triggerMessageId,
+              // Carry inboundAt forward so pacing still measures from the
+              // customer's original message, not from the retry. Without
+              // this, a delayed retry adds the full target delay on top of
+              // the already-elapsed time, blowing past Meta's 25s ceiling.
+              inboundAt: args.inboundAt,
             },
           );
         } catch (schedErr) {
