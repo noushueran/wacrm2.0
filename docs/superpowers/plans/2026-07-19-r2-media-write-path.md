@@ -809,7 +809,7 @@ Additive only. Nothing writes these yet; shipping them first means the write cut
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: optional `mediaKey` / `referral.storedImageKey` on `messages`, `headerMediaKey` on `templates`, `avatarKey` on `users`.
+- Produces: optional `mediaKey` / `referral.storedImageKey` on `messages`, `headerMediaKey` on `templates`, `avatarKey` on `memberships` (NOT `users` — see below).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -879,7 +879,11 @@ In the `templates` table, immediately after `headerMediaUrl: v.optional(v.string
     headerMediaKey: v.optional(v.string()),
 ```
 
-In the `users` table, immediately after its `avatarUrl` field:
+In the **`memberships`** table, immediately after its `avatarUrl` field.
+🚨 NOT `users`: that table is spread from `@convex-dev/auth`'s `authTables`
+and has no `avatarUrl` at all (only an auth-provider-written `image`). The
+app's avatar is the denormalized per-account snapshot on `memberships`.
+`contacts.avatarUrl` is Meta's profile picture and is out of scope.
 
 ```ts
     avatarKey: v.optional(v.string()),

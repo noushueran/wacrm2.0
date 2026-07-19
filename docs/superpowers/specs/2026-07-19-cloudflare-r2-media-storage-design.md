@@ -58,7 +58,7 @@ Required** on 2026-07-19, so this survey used direct search instead.)
 | Composer attachment, agent voice note | `uploadAccountMedia` (`src/lib/storage/upload-media.ts:70`) | `messages.mediaUrl` |
 | Flow `send_media` node | `uploadAccountMedia` via `src/components/flows/forms/node-config-form.tsx:912` | flow node `media_url` |
 | Template header media | `uploadAccountMedia` via `src/components/settings/template-manager.tsx:480` | `templates.headerMediaUrl` |
-| User avatar | `src/components/settings/profile-form.tsx:131` | `users.avatarUrl` |
+| User avatar | `src/components/settings/profile-form.tsx:131` | `memberships.avatarUrl` |
 
 ### The core coupling problem
 
@@ -163,7 +163,14 @@ Additive and initially dormant. Existing URL fields are retained throughout.
 | `messages` | `mediaKey: v.optional(v.string())` |
 | `messages.referral` | `storedImageKey: v.optional(v.string())` |
 | `templates` | `headerMediaKey: v.optional(v.string())` |
-| `users` | `avatarKey: v.optional(v.string())` |
+| `memberships` | `avatarKey: v.optional(v.string())` |
+
+NOT `users` — that table is spread verbatim from `@convex-dev/auth`'s
+`authTables` and has no `avatarUrl`, only an auth-provider-written `image`.
+The app's avatar is the denormalized per-account snapshot on `memberships`
+(`convex/accounts.ts` `updateProfile`/`me`). Corrected during Task 4.
+`contacts.avatarUrl` is deliberately excluded — it is Meta's profile-picture
+URL, never written through our upload path.
 
 Flow nodes need **no schema change**: `flowNodes.config` is `v.optional(v.any())`
 and the media URL lives inside it as the untyped `config.media_url`
