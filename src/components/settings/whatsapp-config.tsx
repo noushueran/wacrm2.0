@@ -54,7 +54,8 @@ export function WhatsAppConfig() {
   // render — this app has no Error Boundary, so a non-admin hard-
   // navigating here would crash instead of being redirected by
   // `RequireSection`. Same 'skip' idiom as `settings-overview.tsx`'s
-  // members query.
+  // `invitations.list` query (that file's `members.list` query has NO
+  // such guard — it's open to every role — so it is not the precedent).
   const configDoc = useQuery(
     api.whatsappConfig.get,
     !profileLoading && canEditSettings ? {} : 'skip',

@@ -295,3 +295,36 @@ test("cross-account denial: B's summary never includes A's usage rows", async ()
   const bobsSummary = await asBob.query(api.aiUsage.summary, { sinceMs: 0 });
   expect(bobsSummary).toHaveLength(0);
 });
+
+// Whole-branch review Fix 2: `summary` used to have no server-side role
+// guard at all — the admin-only restriction was enforced ONLY by
+// `ai-usage.tsx` skipping the query client-side, which is cosmetic (any
+// authenticated member could call `api.aiUsage.summary` directly and see
+// raw provider/model/token rows). This pins the guard is now real.
+test("summary throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  const supervisorId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Sam", email: "sam@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: supervisorId,
+      accountId,
+      role: "supervisor",
+      fullName: "Sam",
+      email: "sam@example.com",
+    }),
+  );
+  const asSupervisor = t.withIdentity({
+    subject: `${supervisorId}|session-Sam`,
+  });
+
+  await expect(
+    asSupervisor.query(api.aiUsage.summary, { sinceMs: 0 }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});

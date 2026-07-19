@@ -4,6 +4,7 @@ import { useQuery } from 'convex/react'
 import { api } from '../../../../convex/_generated/api'
 import { useTranslations } from 'next-intl'
 import { useAuth } from '@/hooks/use-auth'
+import { canAccessNav } from '@/lib/auth/roles'
 import { MetricCard } from '@/components/dashboard/metric-card'
 import { SkeletonCard } from '@/components/dashboard/skeleton'
 import { formatCurrency } from '@/lib/currency'
@@ -13,8 +14,17 @@ import { Users, ShoppingCart, DollarSign } from 'lucide-react'
 export default function CampaignsPage() {
   const t = useTranslations('Campaigns')
   const tFunnel = useTranslations('Inbox.funnel')
-  const { accountId } = useAuth()
-  const data = useQuery(api.campaigns.overview, accountId ? {} : 'skip')
+  const { accountId, accountRole } = useAuth()
+  // Skip until the role is BOTH known and sufficient: `api.campaigns
+  // .overview` is supervisor-gated server-side, and firing it below that
+  // floor returns FORBIDDEN, which `useQuery` re-throws synchronously
+  // during render — this app has no Error Boundary, so a sub-supervisor
+  // caller reaching this page would crash instead of just seeing nothing
+  // (defense in depth: `canAccessNav` is also what keeps the nav link +
+  // route guard from ever sending anyone here in the first place). Same
+  // 'skip' idiom as `whatsapp-config.tsx`'s `whatsappConfig.get` query.
+  const canRead = !!accountRole && !!accountId && canAccessNav(accountRole, '/campaigns')
+  const data = useQuery(api.campaigns.overview, canRead ? {} : 'skip')
   const loading = data === undefined
   const byStage = Object.fromEntries((data?.funnel ?? []).map((f) => [f.stage, f.count]))
   const maxCount = Math.max(1, ...(data?.funnel ?? []).map((f) => f.count))
