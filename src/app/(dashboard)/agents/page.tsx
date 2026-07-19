@@ -39,7 +39,7 @@ export default function AgentsPage() {
   const [tab, setTab] = useState<Tab>('playground');
   const [decided, setDecided] = useState(false);
 
-  const configDoc = useQuery(api.aiConfig.get);
+  const configDoc = useQuery(api.aiConfig.getFull);
   // Land first-time users on Setup, returning users on the Playground —
   // decided exactly once. Render-time "adjust state" (React's own
   // recommended fix for an effect that only mirrors external data into

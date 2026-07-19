@@ -47,11 +47,14 @@ const KEY_PLACEHOLDER: Record<AiProvider, string> = {
 
 /**
  * AI auto-reply config (Phase 8, Task 3 / P8-T3) — `aiConfigs`, one row
- * per account. `api.aiConfig.get` never returns the encrypted
- * `apiKey`/`embeddingsApiKey` columns, only derived `hasKey`/
- * `hasEmbeddingsKey` booleans (see that query's own doc comment), so
- * the masked placeholder below is always a fixed string, never
- * anything read back from the server. Saving goes through
+ * per account. This form reads `api.aiConfig.getFull` (admin-only,
+ * RBAC lockdown split) rather than the member-safe `api.aiConfig.get`,
+ * because it is the one place that edits `systemPrompt` — see
+ * `getFull`'s own doc comment. Like `get`, it never returns the
+ * encrypted `apiKey`/`embeddingsApiKey` columns, only derived `hasKey`/
+ * `hasEmbeddingsKey` booleans, so the masked placeholder below is
+ * always a fixed string, never anything read back from the server.
+ * Saving goes through
  * `api.aiConfig.upsert`, which encrypts a freshly-typed key
  * server-side and REUSES the stored ciphertext whenever a key field is
  * omitted (untouched) — see that mutation's doc comment — so the form
@@ -70,7 +73,7 @@ export function AiConfig() {
   const { canEditSettings: canEdit, profileLoading } = useAuth();
   const t = useTranslations('Settings.aiConfig');
 
-  const configDoc = useQuery(api.aiConfig.get);
+  const configDoc = useQuery(api.aiConfig.getFull);
   const loading = configDoc === undefined;
   const configured = configDoc != null;
   const config = useMemo(

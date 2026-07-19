@@ -722,7 +722,7 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
 // (`aiKnowledgeDocuments`).
 // ============================================================
 
-/** `aiConfig.get`'s return shape, mapped almost unchanged — it is
+/** `aiConfig.getFull`'s return shape, mapped almost unchanged — it is
  *  already a flat camelCase POJO, NOT a raw `Doc<"aiConfigs">`: that
  *  query deliberately never selects `apiKey`/`embeddingsApiKey` into
  *  its return value at all (see its own doc comment), only the derived
@@ -733,7 +733,14 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
  *  `ApiKeyView` above, this UI-facing type is declared here instead.
  *  `autoReplyMaxPerConversation`/`handoffAgentId` are NOT part of this
  *  view (Task B7 removed the deprecated reply-cap/handoff plumbing —
- *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`). */
+ *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`).
+ *
+ *  This mapper is `getFull`-shaped, not `get`-shaped (RBAC lockdown
+ *  split — `aiConfig.ts`'s own doc comments on both exports): `get`'s
+ *  narrower, member-safe payload has no `systemPrompt` field at all, so
+ *  a `configDoc` from `get` is not a valid input here. The only caller
+ *  (`ai-config.tsx`, the admin settings form that edits the prompt)
+ *  already reads `getFull`. */
 export interface AiConfigView {
   provider: "openai" | "anthropic";
   model: string;
@@ -747,7 +754,7 @@ export interface AiConfigView {
 export function toUiAiConfig(config: {
   provider: "openai" | "anthropic";
   model: string;
-  systemPrompt: string | undefined;
+  systemPrompt: string | null;
   isActive: boolean;
   autoReplyEnabled: boolean;
   hasKey: boolean;
