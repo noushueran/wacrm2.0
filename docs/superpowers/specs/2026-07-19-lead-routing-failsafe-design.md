@@ -53,7 +53,7 @@ Five are genuine routing failures:
    analysis stub hardcodes `service: "UAE visa"` — it needs a direct insert.
 
 `startLeadOffer` (`:2358`) receives one undifferentiated `null` and does
-`if (!context) return;` (`:2365`) — treating all seven identically. The
+`if (!context) return;` (`:2365`) — treating all eight identically. The
 `console.error` at `:2391` sits in a `catch` block and never fires, because
 nothing throws.
 
@@ -97,7 +97,7 @@ the silent-loss channel stays open. Fixes the common case and leaves the bug.
 
 | `kind` | Meaning | Fields |
 |---|---|---|
-| `offer` | Route to this agent | existing payload + `cause: FallbackCause \| null` + `firstAttempt: boolean` |
+| `offer` | Route to this agent | existing payload + `fallback: FallbackCause \| null` + `firstAttempt: boolean` |
 | `noop` | Benign — cases 1–3 only | — |
 | `exhausted` | Candidates empty, `alreadyTried` non-empty (case 7) | `scope: "linked" \| "team"` |
 | `unroutable` | Candidates empty, nobody ever tried | `reason: "no_agents"` |
@@ -135,9 +135,10 @@ member *at all*. Precisely:
 2. If `eligibleLinked` is empty (cases 4, 5, 6) — or the session has no
    `serviceName` to match a tag against at all (case 8) — fall back to every
    account membership with role `agent`/`supervisor` and a non-empty phone, set
-   `cause` to whichever of the four applies, then subtract `alreadyTried`.
-3. Otherwise: candidates are `eligibleLinked` minus `alreadyTried`, and `cause`
-   stays `null`.
+   `fallback` to whichever of the four causes applies, then subtract
+   `alreadyTried`.
+3. Otherwise: candidates are `eligibleLinked` minus `alreadyTried`, and
+   `fallback` stays `null`.
 
 This distinction is deliberate. An empty link set means **no routing intent was
 ever expressed**, so widening to the whole team is strictly better than losing
@@ -154,8 +155,8 @@ accepts in the last 72h) is unchanged in every branch.
 ### `startLeadOffer` behaviour
 
 - **`offer`** — send the WhatsApp offer first, exactly as today. Then, if
-  `cause` is non-null **and** `firstAttempt`, alert admins — with the message
-  chosen by `cause`, so it names the remedy that actually applies. The alert is
+  `fallback` is non-null **and** `firstAttempt`, alert admins — with the message
+  chosen by `fallback`, so it names the remedy that actually applies. The alert is
   strictly supplementary and must never precede or block the offer itself: an
   earlier draft awaited it first, which meant a failure in the alert leg could
   suppress the agent send while leaving an `offered` row behind, stranding the
