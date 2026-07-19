@@ -2279,3 +2279,91 @@ test("failsafe: the three benign cases stay noop", async () => {
   expect(await t.query(internal.qualificationEngine.offerContext, { sessionId: session._id }))
     .toEqual({ kind: "noop" });
 });
+
+/** Every message sent to a staff/admin WhatsApp number, newest last. */
+async function staffMessagesTo(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  phoneNormalized: string,
+) {
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", accountId).eq("phoneNormalized", phoneNormalized)).unique());
+  if (!contact) return [];
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", contact._id)).first());
+  if (!conversation) return [];
+  return await messagesFor(t, conversation._id);
+}
+
+/** Points the account's admin alerts at one number. */
+async function setAdminAlertPhone(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  phone: string,
+) {
+  await t.run(async (ctx) => {
+    const config = await ctx.db.query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId)).unique();
+    if (config) await ctx.db.patch(config._id, { adminAlertPhones: [phone] });
+  });
+}
+
+test("failsafe: a fallback offer tells admins the tag has no linked agent", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "Georgia tours",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  const session = await qualifyLead(t, base);
+
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+
+  const msgs = await staffMessagesTo(t, base.accountId, "971559456999");
+  expect(msgs.some((m) => m.contentText?.includes("UAE visa"))).toBe(true);
+  expect(msgs.some((m) => m.contentText?.includes("whole team"))).toBe(true);
+  // the lead still went out — the alert is in addition, not instead
+  expect(await offersFor(t, session._id)).toHaveLength(1);
+});
+
+test("failsafe: an exhausted cycle tells admins the lead is stranded", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Lina", phone: "+971551110001", tagName: "UAE visa",
+  });
+  await setAdminAlertPhone(t, base.accountId, "+971559456999");
+  const session = await qualifyLead(t, base);
+
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971551110001", text: "no",
+  });
+  // the decline re-triggers the offer, which now finds nobody left
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+
+  const msgs = await staffMessagesTo(t, base.accountId, "971559456999");
+  expect(msgs.some((m) => m.contentText?.includes("not taken"))).toBe(true);
+});
+
+test("failsafe: no admin numbers configured means no send, and no crash", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const session = await qualifyLead(t, base);
+  // no agents and no admin phones: unroutable, but nothing to send to.
+  // (Convex actions can't return `undefined` — a void handler resolves
+  // to `null` over the test-client boundary, same as every other action
+  // in this file; asserting `toBeNull()` is "didn't throw" here.)
+  await expect(t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  })).resolves.toBeNull();
+  expect(await offersFor(t, session._id)).toHaveLength(0);
+});

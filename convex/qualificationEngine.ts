@@ -2417,6 +2417,42 @@ export const createOffer = internalMutation({
   },
 });
 
+/** Read side for `alertRoutingFailure`. */
+export const routingAlertPhones = internalQuery({
+  args: { accountId: v.id("accounts") },
+  handler: async (ctx, args): Promise<string[]> => {
+    const config = await ctx.db
+      .query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .unique();
+    return config?.adminAlertPhones ?? [];
+  },
+});
+
+/**
+ * Fans a routing-failure notice out to every configured admin number.
+ *
+ * Deliberately NOT gated on `adminAlertEnabled`, for the same reason
+ * `askAdminContext` above is not: that toggle governs routine new-lead
+ * notifications, whereas these are operational failures — "your routing
+ * is broken", "this lead is stranded". Someone who muted the former
+ * still needs the latter. With no admin numbers configured there is no
+ * channel at all, so this no-ops.
+ */
+export const alertRoutingFailure = internalAction({
+  args: { accountId: v.id("accounts"), text: v.string() },
+  handler: async (ctx, args): Promise<void> => {
+    const phones = await ctx.runQuery(internal.qualificationEngine.routingAlertPhones, {
+      accountId: args.accountId,
+    });
+    for (const phone of phones) {
+      await ctx.runAction(internal.qualificationEngine.notifyStaffText, {
+        accountId: args.accountId, phone, text: args.text,
+      });
+    }
+  },
+});
+
 export const startLeadOffer = internalAction({
   args: { accountId: v.id("accounts"), sessionId: v.id("qualificationSessions") },
   handler: async (ctx, args): Promise<void> => {
@@ -2424,9 +2460,26 @@ export const startLeadOffer = internalAction({
       const decision = await ctx.runQuery(internal.qualificationEngine.offerContext, {
         sessionId: args.sessionId,
       });
-      // Task 2 replaces this with per-kind handling; for now every
-      // non-offer outcome behaves exactly as the old `null` did.
-      if (decision.kind !== "offer") return;
+      if (decision.kind === "noop") return;
+      if (decision.kind === "exhausted") {
+        await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
+          accountId: args.accountId,
+          text:
+            `⚠️ Lead not taken\n${decision.customerName} — ${decision.serviceName}\n` +
+            "Everyone eligible has passed or timed out. Please assign this lead manually.",
+        });
+        return;
+      }
+      if (decision.kind === "unroutable") {
+        await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
+          accountId: args.accountId,
+          text:
+            `⚠️ Lead could not be routed\n${decision.customerName} — ${decision.serviceName}\n` +
+            "No team member has the agent or supervisor role with a WhatsApp number. " +
+            "Add one in Settings → Team, then assign this lead manually.",
+        });
+        return;
+      }
       const context = decision;
       const offerId = await ctx.runMutation(internal.qualificationEngine.createOffer, {
         accountId: context.accountId,
@@ -2437,6 +2490,15 @@ export const startLeadOffer = internalAction({
         agentPhone: context.agent.phone,
       });
       if (!offerId) return;
+      if (context.usedFallback) {
+        await ctx.runAction(internal.qualificationEngine.alertRoutingFailure, {
+          accountId: args.accountId,
+          text:
+            `⚠️ Routing not configured\nNo agent is linked to the tag "${context.serviceName}", ` +
+            `so ${context.customerName}'s lead was offered to the whole team.\n` +
+            "Link the right agents to that tag in Settings → Team to route it properly.",
+        });
+      }
       const target = await ctx.runMutation(
         internal.qualificationEngine.ensureAdminConversation,
         { accountId: context.accountId, phone: context.agent.phone },
