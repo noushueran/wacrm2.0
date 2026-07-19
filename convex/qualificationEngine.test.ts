@@ -2367,3 +2367,42 @@ test("failsafe: no admin numbers configured means no send, and no crash", async 
   })).resolves.toBeNull();
   expect(await offersFor(t, session._id)).toHaveLength(0);
 });
+
+test("failsafe: an alert whose own config lookup throws is swallowed, never propagated", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971559456999"] });
+
+  // Positive control FIRST, while the config is still readable: the alert
+  // really does reach the admin. Without this half, a future refactor that
+  // gutted `alertRoutingFailure` into a no-op would still satisfy the
+  // "resolves" assertion below and the test would rot into a tautology.
+  await t.action(internal.qualificationEngine.alertRoutingFailure, {
+    accountId: base.accountId, text: "⚠️ control: routing alert",
+  });
+  expect((await staffMessagesTo(t, base.accountId, "971559456999"))
+    .some((m) => m.contentText?.includes("control"))).toBe(true);
+
+  // Now break the read side the same way production would: a second
+  // `qualificationConfigs` row for one account makes `routingAlertPhones`'s
+  // `.unique()` throw. (`routingAlertPhones` queries the table directly and
+  // ignores `enabled`, so the duplicate throws whatever its flags say.)
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationConfigs", {
+      accountId: base.accountId,
+      ...holidayysDefaultConfig(),
+      enabled: true,
+      adminAlertPhones: ["+971559456999"],
+    }));
+
+  // The property under test: alerting is best-effort, so this RESOLVES.
+  // Before the fix it rejected, and in `startLeadOffer`'s fallback branch
+  // that rejection escaped past an already-written "offered" leadOffers
+  // row — so the agent never heard about a lead that `offerContext`'s
+  // live-offer guard then made un-retryable by the sweep cron. Keeping
+  // this green is what keeps that silent drop dead. (`toBeNull()` reads
+  // as "resolved"; see the no-admin-numbers test above for why a void
+  // Convex action resolves to `null` rather than `undefined`.)
+  await expect(t.action(internal.qualificationEngine.alertRoutingFailure, {
+    accountId: base.accountId, text: "⚠️ routing alert with a broken config",
+  })).resolves.toBeNull();
+});
