@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
-import { aiReplyDebounceMs } from "./lib/ai/defaults";
+import { debounceMsForText } from "./lib/ai/pacing";
 import { hasMinRole } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import { allocateContactCode } from "./contacts";
@@ -796,7 +796,7 @@ export const processInbound = internalAction({
         // NEWEST customer message replies (see `dispatchInbound`'s
         // debounce gate) — one reply per burst, at human pace.
         await ctx.scheduler.runAfter(
-          aiReplyDebounceMs(),
+          debounceMsForText(inboundText),
           internal.aiReply.dispatchInbound,
           {
             accountId,
