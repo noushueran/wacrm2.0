@@ -54,6 +54,13 @@ import { embedTexts, EMBEDDING_DIMENSIONS } from "./lib/ai/embeddings";
 // the real account's own content — and assert they never come back,
 // for both paths independently.
 //
+// `retrieve` now merges a SECOND pool ahead of that legacy one — the
+// compiled `kbChunks` written by `kbCompile.ts` (Knowledge Engine v2) —
+// via `getKbChunksByIds`/`searchKbChunks`. Those two mirror the three
+// bullets above one-for-one (vector filter → hydration re-assert →
+// search-index filter), so the layering above describes all four
+// retrieval arms, not just the legacy pair.
+//
 // DRY-RUN: `CONVEX_AI_DRY_RUN` (mirrors `metaSend.ts`'s
 // `CONVEX_META_DRY_RUN`) skips the real OpenAI call in both `ingest`
 // and `retrieve`, substituting a deterministic seeded vector
@@ -369,18 +376,102 @@ export const searchChunks = internalQuery({
   },
 });
 
+// ---- Knowledge Engine v2: the compiled `kbChunks` pool -------------
+// `kbChunks` rows are produced by `kbCompile.ts` at publish time from
+// structured `kbEntries`/`kbOpsBlocks`, and carry the metadata the
+// legacy pool has no equivalent for: `serviceKey`, `entryType`, and
+// `audience` ("customer" vs "internal"). These two queries are the
+// `kbChunks` counterparts of `getChunksByIds`/`searchChunks` above and
+// hold the same isolation discipline.
+
+/**
+ * Hydrates `ctx.vectorSearch` hit ids into full `kbChunks` rows —
+ * whole rows, not just `content`, because `retrieve`'s compiled
+ * semantic arm must read `audience` off each row to post-filter it
+ * (see `retrieve` for why that filter can't live in the vector query).
+ * RE-ASSERTS `accountId` on every returned row, exactly like
+ * `getChunksByIds` — same belt-and-braces reasoning as this file's
+ * header comment.
+ */
+export const getKbChunksByIds = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    ids: v.array(v.id("kbChunks")),
+  },
+  handler: async (ctx, args) => {
+    const docs = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
+    return docs.filter(
+      (doc): doc is Doc<"kbChunks"> =>
+        doc !== null && doc.accountId === args.accountId,
+    );
+  },
+});
+
+/**
+ * Lexical arm over the compiled pool via `kbChunks`'s own
+ * `search_content` index. Unlike the vector index, a SEARCH index
+ * supports chained `.eq()` across several `filterFields`, so this can
+ * narrow `accountId` AND `audience` inline in one expression —
+ * `retrieve`'s semantic arm has to post-filter `audience` in code
+ * instead.
+ *
+ * `audience` is deliberately one-way: it only ever narrows to
+ * "customer". There is no "internal" value to pass, because an
+ * unfiltered call already sees everything.
+ */
+export const searchKbChunks = internalQuery({
+  args: {
+    accountId: v.id("accounts"),
+    queryText: v.string(),
+    limit: v.number(),
+    audience: v.optional(v.literal("customer")),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("kbChunks")
+      .withSearchIndex("search_content", (q) => {
+        const base = q
+          .search("content", args.queryText)
+          .eq("accountId", args.accountId);
+        return args.audience ? base.eq("audience", "customer") : base;
+      })
+      .take(args.limit);
+  },
+});
+
 /**
  * Retrieve up to `k` knowledge excerpts relevant to `queryText`, for
- * the given account ONLY. Semantic-primary when the account has an
- * embeddings key configured (embed the query, then `ctx.vectorSearch`
- * the `by_embedding` index — filtered to `accountId`), topped up with
- * lexical `search_content` matches (also filtered to `accountId`) to
- * fill `k`; lexical-only when there's no key. Best-effort throughout —
- * every external/derived step is individually wrapped, so a failure in
- * one (bad key, provider outage, an empty knowledge base) degrades to
- * fewer results or the other path, and NEVER throws into the caller
- * (Task 3's auto-reply dispatch calls this on every inbound message —
- * a retrieval hiccup must not block the reply).
+ * the given account ONLY. Best-effort throughout — every external/
+ * derived step is individually wrapped, so a failure in one (bad key,
+ * provider outage, an empty knowledge base) degrades to fewer results
+ * or another arm, and NEVER throws into the caller (Task 3's auto-reply
+ * dispatch calls this on every inbound message — a retrieval hiccup
+ * must not block the reply).
+ *
+ * Merges TWO pools, in this order:
+ *   1. the COMPILED pool (`kbChunks`) — Knowledge Engine v2's
+ *      publish-time output, entity-first and metadata-stamped;
+ *   2. the LEGACY pool (`aiKnowledgeChunks`) — pasted documents.
+ * Compiled chunks are ranked ahead on purpose (they carry a service /
+ * audience header that grounds the model better than anonymous prose),
+ * and the legacy pool fills whatever slots are left. Each pool is
+ * semantic-primary when the account has an embeddings key configured
+ * (`ctx.vectorSearch` over its `by_embedding` index, filtered to
+ * `accountId`) and lexically topped up from its `search_content` index
+ * (also filtered to `accountId`); lexical-only when there's no key.
+ *
+ * `audience: "customer"` narrows the COMPILED pool to customer-safe
+ * chunks — it is what keeps `kbOpsBlocks`' internal sentinels (PURCHASE
+ * CRITERIA and friends) out of a context that grounds a customer-facing
+ * reply. It is deliberately ONE-WAY: there is no "internal" value,
+ * because omitting the argument already sees everything. It cannot
+ * apply to the legacy pool at all — those rows carry no audience
+ * metadata — so an audience-filtered call still returns legacy chunks.
+ *
+ * An account with no `kbChunks` rows, called without `audience` (i.e.
+ * every caller as of this phase), gets byte-identical results to the
+ * pre-merge implementation: the compiled arms find nothing and the
+ * legacy arms run exactly as they did.
  *
  * `k` defaults to 5 (matches `retrieveKnowledge`'s own default). Trims
  * `queryText` and returns `[]` immediately for a blank query or a
@@ -391,18 +482,39 @@ export const retrieve = internalAction({
     accountId: v.id("accounts"),
     queryText: v.string(),
     k: v.optional(v.number()),
+    audience: v.optional(v.literal("customer")),
   },
   handler: async (ctx, args): Promise<string[]> => {
     const k = args.k ?? 5;
     const query = args.queryText.trim();
     if (!query || k <= 0) return [];
 
-    // id → content; a `Map`'s insertion order preserves the semantic
-    // ranking `ctx.vectorSearch` returns (best cosine match first) all
-    // the way through to the final slice below.
-    const picked = new Map<Id<"aiKnowledgeChunks">, string>();
+    const audience = args.audience;
 
-    // --- Semantic path, when the account has an embeddings key -------
+    // Both pools accumulate here, in rank order. Deduped by CONTENT
+    // rather than by id: the two pools have different id types, so an
+    // id-keyed `Map` couldn't span them, and the same text reachable
+    // through both (a legacy paste since re-authored as a structured
+    // entry) must not burn two of the caller's `k` slots. `push`
+    // enforces the `k` cap at write time, so the array never needs a
+    // trailing slice.
+    const pickedContents: string[] = [];
+    const seen = new Set<string>();
+    const push = (content: string) => {
+      if (pickedContents.length >= k || seen.has(content)) return;
+      seen.add(content);
+      pickedContents.push(content);
+    };
+
+    // --- Query embedding — computed ONCE, shared by both pools -------
+    // Hoisted above both passes deliberately: `retrieve` runs on every
+    // inbound WhatsApp message, so embedding the same query a second
+    // time would double this path's OpenAI cost and latency for no
+    // benefit. `null` means "no embeddings key configured, or embedding
+    // failed" — both semantic arms below are then skipped and the
+    // lexical arms carry the whole retrieval, exactly as they already
+    // do for a lexical-only account.
+    let queryEmbedding: number[] | null = null;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
@@ -410,10 +522,75 @@ export const retrieve = internalAction({
       const embeddingsApiKey = config?.embeddingsApiKey ?? null;
 
       if (embeddingsApiKey) {
-        const queryEmbedding = isDryRun()
+        const embedded = isDryRun()
           ? syntheticEmbedding(query)
           : (await embedTexts(embeddingsApiKey, [query]))[0];
+        if (embedded) queryEmbedding = embedded;
+      }
+    } catch {
+      // Best-effort: bad/rotated key, provider outage, malformed
+      // response — degrade to the lexical arms instead of failing the
+      // caller.
+      queryEmbedding = null;
+    }
 
+    // --- Compiled pool (`kbChunks`), semantic arm -------------------
+    // Convex vector-search filters support only single-field `eq`/`or`
+    // within one expression — there is no cross-field AND — so this arm
+    // CANNOT narrow `accountId` and `audience` together. It filters
+    // `accountId` in the vector query (the isolation-critical half,
+    // applied inside the ANN search itself, never a post-hoc scan) and
+    // over-fetches `k * 2` so that post-filtering `audience` in code on
+    // the hydrated rows still leaves candidates to fill `k`. Search
+    // indexes are different — they DO support chained `.eq()` across
+    // filter fields, which is why `searchKbChunks` narrows both inline.
+    try {
+      if (queryEmbedding) {
+        const results = await ctx.vectorSearch("kbChunks", "by_embedding", {
+          vector: queryEmbedding,
+          limit: k * 2,
+          filter: (q) => q.eq("accountId", args.accountId),
+        });
+        if (results.length > 0) {
+          const rows = await ctx.runQuery(
+            internal.aiKnowledge.getKbChunksByIds,
+            { accountId: args.accountId, ids: results.map((r) => r._id) },
+          );
+          const rowById = new Map(rows.map((r) => [r._id, r]));
+          for (const r of results) {
+            const row = rowById.get(r._id);
+            if (!row) continue;
+            if (audience && row.audience !== "customer") continue;
+            push(row.content);
+          }
+        }
+      }
+    } catch {
+      // Best-effort: fall through to the compiled lexical arm.
+    }
+
+    // --- Compiled pool, lexical arm ---------------------------------
+    if (pickedContents.length < k) {
+      try {
+        const rows = await ctx.runQuery(internal.aiKnowledge.searchKbChunks, {
+          accountId: args.accountId,
+          queryText: query,
+          limit: k,
+          audience,
+        });
+        for (const row of rows) push(row.content);
+      } catch {
+        // Best-effort: fall through to the legacy pool.
+      }
+    }
+
+    // --- Legacy pool (`aiKnowledgeChunks`), semantic arm ------------
+    // Skipped once the compiled pool has already filled `k` — every
+    // `push` from here would be a no-op against the cap anyway, so
+    // this saves a vector search plus a hydration query on the hot
+    // inbound-message path without changing the result.
+    if (pickedContents.length < k) {
+      try {
         if (queryEmbedding) {
           // The `filter` below is what stands between this account's
           // question and every OTHER account's knowledge base — see
@@ -437,34 +614,31 @@ export const retrieve = internalAction({
             const contentById = new Map(chunks.map((c) => [c._id, c.content]));
             for (const r of results) {
               const content = contentById.get(r._id);
-              if (content !== undefined) picked.set(r._id, content);
+              if (content !== undefined) push(content);
             }
           }
         }
+      } catch {
+        // Best-effort: semantic retrieval failed — fall through to the
+        // lexical top-up below instead of failing the caller.
       }
-    } catch {
-      // Best-effort: semantic retrieval failed (bad/rotated key,
-      // provider outage, malformed response) — fall through to the
-      // lexical top-up below instead of failing the caller.
     }
 
-    // --- Lexical top-up (also the sole path with no embeddings key) --
-    if (picked.size < k) {
+    // --- Legacy pool, lexical top-up --------------------------------
+    // (Also the sole path for an account with no embeddings key.)
+    if (pickedContents.length < k) {
       try {
         const ftsChunks = await ctx.runQuery(internal.aiKnowledge.searchChunks, {
           accountId: args.accountId,
           queryText: query,
           limit: k,
         });
-        for (const chunk of ftsChunks) {
-          if (picked.size >= k) break;
-          if (!picked.has(chunk._id)) picked.set(chunk._id, chunk.content);
-        }
+        for (const chunk of ftsChunks) push(chunk.content);
       } catch {
-        // Best-effort: return whatever the semantic pass already found.
+        // Best-effort: return whatever the earlier arms already found.
       }
     }
 
-    return Array.from(picked.values()).slice(0, k);
+    return pickedContents;
   },
 });

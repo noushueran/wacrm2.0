@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
@@ -641,4 +641,279 @@ test("retrieve isolation (vector path): a decoy account's chunk is never returne
   expect(results).toEqual([
     "Alice shipping policy: ships in 3-5 business days.",
   ]);
+});
+
+// ============================================================
+// retrieve — Knowledge Engine v2 merge: compiled `kbChunks` ranked
+// ahead of the legacy `aiKnowledgeChunks` pool, with an optional
+// one-way `audience: "customer"` narrowing.
+// ============================================================
+
+describe("retrieve merge", () => {
+  test("compiled chunks rank ahead of legacy chunks", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+    // Semantic path for BOTH pools — the compiled pass's lead is a
+    // property of pass ORDER, not of one pool happening to be the only
+    // one with embeddings.
+    await configureEmbeddingsKey(asUser);
+
+    const legacyContent = "Georgia visa notes legacy";
+    const compiledContent =
+      "[Georgia — Visa requirements]\nGeorgia visa passport rules";
+
+    const documentId = await seedDocument(t, {
+      accountId,
+      title: "Legacy Georgia",
+      content: legacyContent,
+    });
+    await seedChunk(t, {
+      accountId,
+      documentId,
+      chunkIndex: 0,
+      content: legacyContent,
+      embedding: syntheticEmbedding(legacyContent),
+    });
+    await t.run(async (ctx) => {
+      const entryId = await ctx.db.insert("kbEntries", {
+        accountId,
+        scope: "service",
+        serviceKey: "georgia",
+        type: "requirements",
+        title: "Visa requirements",
+        body: "x",
+        audience: "customer",
+        status: "published",
+        version: 1,
+        updatedAt: Date.now(),
+      });
+      await ctx.db.insert("kbChunks", {
+        accountId,
+        sourceKind: "entry",
+        entryId,
+        serviceKey: "georgia",
+        entryType: "requirements",
+        audience: "customer",
+        chunkIndex: 0,
+        content: compiledContent,
+        embedding: syntheticEmbedding(compiledContent),
+      });
+    });
+
+    const results = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia visa",
+      k: 5,
+    });
+
+    // Compiled first — it carries the self-identifying service header.
+    expect(results[0]).toContain("[Georgia — Visa requirements]");
+    // …and the legacy pool is still merged in behind it, not displaced.
+    expect(results).toContain(legacyContent);
+  });
+
+  test("audience 'customer' excludes internal compiled chunks but keeps legacy", async () => {
+    const t = convexTest(schema, modules);
+    const { accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+
+    const legacyContent = "Georgia purchase info for customers";
+
+    await t.run(async (ctx) => {
+      const opsId = await ctx.db.insert("kbOpsBlocks", {
+        accountId,
+        serviceKey: "georgia",
+        kind: "purchase",
+        conditions: [{ key: "b", label: "Budget threshold" }],
+        status: "published",
+        version: 1,
+        updatedAt: Date.now(),
+      });
+      await ctx.db.insert("kbChunks", {
+        accountId,
+        sourceKind: "ops",
+        opsBlockId: opsId,
+        serviceKey: "georgia",
+        audience: "internal",
+        chunkIndex: 0,
+        content: "PURCHASE CRITERIA — Georgia\n- Budget threshold",
+      });
+    });
+    const documentId = await seedDocument(t, {
+      accountId,
+      title: "Legacy",
+      content: legacyContent,
+    });
+    await seedChunk(t, {
+      accountId,
+      documentId,
+      chunkIndex: 0,
+      content: legacyContent,
+    });
+
+    const customerSafe = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia purchase",
+      audience: "customer",
+    });
+    // The internal ops sentinel must never reach a customer-facing
+    // grounding context…
+    expect(customerSafe.some((c) => c.includes("PURCHASE CRITERIA"))).toBe(
+      false,
+    );
+    // …but legacy chunks carry no audience metadata at all, so the
+    // filter cannot apply to them — they still come back. Expected: an
+    // unfiltered legacy pool is exactly today's behavior, unchanged.
+    expect(customerSafe).toContain(legacyContent);
+
+    const unfiltered = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia purchase",
+    });
+    // No `audience` argument → the filter is absent entirely, so the
+    // internal chunk is visible (the engine's own retrieval path).
+    expect(unfiltered.some((c) => c.includes("PURCHASE CRITERIA"))).toBe(true);
+  });
+
+  test("the compiled semantic arm's k*2 over-fetch is still capped at k", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+    await configureEmbeddingsKey(asUser);
+
+    // The compiled semantic arm deliberately over-fetches `k * 2` so
+    // that post-filtering `audience` in code still has candidates left.
+    // Seed more than that, so an unbounded arm would blow past `k`:
+    // `push`'s cap is the ONLY thing holding the contract here (the
+    // pre-merge implementation had a second guard — a trailing
+    // `.slice(0, k)` — which this rewrite drops).
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 9; i++) {
+        const content = `[Georgia — Note ${i}]\nGeorgia visa detail ${i}`;
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "entry",
+          serviceKey: "georgia",
+          entryType: "note",
+          audience: "customer",
+          chunkIndex: i,
+          content,
+          embedding: syntheticEmbedding(content),
+        });
+      }
+    });
+
+    const results = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia visa",
+      k: 3,
+    });
+    expect(results).toHaveLength(3);
+    expect(new Set(results).size).toBe(3);
+  });
+
+  test("audience 'customer' also filters the compiled SEMANTIC arm, which cannot filter it in the vector query", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+    await configureEmbeddingsKey(asUser);
+
+    // Every row embedded, so the vector arm genuinely runs. Convex
+    // vector filters take a single field, so `audience` CANNOT be part
+    // of the vector query — it is post-filtered on the hydrated rows.
+    // This is the arm that would leak internal content if that
+    // post-filter were ever dropped.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 4; i++) {
+        const content = `INTERNAL ops sentinel ${i} — Georgia margin floor`;
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "ops",
+          serviceKey: "georgia",
+          audience: "internal",
+          chunkIndex: i,
+          content,
+          embedding: syntheticEmbedding(content),
+        });
+      }
+      for (let i = 0; i < 2; i++) {
+        const content = `[Georgia — Visa ${i}]\nGeorgia visa customer detail ${i}`;
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "entry",
+          serviceKey: "georgia",
+          entryType: "requirements",
+          audience: "customer",
+          chunkIndex: i,
+          content,
+          embedding: syntheticEmbedding(content),
+        });
+      }
+    });
+
+    const customerSafe = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia",
+      k: 5,
+    audience: "customer",
+    });
+    expect(customerSafe.some((c) => c.includes("INTERNAL ops sentinel"))).toBe(
+      false,
+    );
+    expect(customerSafe.length).toBeGreaterThan(0);
+
+    // Unfiltered, the same query DOES reach the internal rows — proof
+    // the assertion above is the filter's doing, not the corpus's.
+    const unfiltered = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia",
+      k: 5,
+    });
+    expect(unfiltered.some((c) => c.includes("INTERNAL ops sentinel"))).toBe(
+      true,
+    );
+  });
+
+  test("no kb rows + no audience arg → legacy behavior identical", async () => {
+    const t = convexTest(schema, modules);
+    const { accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+
+    const documentId = await seedDocument(t, {
+      accountId,
+      title: "Doc",
+      content: "alpha beta gamma",
+    });
+    await seedChunk(t, {
+      accountId,
+      documentId,
+      chunkIndex: 0,
+      content: "alpha beta gamma",
+    });
+
+    // The byte-compatibility case: an account that has never published a
+    // compiled chunk, called the way every current caller calls it.
+    expect(
+      await t.action(internal.aiKnowledge.retrieve, {
+        accountId,
+        queryText: "alpha",
+      }),
+    ).toEqual(["alpha beta gamma"]);
+  });
 });
