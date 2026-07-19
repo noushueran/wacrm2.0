@@ -33,6 +33,7 @@ export const CONFIG_PATCH_KEYS = [
   "staffCheckinTemplateLanguage",
   "outboundNudgesEnabled",
   "contactCard",
+  "purchaseSignalsEnabled",
 ] as const;
 
 /** The company-side fields of the customer-facing contact card — must
@@ -74,7 +75,7 @@ function isStringArray(x: unknown): x is string[] {
 export function validateConfigPatch(patch: QualificationConfigPatch): string | null {
   const p = patch as Record<string, unknown>;
 
-  for (const key of ["enabled", "adminAlertEnabled", "outboundNudgesEnabled", "autoAssignEnabled"] as const) {
+  for (const key of ["enabled", "adminAlertEnabled", "outboundNudgesEnabled", "autoAssignEnabled", "purchaseSignalsEnabled"] as const) {
     if (p[key] !== undefined && typeof p[key] !== "boolean") {
       return `${key} must be a boolean`;
     }

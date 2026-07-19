@@ -239,7 +239,8 @@ export interface Conversation {
 export type NotificationType =
   | 'conversation_assigned'
   | 'lead_qualified'
-  | 'sla_alert';
+  | 'sla_alert'
+  | 'purchase_signal';
 
 export interface Notification {
   id: string;

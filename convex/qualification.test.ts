@@ -433,3 +433,22 @@ test("updateConfig contactCard: valid card persists (and round-trips via getConf
     }),
   ).rejects.toThrow(); // unknown field — whitelist, not silently dropped
 });
+
+test("updateConfig round-trips purchaseSignalsEnabled and rejects non-boolean", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const before = await admin.as.query(api.qualification.getConfig, {});
+  expect(before.purchaseSignalsEnabled ?? false).toBe(false); // ships dormant
+
+  await admin.as.mutation(api.qualification.updateConfig, {
+    patch: { purchaseSignalsEnabled: true },
+  });
+  const after = await admin.as.query(api.qualification.getConfig, {});
+  expect(after.purchaseSignalsEnabled).toBe(true);
+
+  await expect(
+    admin.as.mutation(api.qualification.updateConfig, {
+      patch: { purchaseSignalsEnabled: "yes" },
+    }),
+  ).rejects.toThrow(); // BAD_REQUEST — boolean only
+});

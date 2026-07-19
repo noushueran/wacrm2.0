@@ -785,6 +785,9 @@ export default defineSchema({
       // Assigned-agent reply-SLA breach (customer waiting on a taken
       // chat) — targets supervisors+.
       v.literal("sla_alert"),
+      // Proxy Meta Purchase fired for a highly-qualified lead
+      // (purchase-signals spec §3.5).
+      v.literal("purchase_signal"),
     ),
     conversationId: v.optional(v.id("conversations")),
     contactId: v.optional(v.id("contacts")),
@@ -1638,6 +1641,11 @@ export default defineSchema({
     staffCheckinTemplateName: v.optional(v.string()),
     staffCheckinTemplateLanguage: v.optional(v.string()),
     outboundNudgesEnabled: v.boolean(),
+    // Purchase signals (spec 2026-07-19-purchase-signals): when true, a
+    // qualified session that ALSO meets its service's KB `PURCHASE
+    // CRITERIA` section fires the proxy Meta `Purchase` conversion.
+    // Optional so pre-feature rows validate; absent = false (dormant).
+    purchaseSignalsEnabled: v.optional(v.boolean()),
     // Company-wide fields for the WhatsApp contact card sent to the
     // customer when an agent accepts a lead (announceAssignment). The
     // per-person half (name/phone/jobTitle) comes from the membership;
@@ -1809,6 +1817,24 @@ export default defineSchema({
     qualifiedAt: v.optional(v.number()),
     closedReason: v.optional(v.string()),
     summary: v.optional(v.string()),
+    // Purchase-signal verdict trail (spec 2026-07-19-purchase-signals
+    // §3.5). Absent = never evaluated. "sent" is terminal (the
+    // conversation's one `purchased` conversionEvent is spent);
+    // "not_met" keeps re-evaluating on later inbounds inside the
+    // 7-day window. `manual` marks a supervisor-fired signal.
+    purchase: v.optional(
+      v.object({
+        status: v.union(v.literal("sent"), v.literal("not_met")),
+        evaluatedAt: v.number(),
+        confidence: v.number(),
+        reasons: v.array(v.string()),
+        value: v.optional(v.number()),
+        currency: v.optional(v.string()),
+        sentAt: v.optional(v.number()),
+        conversionEventId: v.optional(v.id("conversionEvents")),
+        manual: v.optional(v.boolean()),
+      }),
+    ),
   })
     .index("by_conversation", ["conversationId"])
     .index("by_account_status", ["accountId", "status"])
