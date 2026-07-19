@@ -6,6 +6,7 @@ import { useQuery } from '@/lib/convex/cached';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
 import { LegacyDocuments } from './legacy-documents';
+import { ServiceMatrix } from './service-matrix';
 import { api } from '../../../convex/_generated/api';
 
 /**
@@ -25,9 +26,18 @@ export function KnowledgeStudio() {
   const isAdmin = accountRole ? canEditSettings(accountRole) : false;
   // Owned here (not in a later task's file) because Tasks 4-7 build the
   // matrix/detail toggle on top of this same shell rather than replacing
-  // it. Unused until that UI lands.
+  // it. Task 4 wires the setter to the matrix's onSelectService; the value
+  // itself is read starting Task 6/7's detail view — remove this disable
+  // once that lands and actually reads `selectedService`.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- see comment above
   const [selectedService, setSelectedService] = useState<string | null>(null);
+  // Task 5 supplies the actual create-service dialog/form; this shell only
+  // owns the open/closed flag so the matrix's "Add service" affordance has
+  // somewhere to write to in the meantime. The setter is wired below; the
+  // value itself is read once Task 5's dialog renders — remove this
+  // disable then.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- see comment above
+  const [createServiceOpen, setCreateServiceOpen] = useState(false);
 
   const overview = useQuery(api.knowledge.studioOverview, isAdmin ? {} : 'skip');
   const config = useQuery(api.aiConfig.get, isAdmin ? {} : 'skip');
@@ -39,13 +49,15 @@ export function KnowledgeStudio() {
       <h2 className="text-lg font-semibold text-foreground">{t('title')}</h2>
       <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
 
-      {/* Tasks 4-7 render the matrix / detail here. */}
+      {/* Tasks 6-7 render the selected-service detail view here. */}
       {overview === undefined ? (
         <div className="mt-6 h-24 animate-pulse rounded-md bg-muted" />
       ) : (
-        <p className="mt-6 text-sm text-muted-foreground">
-          {overview.services.length} service(s)
-        </p>
+        <ServiceMatrix
+          services={overview.services}
+          onSelectService={setSelectedService}
+          onCreateService={() => setCreateServiceOpen(true)}
+        />
       )}
 
       <LegacyDocuments
