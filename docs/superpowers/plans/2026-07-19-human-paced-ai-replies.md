@@ -18,7 +18,11 @@
 - Convex `process.env` reads must happen **inside function bodies**, never at module scope (matches the existing `aiReplyDebounceMs` pattern).
 - Only `convex/lib/ai/defaults.ts`'s `MAX_OUTPUT_TOKENS` changes. Leave `src/lib/ai/defaults.ts` alone — that constant serves the human-reviewed draft-reply route, which may legitimately be longer.
 - This is the WhatsApp auto-reply path in production. Every new failure mode must be best-effort: an error in acknowledgement or pacing must never cost the customer their reply.
-- Run the full suite with `npm test` before every commit.
+- 🚨 **NEVER run `convex dev`, `convex deploy`, or `convex codegen`.** This repo points at ONE self-hosted Convex instance and all three push straight to **production** — which for this plan would mean live customers immediately experiencing a half-built reply pipeline. All verification is offline: `npm test` (`convex-test` needs no backend), `npx tsc --noEmit`, `npm run build`. Deployment and live testing are the owner's manual steps — see Task 6.
+- **No `_generated` edits needed.** `aiReply.ackInbound` and `aiReply.deliverReply` are new exports in the **already-registered** `aiReply` module, and `convex/lib/ai/pacing.ts` is a plain library file, not a Convex function module. `api.d.ts` picks up new exports through `typeof import(...)`. Adding a brand-new *module* would require a hand-edit; none of this does.
+- **Stage files explicitly by path. Never `git add -A` or `git add .`** — untracked `.claude/worktrees/*` directories from other sessions show up in `git status` and must not be committed.
+- **Lint has pre-existing debt** (~7 errors / 87 warnings in vendored files). The gate is "build passes and THIS diff adds no NEW lint", not a globally clean run.
+- Run `npm test` before every commit, from the app root `/Volumes/CurserDisk/Dev/wacrm2.0/wacrm2.0`.
 
 ---
 
@@ -919,13 +923,41 @@ customer-visible typing window."
 
 ---
 
-### Task 6: Live verification
-
-This plan changes customer-visible behaviour on a production WhatsApp number. It is not done until it has been watched on a real handset.
+### Task 6: Verification
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Deploy the Convex backend**
+- [ ] **Step 1: Full offline verification**
+
+Run from the app root. **Do not run any `convex` CLI command** — see Global Constraints.
+
+```bash
+npm test && npx tsc --noEmit && npm run build
+```
+
+Expected: full suite green (record the count), `tsc --noEmit` exit 0, `next build` emits its route manifest with no compile errors.
+
+Then confirm this diff adds no new lint:
+
+```bash
+npx eslint convex/lib/ai/pacing.ts convex/lib/ai/pacing.test.ts \
+  convex/lib/ai/defaults.ts convex/aiReply.ts convex/ingest.ts
+```
+
+Expected: clean, or only warnings that already existed on these files.
+
+- [ ] **Step 2: Confirm the pacing constants by inspection**
+
+Read back the final values and check them against Meta's 25-second typing-indicator ceiling:
+`TYPING_MAX_MS` must be ≤ 15,000 and the slowest debounce tier plus `TYPING_MAX_MS` must leave clear headroom under 25,000. If either has drifted, fix before handing over.
+
+---
+
+## Owner deployment and live test (manual — not performed by the implementation session)
+
+Everything above is offline. **This plan changes customer-visible behaviour on a live WhatsApp number**, so it is not truly done until watched on a real handset — but that is the owner's call to make and the owner's number to test on.
+
+- [ ] **Step 3: Deploy the Convex backend**
 
 Per repo convention, merge `origin/main` first — the backend is a separate manual deploy from Netlify.
 
@@ -934,7 +966,9 @@ git fetch origin && git merge origin/main
 npx convex deploy
 ```
 
-- [ ] **Step 2: Send a complete-shaped message from a real handset**
+Note: this plan is backend-only, so there is no Netlify step and no deploy-ordering hazard.
+
+- [ ] **Step 4: Send a complete-shaped message from a real handset**
 
 Send `"how much for 4 nights in Baku?"` to the production number.
 
@@ -944,7 +978,7 @@ Expected, watched on the handset:
 - Reply lands roughly 5-8 seconds after sending
 - Exactly one reply
 
-- [ ] **Step 3: Send a fragmented burst**
+- [ ] **Step 5: Send a fragmented burst**
 
 Send `"hi"`, then ~3 seconds later `"I want a package for August"`.
 
@@ -953,7 +987,7 @@ Expected:
 - **One** reply, addressing the August package — not two replies
 - This is the burst-coalescing regression check; two replies here means `FRAGMENT_MAX_LENGTH` is too low for real traffic
 
-- [ ] **Step 4: Send a question that produces a long answer**
+- [ ] **Step 6: Send a question that produces a long answer**
 
 Ask something that draws a detailed itinerary response.
 
@@ -961,13 +995,13 @@ Expected:
 - Reply lands no later than ~15 seconds
 - "typing…" is still visible when it arrives — if it vanished first, `AI_TYPING_MAX_MS` is set too close to Meta's 25s ceiling and must come down
 
-- [ ] **Step 5: Confirm human takeover still suppresses the bot**
+- [ ] **Step 7: Confirm human takeover still suppresses the bot**
 
 Assign a live conversation to yourself from the dashboard, then message that thread from the handset.
 
 Expected: no blue tick from the bot, no "typing…", no reply. This verifies `ackInbound`'s gates match `dispatchInbound`'s.
 
-- [ ] **Step 6: Record the result**
+- [ ] **Step 8: Record the result**
 
 If any step failed, stop and fix before merging. If all passed, note the observed timings in the PR description — they are the evidence the pacing works, and the baseline for any future tuning.
 
