@@ -12,6 +12,8 @@ import {
   type AppendMessageArgs,
 } from "./messages";
 import { extractRefCode, extractCtwaClid } from "./lib/attribution";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { publicUrl } from "./lib/r2/url";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -611,24 +613,34 @@ export const processInbound = internalAction({
 
     // ---- Ad-referral image → storage ----
     // The referral gives a DIRECT public CDN url (not a Meta mediaId), so a
-    // plain `storeFromUrl` (no auth headers) re-hosts it into Convex storage
+    // plain `storeFromUrl` (no auth headers) re-hosts it into Cloudflare R2
     // — same durability the inbound-media block gives voice notes/photos,
     // so the ad card never breaks when Meta's CDN url expires. After the
     // dedup guard above, so a Meta retry can't orphan a second copy.
+    //
+    // R2-migration write path: Task 6 changed `storeFromUrl` from a
+    // Convex-storage primitive returning `{ storageId }` to an R2
+    // primitive returning `{ key }` (this block and
+    // `whatsappConfig.resolveInboundMedia` are its only two callers, and
+    // had to move together). The resulting key is resolved to R2's
+    // public URL immediately and stored in the existing
+    // `storedImageUrl` field, unchanged — persisting a
+    // `referral.storedImageKey` instead is `convex/messages.ts`'s
+    // `setAdReferralImage` cutover, a separate, later piece of work.
     const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
     if (adImageSrc) {
       await runBestEffort("ingest.storeAdReferralImage", async () => {
-        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+        const { key } = await ctx.runAction(internal.files.storeFromUrl, {
           url: adImageSrc,
+          accountId,
+          kind: "ad",
         });
-        const url = await ctx.storage.getUrl(storageId);
-        if (url) {
-          await ctx.runMutation(internal.messages.setAdReferralImage, {
-            messageId: res.messageId,
-            conversationId: res.conversationId,
-            storedImageUrl: url,
-          });
-        }
+        const url = publicUrl(r2ConfigFromEnv(), key);
+        await ctx.runMutation(internal.messages.setAdReferralImage, {
+          messageId: res.messageId,
+          conversationId: res.conversationId,
+          storedImageUrl: url,
+        });
       });
     }
 

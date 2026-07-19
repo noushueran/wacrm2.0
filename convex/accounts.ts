@@ -127,27 +127,40 @@ export const me = query({
 
 /**
  * The caller updates their OWN account membership's display profile —
- * `fullName`/`avatarUrl`, the same denormalized snapshot `me` above
- * reads back (Phase 8, Task 3: the settings "profile" form). A plain
- * `mutation` (not `accountMutation`) — matches this file's existing
- * `bootstrapAccount`/`currentUser`/`me` style of deriving identity via
- * `getAuthUserId` + a direct `memberships.by_user` lookup, rather than
- * scoping by `ctx.accountId`: there's no cross-tenant reach to guard
- * here, since a user only ever has the one membership row this looks
- * up, and this mutation never takes an accountId/userId argument a
+ * `fullName`/`avatarUrl`/`avatarKey`, the same denormalized snapshot
+ * `me` above reads back (Phase 8, Task 3: the settings "profile" form).
+ * A plain `mutation` (not `accountMutation`) — matches this file's
+ * existing `bootstrapAccount`/`currentUser`/`me` style of deriving
+ * identity via `getAuthUserId` + a direct `memberships.by_user` lookup,
+ * rather than scoping by `ctx.accountId`: there's no cross-tenant reach
+ * to guard here, since a user only ever has the one membership row this
+ * looks up, and this mutation never takes an accountId/userId argument a
  * client could supply to target anyone else's.
  *
- * `avatarUrl` is patched only when supplied — the same "omitted
- * optional arg carries no key at all" idiom `whatsappConfig.upsert`/
- * `aiConfig.upsert` use for their own optional fields, so clearing the
- * avatar field is never an accidental side effect of a name-only save.
- * `name` is required on every call, mirroring `me`'s own "the profile
- * form always has a name field" shape.
+ * `avatarUrl`/`avatarKey` are each patched only when supplied — the same
+ * "omitted optional arg carries no key at all" idiom
+ * `whatsappConfig.upsert`/`aiConfig.upsert` use for their own optional
+ * fields, so clearing the avatar is never an accidental side effect of a
+ * name-only save. `name` is required on every call, mirroring `me`'s own
+ * "the profile form always has a name field" shape.
+ *
+ * `avatarKey` (R2 migration: write path) is the durable replacement for
+ * `avatarUrl` — `src/components/settings/profile-form.tsx` uploads
+ * straight to R2 via `api.files.startUpload` and passes the resulting
+ * key here directly; it no longer resolves an `avatarUrl` itself (that
+ * resolution now happens client-side, at read time, via
+ * `src/hooks/use-auth.tsx`'s `resolveMediaUrl({ key: me.avatarKey, url:
+ * me.avatarUrl })`). `avatarUrl` is left in the args/patch shape
+ * unchanged — both fields can still be set independently, matching every
+ * other row in this migration (`messages.mediaKey`,
+ * `messageTemplates.headerMediaKey`) where the old URL column is kept
+ * dual-write/dual-read until the Plan 2 backfill.
  */
 export const updateProfile = mutation({
   args: {
     name: v.string(),
     avatarUrl: v.optional(v.string()),
+    avatarKey: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
@@ -159,10 +172,11 @@ export const updateProfile = mutation({
       .first();
     if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
 
-    const patch: { fullName: string; avatarUrl?: string } = {
+    const patch: { fullName: string; avatarUrl?: string; avatarKey?: string } = {
       fullName: args.name,
     };
     if (args.avatarUrl !== undefined) patch.avatarUrl = args.avatarUrl;
+    if (args.avatarKey !== undefined) patch.avatarKey = args.avatarKey;
 
     await ctx.db.patch(membership._id, patch);
     return membership._id;

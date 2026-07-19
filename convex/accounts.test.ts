@@ -189,9 +189,12 @@ test("updateProfile updates the caller's own fullName and avatarUrl", async () =
 });
 
 test("me exposes the membership's avatarKey alongside avatarUrl (Task 5 of the R2 migration: dual-read)", async () => {
-  // `updateProfile` has no `avatarKey` argument yet — nothing writes this
-  // field until a later task, so it's seeded directly. `me` is a Convex
-  // `query`, and this codebase's convention (see
+  // Seeded directly (rather than via `updateProfile`) so this test
+  // isolates the READ side from the WRITE side — `updateProfile` gained
+  // an `avatarKey` argument in Task 6 (see the dedicated write-path
+  // tests below); this test only cares that `me` surfaces whatever is on
+  // the row. `me` is a Convex `query`, and this codebase's convention
+  // (see
   // `conversionEvents.ts`/`campaignAds.ts`'s own "only an action can
   // read process.env" comments) is that only an action reads deployment
   // env — so `me` does NOT resolve `avatarKey` to a URL itself; it just
@@ -264,6 +267,52 @@ test("updateProfile only patches the caller's own membership, not a teammate's i
     ctx.db.get(teammateMembershipId),
   );
   expect(teammateMembership!.fullName).toBe("Teammate Tom");
+});
+
+test("updateProfile writes avatarKey (R2 migration: write path) alongside avatarUrl", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
+    name: "Sarah Connor",
+    avatarUrl: "https://objs.holidayys.co/acc1/avatar/sarah.png",
+    avatarKey: "acc1/avatar/sarah.png",
+  });
+
+  const membership = await t.run((ctx) => ctx.db.get(membershipId));
+  expect(membership!.avatarKey).toBe("acc1/avatar/sarah.png");
+
+  // `me` reads the same row it always has — proves this is a real
+  // dual-write, not a key that only the direct DB read above can see.
+  const profile = await asSarah.query(api.accounts.me, {});
+  expect(profile!.avatarKey).toBe("acc1/avatar/sarah.png");
+});
+
+test("updateProfile preserves the existing avatarKey when omitted on a later call", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
+    name: "Sarah Connor",
+    avatarKey: "acc1/avatar/sarah.png",
+  });
+
+  // Second call omits `avatarKey` entirely (a name-only save) — it must
+  // not be cleared, mirroring `avatarUrl`'s own omitted-arg contract.
+  await asSarah.mutation(api.accounts.updateProfile, { name: "Sarah C." });
+
+  const membership = await t.run((ctx) => ctx.db.get(membershipId));
+  expect(membership!.fullName).toBe("Sarah C.");
+  expect(membership!.avatarKey).toBe("acc1/avatar/sarah.png");
 });
 
 test("updateProfile preserves the existing avatarUrl when omitted on a later call", async () => {

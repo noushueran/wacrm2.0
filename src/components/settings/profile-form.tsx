@@ -7,6 +7,7 @@ import { useConvex, useMutation } from 'convex/react';
 
 import { useAuth } from '@/hooks/use-auth';
 import { convexErrorMessage } from '@/lib/convex/adapters';
+import { uploadAccountMedia } from '@/lib/storage/upload-media';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -20,7 +21,6 @@ import { useTranslations } from 'next-intl';
 import { SettingsPanelHead } from './settings-panel-head';
 
 import { api } from '../../../convex/_generated/api';
-import type { Id } from '../../../convex/_generated/dataModel';
 
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const ALLOWED_MIME = new Set([
@@ -34,7 +34,7 @@ export function ProfileForm() {
   const t = useTranslations('Settings.profile');
   const { user, profile } = useAuth();
   const convex = useConvex();
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const startUpload = useMutation(api.files.startUpload);
   const updateProfile = useMutation(api.accounts.updateProfile);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -107,44 +107,41 @@ export function ProfileForm() {
 
     setSaving(true);
     try {
-      // `undefined` = no avatar change — the mutation's `avatarUrl` arg
-      // is patched only when supplied (see convex/accounts.ts's
-      // `updateProfile` doc comment).
+      // `undefined` = no avatar change — the mutation's `avatarKey`/
+      // `avatarUrl` args are each patched only when supplied (see
+      // convex/accounts.ts's `updateProfile` doc comment).
+      let nextAvatarKey: string | undefined;
       let nextAvatarUrl: string | undefined;
 
       if (pendingAvatar) {
-        // Convex client-upload flow: mint a short-lived upload URL, POST
-        // the file bytes to it directly, then resolve the returned
-        // storage id to a fetchable URL.
-        const uploadUrl = await generateUploadUrl({});
-        const response = await fetch(uploadUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': pendingAvatar.type },
-          body: pendingAvatar,
-        });
-        if (!response.ok) {
-          throw new Error(t('uploadFailed'));
-        }
-        const { storageId } = (await response.json()) as {
-          storageId: Id<'_storage'>;
-        };
-        // Record ownership before resolving — `api.files.getUrl` now
-        // asserts the caller's account owns the storage id (mirrors
-        // `src/lib/storage/upload-media.ts`).
-        await convex.mutation(api.files.registerUpload, { storageId });
-        const resolvedUrl = await convex.query(api.files.getUrl, {
-          storageId,
-        });
-        if (!resolvedUrl) {
-          throw new Error(t('uploadFailed'));
-        }
-        nextAvatarUrl = resolvedUrl;
+        // R2 upload: the server mints a key inside this account's own
+        // prefix and a short-lived presigned PUT URL for it; the browser
+        // PUTs the file bytes straight to R2 — never through Convex or
+        // the VPS. Unlike the old Convex-storage flow there is no
+        // separate "register ownership" round trip (ownership is
+        // guaranteed by construction — the key's account segment is
+        // minted server-side from the caller's own session) and no
+        // "resolve to a URL" round trip either (a fetchable URL is pure
+        // string concatenation from the key, done at READ time by
+        // `src/hooks/use-auth.tsx`, not here).
+        const { key } = await uploadAccountMedia(
+          convex,
+          startUpload,
+          pendingAvatar,
+          'avatar',
+        );
+        nextAvatarKey = key;
       } else if (removeAvatar) {
+        // Clear both: a stale key would otherwise keep winning over an
+        // empty url in `resolveMediaUrl`'s "key wins whenever present"
+        // precedence, silently undoing the removal.
+        nextAvatarKey = '';
         nextAvatarUrl = '';
       }
 
       await updateProfile({
         name: trimmedName,
+        ...(nextAvatarKey !== undefined ? { avatarKey: nextAvatarKey } : {}),
         ...(nextAvatarUrl !== undefined ? { avatarUrl: nextAvatarUrl } : {}),
       });
 

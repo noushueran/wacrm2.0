@@ -1279,6 +1279,17 @@ test("processInbound: an automations phase matching zero automations (nothing to
 test("processInbound resolves an inbound voice note's media into storage and attaches a playable mediaUrl", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  // R2-migration write path (Task 6): `resolveInboundMedia` now stores
+  // the downloaded bytes in R2 (`files.storeFromUrl`), which needs
+  // `r2ConfigFromEnv()` to resolve — see `convex/files.test.ts`'s own
+  // comment on why these are set per-test rather than globally in
+  // `vitest.config.ts` (that would defeat `aiReply.test.ts`'s dedicated
+  // R2-unconfigured coverage).
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
 
@@ -1293,11 +1304,20 @@ test("processInbound resolves an inbound voice note's media into storage and att
     }),
   );
 
-  // Mock the two Meta round-trips: getMediaUrl (id -> CDN url + mime),
-  // then the authenticated CDN byte download.
+  // Mock the two Meta round-trips (getMediaUrl: id -> CDN url + mime;
+  // then the authenticated CDN byte download) PLUS the R2 PUT that now
+  // follows (`files.storeFromUrl` -> `putObject`). The R2 PUT goes
+  // through `aws4fetch`, which signs a `Request` and invokes the global
+  // `fetch` with THAT SINGLE `Request` object as its only argument
+  // (mirrors `convex/lib/r2/client.test.ts`'s own
+  // `vi.stubGlobal("fetch", async (req: Request) => ...)` convention) —
+  // so this mock must handle both calling conventions.
   const voiceBytes = new TextEncoder().encode("ogg/opus voice-note bytes");
-  const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
-    const target = String(url);
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (input instanceof Request) {
+      return new Response(null, { status: 200 });
+    }
+    const target = String(input);
     if (target.includes("meta-audio-1")) {
       expect(
         (init?.headers as Record<string, string> | undefined)?.Authorization,
@@ -1314,6 +1334,9 @@ test("processInbound resolves an inbound voice note's media into storage and att
     return {
       ok: true,
       status: 200,
+      // A real `fetch` Response always carries `.headers` — `storeFromUrl`
+      // reads `content-type` off it to pick the R2 object's extension.
+      headers: new Headers({ "content-type": "audio/ogg" }),
       blob: async () => new Blob([voiceBytes], { type: "audio/ogg" }),
     } as unknown as Response;
   });
@@ -1332,11 +1355,19 @@ test("processInbound resolves an inbound voice note's media into storage and att
       .first(),
   );
   expect(message!.contentType).toBe("audio");
-  // The fix: `mediaUrl` is now a fetchable Convex-storage URL (was
-  // undefined -> "audio unavailable" in the inbox).
+  // The fix: `mediaUrl` is now a fetchable R2 URL (was undefined ->
+  // "audio unavailable" in the inbox).
   expect(message!.mediaUrl).toBeTruthy();
-  // Both Meta round-trips happened (resolve id -> url, then download).
-  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(message!.mediaUrl).toContain("objs.holidayys.co");
+  // Both Meta round-trips happened (resolve id -> url, then download),
+  // plus the R2 PUT.
+  expect(fetchMock).toHaveBeenCalledTimes(3);
+
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
 });
 
 // ============================================================
@@ -1764,13 +1795,32 @@ test("processInbound sets no ad fields for a plain (non-ad) inbound message", as
 test("processInbound downloads the ad image into storage and attaches storedImageUrl to the message + conversation", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  // R2-migration write path (Task 6): the ad-referral image now goes
+  // through `files.storeFromUrl` -> R2 too — see the voice-note test
+  // above for why these are set per-test.
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
 
+  // Returns `{ ok: true, blob }` unconditionally, which covers BOTH the
+  // ad-image download (called with a plain string URL) and the R2 PUT
+  // that now follows (called with a single `Request` object — see the
+  // voice-note test above) — `putObject` only inspects `res.ok`.
   const imgBytes = new TextEncoder().encode("jpeg-ad-banner-bytes");
   const fetchMock = vi.fn(async () =>
-    ({ ok: true, status: 200, blob: async () => new Blob([imgBytes], { type: "image/jpeg" }) }) as unknown as Response,
+    ({
+      ok: true,
+      status: 200,
+      // A real `fetch` Response always carries `.headers` —
+      // `storeFromUrl` reads `content-type` off it.
+      headers: new Headers({ "content-type": "image/jpeg" }),
+      blob: async () => new Blob([imgBytes], { type: "image/jpeg" }),
+    }) as unknown as Response,
   );
   vi.stubGlobal("fetch", fetchMock);
 
@@ -1789,30 +1839,49 @@ test("processInbound downloads the ad image into storage and attaches storedImag
     ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADIMG1")).first(),
   );
   expect(message!.referral?.storedImageUrl).toBeTruthy();
+  expect(message!.referral?.storedImageUrl).toContain("objs.holidayys.co");
   const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
   expect(conversation!.adReferral?.storedImageUrl).toBeTruthy();
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+  // The ad-image download, plus the R2 PUT.
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
 });
 
 test("processInbound pins the conversation adReferral image to the FIRST ad — a later DIFFERENT ad updates only its own message, not the conversation denorm", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  // R2-migration write path (Task 6) — see the voice-note test above.
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
 
-  // Distinct bytes per ad creative (adA vs adB) — convex-test's
-  // `ctx.storage.store` is content-addressed, so identical bytes would
-  // collapse to the same storage id (hence the same getUrl) and mask a
-  // conversation-level overwrite. Different bytes → different stored URLs,
-  // so an overwrite of the conversation denorm is observable as a URL flip.
-  const fetchMock = vi.fn(async (url: string | URL) => {
+  // Distinct bytes per ad creative (adA vs adB) by URL — moot for R2
+  // itself (each upload gets a fresh RANDOM key regardless of content,
+  // unlike convex-test's content-addressed `ctx.storage.store` this
+  // test predates), but harmless to keep: the R2 PUT call is invoked
+  // with a `Request` object (not a string), so `String(url)` on it never
+  // matches "adB" and both branches return the same `{ ok: true, blob }`
+  // shape either way — `putObject` only inspects `res.ok`.
+  const fetchMock = vi.fn(async (url: string | URL | Request) => {
     const bytes = new TextEncoder().encode(
       String(url).includes("adB") ? "jpeg-ad-B-bytes" : "jpeg-ad-A-bytes",
     );
     return {
       ok: true,
       status: 200,
+      // A real `fetch` Response always carries `.headers` —
+      // `storeFromUrl` reads `content-type` off it.
+      headers: new Headers({ "content-type": "image/jpeg" }),
       blob: async () => new Blob([bytes], { type: "image/jpeg" }),
     } as unknown as Response;
   });
@@ -1857,6 +1926,12 @@ test("processInbound pins the conversation adReferral image to the FIRST ad — 
   // so it never desyncs from the Ad A headline/imageUrl it holds. Without
   // the guard, this flips to Ad B's URL and the assertion fails.
   expect(convAfterB!.adReferral?.storedImageUrl).toBe(pinnedUrl);
+
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
 });
 
 // ============================================================

@@ -10,6 +10,8 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { encrypt, decrypt } from "./lib/whatsappEncryption";
 import { hasMinRole } from "./lib/roles";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { publicUrl } from "./lib/r2/url";
 import {
   verifyPhoneNumber,
   getSubscribedApps,
@@ -1031,13 +1033,26 @@ export const fetchMedia = action({
 // design `fetchMedia` documents): it decrypts, resolves the Meta media
 // id to its short-lived CDN URL (`getMediaUrl`), then hands that URL plus
 // a `Bearer` header to `files.storeFromUrl`, which downloads the bytes
-// into Convex storage. Only the resulting DURABLE storage URL comes back
-// out — so the inbox `<audio>`/`<video>`/`<img>` can fetch it directly,
-// forever, exactly like agent-sent (outbound) media, with no auth proxy
-// and no dependence on Meta's media-retention window.
+// and PUTs them to Cloudflare R2 under a key scoped to this account
+// (R2-migration write path: Task 6 changed `storeFromUrl` from a
+// Convex-storage primitive returning `{ storageId }` to an R2 primitive
+// returning `{ key }` — this action is one of exactly two callers that
+// had to move in lockstep, the other being `convex/ingest.ts`'s
+// ad-referral block). The resulting key is resolved to R2's public URL
+// immediately (`publicUrl`) — the inbox `<audio>`/`<video>`/`<img>` can
+// fetch it directly, forever, exactly like agent-sent (outbound) media,
+// with no auth proxy and no dependence on Meta's media-retention window.
+//
+// Deliberately still returns `{ url }`, not `{ key }`: switching the
+// caller (`convex/ingest.ts`) to persist a `mediaKey` instead of a
+// resolved `mediaUrl` on the message row is `convex/messages.ts`'s
+// `setMediaKey` cutover — a separate, later piece of work — not this
+// one. This function's own contract to its caller is unchanged; only
+// WHERE the bytes physically land (R2 instead of Convex storage) has.
 //
 // Best-effort by contract: returns `null` (never throws) for a missing
-// config, an undecryptable token, or any failing Meta/storage step, so
+// config, an undecryptable token, or any failing Meta/R2 step —
+// including R2 being unconfigured (`r2ConfigFromEnv()` throwing) — so
 // one media that can't be fetched degrades to an "unavailable" bubble
 // rather than derailing `ingest.processInbound`'s whole fan-out. The
 // caller reads `null` as "leave this message without a mediaUrl".
@@ -1057,12 +1072,13 @@ export const resolveInboundMedia = internalAction({
         mediaId: args.mediaId,
         accessToken,
       });
-      const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+      const { key } = await ctx.runAction(internal.files.storeFromUrl, {
         url: mediaInfo.url,
         headers: { Authorization: `Bearer ${accessToken}` },
+        accountId: args.accountId,
+        kind: "inbound",
       });
-      const url = await ctx.storage.getUrl(storageId);
-      return url ? { url } : null;
+      return { url: publicUrl(r2ConfigFromEnv(), key) };
     } catch (err) {
       console.error(
         "[resolveInboundMedia] failed to resolve media",

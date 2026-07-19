@@ -407,7 +407,7 @@ export function MessageThread({
         await sendMessage({
           conversationId: conversation.id as Id<"conversations">,
           messageType: payload.kind,
-          mediaUrl: payload.mediaUrl,
+          mediaKey: payload.mediaKey,
           contentText,
           filename: payload.filename,
           replyToMessageId: payload.replyToId as Id<"messages"> | undefined,
@@ -417,8 +417,8 @@ export function MessageThread({
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Failed to send: ${reason}`);
         // The upload never reached the recipient — GC the orphaned
-        // object rather than leaving it in storage forever.
-        void deleteAccountMedia(convex, payload.storageId).catch(() => {});
+        // object rather than leaving it in the bucket forever.
+        void deleteAccountMedia(convex, payload.mediaKey).catch(() => {});
       }
     },
     [conversation, sendMessage, convex],
