@@ -1270,17 +1270,18 @@ test("processInbound: an automations phase matching zero automations (nothing to
 // Inbound media resolution — the "follow-up" both webhookParse.ts and
 // files.storeFromUrl flag: an inbound WhatsApp media message arrives as
 // a bare Meta `mediaId` (a signed Graph fetch is real network I/O the
-// mutation can't do), so processInbound must resolve it to a durable
-// Convex-storage URL. Before this, every inbound voice note / video /
-// image rendered "unavailable" in the inbox because `mediaUrl` was never
-// populated.
+// mutation can't do), so processInbound must resolve it to a durable R2
+// object key (R2-migration Task 7; a resolved Convex-storage URL before
+// that migration). Before this, every inbound voice note / video / image
+// rendered "unavailable" in the inbox because neither `mediaKey` nor
+// `mediaUrl` was ever populated.
 // ============================================================
 
-test("processInbound resolves an inbound voice note's media into storage and attaches a playable mediaUrl", async () => {
+test("processInbound resolves an inbound voice note's media into R2 and attaches a mediaKey (not a mediaUrl)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
-  // R2-migration write path (Task 6): `resolveInboundMedia` now stores
-  // the downloaded bytes in R2 (`files.storeFromUrl`), which needs
+  // R2-migration write path (Task 7, completing Task 6): `resolveInboundMedia`
+  // stores the downloaded bytes in R2 (`files.storeFromUrl`), which needs
   // `r2ConfigFromEnv()` to resolve — see `convex/files.test.ts`'s own
   // comment on why these are set per-test rather than globally in
   // `vitest.config.ts` (that would defeat `aiReply.test.ts`'s dedicated
@@ -1355,10 +1356,15 @@ test("processInbound resolves an inbound voice note's media into storage and att
       .first(),
   );
   expect(message!.contentType).toBe("audio");
-  // The fix: `mediaUrl` is now a fetchable R2 URL (was undefined ->
-  // "audio unavailable" in the inbox).
-  expect(message!.mediaUrl).toBeTruthy();
-  expect(message!.mediaUrl).toContain("objs.holidayys.co");
+  // The fix (R2-migration Task 7): the message gets an R2 object KEY,
+  // shaped `<accountId>/inbound/<random><ext>` (`convex/lib/r2/keys.ts`'s
+  // `buildMediaKey`) — was undefined -> "audio unavailable" in the inbox
+  // before Task 6/7. `mediaUrl` is deliberately left unset: readers
+  // resolve `mediaKey ?? mediaUrl` lazily at render time instead
+  // (`convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5).
+  expect(message!.mediaKey).toBeTruthy();
+  expect(message!.mediaKey).toMatch(/^[^/]+\/inbound\//);
+  expect(message!.mediaUrl).toBeUndefined();
   // Both Meta round-trips happened (resolve id -> url, then download),
   // plus the R2 PUT.
   expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -1792,12 +1798,12 @@ test("processInbound sets no ad fields for a plain (non-ad) inbound message", as
   expect(contact!.acquisitionSource).toBeUndefined();
 });
 
-test("processInbound downloads the ad image into storage and attaches storedImageUrl to the message + conversation", async () => {
+test("processInbound downloads the ad image into R2 and attaches a storedImageKey to the message (not the conversation)", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
-  // R2-migration write path (Task 6): the ad-referral image now goes
-  // through `files.storeFromUrl` -> R2 too — see the voice-note test
-  // above for why these are set per-test.
+  // R2-migration write path (Task 7, completing Task 6): the ad-referral
+  // image goes through `files.storeFromUrl` -> R2 — see the voice-note
+  // test above for why these are set per-test.
   process.env.R2_BUCKET = "test-bucket";
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
@@ -1838,10 +1844,26 @@ test("processInbound downloads the ad image into storage and attaches storedImag
   const message = await t.run((ctx) =>
     ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADIMG1")).first(),
   );
-  expect(message!.referral?.storedImageUrl).toBeTruthy();
-  expect(message!.referral?.storedImageUrl).toContain("objs.holidayys.co");
+  // The fix (R2-migration Task 7): the MESSAGE gets an R2 object key,
+  // shaped `<accountId>/ad/<random><ext>` (`convex/lib/r2/keys.ts`'s
+  // `buildMediaKey`) — `storedImageUrl` is deliberately left unset (the
+  // inbox resolves `key ?? url` lazily at render time instead;
+  // `convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5).
+  expect(message!.referral?.storedImageKey).toBeTruthy();
+  expect(message!.referral?.storedImageKey).toMatch(/^[^/]+\/ad\//);
+  expect(message!.referral?.storedImageUrl).toBeUndefined();
+
+  // `conversations.adReferral` has no `storedImageKey` counterpart in the
+  // schema — only `messages.referral` got one (R2-migration design spec's
+  // "Schema changes" table) — and nothing renders its image (confirmed:
+  // the inbox's ad-lead badge only checks presence/`startedAt`;
+  // `AdReferralCard`, the one place an ad image actually renders, takes
+  // the MESSAGE-level referral asserted above, never this denorm).
+  // `setAdReferralImage` therefore no longer touches the conversation at
+  // all as of Task 7 — this is a deliberate retirement, not a regression.
   const conversation = await t.run((ctx) => ctx.db.get(message!.conversationId));
-  expect(conversation!.adReferral?.storedImageUrl).toBeTruthy();
+  expect(conversation!.adReferral?.storedImageUrl).toBeUndefined();
+
   // The ad-image download, plus the R2 PUT.
   expect(fetchMock).toHaveBeenCalledTimes(2);
 
@@ -1852,10 +1874,11 @@ test("processInbound downloads the ad image into storage and attaches storedImag
   delete process.env.R2_PUBLIC_HOST;
 });
 
-test("processInbound pins the conversation adReferral image to the FIRST ad — a later DIFFERENT ad updates only its own message, not the conversation denorm", async () => {
+test("processInbound gives each ad message its OWN storedImageKey — the conversation-level image denorm is retired (Task 7), but its headline still pins to the FIRST ad", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
-  // R2-migration write path (Task 6) — see the voice-note test above.
+  // R2-migration write path (Task 7, completing Task 6) — see the
+  // voice-note test above.
   process.env.R2_BUCKET = "test-bucket";
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
@@ -1905,27 +1928,35 @@ test("processInbound pins the conversation adReferral image to the FIRST ad — 
     ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADA")).first(),
   );
   const convAfterA = await t.run((ctx) => ctx.db.get(msgA!.conversationId));
-  // The conversation denorm is filled from the first ad's own stored image.
-  expect(convAfterA!.adReferral?.storedImageUrl).toBeTruthy();
-  expect(convAfterA!.adReferral?.storedImageUrl).toBe(msgA!.referral?.storedImageUrl);
-  const pinnedUrl = convAfterA!.adReferral!.storedImageUrl;
+  expect(msgA!.referral?.storedImageKey).toBeTruthy();
+  expect(msgA!.referral?.storedImageKey).toMatch(/^[^/]+\/ad\//);
+  // The conversation-level image echo is retired as of Task 7 — there is
+  // no `storedImageKey` field on `conversations.adReferral` to migrate it
+  // to, and nothing ever rendered it (see the test above). This is a
+  // deliberate retirement, not an oversight.
+  expect(convAfterA!.adReferral?.storedImageUrl).toBeUndefined();
+  // The conversation's TEXT fields — unrelated to this task, still set by
+  // `ingestInbound`, not `setAdReferralImage` — DO pin to the first ad.
+  expect(convAfterA!.adReferral?.headline).toBe("Ad A");
 
   // ---- Ad B: a returning contact clicks a DIFFERENT ad; the SAME
-  // conversation is reused (by_contact lookup), and its `adReferral` is
-  // set-once so it still holds Ad A's headline/imageUrl. ----
+  // conversation is reused (by_contact lookup), and its `adReferral` text
+  // fields are set-once so they still hold Ad A's headline/imageUrl. ----
   await sendAd("wamid.ADB", "Ad B", "https://scontent.example/adB.jpg");
   const msgB = await t.run((ctx) =>
     ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("messageId", "wamid.ADB")).first(),
   );
   const convAfterB = await t.run((ctx) => ctx.db.get(msgB!.conversationId));
 
-  // Msg B recorded its OWN stored image (message-scoped — always correct)...
-  expect(msgB!.referral?.storedImageUrl).toBeTruthy();
-  expect(msgB!.referral?.storedImageUrl).not.toBe(pinnedUrl);
-  // ...but the conversation denorm stays PINNED to Ad A's image (set-once),
-  // so it never desyncs from the Ad A headline/imageUrl it holds. Without
-  // the guard, this flips to Ad B's URL and the assertion fails.
-  expect(convAfterB!.adReferral?.storedImageUrl).toBe(pinnedUrl);
+  // Msg B recorded its OWN stored image key (message-scoped — always
+  // correct, and always DIFFERENT from Msg A's: each upload mints a fresh
+  // random key regardless of content — `buildMediaKey`).
+  expect(msgB!.referral?.storedImageKey).toBeTruthy();
+  expect(msgB!.referral?.storedImageKey).not.toBe(msgA!.referral?.storedImageKey);
+  // The conversation denorm's text fields stay PINNED to Ad A...
+  expect(convAfterB!.adReferral?.headline).toBe("Ad A");
+  // ...and its image field is still never populated by anyone.
+  expect(convAfterB!.adReferral?.storedImageUrl).toBeUndefined();
 
   delete process.env.R2_BUCKET;
   delete process.env.R2_ENDPOINT;

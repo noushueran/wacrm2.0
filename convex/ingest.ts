@@ -12,8 +12,6 @@ import {
   type AppendMessageArgs,
 } from "./messages";
 import { extractRefCode, extractCtwaClid } from "./lib/attribution";
-import { r2ConfigFromEnv } from "./lib/r2/config";
-import { publicUrl } from "./lib/r2/url";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -590,23 +588,28 @@ export const processInbound = internalAction({
     // a bare Meta `mediaId`: `flattenInboundMessage` can't resolve it (a
     // signed Graph fetch is real network I/O), and neither can the
     // `ingestInbound` mutation, so the row was just persisted with no
-    // `mediaUrl` — which the inbox renders as an "unavailable" bubble.
-    // Now — AFTER the dedup check, so a Meta retry can't re-download and
-    // orphan a second copy in storage — pull the bytes into Convex
-    // storage and attach the durable URL to the already-persisted
-    // message. Best-effort: `resolveInboundMedia` returns null on any
-    // failure, leaving the "unavailable" bubble rather than derailing the
-    // fan-out below (a media that won't fetch must not cost the customer
-    // their flow/automation/AI reply).
+    // `mediaKey`/`mediaUrl` — which the inbox renders as an "unavailable"
+    // bubble. Now — AFTER the dedup check, so a Meta retry can't
+    // re-download and orphan a second copy in R2 — pull the bytes into
+    // Cloudflare R2 and attach the resulting object KEY (not a resolved
+    // URL — R2-migration Task 7, completing the cutover `resolveInboundMedia`
+    // started in Task 6) to the already-persisted message. Readers
+    // resolve `mediaKey ?? mediaUrl` lazily wherever the media is
+    // actually rendered/fetched (`convex/lib/r2/url.ts`'s
+    // `resolveMediaUrl`, Task 5), so nothing downstream needs an
+    // eagerly-resolved URL. Best-effort: `resolveInboundMedia` returns
+    // null on any failure, leaving the "unavailable" bubble rather than
+    // derailing the fan-out below (a media that won't fetch must not
+    // cost the customer their flow/automation/AI reply).
     if (message.mediaId && !message.mediaUrl) {
       const resolved = await ctx.runAction(
         internal.whatsappConfig.resolveInboundMedia,
         { accountId, mediaId: message.mediaId },
       );
       if (resolved) {
-        await ctx.runMutation(internal.messages.setMediaUrl, {
+        await ctx.runMutation(internal.messages.setMediaKey, {
           messageId: res.messageId,
-          mediaUrl: resolved.url,
+          mediaKey: resolved.key,
         });
       }
     }
@@ -618,15 +621,19 @@ export const processInbound = internalAction({
     // so the ad card never breaks when Meta's CDN url expires. After the
     // dedup guard above, so a Meta retry can't orphan a second copy.
     //
-    // R2-migration write path: Task 6 changed `storeFromUrl` from a
-    // Convex-storage primitive returning `{ storageId }` to an R2
-    // primitive returning `{ key }` (this block and
-    // `whatsappConfig.resolveInboundMedia` are its only two callers, and
-    // had to move together). The resulting key is resolved to R2's
-    // public URL immediately and stored in the existing
-    // `storedImageUrl` field, unchanged — persisting a
-    // `referral.storedImageKey` instead is `convex/messages.ts`'s
-    // `setAdReferralImage` cutover, a separate, later piece of work.
+    // R2-migration write path (Task 7, completing what Task 6 staged):
+    // `storeFromUrl` returns `{ key }`, and that key is now handed
+    // straight to `messages.setAdReferralImage` as `storedImageKey` — NO
+    // `publicUrl`/`r2ConfigFromEnv` resolution happens here anymore (it
+    // used to, as a behavior-preserving shim while the mutation still
+    // expected a URL). The inbox reads
+    // `referral.storedImageKey ?? referral.storedImageUrl` lazily
+    // (`src/lib/convex/adapters.ts`'s `toUiMessage`, Task 5), so eagerly
+    // resolving a URL at ingest time bought nothing but an extra way for
+    // this best-effort step to fail. `setAdReferralImage` no longer
+    // denormalizes onto `conversation.adReferral` either — see that
+    // mutation's own doc comment for why (no `storedImageKey` field on
+    // that denorm, and nothing ever rendered its image).
     const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
     if (adImageSrc) {
       await runBestEffort("ingest.storeAdReferralImage", async () => {
@@ -635,11 +642,9 @@ export const processInbound = internalAction({
           accountId,
           kind: "ad",
         });
-        const url = publicUrl(r2ConfigFromEnv(), key);
         await ctx.runMutation(internal.messages.setAdReferralImage, {
           messageId: res.messageId,
-          conversationId: res.conversationId,
-          storedImageUrl: url,
+          storedImageKey: key,
         });
       });
     }

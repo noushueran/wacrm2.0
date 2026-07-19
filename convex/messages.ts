@@ -104,7 +104,9 @@ export interface AppendMessageArgs {
   interactiveReplyId?: string;
   aiGenerated?: boolean;
   /** Click-to-WhatsApp ad referral (inbound-only), stored verbatim on the
-   *  message row. `storedImageUrl` is filled later (Task 3). */
+   *  message row. `storedImageKey` is filled later (Task 3 originally
+   *  wrote `storedImageUrl`; R2-migration Task 7 cut it over to a key —
+   *  see `setAdReferralImage`). */
   referral?: AdReferral;
   /** Internal id of the message this one replies to (WhatsApp quoted reply).
    *  Outbound: the agent's reply target, threaded from `send`/`metaSend`.
@@ -428,64 +430,80 @@ export const updateDeliveryStatusByWamid = internalMutation({
 });
 
 /**
- * Attach a resolved media URL to an already-persisted message — the
+ * Attach a resolved R2 object key to an already-persisted message — the
  * second half of inbound-media resolution. `ingest.processInbound`
- * inserts an inbound media message with no URL (the webhook carries only
- * Meta's raw `mediaId`, and turning that into fetchable bytes needs a
- * signed Graph call an action must make), then calls
- * `whatsappConfig.resolveInboundMedia` to download + store those bytes,
- * then calls this to attach the resulting Convex-storage URL so the inbox
- * can play/show the media. Split out (rather than folded into
- * `ingestInbound`) precisely because that resolution is async network
- * I/O that can't run inside the insert mutation. No-op if the message
- * was deleted between insert and patch.
+ * inserts an inbound media message with no `mediaKey`/`mediaUrl` (the
+ * webhook carries only Meta's raw `mediaId`, and turning that into
+ * fetchable bytes needs a signed Graph call an action must make), then
+ * calls `whatsappConfig.resolveInboundMedia` to download the bytes and
+ * PUT them to Cloudflare R2, then calls this to attach the resulting key
+ * so the inbox can play/show the media. Split out (rather than folded
+ * into `ingestInbound`) precisely because that resolution is async
+ * network I/O that can't run inside the insert mutation. No-op if the
+ * message was deleted between insert and patch.
+ *
+ * R2-migration cutover (Task 7): this used to be `setMediaUrl`, taking an
+ * already-resolved URL and patching `mediaUrl`. Renamed rather than kept
+ * alongside a new key-writing sibling — `ingest.ts`'s inbound-media block
+ * is its ONLY caller (confirmed by grep), and that caller now has a key,
+ * not a URL, to give it (`resolveInboundMedia` itself stopped resolving
+ * one). Readers still fall back to the legacy `mediaUrl` column for
+ * pre-cutover rows (`convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5) —
+ * this mutation itself never writes that column anymore.
  */
-export const setMediaUrl = internalMutation({
-  args: { messageId: v.id("messages"), mediaUrl: v.string() },
+export const setMediaKey = internalMutation({
+  args: { messageId: v.id("messages"), mediaKey: v.string() },
   handler: async (ctx, args) => {
     const message = await ctx.db.get(args.messageId);
     if (!message) return;
-    await ctx.db.patch(args.messageId, { mediaUrl: args.mediaUrl });
+    await ctx.db.patch(args.messageId, { mediaKey: args.mediaKey });
   },
 });
 
-/** Attach the durable Convex-storage URL of a downloaded ad image to both
- *  the message's `referral` and the conversation's `adReferral` denorm.
- *  Best-effort partner to `ingest.processInbound`'s ad-image step.
+/** Attach the R2 object key of a downloaded ad image to the message's OWN
+ *  `referral` — every ad message records its own stored image key,
+ *  unconditionally. Best-effort partner to `ingest.processInbound`'s
+ *  ad-image step.
  *
- *  The MESSAGE patch is unconditional — every ad message records its OWN
- *  stored image. The CONVERSATION patch is set-once (only when
- *  `storedImageUrl` is still empty), mirroring `ingestInbound`'s "first ad
- *  wins" for the whole `adReferral` denorm: a returning contact who clicks
- *  a DIFFERENT ad reuses the same conversation, whose `adReferral` still
- *  pins Ad A's headline/imageUrl — so its `storedImageUrl` must stay Ad A's
- *  too, never flipping to the later ad's image (which would desync the card:
- *  Ad A's headline over Ad B's picture). */
+ *  R2-migration cutover (Task 7): takes `storedImageKey`, not a
+ *  pre-resolved `storedImageUrl` — `ingest.ts`'s caller now hands this
+ *  mutation the raw key `files.storeFromUrl` returned, with no
+ *  `publicUrl`/`r2ConfigFromEnv` resolution in between (that used to
+ *  happen in `ingest.ts` itself). The inbox resolves
+ *  `referral.storedImageKey ?? referral.storedImageUrl` lazily, at
+ *  render time (`src/lib/convex/adapters.ts`'s `toUiMessage`, Task 5).
+ *
+ *  DROPPED as part of this same cutover: the second, CONVERSATION-level
+ *  patch this mutation used to also make (hence the `conversationId` arg
+ *  it used to take), pinning the same resolved URL onto
+ *  `conversation.adReferral.storedImageUrl` (set-once, "first ad wins" —
+ *  mirroring `ingestInbound`'s own pin for the rest of that denorm's
+ *  fields). `conversations.adReferral` has no `storedImageKey`
+ *  counterpart in the schema (`schema.ts`'s R2-migration additions only
+ *  ever covered `messages.mediaKey` / `messages.referral.storedImageKey`
+ *  — see the design spec's "Schema changes" table) — so keeping that
+ *  second write alive would mean resolving a URL from the key again
+ *  right here, reintroducing inside a mutation the exact eager
+ *  R2-config-at-write-time dependency this whole task exists to retire,
+ *  in service of a field that (confirmed by grep across `src/`) no
+ *  reader ever consumes: `conversation.adReferral` is read for its own
+ *  presence (the inbox's ad-lead badge) and `startedAt` (the 72h timer)
+ *  only — `AdReferralCard`, the one place an ad image actually renders,
+ *  takes the MESSAGE-level `referral` this function still patches, never
+ *  the conversation-level denorm. If a future feature needs to render
+ *  the conversation-level echo, it should add a proper `storedImageKey`
+ *  field to `conversations.adReferral` in `schema.ts` rather than revive
+ *  eager URL resolution here. */
 export const setAdReferralImage = internalMutation({
   args: {
     messageId: v.id("messages"),
-    conversationId: v.id("conversations"),
-    storedImageUrl: v.string(),
+    storedImageKey: v.string(),
   },
   handler: async (ctx, args) => {
     const message = await ctx.db.get(args.messageId);
     if (message?.referral) {
       await ctx.db.patch(args.messageId, {
-        referral: { ...message.referral, storedImageUrl: args.storedImageUrl },
-      });
-    }
-    const conversation = await ctx.db.get(args.conversationId);
-    // "First-image-only" pin: this guard only checks whether storedImageUrl
-    // is still empty, not whether THIS message is the first ad's — so if
-    // the first ad's image download failed (leaving it empty), a LATER,
-    // DIFFERENT ad's image can fill it in here while the denorm's
-    // headline/imageUrl stay pinned to the first ad. Currently harmless
-    // (nothing renders `conversation.adReferral`'s image), but a future
-    // task that does render it should tighten this to "is this the first
-    // ad's message" instead.
-    if (conversation?.adReferral && !conversation.adReferral.storedImageUrl) {
-      await ctx.db.patch(args.conversationId, {
-        adReferral: { ...conversation.adReferral, storedImageUrl: args.storedImageUrl },
+        referral: { ...message.referral, storedImageKey: args.storedImageKey },
       });
     }
   },
