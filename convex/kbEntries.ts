@@ -121,7 +121,7 @@ export const save = accountMutation({
     const fields = {
       scope: args.scope,
       serviceKey: args.scope === "company" ? undefined : args.serviceKey,
-      packageKey: args.packageKey,
+      packageKey: args.scope === "package" ? args.packageKey : undefined,
       type: args.type,
       title: args.title,
       body: args.body,

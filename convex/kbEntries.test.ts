@@ -74,6 +74,28 @@ test("save creates a draft; edit bumps version and demotes to draft", async () =
   expect(row.version).toBe(2);
 });
 
+test("save clears packageKey when a package-scoped entry is re-scoped to service", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, { name: "A", email: "a@x.co", role: "admin" });
+  await asUser.mutation(api.kbServices.upsert, { key: "georgia", name: "Georgia", aliases: [] });
+  const entryId = await asUser.mutation(api.kbEntries.save, {
+    scope: "package", serviceKey: "georgia", packageKey: "luxury-tour", type: "overview",
+    title: "Luxury tour", body: "Luxury package overview.", audience: "customer",
+  });
+  // Simulates a client that re-scopes to "service" without clearing the
+  // stale packageKey field still sitting in its form state — the exact
+  // failure scenario this fix guards against. If `save` stored
+  // packageKey unconditionally, this stale value would persist even
+  // though scope is no longer "package".
+  await asUser.mutation(api.kbEntries.save, {
+    entryId, scope: "service", serviceKey: "georgia", packageKey: "luxury-tour", type: "overview",
+    title: "Luxury tour", body: "Luxury package overview.", audience: "customer",
+  });
+  const [row] = await asUser.query(api.kbEntries.list, { serviceKey: "georgia" });
+  expect(row.packageKey).toBeUndefined();
+  expect(row.serviceKey).toBe("georgia");
+});
+
 test("service-scope save without an existing service is NOT_FOUND", async () => {
   const t = convexTest(schema, modules);
   const { asUser } = await seedAccountMember(t, { name: "A", email: "a@x.co", role: "admin" });
