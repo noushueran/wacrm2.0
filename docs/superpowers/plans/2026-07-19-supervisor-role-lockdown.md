@@ -340,6 +340,7 @@ export const list = accountQuery({
  * the roster is now admin-only. `keyHash` remains explicitly unselected
  * below regardless.
  */
+```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
