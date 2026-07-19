@@ -363,6 +363,16 @@ test("publicUrl percent-encodes each key segment but keeps the slashes", () => {
   );
 });
 
+test("publicUrl normalizes a trailing slash on the public host", () => {
+  const cfgWithTrailingSlash: R2Config = {
+    ...CFG,
+    publicHost: "https://objs.holidayys.co/",
+  };
+  expect(publicUrl(cfgWithTrailingSlash, "acc1/inbound/abc.ogg")).toBe(
+    "https://objs.holidayys.co/acc1/inbound/abc.ogg",
+  );
+});
+
 test("resolveMediaUrl prefers the key over a legacy url", () => {
   expect(
     resolveMediaUrl(CFG, {
@@ -383,6 +393,10 @@ test("resolveMediaUrl falls back to the legacy url when there is no key", () => 
 test("resolveMediaUrl returns null when neither is present", () => {
   expect(resolveMediaUrl(CFG, {})).toBeNull();
   expect(resolveMediaUrl(CFG, { key: null, url: null })).toBeNull();
+});
+
+test("resolveMediaUrl treats an empty-string legacy url as absent", () => {
+  expect(resolveMediaUrl(CFG, { url: "" })).toBeNull();
 });
 ```
 
@@ -414,7 +428,11 @@ function encodeKey(key: string): string {
 }
 
 export function publicUrl(cfg: R2Config, key: string): string {
-  return `${cfg.publicHost}/${encodeKey(key)}`;
+  // Normalized here as well as in `r2ConfigFromEnv` — this module's parity
+  // with `src/lib/storage/media-url.ts` must hold for ANY `R2Config`, not
+  // only one built through that helper. R2 does not collapse `//`.
+  const host = cfg.publicHost.replace(/\/+$/, "");
+  return `${host}/${encodeKey(key)}`;
 }
 
 export function resolveMediaUrl(
@@ -422,14 +440,16 @@ export function resolveMediaUrl(
   row: { key?: string | null; url?: string | null },
 ): string | null {
   if (row.key) return publicUrl(cfg, row.key);
-  return row.url ?? null;
+  // `||`, not `??`, is deliberate: an empty-string legacy url is treated as
+  // absent, matching the truthy check on `row.key` above.
+  return row.url || null;
 }
 ```
 
 - [ ] **Step 4: Run it to verify it passes**
 
 Run: `npx vitest run convex/lib/r2/url.test.ts`
-Expected: PASS — 5 tests.
+Expected: PASS — 7 tests.
 
 - [ ] **Step 5: Write the failing client test**
 
@@ -456,6 +476,15 @@ test("mediaUrlFromKey builds a public URL", async () => {
   );
 });
 
+test("mediaUrlFromKey normalizes a trailing slash on the public host", async () => {
+  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.holidayys.co/";
+  vi.resetModules();
+  const { mediaUrlFromKey } = await import("./media-url");
+  expect(mediaUrlFromKey("acc1/outbound/abc.png")).toBe(
+    "https://objs.holidayys.co/acc1/outbound/abc.png",
+  );
+});
+
 test("resolveMediaUrl prefers key, falls back to legacy url, else null", async () => {
   const { resolveMediaUrl } = await import("./media-url");
   expect(resolveMediaUrl({ key: "acc1/outbound/a.png", url: "legacy" })).toBe(
@@ -463,6 +492,11 @@ test("resolveMediaUrl prefers key, falls back to legacy url, else null", async (
   );
   expect(resolveMediaUrl({ url: "legacy" })).toBe("legacy");
   expect(resolveMediaUrl({})).toBeNull();
+});
+
+test("resolveMediaUrl treats an empty-string legacy url as absent", async () => {
+  const { resolveMediaUrl } = await import("./media-url");
+  expect(resolveMediaUrl({ url: "" })).toBeNull();
 });
 ```
 
@@ -507,7 +541,9 @@ export function resolveMediaUrl(row: {
   url?: string | null;
 }): string | null {
   if (row.key) return mediaUrlFromKey(row.key);
-  return row.url ?? null;
+  // `||`, not `??`, is deliberate: an empty-string legacy url is treated as
+  // absent, matching the truthy check on `row.key` above.
+  return row.url || null;
 }
 ```
 

@@ -18,7 +18,11 @@ function encodeKey(key: string): string {
 }
 
 export function publicUrl(cfg: R2Config, key: string): string {
-  return `${cfg.publicHost}/${encodeKey(key)}`;
+  // Normalized here as well as in `r2ConfigFromEnv` — this module's parity
+  // with `src/lib/storage/media-url.ts` must hold for ANY `R2Config`, not
+  // only one built through that helper. R2 does not collapse `//`.
+  const host = cfg.publicHost.replace(/\/+$/, "");
+  return `${host}/${encodeKey(key)}`;
 }
 
 export function resolveMediaUrl(
@@ -26,5 +30,7 @@ export function resolveMediaUrl(
   row: { key?: string | null; url?: string | null },
 ): string | null {
   if (row.key) return publicUrl(cfg, row.key);
-  return row.url ?? null;
+  // `||`, not `??`, is deliberate: an empty-string legacy url is treated as
+  // absent, matching the truthy check on `row.key` above.
+  return row.url || null;
 }

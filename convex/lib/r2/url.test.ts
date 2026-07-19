@@ -22,6 +22,16 @@ test("publicUrl percent-encodes each key segment but keeps the slashes", () => {
   );
 });
 
+test("publicUrl normalizes a trailing slash on the public host", () => {
+  const cfgWithTrailingSlash: R2Config = {
+    ...CFG,
+    publicHost: "https://objs.holidayys.co/",
+  };
+  expect(publicUrl(cfgWithTrailingSlash, "acc1/inbound/abc.ogg")).toBe(
+    "https://objs.holidayys.co/acc1/inbound/abc.ogg",
+  );
+});
+
 test("resolveMediaUrl prefers the key over a legacy url", () => {
   expect(
     resolveMediaUrl(CFG, {
@@ -42,4 +52,8 @@ test("resolveMediaUrl falls back to the legacy url when there is no key", () => 
 test("resolveMediaUrl returns null when neither is present", () => {
   expect(resolveMediaUrl(CFG, {})).toBeNull();
   expect(resolveMediaUrl(CFG, { key: null, url: null })).toBeNull();
+});
+
+test("resolveMediaUrl treats an empty-string legacy url as absent", () => {
+  expect(resolveMediaUrl(CFG, { url: "" })).toBeNull();
 });

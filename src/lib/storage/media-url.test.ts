@@ -18,6 +18,15 @@ test("mediaUrlFromKey builds a public URL", async () => {
   );
 });
 
+test("mediaUrlFromKey normalizes a trailing slash on the public host", async () => {
+  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.holidayys.co/";
+  vi.resetModules();
+  const { mediaUrlFromKey } = await import("./media-url");
+  expect(mediaUrlFromKey("acc1/outbound/abc.png")).toBe(
+    "https://objs.holidayys.co/acc1/outbound/abc.png",
+  );
+});
+
 test("resolveMediaUrl prefers key, falls back to legacy url, else null", async () => {
   const { resolveMediaUrl } = await import("./media-url");
   expect(resolveMediaUrl({ key: "acc1/outbound/a.png", url: "legacy" })).toBe(
@@ -25,4 +34,9 @@ test("resolveMediaUrl prefers key, falls back to legacy url, else null", async (
   );
   expect(resolveMediaUrl({ url: "legacy" })).toBe("legacy");
   expect(resolveMediaUrl({})).toBeNull();
+});
+
+test("resolveMediaUrl treats an empty-string legacy url as absent", async () => {
+  const { resolveMediaUrl } = await import("./media-url");
+  expect(resolveMediaUrl({ url: "" })).toBeNull();
 });

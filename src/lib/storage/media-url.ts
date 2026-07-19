@@ -31,5 +31,7 @@ export function resolveMediaUrl(row: {
   url?: string | null;
 }): string | null {
   if (row.key) return mediaUrlFromKey(row.key);
-  return row.url ?? null;
+  // `||`, not `??`, is deliberate: an empty-string legacy url is treated as
+  // absent, matching the truthy check on `row.key` above.
+  return row.url || null;
 }
