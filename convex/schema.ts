@@ -47,6 +47,18 @@ export default defineSchema({
     fullName: v.optional(v.string()),
     email: v.optional(v.string()),
     avatarUrl: v.optional(v.string()),
+    // R2 object key for this member's avatar — the durable replacement
+    // for `avatarUrl`, which stored a resolved absolute URL. Readers
+    // resolve `avatarKey ?? avatarUrl` (see `convex/lib/r2/url.ts`), so
+    // pre-cutover rows keep working untouched. Lives here, not on the
+    // real Convex `users` table (spread verbatim from `@convex-dev/auth`'s
+    // `authTables`, which has no avatar field of its own — only `image`,
+    // written by the auth provider, never by this app): `avatarUrl` is
+    // patched onto `memberships` by `accounts.ts`'s `updateProfile`
+    // mutation, and `avatarKey` is the same denormalized-per-account
+    // snapshot. `avatarUrl` is retained until the Plan 2 backfill is
+    // verified, then dropped separately.
+    avatarKey: v.optional(v.string()),
     // v4 (qualification): the member's own WhatsApp number — the channel
     // the AI uses to reach agents (lead offers, questions) when they're
     // away from the desktop. Set by admin+ in Settings → Team members.
@@ -300,6 +312,13 @@ export default defineSchema({
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
+    // R2 object key for this message's media — the durable replacement
+    // for `mediaUrl`, which stored a resolved absolute URL and therefore
+    // had to be rewritten row-by-row to move storage providers. Readers
+    // resolve `mediaKey ?? mediaUrl` (see `convex/lib/r2/url.ts`), so
+    // pre-cutover rows keep working untouched. `mediaUrl` is retained
+    // until the Plan 2 backfill is verified, then dropped separately.
+    mediaKey: v.optional(v.string()),
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()), // Meta wamid
     status: v.union(
@@ -342,6 +361,7 @@ export default defineSchema({
         videoUrl: v.optional(v.string()),
         thumbnailUrl: v.optional(v.string()),
         storedImageUrl: v.optional(v.string()),
+        storedImageKey: v.optional(v.string()),
       }),
     ),
   })
@@ -571,6 +591,7 @@ export default defineSchema({
     ),
     headerHandle: v.optional(v.string()),
     headerMediaUrl: v.optional(v.string()),
+    headerMediaKey: v.optional(v.string()),
     submissionError: v.optional(v.string()),
     lastSubmittedAt: v.optional(v.number()),
     // Same on-UPDATE-trigger parity as `conversations.updatedAt` (P1 review).
