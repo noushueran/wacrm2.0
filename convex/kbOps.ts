@@ -85,12 +85,19 @@ async function loadOps(
 
 /**
  * The ops block for one `(serviceKey, kind)` pair, or `null` if none
- * has been saved yet. Any account member may read this — the editor UI
- * and the AI engines both need it, not sensitive configuration.
+ * has been saved yet.
+ *
+ * Admin+ only, mirroring `aiKnowledge.list`'s gate: ops blocks carry
+ * purchase criteria and `reportValue` — internal commercial thresholds
+ * in the same class of content that module governs, not the reference
+ * data `kbServices.list` exposes. Gating now is free because no UI
+ * binds to this yet; tightening it after one does would be a breaking
+ * change.
  */
 export const get = accountQuery({
   args: { serviceKey: v.string(), kind: kindValidator },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin");
     return await loadOps(ctx.db, ctx.accountId, args.serviceKey, args.kind);
   },
 });
@@ -98,11 +105,14 @@ export const get = accountQuery({
 /**
  * Every ops row for the caller's own account, regardless of service or
  * kind — feeds the Phase-2 service health matrix (which services are
- * missing which block kinds, and which are still draft).
+ * missing which block kinds, and which are still draft). Admin+ for the
+ * same reason as `get` above: same rows, same purchase criteria and
+ * `reportValue`, just unfiltered.
  */
 export const listForAccount = accountQuery({
   args: {},
   handler: async (ctx) => {
+    ctx.requireRole("admin");
     return await ctx.db
       .query("kbOpsBlocks")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))

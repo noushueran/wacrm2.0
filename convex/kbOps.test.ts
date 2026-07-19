@@ -91,3 +91,15 @@ test("save against a missing service is NOT_FOUND; agent role rejected", async (
     serviceKey: "x", kind: "sales", steps: [],
   })).rejects.toThrow();
 });
+
+test("get and listForAccount are admin-gated — a viewer cannot read purchase criteria", async () => {
+  const t = convexTest(schema, modules);
+  // Ops blocks carry purchase criteria and `reportValue` — internal
+  // commercial thresholds, same class of content `aiKnowledge.list`
+  // gates on admin.
+  const { asUser: asViewer } = await seedAccountMember(t, { name: "V", email: "v@x.co", role: "viewer" });
+  await expect(asViewer.query(api.kbOps.get, {
+    serviceKey: "georgia", kind: "purchase",
+  })).rejects.toThrow(/FORBIDDEN/);
+  await expect(asViewer.query(api.kbOps.listForAccount, {})).rejects.toThrow(/FORBIDDEN/);
+});

@@ -100,6 +100,54 @@ test("preview reports without writing; apply creates drafts idempotently", async
   expect(second).toMatchObject({ servicesCreated: 0, entriesCreated: 0, opsCreated: 0 });
 });
 
+// Two documents in the order that used to defeat convergence: the
+// SALES CHECKLIST naming a service appears in an EARLIER document than
+// the QUALIFICATION CHECKLIST that actually declares that service.
+const SALES_FIRST_DOC = [
+  "Mandatory sales process.",
+  "",
+  "SALES CHECKLIST — Dubai Holiday Packages",
+  "- Call the lead",
+].join("\n");
+
+const QUAL_SECOND_DOC = [
+  "Dubai city breaks for families.",
+  "",
+  "QUALIFICATION CHECKLIST — Dubai Holiday Packages",
+  "- Travel dates (40 marks)",
+].join("\n");
+
+test("a sales checklist ahead of its service's qualification doc converges on the first apply", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "A", email: "a@x.co", role: "admin" });
+  await t.run(async (ctx) => {
+    await ctx.db.insert("aiKnowledgeDocuments", {
+      accountId, title: "KB 12 — Sales process", content: SALES_FIRST_DOC,
+    });
+    await ctx.db.insert("aiKnowledgeDocuments", {
+      accountId, title: "KB 2 — Dubai packages", content: QUAL_SECOND_DOC,
+    });
+  });
+
+  await asUser.mutation(api.kbImport.apply, {});
+  // The module's stated contract: re-running creates nothing. Classifying
+  // from `existing.serviceKeys` broke it here — run 1 saw no `dubai`
+  // service yet and filed the sales section as a company entry, then run 2
+  // saw the service run 1 had created, reclassified the SAME section as a
+  // `dubai-holiday-packages::sales` ops block, and inserted it again.
+  const second = await asUser.mutation(api.kbImport.apply, {});
+  expect(second).toMatchObject({ servicesCreated: 0, entriesCreated: 0, opsCreated: 0 });
+
+  // …and the section exists in exactly ONE representation: a service-
+  // scoped ops block, with no orphaned company-scope twin left behind.
+  const sales = await asUser.query(api.kbOps.get, {
+    serviceKey: "dubai-holiday-packages", kind: "sales",
+  });
+  expect(sales?.steps).toEqual([{ key: "call-the-lead", label: "Call the lead" }]);
+  const entries = await asUser.query(api.kbEntries.list, {});
+  expect(entries.filter((e) => e.title.startsWith("SALES CHECKLIST"))).toEqual([]);
+});
+
 test("company-wide sales checklist becomes an internal process entry", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, { name: "A", email: "a@x.co", role: "admin" });

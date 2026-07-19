@@ -782,7 +782,7 @@ describe("retrieve merge", () => {
     expect(unfiltered.some((c) => c.includes("PURCHASE CRITERIA"))).toBe(true);
   });
 
-  test("the compiled semantic arm's k*2 over-fetch is still capped at k", async () => {
+  test("the compiled semantic arm's k*2 over-fetch is still capped by the compiled budget", async () => {
     const t = convexTest(schema, modules);
     const { asUser, accountId } = await seedAccountMember(t, {
       name: "A",
@@ -818,8 +818,13 @@ describe("retrieve merge", () => {
       queryText: "Georgia visa",
       k: 3,
     });
-    expect(results).toHaveLength(3);
-    expect(new Set(results).size).toBe(3);
+    // Capped at the migration-window budget — `ceil(3 / 2)` = 2 — rather
+    // than at `k`. This account has no legacy chunks, so the 1 slot the
+    // budget reserves for that pool simply goes unfilled; that is the
+    // deliberate cost of the guard while both pools coexist. See
+    // `retrieve`'s `compiledBudget` comment, and Phase 3 removes it.
+    expect(results).toHaveLength(2);
+    expect(new Set(results).size).toBe(2);
   });
 
   test("audience 'customer' also filters the compiled SEMANTIC arm, which cannot filter it in the vector query", async () => {
@@ -972,5 +977,70 @@ describe("retrieve merge", () => {
         queryText: "refunds",
       }),
     ).toEqual([content, content]);
+  });
+
+  test("the compiled pool cannot claim every slot — legacy keeps its share at the default k", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+    await configureEmbeddingsKey(asUser);
+
+    // Eight compiled chunks — more than the default `k`, so an
+    // unbudgeted compiled pass fills every slot on its own. This is the
+    // shape of a real FIRST publish: one entry compiles to several
+    // chunks, and `ctx.vectorSearch` applies no relevance floor, so they
+    // come back as best-of-pool however off-topic they are.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 8; i++) {
+        const content = `[Georgia — Note ${i}]\nGeorgia compiled detail ${i}`;
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "entry",
+          serviceKey: "georgia",
+          entryType: "note",
+          audience: "customer",
+          chunkIndex: i,
+          content,
+          embedding: syntheticEmbedding(content),
+        });
+      }
+    });
+
+    // …against a section that still lives ONLY in a pasted legacy
+    // document. The three engines' checklists are exactly this until
+    // Phase 3 migrates them, which is what makes starving this pool a
+    // silent, total cutover rather than a ranking nit.
+    const legacyContent = "QUALIFICATION CHECKLIST — Georgia\n- Travel dates";
+    const documentId = await seedDocument(t, {
+      accountId,
+      title: "KB 3 — Georgia",
+      content: legacyContent,
+    });
+    await seedChunk(t, {
+      accountId,
+      documentId,
+      chunkIndex: 0,
+      content: legacyContent,
+      embedding: syntheticEmbedding(legacyContent),
+    });
+
+    // Default `k` and no `audience` — what every live caller passes.
+    const results = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia",
+    });
+
+    // The point of the guard: publishing to v2 must not silently cut the
+    // legacy pool out from under the engines.
+    expect(results).toContain(legacyContent);
+    // Compiled is capped at `ceil(5 / 2)` = 3, leaving 2 slots for
+    // legacy — of which only the one seeded chunk exists to fill them.
+    expect(
+      results.filter((c) => c.startsWith("[Georgia — Note")),
+    ).toHaveLength(3);
+    expect(results).toHaveLength(4);
   });
 });

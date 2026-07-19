@@ -54,6 +54,36 @@ export function buildImportPlan(
   const opsBlocks: PlannedOps[] = [];
   const plannedOps = new Set<string>();
 
+  const parsedDocs = docs.map((d) => parseLegacyDocument(d.title, d.content));
+
+  // Corpus-level pre-scan, BEFORE any planning: every service that a
+  // heading names anywhere in the legacy corpus. A QUALIFICATION or
+  // PURCHASE heading is what DECLARES a service (both unconditionally
+  // create one below); a bare SALES CHECKLIST heading does not — which
+  // is precisely the ambiguity this set resolves.
+  //
+  // Classification must read this, never `existing.serviceKeys` nor the
+  // services planned so far. Both of those are order- and run-dependent:
+  // a `SALES CHECKLIST — Dubai` in an EARLIER document than Dubai's own
+  // QUALIFICATION heading classified as a company entry on run 1
+  // (nothing had declared Dubai yet), then flipped to a `dubai::sales`
+  // ops block on run 2 once run 1's own service row existed — inserting
+  // the same source section a second time in a second representation and
+  // breaking `apply`'s "re-running creates nothing" contract. Reading the
+  // whole corpus first makes the plan a pure function of the documents,
+  // so every run and every document order agree.
+  //
+  // `existing` is still consulted below, but ONLY for the `exists` flags
+  // — that is what makes a re-run skip rather than reclassify.
+  const corpusServiceKeys = new Set<string>();
+  for (const parsed of parsedDocs) {
+    for (const section of parsed.sections) {
+      if (section.kind !== "sales") {
+        corpusServiceKeys.add(slugify(section.serviceName));
+      }
+    }
+  }
+
   const ensureService = (name: string): string => {
     const key = slugify(name);
     if (!services.has(key)) {
@@ -62,17 +92,13 @@ export function buildImportPlan(
     return key;
   };
 
-  for (const doc of docs) {
-    const parsed = parseLegacyDocument(doc.title, doc.content);
+  for (const parsed of parsedDocs) {
     const qualSections = parsed.sections.filter((s) => s.kind === "qualification");
 
     for (const section of parsed.sections) {
       const sectionKey = slugify(section.serviceName);
       const isServiceScoped =
-        section.kind !== "sales" ||
-        existing.serviceKeys.has(sectionKey) ||
-        services.has(sectionKey) ||
-        qualSections.some((q) => slugify(q.serviceName) === sectionKey);
+        section.kind !== "sales" || corpusServiceKeys.has(sectionKey);
       if (!isServiceScoped) {
         // e.g. "SALES CHECKLIST — All Services": no such service — keep
         // the raw section as an internal company process entry.
@@ -122,10 +148,10 @@ export function buildImportPlan(
       entries.push({
         serviceKey,
         type: "overview",
-        audience: /sales process/i.test(doc.title) ? "internal" : "customer",
-        title: doc.title,
+        audience: /sales process/i.test(parsed.title) ? "internal" : "customer",
+        title: parsed.title,
         body: parsed.prose,
-        exists: existing.entryTitles.has(`${serviceKey ?? ""}::${doc.title}`),
+        exists: existing.entryTitles.has(`${serviceKey ?? ""}::${parsed.title}`),
       });
     }
   }

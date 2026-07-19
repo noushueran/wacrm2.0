@@ -37,12 +37,20 @@ import { hasLintErrors, lintEntryInput } from "./lib/kb/lint";
 /**
  * Every entry for the caller's own account, optionally narrowed to one
  * service via `by_account_service` (else the full `by_account` scan).
- * Any account member may read this; entries are reference data the AI
- * and the editor UI both need, not sensitive configuration.
+ *
+ * Admin+ only, mirroring `aiKnowledge.list`'s gate: this returns full
+ * entry `body` text — including `audience: "internal"` entries never
+ * meant for a customer — which is the same class of content that
+ * module governs, so it gets the same write-level trust rather than a
+ * plain-member read. (`kbServices.list` stays member-readable: names,
+ * keys and aliases are genuine reference data with nothing sensitive
+ * in them.) Gating now is free because no UI binds to this yet;
+ * tightening it after one does would be a breaking change.
  */
 export const list = accountQuery({
   args: { serviceKey: v.optional(v.string()) },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin");
     if (args.serviceKey !== undefined) {
       return await ctx.db.query("kbEntries")
         .withIndex("by_account_service", (q) =>

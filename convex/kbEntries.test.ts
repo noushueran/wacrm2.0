@@ -126,3 +126,12 @@ test("lint error (blank body) rejects; remove deletes row + chunks", async () =>
       .withIndex("by_entry", (q) => q.eq("entryId", entryId)).collect());
   expect(leftover).toEqual([]);
 });
+
+test("list is admin-gated — a viewer cannot read entry bodies", async () => {
+  const t = convexTest(schema, modules);
+  // Mirrors `aiKnowledge.list`'s gate: `list` returns full entry `body`
+  // text, `audience: "internal"` rows included, so it takes the same
+  // write-level trust rather than a plain-member read.
+  const { asUser: asViewer } = await seedAccountMember(t, { name: "V", email: "v@x.co", role: "viewer" });
+  await expect(asViewer.query(api.kbEntries.list, {})).rejects.toThrow(/FORBIDDEN/);
+});

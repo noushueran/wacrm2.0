@@ -532,11 +532,29 @@ export const retrieve = internalAction({
      * That write-time cap is why the final array needs no trailing
      * slice.
      */
-    const tryPush = (id: string, content: string) => {
-      if (pickedContents.length >= k || seenIds.has(id)) return;
+    const tryPush = (id: string, content: string, cap: number = k) => {
+      if (pickedContents.length >= cap || seenIds.has(id)) return;
       seenIds.add(id);
       pickedContents.push(content);
     };
+
+    // --- Migration-window guard -------------------------------------
+    // The compiled pool may claim at most HALF of `k`; the rest stays
+    // reserved for legacy. Phase 3 retires the legacy pool and this
+    // budget goes with it — until then it is load-bearing, not
+    // arbitrary tuning.
+    //
+    // Why: every live caller uses the default `k = 5`, so without a
+    // budget the natural first step of adopting v2 — publishing ONE
+    // entry to see what it does — compiles ~5 chunks that fill every
+    // slot and starve the legacy pool for all three engines at once,
+    // including the QUALIFICATION CHECKLIST / SALES CHECKLIST /
+    // PURCHASE CRITERIA sections that still live only in the pasted
+    // legacy documents. `ctx.vectorSearch` has no relevance floor, so a
+    // tiny, wholly irrelevant compiled pool still returns its best-of-
+    // pool and displaces a large relevant one — silently, with no error
+    // anywhere. A first publish must not be a total cutover.
+    const compiledBudget = Math.ceil(k / 2);
 
     // --- Query embedding — computed ONCE, shared by both pools -------
     // Hoisted above both passes deliberately: `retrieve` runs on every
@@ -596,7 +614,7 @@ export const retrieve = internalAction({
             const row = rowById.get(r._id);
             if (!row) continue;
             if (audience && row.audience !== "customer") continue;
-            tryPush(row._id, row.content);
+            tryPush(row._id, row.content, compiledBudget);
           }
         }
       }
@@ -605,25 +623,31 @@ export const retrieve = internalAction({
     }
 
     // --- Compiled pool, lexical arm ---------------------------------
-    if (pickedContents.length < k) {
+    // Same `compiledBudget` as the semantic arm above: the two together
+    // are one pool's allowance, not one each.
+    if (pickedContents.length < compiledBudget) {
       try {
         const rows = await ctx.runQuery(internal.aiKnowledge.searchKbChunks, {
           accountId: args.accountId,
           queryText: query,
-          limit: k,
+          limit: compiledBudget,
           audience,
         });
-        for (const row of rows) tryPush(row._id, row.content);
+        for (const row of rows) tryPush(row._id, row.content, compiledBudget);
       } catch {
         // Best-effort: fall through to the legacy pool.
       }
     }
 
     // --- Legacy pool (`aiKnowledgeChunks`), semantic arm ------------
-    // Skipped once the compiled pool has already filled `k` — every
-    // `push` from here would be a no-op against the cap anyway, so
-    // this saves a vector search plus a hydration query on the hot
-    // inbound-message path without changing the result.
+    // Both legacy arms fill up to the FULL `k`, unlike the compiled
+    // arms above — the budget caps one pool, it does not split the
+    // result set in half. The guard is still worth keeping: `k` can be
+    // 1 (`compiledBudget` then equals `k`), and a caller may raise `k`
+    // enough for the compiled arms to satisfy it outright, in which
+    // case every `push` from here would no-op against the cap anyway
+    // and this saves a vector search plus a hydration query on the hot
+    // inbound-message path.
     if (pickedContents.length < k) {
       try {
         if (queryEmbedding) {
