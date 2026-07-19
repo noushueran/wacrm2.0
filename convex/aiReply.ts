@@ -114,13 +114,15 @@ const DISPATCH_RETRY_DELAY_MS = 30_000;
 // HTTP API). Deliberately its OWN budget, separate from
 // `DISPATCH_MAX_ATTEMPTS`/`DISPATCH_RETRY_DELAY_MS` above: by the time
 // `deliverReply` even runs, the typing indicator has already been ticking
-// for up to `deliveryDelayMs`'s ~20s ceiling, so this retry cannot afford
-// anywhere near the 30s dispatch-level delay without risking the same
-// dead-air failure Fix F1 exists to close, just one step further down the
-// pipeline — a few seconds is enough for a rate-limit blip to clear while
-// staying well inside that shrunken budget in the common (fast-
-// generation) case; one retry (never a loop) keeps the worst case bounded
-// even when it doesn't.
+// for up to `deliveryDelayMs`'s ~15-20s range, so this retry cannot afford
+// the full 30s dispatch-level delay without risking the exact dead-air
+// failure Fix F1 exists to close. In the worst case (target up to 20s +
+// failed attempt + 3s wait + successful attempt), the total reaches ~25-27s
+// — at or slightly past Meta's ~25s typing-indicator ceiling. When the
+// margin is exceeded, the failure is graceful: the indicator disappears a
+// few seconds early and the retried message still arrives — unlike the
+// silent-forever failure the retry exists to prevent. One retry (never a
+// loop) keeps this worst case bounded.
 const DELIVER_MAX_ATTEMPTS = 2;
 const DELIVER_RETRY_DELAY_MS = 3_000;
 
@@ -1053,10 +1055,25 @@ export const dispatchInbound = internalAction({
  * A failure AFTER that point (a downstream mutation, the admin relay) is
  * logged, never retried: the customer already has the message, and
  * retrying would mean re-running this action's own body again, double-
- * texting them. Bounded like `dispatchInbound`'s own retry (one retry,
- * never a loop, its own `sendAttempt` counter so the two schemes can't be
- * confused) but with its own much shorter delay — see
- * `DELIVER_RETRY_DELAY_MS`'s own comment for why it must stay short.
+ * texting them.
+ *
+ * The retry's safety from double-texting relies on the distinction between
+ * a clean send rejection (definitive HTTP error from Meta, a pre-send check
+ * throwing) vs. an ambiguous network failure where the response is lost in
+ * transit after Meta has already received and processed the message. For
+ * clean rejections, `sent` stays false and a retry is safe. But the Cloud
+ * API's text-send endpoint takes no client-supplied idempotency key, and
+ * our `fetch()` call has no `AbortController`, timeout, or timeout detection
+ * — so a network-level response loss can go undetected, leaving `sent`
+ * false while the customer already received the message. A retry in this
+ * case sends a duplicate. This tradeoff was accepted deliberately: a rare
+ * duplicate is preferred over the silent-forever failure (a typing indicator
+ * that disappears without a reply) the retry exists to prevent.
+ *
+ * Bounded like `dispatchInbound`'s own retry (one retry, never a loop, its
+ * own `sendAttempt` counter so the two schemes can't be confused) but with
+ * its own much shorter delay — see `DELIVER_RETRY_DELAY_MS`'s own comment
+ * for why it must stay short.
  */
 export const deliverReply = internalAction({
   args: {
