@@ -660,7 +660,18 @@ export function toUiQuickReply(doc: Doc<"quickReplies">): QuickReply {
  *  verbatim by reading the raw `useQuery` result directly, not through
  *  this adapter. A fixed placeholder satisfies the (required,
  *  non-optional) UI field without ever surfacing whatever the row
- *  actually holds. */
+ *  actually holds.
+ *
+ *  As of Task 5 (supervisor-lockdown series), `whatsappConfig.get` is
+ *  admin-only (`ctx.requireRole("admin")`) — this adapter is therefore
+ *  only ever fed a doc an admin+ caller was allowed to fetch in the
+ *  first place, and `whatsapp-config.tsx` (the only caller, the
+ *  admin-only WhatsApp settings tab) is the only place this runs.
+ *  Non-admin surfaces that used to read `get` (the inbox header,
+ *  `settings-overview.tsx`'s WhatsApp tile) now read the member-safe
+ *  `whatsappConfig.connectionState` query instead — a `{ status,
+ *  isConfigured }` projection with no adapter of its own, since it's
+ *  already UI-shaped. */
 export function toUiWhatsappConfig(doc: Doc<"whatsappConfig">): WhatsAppConfig {
   return {
     id: doc._id,

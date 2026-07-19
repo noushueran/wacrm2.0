@@ -65,10 +65,18 @@ const WABA_EQUALS_PHONE_NUMBER_MESSAGE =
  * index `upsert` below relies on for its find-or-insert check — there
  * is no `configId` argument anywhere in this module, so a caller can
  * never address another account's row even by guessing an id.
+ *
+ * Admin+ only (Task 5, supervisor-lockdown series): this returns the
+ * FULL raw row — phone number id, WABA id, verify token, encrypted
+ * access token — which is far more than any non-admin surface needs.
+ * Both non-admin consumers (`src/app/(dashboard)/inbox/page.tsx` and
+ * `settings-overview.tsx`) have been migrated onto `connectionState`
+ * below, which exposes only the two booleans they actually read.
  */
 export const get = accountQuery({
   args: {},
   handler: async (ctx) => {
+    ctx.requireRole("admin");
     return await ctx.db
       .query("whatsappConfig")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
@@ -718,23 +726,25 @@ interface ConnectionStatusResult {
 
 /**
  * Health-check backing the settings form's connection banner/"Test API
- * Connection" button and `settings-overview.tsx`'s WhatsApp tile.
- * Convex port of `GET /api/whatsapp/config` — mirrors its exact
- * branches: no config saved yet (`no_config`), a token that can't be
- * decrypted with the current `ENCRYPTION_KEY` (`token_corrupted`,
- * `needs_reset: true` — surfaces the Reset Configuration flow), Meta
- * rejecting the credentials (`meta_api_error`), or a genuine
- * `{ connected: true, phone_info }`. Always resolves (never throws)
- * for every one of those diagnostic outcomes, exactly like the source
- * route's own "200 in all non-auth cases" contract.
+ * Connection" button. Convex port of `GET /api/whatsapp/config` —
+ * mirrors its exact branches: no config saved yet (`no_config`), a
+ * token that can't be decrypted with the current `ENCRYPTION_KEY`
+ * (`token_corrupted`, `needs_reset: true` — surfaces the Reset
+ * Configuration flow), Meta rejecting the credentials
+ * (`meta_api_error`), or a genuine `{ connected: true, phone_info }`.
+ * Always resolves (never throws) for every one of those diagnostic
+ * outcomes, exactly like the source route's own "200 in all non-auth
+ * cases" contract.
  *
- * Unlike `connectAndSave`/`verifyRegistration` (both admin+), the
- * source route has NO role check at all — any authenticated member of
- * the account can view this diagnostic. Gated here at `viewer` (the
- * lowest rank) rather than left ungated, so `settings-overview.tsx`'s
- * health tile still renders correctly for non-admin teammates
- * (matching the route's own "any authenticated member" floor) while
- * still requiring genuine account membership.
+ * The source route has NO role check at all — any authenticated member
+ * of the account can view this diagnostic. Task 5 of the
+ * supervisor-lockdown series deliberately tightens that here to
+ * admin+, matching `whatsappConfig.get` (this performs a LIVE Meta API
+ * call against the account's own credentials on every invocation, and
+ * the settings tile that used to drive it for non-admins now reads the
+ * member-safe `connectionState` query instead — see that query's own
+ * doc comment). `verifyRegistration` below made the same admin+
+ * tightening earlier.
  *
  * DRY-RUN aware (`CONVEX_META_DRY_RUN`): the one outbound Meta call
  * (`verifyPhoneNumber`) is skipped and replaced with a synthetic
@@ -751,8 +761,11 @@ export const connectionStatus = action({
       { userId },
     );
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "viewer")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "viewer" });
+    // Admin+ only: this performs a live Meta health check against the
+    // account's own credentials, and the settings tile it feeds is
+    // itself admin-gated. Supervisors and below use `connectionState`.
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
     }
     const { accountId } = context;
 

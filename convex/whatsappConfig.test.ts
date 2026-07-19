@@ -383,7 +383,7 @@ test("cross-account denial: B's get never sees A's config", async () => {
   expect(alicesConfig!.phoneNumberId).toBe("1000000000");
 });
 
-test("get is visible to a non-admin member of the same account", async () => {
+test("get is visible to any admin-or-above teammate of the same account", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -395,15 +395,21 @@ test("get is visible to a non-admin member of the same account", async () => {
     accessToken: "alice-token",
     status: "connected",
   });
-  const viewerId = await seedTeammate(t, {
+  // `get` is now admin+ only (Task 5, supervisor-lockdown series) — this
+  // used to seed a "viewer" teammate to prove non-admin visibility, which
+  // is no longer true (see "get throws FORBIDDEN for a caller below the
+  // admin role" below); a second SAME-role teammate on the same account
+  // (not just the row's original creator) is the still-valid case this
+  // test now covers.
+  const teammateId = await seedTeammate(t, {
     accountId,
-    name: "Vic",
-    email: "vic@example.com",
-    role: "viewer",
+    name: "Tia",
+    email: "tia@example.com",
+    role: "admin",
   });
-  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
+  const asTeammate = t.withIdentity({ subject: `${teammateId}|session-Tia` });
 
-  const config = await asViewer.query(api.whatsappConfig.get, {});
+  const config = await asTeammate.query(api.whatsappConfig.get, {});
   expect(config!.phoneNumberId).toBe("1000000000");
 });
 
@@ -1805,8 +1811,7 @@ test("connectionStatus in DRY-RUN reports a synthetic success without ever calli
   delete process.env.CONVEX_META_DRY_RUN;
 });
 
-test("connectionStatus is reachable by a non-admin viewer (role floor)", async () => {
-  process.env.CONVEX_META_DRY_RUN = "1";
+test("connectionStatus throws FORBIDDEN for a caller below the admin role", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -1818,6 +1823,12 @@ test("connectionStatus is reachable by a non-admin viewer (role floor)", async (
     accessToken: "alice-token",
     status: "connected",
   });
+  // `connectionStatus` used to float at "viewer" (any authenticated
+  // member) — this test asserted exactly that "role floor" until Task 5
+  // of the supervisor-lockdown series raised it to admin+, matching
+  // `get`'s own new gate. Non-admin members now read `connectionState`
+  // instead (member-safe, no live Meta call — see that query's doc
+  // comment).
   const viewerId = await seedTeammate(t, {
     accountId,
     name: "Vic",
@@ -1826,10 +1837,9 @@ test("connectionStatus is reachable by a non-admin viewer (role floor)", async (
   });
   const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
 
-  const result = await asViewer.action(api.whatsappConfig.connectionStatus, {});
-  expect(result).toMatchObject({ connected: true });
-
-  delete process.env.CONVEX_META_DRY_RUN;
+  await expect(
+    asViewer.action(api.whatsappConfig.connectionStatus, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
 
 test("connectionStatus throws UNAUTHENTICATED when there is no identity", async () => {
@@ -2000,4 +2010,53 @@ test("connectionState reports an unconfigured account without throwing", async (
 
   const state = await asOwner.query(api.whatsappConfig.connectionState, {});
   expect(state).toEqual({ status: null, isConfigured: false });
+});
+
+// ============================================================
+// Task 5 (supervisor-lockdown series): `get` gated to admin+, now that
+// both non-admin consumers (the inbox and settings-overview.tsx) read
+// `connectionState` instead.
+// ============================================================
+
+test("get throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  // `seedTeammate` returns a raw userId (see its own definition above) —
+  // an authenticated client is derived the same way every other test in
+  // this file does, via `t.withIdentity`.
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  await expect(
+    asSupervisor.query(api.whatsappConfig.get, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("connectionState remains readable by a supervisor after get is gated", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  await expect(
+    asSupervisor.query(api.whatsappConfig.connectionState, {}),
+  ).resolves.toEqual({ status: null, isConfigured: false });
 });

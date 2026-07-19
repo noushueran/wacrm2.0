@@ -10,6 +10,7 @@ import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { THEMES } from '@/lib/themes';
 import { CURRENCIES } from '@/lib/currency';
+import { canAccessSettingsSection } from '@/lib/auth/roles';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Card } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
@@ -61,13 +62,21 @@ export function SettingsOverview({
   // cheap Convex reads below (it calls out to Meta), so it's kept on
   // its own loading flag rather than blocking the rest of the tiles.
   // Whether a config row exists at all (`whatsappConfigResult` below)
-  // already comes from the reactive `api.whatsappConfig.get` query.
+  // now comes from the member-safe `api.whatsappConfig.connectionState`
+  // query — `get` itself is admin-only as of Task 5 (supervisor-lockdown
+  // series).
   const checkConnectionStatus = useAction(api.whatsappConfig.connectionStatus);
+  // Admin-only action: calling it as a supervisor now throws FORBIDDEN.
+  // `accountRole` is null while the profile is still loading, so this
+  // stays false (not invoked) until we actually know the role — mirrors
+  // `SettingsPage`'s own `blocked` gate in `app/(dashboard)/settings/page.tsx`.
+  const canSeeWhatsapp =
+    !!accountRole && canAccessSettingsSection(accountRole, 'whatsapp');
   const [whatsappConnected, setWhatsappConnected] = useState(false);
   const [whatsappHealthLoading, setWhatsappHealthLoading] = useState(true);
 
   useEffect(() => {
-    if (!user || !accountId) return;
+    if (!user || !accountId || !canSeeWhatsapp) return;
     let cancelled = false;
 
     (async () => {
@@ -81,7 +90,7 @@ export function SettingsOverview({
     return () => {
       cancelled = true;
     };
-  }, [user?.id, accountId, checkConnectionStatus]);
+  }, [user?.id, accountId, canSeeWhatsapp, checkConnectionStatus]);
 
   // Templates / tags / custom fields / WhatsApp-config-row — reactive
   // Convex reads (Phase 8/9 stragglers rewire), replacing the one-shot
@@ -102,7 +111,7 @@ export function SettingsOverview({
   const customFieldsResult = useQuery(api.customFields.list);
   const customFieldsLoading = customFieldsResult === undefined;
 
-  const whatsappConfigResult = useQuery(api.whatsappConfig.get);
+  const whatsappConfigResult = useQuery(api.whatsappConfig.connectionState);
   const whatsappConfigLoading = whatsappConfigResult === undefined;
 
   const displayName = profile?.full_name || profile?.email || t('yourAccount');
@@ -129,7 +138,7 @@ export function SettingsOverview({
     {
       section: 'whatsapp',
       loading: whatsappConfigLoading || whatsappHealthLoading,
-      subtitle: !whatsappConfigResult?.phoneNumberId ? (
+      subtitle: !whatsappConfigResult?.isConfigured ? (
         t('notSetup')
       ) : whatsappConnected ? (
         <>
@@ -213,7 +222,11 @@ export function SettingsOverview({
 
       {/* Status tiles */}
       <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {tiles.map(({ section, loading, subtitle }) => {
+        {tiles
+          .filter(
+            (tile) => !!accountRole && canAccessSettingsSection(accountRole, tile.section),
+          )
+          .map(({ section, loading, subtitle }) => {
           const meta = SECTION_META[section];
           const Icon = meta.icon;
           return (
