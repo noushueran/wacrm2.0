@@ -276,21 +276,21 @@ test("updateProfile writes avatarKey (R2 migration: write path) alongside avatar
     email: "sarah@example.com",
   });
   const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
-  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
 
   const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
     name: "Sarah Connor",
-    avatarUrl: "https://objs.holidayys.co/acc1/avatar/sarah.png",
-    avatarKey: "acc1/avatar/sarah.png",
+    avatarUrl: `https://objs.holidayys.co/${accountId}/avatar/sarah.png`,
+    avatarKey: `${accountId}/avatar/sarah.png`,
   });
 
   const membership = await t.run((ctx) => ctx.db.get(membershipId));
-  expect(membership!.avatarKey).toBe("acc1/avatar/sarah.png");
+  expect(membership!.avatarKey).toBe(`${accountId}/avatar/sarah.png`);
 
   // `me` reads the same row it always has — proves this is a real
   // dual-write, not a key that only the direct DB read above can see.
   const profile = await asSarah.query(api.accounts.me, {});
-  expect(profile!.avatarKey).toBe("acc1/avatar/sarah.png");
+  expect(profile!.avatarKey).toBe(`${accountId}/avatar/sarah.png`);
 });
 
 test("updateProfile preserves the existing avatarKey when omitted on a later call", async () => {
@@ -300,10 +300,10 @@ test("updateProfile preserves the existing avatarKey when omitted on a later cal
     email: "sarah@example.com",
   });
   const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
-  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+  const accountId = await asSarah.mutation(api.accounts.bootstrapAccount, {});
   const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
     name: "Sarah Connor",
-    avatarKey: "acc1/avatar/sarah.png",
+    avatarKey: `${accountId}/avatar/sarah.png`,
   });
 
   // Second call omits `avatarKey` entirely (a name-only save) — it must
@@ -312,7 +312,78 @@ test("updateProfile preserves the existing avatarKey when omitted on a later cal
 
   const membership = await t.run((ctx) => ctx.db.get(membershipId));
   expect(membership!.fullName).toBe("Sarah C.");
-  expect(membership!.avatarKey).toBe("acc1/avatar/sarah.png");
+  expect(membership!.avatarKey).toBe(`${accountId}/avatar/sarah.png`);
+});
+
+// ============================================================
+// updateProfile — avatarKey cross-tenant ownership (final-review
+// fix): `convex/files.ts`'s module header claimed a client "supplies
+// only a kind/contentType/optional filename, NEVER a key" — false for
+// `updateProfile`'s `avatarKey` argument, which IS a client-supplied
+// key with no ownership check at all before this fix. Without one, a
+// caller could patch their OWN membership row with a key belonging to
+// a DIFFERENT account, and every other member's `me` query would then
+// resolve and display that foreign object as this user's avatar
+// (`convex/lib/r2/url.ts`'s `resolveMediaUrl` has no owner awareness —
+// it just builds a URL from whatever key it's given). Same non-leaky
+// `NOT_FOUND` contract `convex/files.ts`'s `remove` and `convex/
+// send.ts`'s media guard already use for this exact class of check.
+// ============================================================
+
+test("updateProfile rejects an avatarKey belonging to a different account (cross-tenant)", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  const otherUserId = await insertUser(t, {
+    name: "Mallory",
+    email: "mallory@example.com",
+  });
+  const asMallory = t.withIdentity({ subject: `${otherUserId}|session-mallory` });
+  const otherAccountId = await asMallory.mutation(api.accounts.bootstrapAccount, {});
+
+  await expect(
+    asSarah.mutation(api.accounts.updateProfile, {
+      name: "Sarah Connor",
+      avatarKey: `${otherAccountId}/avatar/stolen.png`,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
+
+  // Nothing was persisted — not even the name — proving the check runs
+  // BEFORE the patch rather than racing it.
+  const membership = await t.run((ctx) =>
+    ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first(),
+  );
+  expect(membership!.avatarKey).toBeUndefined();
+  expect(membership!.fullName).toBe("Sarah");
+});
+
+test("updateProfile rejects a malformed avatarKey with the SAME NOT_FOUND shape as a foreign key", async () => {
+  const t = convexTest(schema, modules);
+  const userId = await insertUser(t, {
+    name: "Sarah",
+    email: "sarah@example.com",
+  });
+  const asSarah = t.withIdentity({ subject: `${userId}|session-sarah` });
+  await asSarah.mutation(api.accounts.bootstrapAccount, {});
+
+  await expect(
+    asSarah.mutation(api.accounts.updateProfile, {
+      name: "Sarah Connor",
+      // `parseMediaKey` requires exactly 3 `/`-separated segments with
+      // a known `kind` — this has neither, so it must be rejected
+      // without ever attempting to resolve it, identically to a
+      // foreign key.
+      avatarKey: "not-a-real-key",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
 });
 
 test("updateProfile preserves the existing avatarUrl when omitted on a later call", async () => {

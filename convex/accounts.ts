@@ -2,6 +2,7 @@ import { mutation, query, internalQuery } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
 import { hasMinRole } from "./lib/roles";
+import { parseMediaKey } from "./lib/r2/keys";
 
 /**
  * First-login bootstrap: gives the current user exactly one account (as
@@ -171,6 +172,30 @@ export const updateProfile = mutation({
       .withIndex("by_user", (q) => q.eq("userId", userId))
       .first();
     if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
+
+    // A client-supplied `avatarKey` must be verified to belong to the
+    // CALLER's own account before it's ever written to their membership
+    // row: `updateProfile` has no accountId-vs-key check of its own the
+    // way `accountMutation`-built mutations get from `ctx.accountId`
+    // being derived server-side, and `avatarKey` is a plain client
+    // argument. Without this, a caller could patch their own profile
+    // with a key belonging to a DIFFERENT account, and every teammate's
+    // `me` query would then resolve and display that foreign object as
+    // this user's avatar — `resolveMediaUrl` (`convex/lib/r2/url.ts`)
+    // has no owner awareness of its own; it just builds a URL from
+    // whatever key it's given. A foreign key and a malformed one
+    // (`parseMediaKey` returns `null`) are BOTH `NOT_FOUND` — never
+    // `FORBIDDEN`, and never distinguishable from each other — the same
+    // non-leaky tenant-isolation contract `convex/files.ts`'s `remove`
+    // mutation and `convex/send.ts`'s media guard already use for this
+    // exact class of check. Runs BEFORE the patch below so a rejected
+    // call changes nothing at all, not even the name.
+    if (
+      args.avatarKey !== undefined &&
+      parseMediaKey(args.avatarKey)?.accountId !== membership.accountId
+    ) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+    }
 
     const patch: { fullName: string; avatarUrl?: string; avatarKey?: string } = {
       fullName: args.name,

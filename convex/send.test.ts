@@ -510,13 +510,16 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
   expect(messages).toHaveLength(1);
   expect(messages[0]!.contentType).toBe("image");
   expect(messages[0]!.mediaUrl).toBe("https://example.com/photo.jpg");
+  // A legacy `mediaUrl`-only send persists just the URL — no key exists
+  // to carry (final-review fix: "outbound media never persists a key").
+  expect(messages[0]!.mediaKey).toBeUndefined();
   expect(messages[0]!.contentText).toBe("Here's the photo");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
 
   delete process.env.CONVEX_META_DRY_RUN;
 });
 
-test("send resolves a message's mediaKey to a public R2 URL for Meta", async () => {
+test("send resolves a message's mediaKey to a public R2 URL for Meta, and persists BOTH the key and the resolved URL", async () => {
   // Arrange an outbound media send whose staged object is identified by
   // key, not by legacy URL, and assert the `link` handed to Meta is the
   // objs.holidayys.co URL rather than a Convex storage URL.
@@ -532,6 +535,13 @@ test("send resolves a message's mediaKey to a public R2 URL for Meta", async () 
   // `whatsappMessageId` is synthetic) — so the persisted row's
   // `mediaUrl` IS the exact `link` value that would have been handed to
   // Meta's Graph API on a real send.
+  //
+  // Also the regression test for the final-review fix "outbound media
+  // never persists a key": `send` threads its already-ownership-checked
+  // `args.mediaKey` through to `metaSend.sendMedia` (not just the
+  // resolved `link`), so the persisted row carries BOTH — proving the
+  // composer-attachment / voice-note write path durably stores a key
+  // instead of discarding it after resolution.
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.R2_BUCKET = "wa-holidayys";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
@@ -577,6 +587,7 @@ test("send resolves a message's mediaKey to a public R2 URL for Meta", async () 
   expect(capturedLink).toBe(
     `https://objs.holidayys.co/${accountId}/outbound/photo.png`,
   );
+  expect(messages[0]!.mediaKey).toBe(`${accountId}/outbound/photo.png`);
 
   delete process.env.CONVEX_META_DRY_RUN;
   delete process.env.R2_BUCKET;

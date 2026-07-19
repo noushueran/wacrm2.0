@@ -34,6 +34,11 @@ test("putObject PUTs to endpoint/bucket/key with a signed Authorization header",
   );
   expect(calls[0].headers.get("content-type")).toBe("audio/ogg");
   expect(calls[0].headers.get("authorization")).toMatch(/^AWS4-HMAC-SHA256 /);
+  // Final-review fix: pinned explicitly so the body is never read a
+  // second time just to hash it — see `putObject`'s own comment.
+  expect(calls[0].headers.get("x-amz-content-sha256")).toBe(
+    "UNSIGNED-PAYLOAD",
+  );
 });
 
 test("putObject throws with the status when R2 rejects the write", async () => {

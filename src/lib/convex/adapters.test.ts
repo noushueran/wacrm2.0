@@ -153,4 +153,19 @@ describe("toUiTemplate — header_media_url", () => {
       "https://convex-api.holidayys.co/api/storage/old",
     );
   });
+
+  it("passes headerMediaKey through as-is, so template-send-builder's own resolution can reach it (final-review fix)", () => {
+    // `template-send-builder.ts`'s `buildHeaderComponent` resolves
+    // `template.header_media_key` directly as a defensive second layer
+    // at send time — before this fix, `toUiTemplate` never set that
+    // field on the object it returns, so it was always `undefined` on
+    // every `MessageTemplate` built through this adapter and that
+    // resolution could never fire.
+    const doc = baseTemplateDoc({
+      headerMediaKey: "acc1/templates/sample.jpg",
+    });
+    expect(toUiTemplate(doc).header_media_key).toBe(
+      "acc1/templates/sample.jpg",
+    );
+  });
 });

@@ -154,16 +154,28 @@ export const send = action({
         // handler's own opening comment), so nothing upstream stops an
         // agent of account A from passing a key that belongs to account
         // B. Without this check, `resolveMediaUrlLazy` below would
-        // happily resolve B's key to a real, fetchable R2 URL, Meta
-        // would fetch and deliver B's object, and B's URL would then be
-        // persisted into A's own message row (`convex/metaSend.ts`'s
-        // `sendMedia` persists `mediaUrl: args.link` unconditionally —
-        // see that module's own doc comment). A foreign key and a
-        // malformed one (`parseMediaKey` returns `null`) are BOTH
-        // `NOT_FOUND` — never `FORBIDDEN`, and never distinguishable
-        // from each other — the same non-leaky tenant-isolation contract
-        // `convex/files.ts`'s `remove` mutation already uses for the
-        // identical class of check.
+        // happily resolve B's key to a real, fetchable R2 URL on A's
+        // behalf, and THAT resolved URL is what would then be persisted
+        // via the `mediaKey` path (`convex/metaSend.ts`'s `sendMedia`
+        // persists `mediaUrl: args.link` unconditionally — see that
+        // module's own doc comment). A foreign key and a malformed one
+        // (`parseMediaKey` returns `null`) are BOTH `NOT_FOUND` — never
+        // `FORBIDDEN`, and never distinguishable from each other — the
+        // same non-leaky tenant-isolation contract `convex/files.ts`'s
+        // `remove` mutation already uses for the identical class of
+        // check.
+        //
+        // What this check does NOT cover: the sibling `mediaUrl`
+        // argument (this file's own args validator, above) is a
+        // free-form string with no validation at all — a caller can
+        // already pass any URL, including one pointing at someone
+        // else's object, and it lands in the message row exactly like a
+        // legitimate one would. That was true before this migration and
+        // remains true after it; this check only closes the NEW surface
+        // the `mediaKey` argument itself introduces (a key this account
+        // doesn't own getting silently resolved to a fetchable URL on
+        // its behalf) — it is not a general guarantee that every
+        // persisted `mediaUrl` points at this account's own media.
         if (
           args.mediaKey &&
           parseMediaKey(args.mediaKey)?.accountId !== accountId
@@ -192,6 +204,15 @@ export const send = action({
           to,
           kind: args.messageType,
           link,
+          // Threaded through (not just resolved into `link` above) so
+          // the message row durably keeps the key, not only the
+          // resolved URL — final-review fix: previously `mediaKey` was
+          // resolved to `link` here and then discarded, so the composer
+          // attachment / voice-note write path never persisted a key.
+          // Safe to pass unconditionally: when present, it already
+          // passed the ownership check above; when absent, this is a
+          // no-op legacy `mediaUrl` send.
+          mediaKey: args.mediaKey,
           caption: args.contentText,
           filename: args.filename,
           contextMessageId,

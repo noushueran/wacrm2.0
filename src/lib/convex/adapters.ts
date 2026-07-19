@@ -590,6 +590,15 @@ export function toUiTemplate(doc: Doc<"messageTemplates">): MessageTemplate {
     header_media_url:
       resolveMediaUrl({ key: doc.headerMediaKey, url: doc.headerMediaUrl }) ??
       undefined,
+    // Passed through as-is (not resolved) so `template-send-builder.ts`'s
+    // own defensive second resolution — which reads `template
+    // .header_media_key` directly — has a real value to prefer instead
+    // of always falling through to the already-resolved `header_media_url`
+    // above. Final-review fix: before this, `toUiTemplate` never set this
+    // field at all, so `header_media_key` was permanently `undefined` on
+    // every `MessageTemplate` built through this adapter, making that
+    // send-time resolution dead code in practice.
+    header_media_key: doc.headerMediaKey,
     body_text: doc.bodyText,
     footer_text: doc.footerText,
     buttons: doc.buttons as TemplateButton[] | undefined,

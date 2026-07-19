@@ -15,11 +15,19 @@ import { buildMediaKey, parseMediaKey, MEDIA_KINDS } from "./lib/r2/keys";
 // checked on every read/delete.
 //
 // An R2 object key carries its own owner in its first path segment
-// (`{accountId}/{kind}/{uuid}.{ext}` — see `convex/lib/r2/keys.ts`) and
-// is minted SERVER-SIDE from `ctx.accountId`: a client supplies only a
-// `kind`/`contentType`/optional `filename`, NEVER a key. Ownership is
-// therefore guaranteed by construction and checkable by a plain string
-// comparison — no lookup table required. `fileOwners` and
+// (`{accountId}/{kind}/{uuid}.{ext}` — see `convex/lib/r2/keys.ts`).
+// Every key is MINTED server-side (`buildMediaKey`, called with
+// `ctx.accountId` or an internal caller's own already-resolved
+// `accountId` — never a client-chosen value): `startUpload` below
+// hands a client only a `kind`/`contentType`/optional `filename` on
+// the way IN. A client CAN still hand a key back on a LATER call,
+// though — `send.sendMedia`'s `mediaKey`, this file's own `remove`'s
+// `key`, `accounts.updateProfile`'s `avatarKey`, and a flow node's
+// `config.media_key` all accept one — and ownership there is
+// guaranteed not by construction but by a check EVERY one of those
+// entry points performs: `parseMediaKey(key)?.accountId` must match
+// the caller's own account, or the request is rejected as `NOT_FOUND`
+// before the key is ever resolved or acted on. `fileOwners` and
 // `registerUpload` are retired accordingly (the `fileOwners` table
 // definition itself is left in `convex/schema.ts` for now, unused —
 // dropping it is a data-retention decision for the Plan 2 cleanup, not

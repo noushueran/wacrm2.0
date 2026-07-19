@@ -44,7 +44,27 @@ export async function putObject(
   const res = await awsClient(cfg).fetch(objectUrl(cfg, args.key), {
     method: "PUT",
     body: args.body,
-    headers: { "Content-Type": args.contentType },
+    headers: {
+      "Content-Type": args.contentType,
+      // Without an `X-Amz-Content-Sha256` header, aws4fetch has to read
+      // the whole body to SHA-256-hash it for the signature — for the
+      // Blob this call is handed (an inbound WhatsApp document, already
+      // sitting in a Convex action's memory once), that would mean
+      // holding the bytes a second time just to compute a hash R2 never
+      // actually checks. "UNSIGNED-PAYLOAD" is SigV4's documented
+      // sentinel for "trust the transport" — R2 accepts it over HTTPS,
+      // where the TLS channel already authenticates the body — so
+      // setting it explicitly skips that extra read. Pinned here rather
+      // than left to aws4fetch's own default for a non-query-signed S3
+      // request (which happens to already be "UNSIGNED-PAYLOAD" today),
+      // so this call's memory behavior doesn't depend on that internal
+      // default surviving a library upgrade or a future refactor of
+      // this function. `presignPut` deliberately does NOT get this
+      // header — its signature must stay verifiable against whatever
+      // bytes the BROWSER ends up sending, which this module never
+      // sees or hashes itself.
+      "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+    },
   });
   if (!res.ok) {
     throw new Error(

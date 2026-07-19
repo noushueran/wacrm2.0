@@ -311,6 +311,14 @@ export const sendMedia = internalAction({
       v.literal("audio"),
     ),
     link: v.string(),
+    // R2 object key the caller already resolved `link` from (Task 5's
+    // dual-read: `send.ts`/`flowsEngine.ts` both call
+    // `resolveMediaUrlLazy` before reaching this action). Persisted
+    // alongside `mediaUrl` below so the durable key isn't discarded the
+    // moment it's resolved to a URL — see this file's own
+    // `appendInternal` call for why both are kept. Absent for a legacy
+    // caller that only ever had a `mediaUrl` (no key to carry).
+    mediaKey: v.optional(v.string()),
     caption: v.optional(v.string()),
     filename: v.optional(v.string()),
     contextMessageId: v.optional(v.string()),
@@ -356,6 +364,15 @@ export const sendMedia = internalAction({
       contentType: args.kind,
       contentText: args.caption,
       mediaUrl: args.link,
+      // Persisted alongside `mediaUrl`, not instead of it: `mediaUrl` is
+      // what Meta was actually POSTed (`args.link`), and the read
+      // resolver (`convex/lib/r2/url.ts`'s `resolveMediaUrl`) prefers
+      // the key anyway when both are present. Final-review fix:
+      // previously this was `mediaUrl: args.link` unconditionally with
+      // no `mediaKey` field at all, so a caller's already-minted key
+      // was resolved to a URL one call earlier and then silently
+      // dropped — see this action's own args doc comment on `mediaKey`.
+      mediaKey: args.mediaKey,
       messageId: whatsappMessageId,
     });
 

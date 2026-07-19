@@ -7,6 +7,7 @@ import { decideFallback, resolveFallbackPolicy } from "./lib/flows/fallback";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { r2ConfigFromEnv } from "./lib/r2/config";
 import { resolveMediaUrlLazy } from "./lib/r2/url";
+import { parseMediaKey } from "./lib/r2/keys";
 import type {
   CollectInputNodeConfig,
   ConditionNodeConfig,
@@ -684,6 +685,27 @@ async function advanceFromNodeKey(
       const cfg = node.config as SendMediaNodeConfig;
       try {
         if (!to || !run.conversationId) throw new Error("no send target for this run");
+        // A flow node's `media_key` is operator-authored (the flow
+        // builder UI persists it into `flowNodes.config`), not
+        // client-supplied at request time the way `send.ts`'s
+        // `mediaKey` argument is — but the same class of cross-tenant
+        // risk still applies: without this check, `resolveMediaUrlLazy`
+        // below would happily resolve a key belonging to a DIFFERENT
+        // account to a real, fetchable R2 URL, and that URL would then
+        // be persisted onto THIS run's own message row via
+        // `metaSend.sendMedia` (which persists `mediaUrl: args.link`
+        // unconditionally). A foreign key is rejected here — landing in
+        // the catch below exactly like any other send failure
+        // (`send_media_failed`), never a raw throw out of the advance
+        // loop — the same non-leaky treatment `send.ts`'s identical
+        // check (and `files.ts`'s `remove`) already give this class of
+        // key.
+        if (
+          cfg.media_key &&
+          parseMediaKey(cfg.media_key)?.accountId !== run.accountId
+        ) {
+          throw new Error("media_key does not belong to this account");
+        }
         // `resolveMediaUrlLazy` only builds the R2 config (which throws
         // when R2 env vars are unset) when `cfg.media_key` is actually
         // present, so an existing `media_url`-only node keeps working
@@ -709,6 +731,14 @@ async function advanceFromNodeKey(
           to,
           kind: cfg.media_type,
           link,
+          // Threaded through (not just resolved into `link` above) so
+          // the message row durably keeps the key — final-review fix:
+          // previously `cfg.media_key` was resolved to `link` and then
+          // discarded, so a flow's `send_media` node never persisted a
+          // key. Safe to pass unconditionally: when present, it already
+          // passed the ownership check above; when absent, this is a
+          // no-op legacy `media_url` node.
+          mediaKey: cfg.media_key,
           caption: cfg.caption ? interpolateVars(cfg.caption, run.vars ?? {}) : undefined,
           filename: cfg.filename,
         });

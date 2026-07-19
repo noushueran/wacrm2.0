@@ -87,6 +87,13 @@ export interface AppendMessageArgs {
     | "contacts";
   contentText?: string;
   mediaUrl?: string;
+  /** R2 object key for this message's media — the durable replacement
+   *  for `mediaUrl` (`schema.ts`'s `messages.mediaKey`). Currently
+   *  threaded through only by `metaSend.sendMedia`'s `appendInternal`
+   *  call (composer attachment / agent voice note / flow send); every
+   *  other caller of this shared insert core simply never has one to
+   *  pass, which is why this stays optional rather than required. */
+  mediaKey?: string;
   templateName?: string;
   messageId?: string;
   interactivePayload?: unknown;
@@ -127,6 +134,7 @@ export async function insertMessageAndUpdateConversation(
     contentType,
     contentText,
     mediaUrl,
+    mediaKey,
     templateName,
     messageId,
     interactivePayload,
@@ -144,6 +152,7 @@ export async function insertMessageAndUpdateConversation(
     contentType,
     contentText,
     mediaUrl,
+    mediaKey,
     templateName,
     messageId,
     interactivePayload,
@@ -286,6 +295,10 @@ export const appendInternal = internalMutation({
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
+    // R2 object key for this message's media, dual-written alongside
+    // `mediaUrl` — see `AppendMessageArgs.mediaKey`'s own doc comment
+    // above for which callers actually supply one.
+    mediaKey: v.optional(v.string()),
     templateName: v.optional(v.string()),
     messageId: v.optional(v.string()),
     interactivePayload: v.optional(v.any()),
