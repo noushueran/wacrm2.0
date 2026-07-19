@@ -1523,7 +1523,9 @@ Not optional, and **must precede Plan 2**. Several failure modes here are silent
 
 - `objs.holidayys.co` bound to the `wa-holidayys` bucket as a **custom domain** (not `r2.dev`).
 - `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment.
-- `NEXT_PUBLIC_R2_PUBLIC_HOST` set on Netlify.
+- 🚨 **`NEXT_PUBLIC_R2_PUBLIC_HOST` must be set in the Netlify *build* environment BEFORE any writer is enabled** (i.e. before Step 2's `npx convex deploy`, and before any Task 6/7 write path can put a key into a row). This is a build-time Next.js public env var — setting it on Netlify *after* deploying a build does nothing until the next build runs. Verify it by checking the deployed build's environment, not just the Netlify UI's saved value.
+  - **Consequence if it's missing when a key-bearing row is first read:** `src/lib/storage/media-url.ts`'s client resolver now degrades gracefully — it falls back to the legacy Convex-storage URL and logs a `console.error` naming the missing variable, rather than throwing. So a missing var no longer blanks the app. But the degraded behavior is still broken in its own way: **any media uploaded after the R2 cutover has no legacy URL to fall back to, so it will not load** (broken avatar / broken message attachment) until the var is set and the affected rows are re-read. Treat the `console.error` as a page-this-person signal, not background noise.
+  - Before this fix (fixed in the Task 5 review pass), the same missing-var condition was worse: the resolver *threw* during render, which blanked the entire app (`AuthProvider`) or the entire message thread (`message-thread.tsx`) the instant one row carried a key — not just a missing image.
 
 - [ ] **Step 2: Owner deploys backend, then frontend**
 
