@@ -42,6 +42,7 @@ import type * as ingest from "../ingest.js";
 import type * as invitations from "../invitations.js";
 import type * as kbCompile from "../kbCompile.js";
 import type * as kbEntries from "../kbEntries.js";
+import type * as kbImport from "../kbImport.js";
 import type * as kbOps from "../kbOps.js";
 import type * as kbServices from "../kbServices.js";
 import type * as leadCharges from "../leadCharges.js";
@@ -157,6 +158,7 @@ declare const fullApi: ApiFromModules<{
   invitations: typeof invitations;
   kbCompile: typeof kbCompile;
   kbEntries: typeof kbEntries;
+  kbImport: typeof kbImport;
   kbOps: typeof kbOps;
   kbServices: typeof kbServices;
   leadCharges: typeof leadCharges;
