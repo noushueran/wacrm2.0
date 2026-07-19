@@ -82,6 +82,6 @@
 
 ### Task 8: Ship (backend-first)
 
-- [ ] Push branch, open PR with spec summary + dormancy note.
-- [ ] `git merge origin/main` (deploy-collision rule); copy `.env.local` from the main checkout into the worktree; `npx convex deploy -y`; commit any `_generated` reconciliation.
-- [ ] Merge PR → Netlify; verify function-spec lists the new engine functions + live site 200/307s.
+- [x] Push branch, open PR with spec summary + dormancy note.
+- [x] `git merge origin/main` (deploy-collision rule); copy `.env.local` from the main checkout into the worktree; `npx convex deploy -y`; commit any `_generated` reconciliation.
+- [x] Merge PR → Netlify; verify function-spec lists the new engine functions + live site 200/307s.
