@@ -29,8 +29,8 @@
 - `syntheticPurchaseRaw(latestText: string): string` — dry-run JSON from markers.
 - Constants above.
 
-- [ ] Failing tests: prompt contains excerpts/service/fields/media count & is deterministic; parse happy path; parse garbage → null; clamps; synthetic marker matrix.
-- [ ] Implement minimal lib; tests pass; commit.
+- [x] Failing tests: prompt contains excerpts/service/fields/media count & is deterministic; parse happy path; parse garbage → null; clamps; synthetic marker matrix.
+- [x] Implement minimal lib; tests pass; commit.
 
 ### Task 2: `seedStageConversionEvent` refactor (behavior-preserving)
 
@@ -38,13 +38,13 @@
 
 **Produces:** `export async function seedStageConversionEvent(ctx: {db; scheduler}, args: {accountId: Id<"accounts">; conversation: Doc<"conversations">; stage: FunnelStageKey; value?: number; currency?: string}): Promise<{conversionEventId: Id<"conversionEvents"> | undefined}>` — returns existing row id on eventId hit (no re-schedule); `undefined` when unattributed / stage unmapped / identifier missing. `applyStageTransition` delegates to it (passes `hasValue ? saleValue : undefined`).
 
-- [ ] Extract; existing `funnel.test.ts` + engine suite stay green untouched; commit.
+- [x] Extract; existing `funnel.test.ts` + engine suite stay green untouched; commit.
 
 ### Task 3: Schema + config plumbing
 
 **Files:** Modify `convex/schema.ts` (qualificationConfigs `purchaseSignalsEnabled: v.optional(v.boolean())`; qualificationSessions `purchase` object per spec §3.5; notifications type union + `purchase_signal`), `convex/lib/qualification/validate.ts` (patch key + boolean check), `convex/lib/qualification/defaults.ts` (`purchaseSignalsEnabled: false`), `src/lib/notifications/shared.ts` (+ any client NotificationType union — follow the `lead_qualified` trail) with a 💰-appropriate lucide icon.
 
-- [ ] Config-patch test in `convex/qualification.test.ts` (round-trips the new key; rejects non-boolean); suite green; commit.
+- [x] Config-patch test in `convex/qualification.test.ts` (round-trips the new key; rejects non-boolean); suite green; commit.
 
 ### Task 4: Engine — context, action, verdict, triggers
 
@@ -57,8 +57,8 @@
 - Trigger A: `completeQualification` tail — `scheduler.runAfter(0, evaluatePurchase)` when `config.purchaseSignalsEnabled === true`.
 - Trigger B: `onInbound` — after follow-up arming, when latest session `qualified` && enabled && not sent && in window ⇒ schedule `evaluatePurchase` (covers media inbounds).
 
-- [ ] Test battery (dry-run + convex-test, mirroring the file's existing harness): happy-path fire (row stage/eventId/lane/value + session stamp + notification + `conversation.funnel` UNCHANGED); not-met then re-eval fires later; idempotency both orders (proxy-then-agent links row & no 2nd insert; agent-then-proxy no-ops); gates (disabled / organic / non-qualified / window expiry); media-caption trigger path; confidence floor.
-- [ ] Suite green; commit.
+- [x] Test battery (dry-run + convex-test, mirroring the file's existing harness): happy-path fire (row stage/eventId/lane/value + session stamp + notification + `conversation.funnel` UNCHANGED); not-met then re-eval fires later; idempotency both orders (proxy-then-agent links row & no 2nd insert; agent-then-proxy no-ops); gates (disabled / organic / non-qualified / window expiry); media-caption trigger path; confidence floor.
+- [x] Suite green; commit.
 
 ### Task 5: Manual fire + read surfaces
 
@@ -66,7 +66,7 @@
 
 **Produces:** `sendPurchaseSignal` accountMutation `{sessionId}` — `ctx.requireRole("supervisor")`; session qualified & not sent; conversation attributed else `BAD_REQUEST reason:"not_attributed"`; seeds with last verdict's value when present; stamps `manual: true`. `getSessionForConversation` + `leadsBoard` rows expose `purchase` projection `{status, confidence, reasons, value, currency, sentAt, manual}`.
 
-- [ ] Tests: role gate (agent rejected, supervisor fires), unattributed rejection, board projection; commit.
+- [x] Tests: role gate (agent rejected, supervisor fires), unattributed rejection, board projection; commit.
 
 ### Task 6: UI + i18n
 
@@ -78,7 +78,7 @@
 
 **Files:** Modify `convex/_generated/api.d.ts` (add `lib/qualification/purchase` import + both map entries, alpha-ordered); append paste-ready `PURCHASE CRITERIA — <Service>` sections (6 services + intro note) to `/Volumes/CurserDisk/Dev/wacrm2.0/holidayys-ai-agent/agent-content.md` (outside the repo).
 
-- [ ] Full verification: `npx vitest run` (all green), `npx tsc --noEmit` (0), `npx eslint .` (0 new), `npx next build` (green); commit.
+- [x] Full verification: `npx vitest run` (all green), `npx tsc --noEmit` (0), `npx eslint .` (0 new), `npx next build` (green); commit.
 
 ### Task 8: Ship (backend-first)
 
