@@ -47,11 +47,13 @@ function defaultRandomHex(): string {
 /** Extension from a filename, else from a content type, else "". Never
  *  includes a dot, never longer than 5 chars, always lowercase. */
 function extensionFor(filename?: string, contentType?: string): string {
-  const fromName = filename?.split("/").pop()?.split(".").pop() ?? "";
+  const basename = filename?.split("/").pop() ?? "";
+  const dot = basename.lastIndexOf(".");
+  // `> 0`, not `>= 0`: a leading-dot name like ".env" is a dotfile, not an
+  // extension, and should fall through to the content-type map.
+  const fromName = dot > 0 ? basename.slice(dot + 1) : "";
   const cleaned = fromName.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (cleaned && cleaned.length <= 5 && cleaned !== filename?.toLowerCase()) {
-    return cleaned;
-  }
+  if (cleaned && cleaned.length <= 5) return cleaned;
   const base = contentType?.split(";")[0]?.trim().toLowerCase() ?? "";
   return EXT_BY_CONTENT_TYPE[base] ?? "";
 }

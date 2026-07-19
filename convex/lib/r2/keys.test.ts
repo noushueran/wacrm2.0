@@ -45,6 +45,41 @@ test("buildMediaKey never lets a hostile filename escape its prefix", () => {
   expect(key).not.toContain("..");
 });
 
+test("buildMediaKey falls back to the content type when a path-bearing filename has no dot", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: "uploads/photo",
+    contentType: "image/png",
+    randomHex: FIXED,
+  });
+  // Must resolve from the content type ("png"), not the last path segment
+  // ("photo") — a dot-less basename is not an extension.
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef.png");
+});
+
+test("buildMediaKey omits the extension for a path-bearing dot-less filename with no content type", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: "uploads/photo",
+    randomHex: FIXED,
+  });
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef");
+});
+
+test("buildMediaKey treats a leading-dot filename as a dotfile, not an extension", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: ".env",
+    contentType: "image/png",
+    randomHex: FIXED,
+  });
+  // Must resolve from the content type ("png"), not "env" from ".env".
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef.png");
+});
+
 test("buildMediaKey generates a distinct key per call", () => {
   const a = buildMediaKey({ accountId: "acc123", kind: "inbound" });
   const b = buildMediaKey({ accountId: "acc123", kind: "inbound" });

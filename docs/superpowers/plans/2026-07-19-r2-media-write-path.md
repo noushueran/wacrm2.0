@@ -101,6 +101,41 @@ test("buildMediaKey never lets a hostile filename escape its prefix", () => {
   expect(key).not.toContain("..");
 });
 
+test("buildMediaKey falls back to the content type when a path-bearing filename has no dot", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: "uploads/photo",
+    contentType: "image/png",
+    randomHex: FIXED,
+  });
+  // Must resolve from the content type ("png"), not the last path segment
+  // ("photo") — a dot-less basename is not an extension.
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef.png");
+});
+
+test("buildMediaKey omits the extension for a path-bearing dot-less filename with no content type", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: "uploads/photo",
+    randomHex: FIXED,
+  });
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef");
+});
+
+test("buildMediaKey treats a leading-dot filename as a dotfile, not an extension", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "outbound",
+    filename: ".env",
+    contentType: "image/png",
+    randomHex: FIXED,
+  });
+  // Must resolve from the content type ("png"), not "env" from ".env".
+  expect(key).toBe("acc123/outbound/0123456789abcdef0123456789abcdef.png");
+});
+
 test("buildMediaKey generates a distinct key per call", () => {
   const a = buildMediaKey({ accountId: "acc123", kind: "inbound" });
   const b = buildMediaKey({ accountId: "acc123", kind: "inbound" });
@@ -230,11 +265,13 @@ function defaultRandomHex(): string {
 /** Extension from a filename, else from a content type, else "". Never
  *  includes a dot, never longer than 5 chars, always lowercase. */
 function extensionFor(filename?: string, contentType?: string): string {
-  const fromName = filename?.split("/").pop()?.split(".").pop() ?? "";
+  const basename = filename?.split("/").pop() ?? "";
+  const dot = basename.lastIndexOf(".");
+  // `> 0`, not `>= 0`: a leading-dot name like ".env" is a dotfile, not an
+  // extension, and should fall through to the content-type map.
+  const fromName = dot > 0 ? basename.slice(dot + 1) : "";
   const cleaned = fromName.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (cleaned && cleaned.length <= 5 && cleaned !== filename?.toLowerCase()) {
-    return cleaned;
-  }
+  if (cleaned && cleaned.length <= 5) return cleaned;
   const base = contentType?.split(";")[0]?.trim().toLowerCase() ?? "";
   return EXT_BY_CONTENT_TYPE[base] ?? "";
 }
@@ -269,7 +306,7 @@ export function parseMediaKey(
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `npx vitest run convex/lib/r2/keys.test.ts`
-Expected: PASS — 7 tests.
+Expected: PASS — 10 tests.
 
 - [ ] **Step 6: Typecheck and commit**
 
