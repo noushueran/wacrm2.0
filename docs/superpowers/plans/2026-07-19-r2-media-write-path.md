@@ -22,7 +22,12 @@
 - **`Content-Type` is part of the presigned signature.** The browser must PUT with byte-identical `Content-Type` to the one signed, or R2 rejects the upload.
 - **Public host is `https://objs.holidayys.co`** (never `r2.dev`).
 - Media size limits in `src/lib/storage/upload-media.ts:28-43` are unchanged.
-- Convex backend deploys separately from Netlify, and **backend must deploy first**. Merge `origin/main` before every `convex deploy`.
+- 🚨 **NEVER run `npx convex dev`, `npx convex deploy`, or `npx convex codegen`.** There is exactly ONE self-hosted Convex instance (`convex-api.holidayys.co`) and it is **production** — all three commands push straight to it. Every task in this plan is built and tested **offline**; `convex-test` runs without a deployment. Deploying is an owner action, performed only at Task 8 after all code review is complete.
+- **New Convex *function module* ⇒ hand-edit `convex/_generated/api.d.ts`** (import line + member); `api.js` is a Proxy and needs no edit. This plan adds no new function module — `convex/lib/r2/*` are plain libraries, and `startUpload` is a new export on the *existing* `files` module, whose type flows through automatically. Do not edit `_generated/` in this plan.
+- **Stage files explicitly by path. NEVER `git add -A` or `git add .`** — untracked `.claude/worktrees/*` directories from other sessions appear in `git status` and must not be committed.
+- **Verification commands** (from app root `/Volumes/CurserDisk/Dev/wacrm2.0/wacrm2.0`): `npm test`, `npm run typecheck`, `npm run build`, `npm run lint`.
+- **Lint has pre-existing debt** (~7 errors / 87 warnings in vendored files). The gate is "build passes **and this diff adds no NEW lint**" — not a globally clean lint run.
+- Convex backend deploys separately from Netlify, and **backend must deploy first** — but see the prohibition above: that deploy is the owner's, not this plan's.
 
 ---
 
@@ -269,7 +274,7 @@ Expected: PASS — 7 tests.
 - [ ] **Step 6: Typecheck and commit**
 
 ```bash
-npx tsc --noEmit
+npm run typecheck
 git add convex/lib/r2/config.ts convex/lib/r2/keys.ts convex/lib/r2/keys.test.ts
 git commit -m "feat(r2): object key generation and deployment config"
 ```
@@ -473,7 +478,7 @@ export function resolveMediaUrl(row: {
 
 ```bash
 npx vitest run convex/lib/r2/url.test.ts src/lib/storage/media-url.test.ts
-npx tsc --noEmit
+npm run typecheck
 git add convex/lib/r2/url.ts convex/lib/r2/url.test.ts src/lib/storage/media-url.ts src/lib/storage/media-url.test.ts
 git commit -m "feat(r2): public URL resolution with legacy-url fallback"
 ```
@@ -709,7 +714,7 @@ Expected: PASS — 4 tests.
 - [ ] **Step 6: Typecheck and commit**
 
 ```bash
-npx tsc --noEmit
+npm run typecheck
 git add package.json package-lock.json convex/lib/r2/client.ts convex/lib/r2/client.test.ts
 git commit -m "feat(r2): signed PUT/DELETE and presigned upload URLs via aws4fetch"
 ```
@@ -804,13 +809,13 @@ In the `users` table, immediately after its `avatarUrl` field:
 
 - [ ] **Step 4: Run the full suite to verify nothing regressed**
 
-Run: `npx vitest run`
+Run: `npm test`
 Expected: PASS — all suites, including the new schema test.
 
 - [ ] **Step 5: Typecheck and commit**
 
 ```bash
-npx tsc --noEmit
+npm run typecheck
 git add convex/schema.ts convex/schema.test.ts
 git commit -m "feat(r2): add dormant media key fields to schema"
 ```
@@ -925,24 +930,23 @@ import { resolveMediaUrl } from "@/lib/storage/media-url";
 
 - [ ] **Step 5: Run the full suite**
 
-Run: `npx vitest run`
+Run: `npm test`
 Expected: PASS — including the new `send` test.
 
 - [ ] **Step 6: Typecheck, lint, commit**
 
 ```bash
-npx tsc --noEmit && npx eslint
+npm run typecheck && npm run lint   # gate: no NEW lint from this diff
 git add convex/send.ts convex/apiV1.ts convex/flowsEngine.ts convex/aiReply.ts src/lib/whatsapp/template-send-builder.ts src/lib/convex/adapters.ts convex/send.test.ts
 git commit -m "feat(r2): resolve media keys at every read site, falling back to legacy URLs"
 ```
 
-- [ ] **Step 7: Deploy backend first, then Netlify**
+- [ ] **Step 7: Do NOT deploy — record readiness only**
 
-```bash
-git fetch origin && git merge origin/main
-npx convex deploy
-```
-Then let Netlify build. Reads now understand keys; nothing writes them yet, so this deploy is a no-op behaviorally.
+Deployment is deferred to Task 8 and is the **owner's** action. Do not run
+`npx convex deploy`. This change is behaviorally inert until Task 6/7 land
+(reads understand keys; nothing writes them yet), so there is nothing to
+verify live at this point.
 
 ---
 
@@ -1270,7 +1274,7 @@ Each `useMutation(api.files.generateUploadUrl)` becomes `useMutation(api.files.s
 - [ ] **Step 7: Run the full suite, typecheck, lint**
 
 ```bash
-npx vitest run && npx tsc --noEmit && npx eslint
+npx vitest run && npm run typecheck && npm run lint   # gate: no NEW lint from this diff
 ```
 Expected: all green.
 
@@ -1414,7 +1418,7 @@ The ad-referral block at L616 — note the `ctx.storage.getUrl` call disappears 
 - [ ] **Step 6: Run the full suite, typecheck, lint**
 
 ```bash
-npx vitest run && npx tsc --noEmit && npx eslint
+npx vitest run && npm run typecheck && npm run lint   # gate: no NEW lint from this diff
 ```
 Expected: all green.
 
@@ -1439,11 +1443,16 @@ Not optional, and **must precede Plan 2**. Several failure modes here are silent
 - `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment.
 - `NEXT_PUBLIC_R2_PUBLIC_HOST` set on Netlify.
 
-- [ ] **Step 2: Deploy backend, then frontend**
+- [ ] **Step 2: Owner deploys backend, then frontend**
+
+🚨 **This step is run by the owner, not by an implementer subagent.** It is the
+only production push in this plan, and it must follow a clean whole-branch
+review.
 
 ```bash
 git fetch origin && git merge origin/main
-npx convex deploy
+npm test && npm run typecheck && npm run build   # all green before pushing
+npx convex deploy                                 # PRODUCTION — owner only
 ```
 Then let Netlify build.
 
