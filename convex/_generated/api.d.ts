@@ -77,6 +77,7 @@ import type * as lib_pushPayload from "../lib/pushPayload.js";
 import type * as lib_pushRecipients from "../lib/pushRecipients.js";
 import type * as lib_qualification_analyze from "../lib/qualification/analyze.js";
 import type * as lib_qualification_defaults from "../lib/qualification/defaults.js";
+import type * as lib_qualification_purchase from "../lib/qualification/purchase.js";
 import type * as lib_qualification_schedule from "../lib/qualification/schedule.js";
 import type * as lib_qualification_staffReply from "../lib/qualification/staffReply.js";
 import type * as lib_qualification_track from "../lib/qualification/track.js";
@@ -187,6 +188,7 @@ declare const fullApi: ApiFromModules<{
   "lib/pushRecipients": typeof lib_pushRecipients;
   "lib/qualification/analyze": typeof lib_qualification_analyze;
   "lib/qualification/defaults": typeof lib_qualification_defaults;
+  "lib/qualification/purchase": typeof lib_qualification_purchase;
   "lib/qualification/schedule": typeof lib_qualification_schedule;
   "lib/qualification/staffReply": typeof lib_qualification_staffReply;
   "lib/qualification/track": typeof lib_qualification_track;

@@ -1,4 +1,4 @@
-import { AlarmClock, BadgeCheck, UserPlus } from "lucide-react";
+import { AlarmClock, BadgeCheck, BadgeDollarSign, UserPlus } from "lucide-react";
 
 import type { Notification, NotificationType } from "@/types";
 
@@ -10,6 +10,7 @@ export const TYPE_ICON: Record<NotificationType, typeof UserPlus> = {
   conversation_assigned: UserPlus,
   lead_qualified: BadgeCheck,
   sla_alert: AlarmClock,
+  purchase_signal: BadgeDollarSign,
 };
 
 /**

@@ -1637,3 +1637,475 @@ test("staffLoopsDue reaches a freshly accepted offer instead of starving it behi
     vi.useRealTimers();
   }
 });
+
+// ============================================================
+// PURCHASE SIGNALS (spec 2026-07-19-purchase-signals) — the proxy Meta
+// Purchase judge that runs only on already-qualified sessions.
+// ============================================================
+
+async function enablePurchaseSignals(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  await t.run(async (ctx) => {
+    const config = await ctx.db
+      .query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .unique();
+    if (config) await ctx.db.patch(config._id, { purchaseSignalsEnabled: true });
+  });
+}
+
+/** Drives a session to `qualified` through the normal analysis path,
+ *  drains completion's scheduled fan-out (incl. the automatic first
+ *  purchase evaluation) so tests aren't raced by it, and clears the
+ *  eval debounce so the test's own evaluations run deterministically. */
+async function qualifySession(
+  t: TestConvex<typeof schema>,
+  base: { accountId: Id<"accounts">; conversationId: Id<"conversations">; contactId: Id<"contacts"> },
+) {
+  // Fake timers must be active BEFORE completion schedules its fan-out:
+  // a `runAfter(0)` created under real timers is a real setTimeout that
+  // `vi.runAllTimers` cannot drain — the stray automatic first purchase
+  // evaluation would then race the test's own evaluations and re-arm
+  // the debounce mid-assertion (observed flake).
+  const hadFakeTimers = vi.isFakeTimers();
+  if (!hadFakeTimers) vi.useFakeTimers();
+  try {
+    await seedCustomerMessage(t, base.accountId, base.conversationId,
+      "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+    await t.action(internal.qualificationEngine.analyzeInbound, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+  } finally {
+    if (!hadFakeTimers) vi.useRealTimers();
+  }
+  await clearPurchaseDebounce(t, base.conversationId);
+}
+
+/** Clears the eval debounce so a follow-up evaluatePurchase isn't skipped. */
+async function clearPurchaseDebounce(
+  t: TestConvex<typeof schema>,
+  conversationId: Id<"conversations">,
+) {
+  await t.run(async (ctx) => {
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .order("desc")
+      .first();
+    if (session?.purchase) {
+      await ctx.db.patch(session._id, {
+        purchase: { ...session.purchase, evaluatedAt: Date.now() - 60_000 },
+      });
+    }
+  });
+}
+
+function purchasedEventsFor(
+  t: TestConvex<typeof schema>,
+  conversationId: Id<"conversations">,
+) {
+  return t.run((ctx) =>
+    ctx.db.query("conversionEvents")
+      .withIndex("by_event_id", (q) => q.eq("eventId", `${conversationId}:purchased`))
+      .collect());
+}
+
+/** Ticks off the auto-generated sales checklist so the agent's real
+ *  `setStage("purchased")` passes the deal-discipline gate. */
+async function completeSalesChecklist(
+  t: TestConvex<typeof schema>,
+  conversationId: Id<"conversations">,
+) {
+  await t.run(async (ctx) => {
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .order("desc")
+      .first();
+    if (!session) return;
+    const checklist = await ctx.db
+      .query("salesChecklists")
+      .withIndex("by_session", (q) => q.eq("sessionId", session._id))
+      .unique();
+    if (!checklist) return;
+    await ctx.db.patch(checklist._id, {
+      items: checklist.items.map((item) => ({
+        ...item,
+        done: true,
+        doneAt: Date.now(),
+        note: item.note ?? "done",
+      })),
+    });
+  });
+}
+
+test("PS: criteria met fires the proxy Purchase — outbox row + session stamp + notification, funnel stage UNTOUCHED", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "Budget is fine [[PURCHASE]] pvalue:9000; pcurrency:AED;");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0].eventName).toBe("Purchase");
+  expect(events[0].lane).toBe("ctwa");
+  expect(events[0].identifier).toBe("clid-123");
+  expect(events[0].value).toBe(9000);
+  expect(events[0].currency).toBe("AED");
+  expect(events[0].status).toBe("pending");
+
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("sent");
+  expect(s.purchase?.conversionEventId).toBe(events[0]._id);
+  expect(s.purchase?.value).toBe(9000);
+  expect(s.purchase?.manual).toBeFalsy();
+
+  // Operational funnel untouched: still at the auto-advanced "qualified",
+  // and NO purchased transition was logged.
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.funnel?.stage).toBe("qualified");
+  const transitions = await transitionsFor(t, base.conversationId);
+  expect(transitions.filter((tr) => tr.stage === "purchased")).toHaveLength(0);
+
+  const notifications = await t.run((ctx) =>
+    ctx.db.query("notifications")
+      .withIndex("by_user", (q) => q.eq("userId", base.userId))
+      .collect());
+  expect(notifications.some((n) => n.type === "purchase_signal")).toBe(true);
+});
+
+test("PS: not-met stamps the verdict without firing; a later inbound re-evaluates and can fire", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "thinking about it");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+  let [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("not_met");
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
+
+  await clearPurchaseDebounce(t, base.conversationId);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "ok budget confirmed [[PURCHASE]]");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+  [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("sent");
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+});
+
+test("PS: proxy-then-agent — the later real sale links the SAME outbox row, no second event", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "[[PURCHASE]] pvalue:9000;");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+  const [proxyEvent] = await purchasedEventsFor(t, base.conversationId);
+
+  await completeSalesChecklist(t, base.conversationId);
+  await base.asUser.mutation(api.funnel.setStage, {
+    conversationId: base.conversationId,
+    stage: "purchased",
+    saleValue: 12_000,
+    saleCurrency: "AED",
+  });
+
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1); // still just the proxy row
+  expect(events[0]._id).toBe(proxyEvent._id);
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.funnel?.stage).toBe("purchased"); // CRM truth advanced
+  const transitions = await transitionsFor(t, base.conversationId);
+  const purchasedTr = transitions.filter((tr) => tr.stage === "purchased");
+  expect(purchasedTr).toHaveLength(1);
+  expect(purchasedTr[0].conversionEventId).toBe(proxyEvent._id); // linked, not duplicated
+});
+
+test("PS: agent-then-proxy — an already-recorded real sale makes the judge a no-op on the outbox", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+  await completeSalesChecklist(t, base.conversationId);
+  await base.asUser.mutation(api.funnel.setStage, {
+    conversationId: base.conversationId,
+    stage: "purchased",
+    saleValue: 12_000,
+    saleCurrency: "AED",
+  });
+  const [agentEvent] = await purchasedEventsFor(t, base.conversationId);
+
+  await seedCustomerMessage(t, base.accountId, base.conversationId, "[[PURCHASE]]");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0]._id).toBe(agentEvent._id);
+  expect(events[0].value).toBe(12_000); // the real sale's value stands
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("sent"); // session reflects: Meta has it
+});
+
+test("PS: gates — disabled toggle, organic conversation, unqualified session, expired window all skip evaluation", async () => {
+  const t = convexTest(schema, modules);
+
+  // Toggle off (default): nothing happens even for a qualified lead.
+  const off = await seedAttributed(t);
+  await qualifySession(t, off);
+  await seedCustomerMessage(t, off.accountId, off.conversationId, "[[PURCHASE]]");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: off.accountId, conversationId: off.conversationId,
+  });
+  let [s] = await sessionsFor(t, off.conversationId);
+  expect(s.purchase).toBeUndefined();
+
+  // Organic (no attribution): no evaluation.
+  const organic = await seed(t);
+  await configureAi(organic.asUser);
+  await enablePurchaseSignals(t, organic.accountId);
+  await qualifySession(t, organic);
+  await seedCustomerMessage(t, organic.accountId, organic.conversationId, "[[PURCHASE]]");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: organic.accountId, conversationId: organic.conversationId,
+  });
+  [s] = await sessionsFor(t, organic.conversationId);
+  expect(s.purchase).toBeUndefined();
+  expect(await purchasedEventsFor(t, organic.conversationId)).toHaveLength(0);
+
+  // Still collecting: the judge never runs before qualification.
+  const collecting = await seedAttributed(t);
+  await enablePurchaseSignals(t, collecting.accountId);
+  await seedCustomerMessage(t, collecting.accountId, collecting.conversationId,
+    "field:a=1; [[PURCHASE]]");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: collecting.accountId, conversationId: collecting.conversationId,
+    contactId: collecting.contactId,
+  });
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: collecting.accountId, conversationId: collecting.conversationId,
+  });
+  [s] = await sessionsFor(t, collecting.conversationId);
+  expect(s.status).toBe("collecting");
+  expect(s.purchase).toBeUndefined();
+
+  // Window expired: qualified 8 days ago → no more evaluations (the
+  // in-window completion eval may have stamped a not_met verdict; what
+  // matters is that nothing ever fires once the window closes).
+  const stale = await seedAttributed(t);
+  await enablePurchaseSignals(t, stale.accountId);
+  await qualifySession(t, stale);
+  await t.run(async (ctx) => {
+    const session = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", stale.conversationId))
+      .order("desc")
+      .first();
+    if (session) await ctx.db.patch(session._id, { qualifiedAt: Date.now() - 8 * 24 * 3_600_000 });
+  });
+  await seedCustomerMessage(t, stale.accountId, stale.conversationId, "[[PURCHASE]]");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: stale.accountId, conversationId: stale.conversationId,
+  });
+  [s] = await sessionsFor(t, stale.conversationId);
+  expect(s.purchase?.status ?? "not_met").toBe("not_met"); // never "sent"
+  expect(await purchasedEventsFor(t, stale.conversationId)).toHaveLength(0);
+});
+
+test("PS: a media message (visa documents) on a qualified session triggers evaluation via onInbound", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seedAttributed(t);
+    await enablePurchaseSignals(t, base.accountId);
+    await qualifySession(t, base);
+    await t.finishAllScheduledFunctions(vi.runAllTimers); // drain completion's own eval
+    await clearPurchaseDebounce(t, base.conversationId);
+
+    // The documents arrive as an image with a caption — the dry-run
+    // marker rides the caption exactly like a real doc description would.
+    await t.run((ctx) =>
+      ctx.db.insert("messages", {
+        accountId: base.accountId,
+        conversationId: base.conversationId,
+        senderType: "customer",
+        contentType: "image",
+        contentText: "passport copy [[PURCHASE]]",
+        status: "delivered",
+      }),
+    );
+    await t.mutation(internal.qualificationEngine.onInbound, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      phoneNormalized: "971500000001",
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const [s] = await sessionsFor(t, base.conversationId);
+    expect(s.purchase?.status).toBe("sent");
+    expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("PS: applyPurchaseVerdict enforces the confidence floor and idempotency", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+
+  // met but hesitant → never fires.
+  const hesitant = await t.mutation(internal.qualificationEngine.applyPurchaseVerdict, {
+    accountId: base.accountId,
+    conversationId: base.conversationId,
+    verdict: { met: true, confidence: 50, reasons: ["maybe"], value: null, currency: null, criteriaFound: true },
+  });
+  expect(hesitant.fired).toBe(false);
+  let [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("not_met");
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
+
+  // criteria section missing → never fires, whatever met says.
+  const noCriteria = await t.mutation(internal.qualificationEngine.applyPurchaseVerdict, {
+    accountId: base.accountId,
+    conversationId: base.conversationId,
+    verdict: { met: true, confidence: 95, reasons: ["?"], value: null, currency: null, criteriaFound: false },
+  });
+  expect(noCriteria.fired).toBe(false);
+
+  // Confident met fires once; a duplicate verdict is a no-op.
+  const fired = await t.mutation(internal.qualificationEngine.applyPurchaseVerdict, {
+    accountId: base.accountId,
+    conversationId: base.conversationId,
+    verdict: { met: true, confidence: 90, reasons: ["all criteria met"], value: 3000, currency: null, criteriaFound: true },
+  });
+  expect(fired.fired).toBe(true);
+  const again = await t.mutation(internal.qualificationEngine.applyPurchaseVerdict, {
+    accountId: base.accountId,
+    conversationId: base.conversationId,
+    verdict: { met: true, confidence: 90, reasons: ["all criteria met"], value: 3000, currency: null, criteriaFound: true },
+  });
+  expect(again.fired).toBe(false);
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0].currency).toBe("AED"); // account default backfills a value-bearing event
+  [s] = await sessionsFor(t, base.conversationId);
+  expect(s.purchase?.status).toBe("sent");
+});
+
+test("PS: completing qualification schedules the first purchase evaluation automatically", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seedAttributed(t);
+    await enablePurchaseSignals(t, base.accountId);
+    // One message carries BOTH vocabularies: qualification completes AND
+    // the scheduled first evaluation immediately finds criteria met.
+    await seedCustomerMessage(t, base.accountId, base.conversationId,
+      "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3 [[PURCHASE]] pvalue:3000;");
+    await t.action(internal.qualificationEngine.analyzeInbound, {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const [s] = await sessionsFor(t, base.conversationId);
+    expect(s.status).toBe("qualified");
+    expect(s.purchase?.status).toBe("sent");
+    expect(s.purchase?.value).toBe(3000);
+    expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("PS: sendPurchaseSignal — supervisor+ fires manually (works with auto toggle OFF), agents rejected, organic rejected", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t); // asUser = admin; purchase toggle stays OFF
+  await qualifySession(t, base);
+  const [s] = await sessionsFor(t, base.conversationId);
+
+  // Below supervisor → FORBIDDEN.
+  const agentUserId = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "Agent", email: "agent@example.com" });
+    await ctx.db.insert("memberships", {
+      userId, accountId: base.accountId, role: "agent", fullName: "Agent", email: "agent@example.com",
+    });
+    return userId;
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|s2` });
+  await expect(
+    asAgent.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id }),
+  ).rejects.toThrow();
+
+  // Admin fires — even though purchaseSignalsEnabled is false (manual is
+  // explicit human intent, the toggle only governs the automatic judge).
+  await base.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id });
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0].eventName).toBe("Purchase");
+  const [after] = await sessionsFor(t, base.conversationId);
+  expect(after.purchase?.status).toBe("sent");
+  expect(after.purchase?.manual).toBe(true);
+
+  // Firing twice is rejected cleanly.
+  await expect(
+    base.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id }),
+  ).rejects.toThrow();
+
+  // Organic conversation → BAD_REQUEST not_attributed.
+  const organic = await seed(t);
+  await configureAi(organic.asUser);
+  await qualifySession(t, organic);
+  const [os] = await sessionsFor(t, organic.conversationId);
+  await expect(
+    organic.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: os._id }),
+  ).rejects.toThrow();
+});
+
+test("PS: leadsBoard and getSessionForConversation expose the purchase verdict", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[PURCHASE]] pvalue:9000; pcurrency:AED;");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+
+  const board = await base.asUser.query(api.qualification.leadsBoard, {});
+  const [ls] = await sessionsFor(t, base.conversationId);
+  const row = board.leads.find((l) => l.sessionId === ls._id);
+  expect(row?.purchase?.status).toBe("sent");
+  expect(row?.purchase?.value).toBe(9000);
+  expect(row?.purchase?.currency).toBe("AED");
+  expect(row?.purchase?.manual).toBe(false);
+
+  const chip = await base.asUser.query(api.qualification.getSessionForConversation, {
+    conversationId: base.conversationId,
+  });
+  expect(chip?.purchase?.status).toBe("sent");
+  expect(chip?.purchase?.confidence).toBe(90);
+});

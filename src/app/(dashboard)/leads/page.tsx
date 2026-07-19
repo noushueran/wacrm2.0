@@ -67,6 +67,10 @@ export default function LeadsPage() {
     accountRole === 'admin' ||
     accountRole === 'owner';
   const canEdit = canView; // viewers never reach the board query at all
+  // Manual purchase signals move ad spend — supervisor+ only (matches
+  // the server's requireRole("supervisor") on sendPurchaseSignal).
+  const canSendPurchase =
+    accountRole === 'supervisor' || accountRole === 'admin' || accountRole === 'owner';
   const board = useQuery(api.qualification.leadsBoard, canView ? {} : 'skip');
 
   const view = useSyncExternalStore(
@@ -87,6 +91,29 @@ export default function LeadsPage() {
   const setItemDone = useMutation(api.salesChecklists.setItemDone);
   const reopenItem = useMutation(api.salesChecklists.reopenItem);
   const setStage = useMutation(api.funnel.setStage);
+  const sendPurchaseSignal = useMutation(api.qualification.sendPurchaseSignal);
+
+  const handleSendPurchaseSignal = useCallback(
+    async (lead: LeadRow) => {
+      try {
+        await sendPurchaseSignal({
+          sessionId: lead.sessionId as Id<'qualificationSessions'>,
+        });
+        toast.success(t('purchase.sentToast'));
+      } catch (err) {
+        console.error('Failed to send the purchase signal:', err);
+        const reason = convexErrorData(err)?.reason;
+        toast.error(
+          reason === 'not_attributed'
+            ? t('purchase.notAttributed')
+            : reason === 'already_sent'
+              ? t('purchase.alreadySent')
+              : t('purchase.error'),
+        );
+      }
+    },
+    [sendPurchaseSignal, t],
+  );
 
   const handleCompleteItem = useCallback(
     async (lead: LeadRow, itemKey: string, note: string) => {
@@ -158,8 +185,10 @@ export default function LeadsPage() {
       view={view}
       onViewChange={handleViewChange}
       canEdit={canEdit}
+      canSendPurchase={canSendPurchase}
       onCompleteItem={handleCompleteItem}
       onReopenItem={handleReopenItem}
+      onSendPurchaseSignal={handleSendPurchaseSignal}
       onStageChange={handleStageChange}
     />
   );

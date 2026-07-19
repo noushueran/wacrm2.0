@@ -56,6 +56,7 @@ export function QualificationSettings() {
   const updateConfig = useMutation(api.qualification.updateConfig);
   const [routingSavingTag, setRoutingSavingTag] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [purchaseSaving, setPurchaseSaving] = useState(false);
   const [alertsSaving, setAlertsSaving] = useState(false);
   const [alertsError, setAlertsError] = useState<string | null>(null);
   const [alertsSaved, setAlertsSaved] = useState(false);
@@ -116,6 +117,15 @@ export function QualificationSettings() {
       await updateConfig({ patch: { enabled } });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onTogglePurchase = async (purchaseSignalsEnabled: boolean) => {
+    setPurchaseSaving(true);
+    try {
+      await updateConfig({ patch: { purchaseSignalsEnabled } });
+    } finally {
+      setPurchaseSaving(false);
     }
   };
 
@@ -204,6 +214,28 @@ export function QualificationSettings() {
                     disabled={saving}
                   />
                 </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="space-y-3 pt-6 text-sm">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="font-medium text-foreground">{t('purchase.title')}</p>
+                    <p className="mt-1 text-muted-foreground">{t('purchase.desc')}</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {purchaseSaving ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                    ) : null}
+                    <Switch
+                      checked={config.purchaseSignalsEnabled === true}
+                      onCheckedChange={onTogglePurchase}
+                      disabled={purchaseSaving}
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">{t('purchase.criteriaHint')}</p>
+                <p className="text-xs text-muted-foreground">{t('purchase.strictnessHint')}</p>
               </CardContent>
             </Card>
             <Card>

@@ -85,5 +85,8 @@ export function holidayysDefaultConfig(): QualificationConfigSeed {
     staffCheckinTemplateName: "staff_checkin",
     staffCheckinTemplateLanguage: "en_US",
     outboundNudgesEnabled: false,
+    // Purchase signals ship dormant — the owner pastes PURCHASE
+    // CRITERIA sections into the KB and flips this in Settings.
+    purchaseSignalsEnabled: false,
   };
 }

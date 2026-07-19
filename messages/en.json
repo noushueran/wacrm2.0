@@ -518,6 +518,21 @@
       "openLead": "Open lead",
       "checklistShort": "{done}/{total}"
     },
+    "purchase": {
+      "title": "Purchase signal",
+      "sentBadge": "Purchase sent",
+      "sentTooltip": "Reported to Meta as a Purchase conversion",
+      "sent": "Reported to Meta as a Purchase",
+      "manual": "(sent manually)",
+      "reportedValue": "Reported value ~{value} {currency}",
+      "notMet": "Purchase criteria not met yet (confidence {confidence}/100)",
+      "notEvaluated": "Not evaluated yet — the AI checks after each customer message.",
+      "send": "Send purchase signal",
+      "sentToast": "Purchase signal sent to Meta.",
+      "notAttributed": "This lead has no ad or website attribution — Meta has nothing to receive.",
+      "alreadySent": "A purchase signal was already sent for this lead.",
+      "error": "Could not send the purchase signal."
+    },
     "checklist": {
       "title": "Sales checklist",
       "subtitle": "Complete every step — a comment is required each time.",
@@ -1931,6 +1946,12 @@
       "description": "AI-driven qualification on every chat: questions from your service documents, automatic follow-ups, lead scoring, and a Meta signal when a lead qualifies.",
       "enableLabel": "Enable lead qualification",
       "enableDesc": "Dormant until enabled. Turning this on starts tracking qualification sessions for new conversations.",
+      "purchase": {
+        "title": "Purchase signals (Meta)",
+        "desc": "Report a Purchase conversion to Meta the moment a qualified lead also meets its service's purchase criteria — so Sales-objective ads optimize for your best leads instead of waiting weeks for the real sale.",
+        "criteriaHint": "Define the bar per service: add a \"PURCHASE CRITERIA — <Service>\" section to that service's knowledge-base document (e.g. minimum budget per person, documents received). An optional \"Report value: 3000 AED per person\" line sets the reported value.",
+        "strictnessHint": "Keep criteria strict — Meta optimizes toward whatever you call a purchase. Loose criteria buy cheap, unqualified leads at scale."
+      },
       "alerts": {
         "title": "Admin alerts & templates",
         "enableLabel": "WhatsApp a lead alert to the admin number(s) when a lead qualifies",
