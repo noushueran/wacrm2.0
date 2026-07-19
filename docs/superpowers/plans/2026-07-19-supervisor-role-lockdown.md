@@ -12,12 +12,15 @@
 
 ## Global Constraints
 
-- **Deploy Convex before Netlify.** Safe in that direction because supervisors already cannot reach these tabs in the UI, so nothing errors mid-deploy. The reverse order ships UI changes with the guards still off. Merge `origin/main` before every `convex deploy`.
+- 🚨 **NEVER run `convex dev`, `convex deploy`, or `convex codegen`.** This repo points at ONE self-hosted Convex instance and all three push straight to **production**. Every verification in this plan is offline: `npm test` (`convex-test` runs without a backend), `npm run typecheck`, `npm run build`, `npm run lint`. Deployment is the owner's manual step — see Task 6.
+- **No `_generated` edits needed.** Every new function in this plan (`aiConfig.getFull`, `whatsappConfig.connectionState`) is a new export in an **already-registered** module, so `api.d.ts` picks it up through `typeof import(...)`. Adding a brand-new module would require a hand-edit; adding an export does not.
+- **Stage files explicitly by path. Never `git add -A` or `git add .`** — untracked `.claude/worktrees/*` directories from other sessions show up in `git status` and must not be committed.
 - **`/settings` and `/notifications` MUST stay in the supervisor allowlist.** `bottomNavItems` is filtered by `canAccessNav` (`src/components/layout/sidebar.tsx:336`), so dropping `/settings` would remove supervisors' access to their own Profile and Appearance. `require-section.tsx:16` route-guards on `canAccessRoute`, so dropping `/notifications` would redirect them off their own notifications page.
 - **Never gate a query without first checking its consumers.** Three of the four reads here have non-admin callers; gating them blindly breaks the inbox for every agent and viewer.
 - No plaintext secret is exposed today — the WhatsApp access token and API key hashes are already withheld. This work protects configuration and prompt content, not credentials. Do not weaken the existing withholding while editing these files.
-- This plan touches supervisor permissions only. Agent and viewer behaviour must be byte-identical afterwards.
-- Run the full suite with `npm test` before every commit.
+- **Scope of behaviour change:** nav and settings-section *policy* changes for `supervisor` only — agent and viewer nav/section access must be byte-identical afterwards. The backend guards in Tasks 2, 3 and 5 necessarily tighten *reads* for every role below admin, which is intended; what must not change is any agent or viewer **user-visible flow** (the inbox must still show connection state, the AI banner must still work).
+- **Lint has pre-existing debt** (~7 errors / 87 warnings in vendored files). The gate is "build passes and THIS diff adds no NEW lint", not a globally clean run.
+- Run `npm test` before every commit, from the app root `/Volumes/CurserDisk/Dev/wacrm2.0/wacrm2.0`.
 
 ---
 
@@ -873,20 +876,46 @@ grep -nE "^export const (get|list|overview|listSystemTasks|listRecent|connection
 
 Then read each hit and confirm it either calls `requireRole("admin")` or is a deliberately member-safe projection (`aiConfig.get`, `whatsappConfig.connectionState`). Anything else is a gap — fix it before proceeding.
 
-- [ ] **Step 2: Deploy the backend first**
+- [ ] **Step 2: Full offline verification**
+
+Run from the app root. **Do not run any `convex` CLI command** — see Global Constraints.
+
+```bash
+npm test && npm run typecheck && npm run build
+```
+
+Expected: full suite green (record the count), `tsc --noEmit` exit 0, `next build` emits its route manifest with no compile errors.
+
+Then confirm this diff adds no new lint:
+
+```bash
+npx eslint src/lib/auth/roles.ts src/lib/auth/roles.test.ts \
+  convex/apiKeys.ts convex/aiConfig.ts convex/whatsappConfig.ts \
+  src/components/settings/settings-overview.tsx
+```
+
+Expected: clean, or only warnings that already existed on `main` for these files.
+
+---
+
+## Owner deployment (manual — not performed by the implementation session)
+
+Everything above is offline. The steps below touch production and are the account owner's to run.
+
+- [ ] **Step 3: Deploy the Convex backend first**
 
 ```bash
 git fetch origin && git merge origin/main
 npx convex deploy
 ```
 
-Backend-before-frontend is required here. It is safe in this direction because supervisors already cannot reach these tabs in the UI, so no live session starts erroring mid-deploy.
+Backend-before-frontend is required. It is safe in this direction because supervisors already cannot reach these tabs in the UI, so no live session starts erroring mid-deploy. The reverse order would ship the UI with the guards still off.
 
-- [ ] **Step 3: Deploy the frontend**
+- [ ] **Step 4: Deploy the frontend**
 
 Push the branch and let Netlify build, or merge per the repo's normal flow.
 
-- [ ] **Step 4: Click-verify as a real supervisor**
+- [ ] **Step 5: Click-verify as a real supervisor**
 
 Log in as an account member whose role is `supervisor` and confirm:
 
@@ -898,10 +927,10 @@ Log in as an account member whose role is `supervisor` and confirm:
 - The Settings Overview page renders without a console error (this is where a missed `FORBIDDEN` would surface)
 - Team members tab lists the roster but offers no invite/remove/role controls
 
-- [ ] **Step 5: Regression-check the lower roles**
+- [ ] **Step 6: Regression-check the lower roles**
 
 Log in as an `agent` and confirm the inbox still loads and still shows correct WhatsApp connection state. This is the surface most at risk from Task 4 and Task 5 — a `FORBIDDEN` here means a consumer was missed.
 
-- [ ] **Step 6: Regression-check admin**
+- [ ] **Step 7: Regression-check admin**
 
 Log in as an `admin` or `owner` and confirm the AI agent settings page still loads the system prompt, the WhatsApp settings tab still populates, and the API keys tab still lists keys.
