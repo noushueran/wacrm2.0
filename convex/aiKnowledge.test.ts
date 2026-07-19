@@ -818,13 +818,16 @@ describe("retrieve merge", () => {
       queryText: "Georgia visa",
       k: 3,
     });
-    // Capped at the migration-window budget — `ceil(3 / 2)` = 2 — rather
-    // than at `k`. This account has no legacy chunks, so the 1 slot the
-    // budget reserves for that pool simply goes unfilled; that is the
-    // deliberate cost of the guard while both pools coexist. See
-    // `retrieve`'s `compiledBudget` comment, and Phase 3 removes it.
-    expect(results).toHaveLength(2);
-    expect(new Set(results).size).toBe(2);
+    // Capped at `k` — never at the 6 rows the `k * 2` over-fetch pulled
+    // back, and never at the 9 seeded. `tryPush`'s cap is the ONLY thing
+    // holding that contract, including on the final top-up pass, which
+    // replays the retained over-fetch candidates against the full `k`.
+    // (The migration-window budget bounds only the FIRST compiled pass —
+    // `ceil(3 / 2)` = 2 here — and this account has no legacy chunks, so
+    // the 1 slot reserved for that pool comes back to compiled rather
+    // than going unfilled. See `retrieve`'s `compiledBudget` comment.)
+    expect(results).toHaveLength(3);
+    expect(new Set(results).size).toBe(3);
   });
 
   test("audience 'customer' also filters the compiled SEMANTIC arm, which cannot filter it in the vector query", async () => {
@@ -1034,13 +1037,101 @@ describe("retrieve merge", () => {
     });
 
     // The point of the guard: publishing to v2 must not silently cut the
-    // legacy pool out from under the engines.
+    // legacy pool out from under the engines. THIS is the assertion the
+    // budget exists for, and it holds simultaneously with the top-up
+    // covered by the next test — reserving and reclaiming are not in
+    // tension, because legacy gets first refusal on the reserved slots
+    // and only what it declines goes back.
     expect(results).toContain(legacyContent);
-    // Compiled is capped at `ceil(5 / 2)` = 3, leaving 2 slots for
-    // legacy — of which only the one seeded chunk exists to fill them.
+    // The reserved portion is `ceil(5 / 2)` = 3 compiled, then legacy
+    // takes its pick of the remaining 2 — but only one legacy chunk
+    // exists, so the slot it leaves unused returns to the compiled pool
+    // as a 4th compiled excerpt rather than being forfeited.
     expect(
       results.filter((c) => c.startsWith("[Georgia — Note")),
-    ).toHaveLength(3);
-    expect(results).toHaveLength(4);
+    ).toHaveLength(4);
+    expect(results).toHaveLength(5);
+  });
+
+  test("a fully migrated account still gets the full k — unused reserved slots go back to the compiled pool", async () => {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+    await configureEmbeddingsKey(asUser);
+
+    // Eight compiled chunks — more than the default `k` — and NO legacy
+    // document at all. That is the far end of the migration, reachable
+    // today: publish to v2, then delete the pasted documents through
+    // `aiKnowledge.remove` in the settings UI.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 8; i++) {
+        const content = `[Georgia — Note ${i}]\nGeorgia compiled detail ${i}`;
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "entry",
+          serviceKey: "georgia",
+          entryType: "note",
+          audience: "customer",
+          chunkIndex: i,
+          content,
+          embedding: syntheticEmbedding(content),
+        });
+      }
+    });
+
+    // Default `k` and no `audience` — what every live caller passes.
+    const results = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia",
+    });
+
+    // The budget RESERVES the back half of `k` for legacy; it does not
+    // forfeit those slots when legacy has nothing to put in them. An
+    // empty legacy pool claims none of them, so they return to the
+    // compiled pool and the caller still gets a full `k` — not
+    // `ceil(5 / 2)` = 3, which would be a silent 40% cut in grounding
+    // context for exactly the accounts furthest along the migration.
+    expect(results).toHaveLength(5);
+    expect(new Set(results).size).toBe(5);
+    expect(results.every((c) => c.startsWith("[Georgia — Note"))).toBe(true);
+  });
+
+  test("the top-up works with no embeddings key too — the compiled LEXICAL arm over-fetches for it", async () => {
+    const t = convexTest(schema, modules);
+    const { accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+
+    // Deliberately NO embeddings key, so the compiled SEMANTIC arm never
+    // runs and contributes no retained candidates. Every candidate the
+    // top-up replays has to come from the lexical arm — which is why
+    // that arm asks for `k` rows while pushing only `compiledBudget` of
+    // them. Without that over-fetch a lexical-only account would be
+    // pinned at `ceil(k / 2)` no matter how empty its legacy pool is.
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 8; i++) {
+        await ctx.db.insert("kbChunks", {
+          accountId,
+          sourceKind: "entry",
+          serviceKey: "georgia",
+          entryType: "note",
+          audience: "customer",
+          chunkIndex: i,
+          content: `[Georgia — Note ${i}]\nGeorgia compiled detail ${i}`,
+        });
+      }
+    });
+
+    const results = await t.action(internal.aiKnowledge.retrieve, {
+      accountId,
+      queryText: "Georgia",
+    });
+    expect(results).toHaveLength(5);
+    expect(new Set(results).size).toBe(5);
   });
 });

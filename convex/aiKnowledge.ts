@@ -539,22 +539,45 @@ export const retrieve = internalAction({
     };
 
     // --- Migration-window guard -------------------------------------
-    // The compiled pool may claim at most HALF of `k`; the rest stays
-    // reserved for legacy. Phase 3 retires the legacy pool and this
-    // budget goes with it — until then it is load-bearing, not
-    // arbitrary tuning.
+    // RESERVES the back half of `k` for the legacy pool. It is a FLOOR
+    // for legacy, not a ceiling for compiled: the compiled arms fill
+    // only up to `compiledBudget` on their first pass, the legacy arms
+    // then get first refusal on every remaining slot, and whatever they
+    // DECLINE returns to the compiled pool in the top-up at the end of
+    // this handler. So the guard costs a fully migrated account nothing
+    // — with an empty legacy pool `retrieve` still returns a full `k`.
+    // Phase 3 retires the legacy pool and this whole guard goes with it;
+    // until then it is load-bearing, not arbitrary tuning.
     //
-    // Why: every live caller uses the default `k = 5`, so without a
-    // budget the natural first step of adopting v2 — publishing ONE
-    // entry to see what it does — compiles ~5 chunks that fill every
-    // slot and starve the legacy pool for all three engines at once,
-    // including the QUALIFICATION CHECKLIST / SALES CHECKLIST /
+    // Why reserve at all: every live caller uses the default `k = 5`, so
+    // without a budget the natural first step of adopting v2 —
+    // publishing ONE entry to see what it does — compiles ~5 chunks that
+    // fill every slot and starve the legacy pool for all three engines
+    // at once, including the QUALIFICATION CHECKLIST / SALES CHECKLIST /
     // PURCHASE CRITERIA sections that still live only in the pasted
     // legacy documents. `ctx.vectorSearch` has no relevance floor, so a
     // tiny, wholly irrelevant compiled pool still returns its best-of-
     // pool and displaces a large relevant one — silently, with no error
     // anywhere. A first publish must not be a total cutover.
     const compiledBudget = Math.ceil(k / 2);
+
+    /**
+     * Compiled-pool candidates the arms below have ALREADY fetched and
+     * hydrated, in rank order, retained for the top-up that runs after
+     * the legacy arms. Holding them is what makes handing unused
+     * reserved slots back to the compiled pool free: the semantic arm
+     * over-fetches `k * 2` and the lexical arm asks for `k` — both more
+     * than `compiledBudget` — so the rows the first pass had to leave
+     * behind are already in memory and the top-up costs ZERO additional
+     * queries.
+     *
+     * Only rows that cleared the semantic arm's `audience` post-filter
+     * are recorded. A chunk withheld from the reserved portion for being
+     * internal must stay withheld from the top-up too — this array must
+     * never become a second, unfiltered way into `kbOpsBlocks`'
+     * sentinels.
+     */
+    const compiledCandidates: { id: string; content: string }[] = [];
 
     // --- Query embedding — computed ONCE, shared by both pools -------
     // Hoisted above both passes deliberately: `retrieve` runs on every
@@ -614,6 +637,10 @@ export const retrieve = internalAction({
             const row = rowById.get(r._id);
             if (!row) continue;
             if (audience && row.audience !== "customer") continue;
+            // Retained AFTER the audience post-filter, so the top-up
+            // can only ever replay customer-safe rows when the caller
+            // asked for them.
+            compiledCandidates.push({ id: row._id, content: row.content });
             tryPush(row._id, row.content, compiledBudget);
           }
         }
@@ -625,15 +652,28 @@ export const retrieve = internalAction({
     // --- Compiled pool, lexical arm ---------------------------------
     // Same `compiledBudget` as the semantic arm above: the two together
     // are one pool's allowance, not one each.
+    //
+    // Asks for `k` rows while pushing at most `compiledBudget` of them —
+    // the same over-fetch the semantic arm does with `k * 2`, and still
+    // ONE query. The surplus is what lets the top-up below return unused
+    // reserved slots on a LEXICAL-ONLY account: with no embeddings key
+    // the semantic arm never runs, so this is the sole source of
+    // retained candidates, and a `compiledBudget`-sized fetch would
+    // leave the top-up nothing to replay.
     if (pickedContents.length < compiledBudget) {
       try {
         const rows = await ctx.runQuery(internal.aiKnowledge.searchKbChunks, {
           accountId: args.accountId,
           queryText: query,
-          limit: compiledBudget,
+          limit: k,
           audience,
         });
-        for (const row of rows) tryPush(row._id, row.content, compiledBudget);
+        for (const row of rows) {
+          // `searchKbChunks` narrows `audience` inline in its search
+          // index, so every row here is already caller-appropriate.
+          compiledCandidates.push({ id: row._id, content: row.content });
+          tryPush(row._id, row.content, compiledBudget);
+        }
       } catch {
         // Best-effort: fall through to the legacy pool.
       }
@@ -641,13 +681,17 @@ export const retrieve = internalAction({
 
     // --- Legacy pool (`aiKnowledgeChunks`), semantic arm ------------
     // Both legacy arms fill up to the FULL `k`, unlike the compiled
-    // arms above — the budget caps one pool, it does not split the
-    // result set in half. The guard is still worth keeping: `k` can be
-    // 1 (`compiledBudget` then equals `k`), and a caller may raise `k`
-    // enough for the compiled arms to satisfy it outright, in which
-    // case every `push` from here would no-op against the cap anyway
-    // and this saves a vector search plus a hydration query on the hot
-    // inbound-message path.
+    // arms above — the budget reserves the rest of the result set for
+    // THIS pool, it does not split the result set in half. Running
+    // before the compiled top-up is what gives legacy first refusal on
+    // those reserved slots; the top-up only ever gets what these two
+    // arms leave behind.
+    //
+    // The `< k` guard is still worth keeping: at `k = 1`,
+    // `compiledBudget` equals `k`, so the compiled arms can satisfy the
+    // caller outright and every `tryPush` from here would no-op against
+    // the cap anyway — skipping saves a vector search plus a hydration
+    // query on the hot inbound-message path.
     if (pickedContents.length < k) {
       try {
         if (queryEmbedding) {
@@ -695,6 +739,36 @@ export const retrieve = internalAction({
         for (const chunk of ftsChunks) tryPush(chunk._id, chunk.content);
       } catch {
         // Best-effort: return whatever the earlier arms already found.
+      }
+    }
+
+    // --- Compiled top-up: unused reserved slots go back -------------
+    // The budget RESERVES the back half of `k` for legacy; it does not
+    // forfeit those slots when legacy has nothing to put in them. Both
+    // legacy arms have now had their pick, so anything still empty is
+    // genuinely unclaimed and belongs to the compiled pool. Without
+    // this, a fully migrated account — compiled pool populated, legacy
+    // documents deleted — would silently get `ceil(k / 2)` excerpts
+    // instead of `k`: a 40% cut in grounding context at the default
+    // `k = 5`, hitting exactly the accounts that adopted v2 most
+    // completely.
+    //
+    // Replays the candidates the compiled arms already fetched, in
+    // their original rank order, this time against the full `k`.
+    // `tryPush` dedups by chunk `_id`, so re-offering a row the
+    // reserved portion already took is a safe no-op and only the truly
+    // unused slots get filled. Final ordering, therefore: compiled
+    // (reserved), then legacy, then the compiled remainder.
+    //
+    // Deliberately NOT wrapped in try/catch, unlike every stage above:
+    // those each own an external or derived step that can fail (a
+    // provider call, a vector search, an index read), whereas this
+    // walks an in-memory array the arms above already hydrated and
+    // audience-filtered. There is no I/O left here to fail, and a
+    // catch would only hide a genuine logic bug.
+    if (pickedContents.length < k) {
+      for (const candidate of compiledCandidates) {
+        tryPush(candidate.id, candidate.content);
       }
     }
 

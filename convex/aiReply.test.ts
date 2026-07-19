@@ -1144,3 +1144,90 @@ test("an ad-lead conversation with no source_url replies without a landing row",
   const landingRows = await t.run((ctx) => ctx.db.query("adLandingPages").collect());
   expect(landingRows).toHaveLength(0);
 });
+
+// ============================================================
+// hasKnowledgeChunks — the retrieval gate over BOTH pools
+// ============================================================
+
+// Every caller of `aiKnowledge.retrieve` is gated on this query, so a
+// pool it fails to probe is a pool the AI silently cannot see. It
+// deliberately spans both: the legacy `aiKnowledgeChunks` and the
+// compiled `kbChunks` of Knowledge Engine v2.
+test("hasKnowledgeChunks is true for EITHER pool alone and false with neither", async () => {
+  const t = convexTest(schema, modules);
+
+  // 1. Compiled-only — the account that migrated to v2 and then deleted
+  //    its pasted documents through `aiKnowledge.remove` in the settings
+  //    UI. This is the case a legacy-only probe would get wrong, and it
+  //    fails CLOSED: auto-reply and all three engines would ground on
+  //    nothing while `kbChunks` sat fully populated, with no error
+  //    anywhere to notice it by.
+  const { accountId: compiledOnly } = await seedAccountMember(t, {
+    name: "Compiled",
+    email: "compiled@example.com",
+  });
+  await t.run((ctx) =>
+    ctx.db.insert("kbChunks", {
+      accountId: compiledOnly,
+      sourceKind: "entry" as const,
+      serviceKey: "georgia",
+      entryType: "note",
+      audience: "customer" as const,
+      chunkIndex: 0,
+      content: "[Georgia — Visa requirements]\nPassport valid 6 months.",
+    }),
+  );
+  await t.run(async (ctx) => {
+    // Guard the guard: assert the premise (NO legacy rows at all), so
+    // this can never pass for the wrong reason.
+    const legacy = await ctx.db
+      .query("aiKnowledgeChunks")
+      .withIndex("by_account", (q) => q.eq("accountId", compiledOnly))
+      .collect();
+    expect(legacy).toHaveLength(0);
+  });
+  expect(
+    await t.query(internal.aiReply.hasKnowledgeChunks, {
+      accountId: compiledOnly,
+    }),
+  ).toBe(true);
+
+  // 2. Legacy-only — the pre-v2 shape, still how this account is served
+  //    for everything not yet migrated. Proves the widened check is a
+  //    real OR rather than a swapped probe.
+  const { accountId: legacyOnly } = await seedAccountMember(t, {
+    name: "Legacy",
+    email: "legacy@example.com",
+  });
+  await t.run(async (ctx) => {
+    const documentId = await ctx.db.insert("aiKnowledgeDocuments", {
+      accountId: legacyOnly,
+      title: "KB 3 — Georgia",
+      content: "QUALIFICATION CHECKLIST — Georgia",
+      updatedAt: Date.now(),
+    });
+    await ctx.db.insert("aiKnowledgeChunks", {
+      accountId: legacyOnly,
+      documentId,
+      chunkIndex: 0,
+      content: "QUALIFICATION CHECKLIST — Georgia",
+    });
+  });
+  expect(
+    await t.query(internal.aiReply.hasKnowledgeChunks, {
+      accountId: legacyOnly,
+    }),
+  ).toBe(true);
+
+  // 3. Neither pool — the negative control that keeps the two above from
+  //    being vacuous, and the perf fast-path this query exists for: no
+  //    knowledge anywhere means `dispatchInbound` skips the `retrieve`
+  //    action (its config load + potential embedding call) entirely.
+  const { accountId: empty } = await seedAccountMember(t, {
+    name: "Empty",
+    email: "empty@example.com",
+  });
+  expect(
+    await t.query(internal.aiReply.hasKnowledgeChunks, { accountId: empty }),
+  ).toBe(false);
+});
