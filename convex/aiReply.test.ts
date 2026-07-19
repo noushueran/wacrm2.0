@@ -167,6 +167,7 @@ async function messagesFor(t: TestConvex<typeof schema>, conversationId: Id<"con
 // explicit timeout avoids that flake without masking a real bug (the
 // other, lighter early-exit tests in this file never need it).
 test("generates and sends a DRY-RUN reply, marks it AI-generated, and bumps aiReplyCount", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -180,6 +181,9 @@ test("generates and sends a DRY-RUN reply, marks it AI-generated, and bumps aiRe
   });
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  // The reply now lands via a scheduled `deliverReply` (length-proportional
+  // delay) instead of sending inline — drain the scheduler so it fires.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const messages = await messagesFor(t, conversationId);
   const botMessages = messages.filter((m) => m.senderType === "bot");
@@ -283,6 +287,7 @@ test("early-exits without sending when a human already owns the conversation", a
 });
 
 test("no reply cap: the bot keeps replying no matter how many replies it has already sent", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -300,6 +305,7 @@ test("no reply cap: the bot keeps replying no matter how many replies it has alr
   await t.run((ctx) => ctx.db.patch(conversationId, { aiReplyCount: 50 }));
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const botMessages = (await messagesFor(t, conversationId)).filter(
     (m) => m.senderType === "bot",
@@ -320,6 +326,7 @@ test("no reply cap: the bot keeps replying no matter how many replies it has alr
 // ============================================================
 
 test("a voice note is transcribed before replying and the transcript is stored on the row", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -347,6 +354,7 @@ test("a voice note is transcribed before replying and the transcript is stored o
   );
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
   expect(audioRow!.aiTranscription).toBe("[dry-run transcript]");
@@ -483,6 +491,7 @@ test("a customer media row with mediaKey and R2 unconfigured is skipped (best-ef
 }, 20_000);
 
 test("no usable OpenAI key (anthropic provider, no embeddings key) skips transcription but still replies", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -510,6 +519,7 @@ test("no usable OpenAI key (anthropic provider, no embeddings key) skips transcr
   );
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
   expect(audioRow!.aiTranscription).toBeUndefined();
@@ -598,6 +608,7 @@ test("a persistent failure stops after the single retry — no reply, no endless
 // ============================================================
 
 test("a model-emitted handoff marker never silences the bot — the customer still gets a reply", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -611,6 +622,7 @@ test("a model-emitted handoff marker never silences the bot — the customer sti
   });
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   // Handoff is MANUAL-ONLY (dashboard takeover). Even if the model
   // emits the legacy marker, the customer still hears something and the
@@ -704,6 +716,7 @@ test("flagForHuman marks the thread pending + bells supervisors, but never silen
 // ============================================================
 
 test("account isolation: dispatching for one account never reads or mutates another account's conversation", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const alice = await seedAccountMember(t, { name: "Alice", email: "alice@example.com" });
   await configureAi(alice.asUser);
@@ -726,6 +739,7 @@ test("account isolation: dispatching for one account never reads or mutates anot
     conversationId: aliceThread.conversationId,
     contactId: aliceThread.contactId,
   });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   // Alice's own thread got the reply...
   expect(
@@ -1186,6 +1200,7 @@ test("draft allows an agent on an unassigned (pool) conversation", async () => {
 // `lib/ai/adContext.test.ts`; the fetch itself is `CONVEX_AI_DRY_RUN`-
 // synthetic here (see `adLanding.ts`).
 test("an ad-lead conversation replies AND warms the landing cache lazily", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Ada",
@@ -1210,6 +1225,7 @@ test("an ad-lead conversation replies AND warms the landing cache lazily", async
   });
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const botMessages = (await messagesFor(t, conversationId)).filter(
     (m) => m.senderType === "bot",
@@ -1234,6 +1250,7 @@ test("an ad-lead conversation replies AND warms the landing cache lazily", async
 // A referral WITHOUT a usable link still replies (context is just the
 // ad text) and never touches the landing cache.
 test("an ad-lead conversation with no source_url replies without a landing row", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Ben",
@@ -1256,6 +1273,7 @@ test("an ad-lead conversation with no source_url replies without a landing row",
   });
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const botMessages = (await messagesFor(t, conversationId)).filter(
     (m) => m.senderType === "bot",
@@ -1428,4 +1446,83 @@ test("ackInbound returns acked when the conversation is eligible", async () => {
   });
 
   expect(result).toBe("acked");
+});
+
+// ============================================================
+// deliverReply — length-proportional delivery (Task 4). Split out of
+// `dispatchInbound` so the wait before sending can be scheduled rather
+// than slept; the final debounce-token re-check moves here too, since
+// more time has passed by delivery time than at any earlier gate.
+// ============================================================
+
+test("deliverReply sends the text it was handed", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000201",
+    messageText: "how much?",
+  });
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000201",
+    replyText: "Yes, we have packages for August!",
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(
+    messages.some((m) => m.contentText === "Yes, we have packages for August!"),
+  ).toBe(true);
+});
+
+test("deliverReply stands down when a newer inbound has arrived", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-stale@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000202",
+    messageText: "first",
+  });
+
+  // The thread's only message so far is the debounce token we will pass.
+  const [firstInbound] = await messagesFor(t, conversationId);
+
+  // A newer customer message overtakes it, so the delivery must abort.
+  await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "text" as const,
+      contentText: "second, newer",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000202",
+    replyText: "stale reply that must not send",
+    triggerMessageId: firstInbound._id,
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(
+    messages.some((m) => m.contentText === "stale reply that must not send"),
+  ).toBe(false);
 });

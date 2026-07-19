@@ -812,6 +812,10 @@ export const processInbound = internalAction({
             conversationId: res.conversationId,
             contactId: res.contactId,
             triggerMessageId: res.messageId,
+            // Wall-clock time of THIS inbound — `deliverReply` subtracts
+            // time-already-spent from its typing-pace target so model
+            // think time is absorbed rather than stacked on top.
+            inboundAt: Date.now(),
             // Carried through only so a scheduled retry can resend it —
             // the initial blue-tick + "typing…" already fired above via
             // `ackInbound`.

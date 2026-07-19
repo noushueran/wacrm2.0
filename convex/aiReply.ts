@@ -12,6 +12,7 @@ import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
+import { deliveryDelayMs } from "./lib/ai/pacing";
 import { landingUrlKey, type AdContext } from "./lib/ai/adContext";
 import { latestUserMessage } from "./lib/ai/query";
 import {
@@ -641,6 +642,10 @@ export const dispatchInbound = internalAction({
     // fragments gets ONE reply. Optional: direct callers (tests, a
     // future manual trigger) skip the staleness check.
     triggerMessageId: v.optional(v.id("messages")),
+    // Wall-clock ms when the triggering inbound arrived, so delivery can
+    // subtract time already spent. Optional: dispatches scheduled before
+    // this shipped carry no value and simply skip the subtraction.
+    inboundAt: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
     // Flipped right after the Meta send succeeds: a failure AFTER this
@@ -854,54 +859,30 @@ export const dispatchInbound = internalAction({
         replyText = FALLBACK_REPLY_TEXT;
       }
 
-      // Re-check the debounce token at the last moment: transcription +
-      // generation can take many seconds, and a message that arrived
-      // meanwhile owns the reply (its own dispatch fires shortly). One
-      // wasted generation beats a reply that ignores the newest message.
-      if (args.triggerMessageId) {
-        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+      // Hand off to a delayed delivery instead of sending now, so the
+      // reply lands at a pace proportional to its own length. `elapsed`
+      // is measured from the INBOUND, not from here — that absorbs the
+      // model's think time into the typing window rather than stacking
+      // on top of it.
+      const elapsedMs = args.inboundAt ? Date.now() - args.inboundAt : 0;
+      await ctx.scheduler.runAfter(
+        deliveryDelayMs({ replyLength: replyText.length, elapsedMs }),
+        internal.aiReply.deliverReply,
+        {
           accountId: args.accountId,
           conversationId: args.conversationId,
-        });
-        if (latestNow && latestNow !== args.triggerMessageId) return;
-      }
-
-      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-        to,
-        text: replyText,
-      });
-      sent = true;
-      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
-        accountId: args.accountId,
-        whatsappMessageId: sendResult.whatsappMessageId,
-      });
-      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-      });
-
-      // Ask-admin relay (v3): fan the question out to the admin numbers
-      // AFTER the holding reply went out; and retire any team answers
-      // this reply just delivered.
-      if (generation.askAdmin) {
-        await ctx.scheduler.runAfter(
-          0,
-          internal.qualificationEngine.relayQuestionToAdmin,
-          {
-            accountId: args.accountId,
-            conversationId: args.conversationId,
-            contactId: args.contactId,
-            question: generation.askAdmin,
-          },
-        );
-      }
-      if (teamAnswers.inquiryIds.length > 0) {
-        await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+          contactId: args.contactId,
+          to,
+          replyText,
+          triggerMessageId: args.triggerMessageId,
+          askAdmin: generation.askAdmin ?? undefined,
           inquiryIds: teamAnswers.inquiryIds,
-        });
-      }
+        },
+      );
+      // Delivery is scheduled and owns the send from here. Any failure
+      // past this point must not re-dispatch — see this flag's own
+      // declaration comment.
+      sent = true;
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
       // Transient failures (provider 429/timeout, an infra hiccup) must
@@ -930,6 +911,94 @@ export const dispatchInbound = internalAction({
           console.error("[ai auto-reply] retry scheduling failed:", schedErr);
         }
       }
+    }
+  },
+});
+
+/**
+ * Send a reply that has already been generated, then do the post-send
+ * bookkeeping. Scheduled by `dispatchInbound` after a delay derived from
+ * the reply's own length, so the message lands at a human typing pace
+ * instead of the instant the model finishes.
+ *
+ * Split out rather than sleeping inside `dispatchInbound`: an in-action
+ * sleep would hold an action slot and bill up to ~12s of idle compute on
+ * every single reply.
+ *
+ * The debounce token is re-checked HERE, at the last possible moment —
+ * more time has passed than at any earlier gate, so this is where a
+ * newer customer message is most likely to have overtaken us.
+ *
+ * Retry semantics deliberately differ from `dispatchInbound`'s own: once
+ * this action is scheduled, `dispatchInbound` considers its work done
+ * (`sent = true`) and will not retry regardless of what happens in here.
+ * A failure inside this action (most likely a Meta send rejection) is
+ * logged, not retried — Meta rejections are near-always non-retryable,
+ * and retrying here would mean re-running this action's OWN body again,
+ * which risks double-texting a customer who may already have received
+ * the message on a partial failure (e.g. the send succeeded but a
+ * downstream mutation threw).
+ */
+export const deliverReply = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    to: v.string(),
+    replyText: v.string(),
+    triggerMessageId: v.optional(v.id("messages")),
+    askAdmin: v.optional(v.string()),
+    // Table name verified against `qualificationEngine.markAnswersDelivered`
+    // (`convex/qualificationEngine.ts:1332`) — it is `adminInquiries`.
+    inquiryIds: v.array(v.id("adminInquiries")),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      if (args.triggerMessageId) {
+        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+        });
+        if (latestNow && latestNow !== args.triggerMessageId) return;
+      }
+
+      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        to: args.to,
+        text: args.replyText,
+      });
+      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
+        accountId: args.accountId,
+        whatsappMessageId: sendResult.whatsappMessageId,
+      });
+      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+      });
+
+      if (args.askAdmin) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.qualificationEngine.relayQuestionToAdmin,
+          {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+            question: args.askAdmin,
+          },
+        );
+      }
+      if (args.inquiryIds.length > 0) {
+        await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+          inquiryIds: args.inquiryIds,
+        });
+      }
+    } catch (err) {
+      // No retry: `dispatchInbound` already considers this reply handed
+      // off, and re-generating here would risk double-texting a customer
+      // who may already have received the message.
+      console.error("[ai auto-reply] delivery failed:", err);
     }
   },
 });
