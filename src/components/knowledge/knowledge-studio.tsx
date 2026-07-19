@@ -26,18 +26,12 @@ export function KnowledgeStudio() {
   const isAdmin = accountRole ? canEditSettings(accountRole) : false;
   // Owned here (not in a later task's file) because Tasks 4-7 build the
   // matrix/detail toggle on top of this same shell rather than replacing
-  // it. Task 4 wires the setter to the matrix's onSelectService; the value
-  // itself is read starting Task 6/7's detail view — remove this disable
-  // once that lands and actually reads `selectedService`.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- see comment above
-  const [selectedService, setSelectedService] = useState<string | null>(null);
+  // it. Task 6/7's detail view re-introduces the read of this value.
+  const [, setSelectedService] = useState<string | null>(null);
   // Task 5 supplies the actual create-service dialog/form; this shell only
   // owns the open/closed flag so the matrix's "Add service" affordance has
-  // somewhere to write to in the meantime. The setter is wired below; the
-  // value itself is read once Task 5's dialog renders — remove this
-  // disable then.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- see comment above
-  const [createServiceOpen, setCreateServiceOpen] = useState(false);
+  // somewhere to write to in the meantime. Task 5 re-introduces the read.
+  const [, setCreateServiceOpen] = useState(false);
 
   const overview = useQuery(api.knowledge.studioOverview, isAdmin ? {} : 'skip');
   const config = useQuery(api.aiConfig.get, isAdmin ? {} : 'skip');

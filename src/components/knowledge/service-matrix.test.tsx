@@ -76,6 +76,22 @@ describe('ServiceMatrix', () => {
     })])).toContain('90');
   });
 
+  test('renders the marks-off warning when qualification is published but not at 100', () => {
+    const warnLabel = messages.Knowledge.matrix.marksOff.replace('{total}', '90');
+    const html = markup([row({
+      ops: { ...absentOps, qualification: { state: 'published', marksTotal: 90 } },
+    })]);
+    expect(html).toContain(warnLabel);
+  });
+
+  test('does not render the marks-off warning for a draft block at 90 marks', () => {
+    const warnLabel = messages.Knowledge.matrix.marksOff.replace('{total}', '90');
+    const html = markup([row({
+      ops: { ...absentOps, qualification: { state: 'draft', marksTotal: 90 } },
+    })]);
+    expect(html).not.toContain(warnLabel);
+  });
+
   test('renders a "+N more" count for entry types without a column', () => {
     expect(markup([row({
       entries: {
