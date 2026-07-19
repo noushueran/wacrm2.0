@@ -385,13 +385,22 @@ export const searchChunks = internalQuery({
 // hold the same isolation discipline.
 
 /**
- * Hydrates `ctx.vectorSearch` hit ids into full `kbChunks` rows —
- * whole rows, not just `content`, because `retrieve`'s compiled
- * semantic arm must read `audience` off each row to post-filter it
- * (see `retrieve` for why that filter can't live in the vector query).
- * RE-ASSERTS `accountId` on every returned row, exactly like
+ * Hydrates `ctx.vectorSearch` hit ids into the three fields `retrieve`'s
+ * compiled semantic arm actually reads: `_id` (dedup key), `content`
+ * (the payload) and `audience` (which that arm must post-filter in code
+ * — see `retrieve` for why it can't live in the vector query).
+ *
+ * Projected rather than returning whole `Doc<"kbChunks">` rows on
+ * purpose: every row carries a 1536-float `embedding`, and this runs
+ * for up to `k * 2` rows on the hottest path in the app (an inbound
+ * WhatsApp message). Shipping those vectors back over the action↔query
+ * boundary would roughly triple the hydration payload for data the
+ * caller discards immediately.
+ *
+ * RE-ASSERTS `accountId` on every row before projecting, exactly like
  * `getChunksByIds` — same belt-and-braces reasoning as this file's
- * header comment.
+ * header comment. The projection is a payload optimization layered on
+ * top of that check, never a substitute for it.
  */
 export const getKbChunksByIds = internalQuery({
   args: {
@@ -400,10 +409,16 @@ export const getKbChunksByIds = internalQuery({
   },
   handler: async (ctx, args) => {
     const docs = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
-    return docs.filter(
-      (doc): doc is Doc<"kbChunks"> =>
-        doc !== null && doc.accountId === args.accountId,
-    );
+    return docs
+      .filter(
+        (doc): doc is Doc<"kbChunks"> =>
+          doc !== null && doc.accountId === args.accountId,
+      )
+      .map((doc) => ({
+        _id: doc._id,
+        content: doc.content,
+        audience: doc.audience,
+      }));
   },
 });
 
@@ -491,18 +506,35 @@ export const retrieve = internalAction({
 
     const audience = args.audience;
 
-    // Both pools accumulate here, in rank order. Deduped by CONTENT
-    // rather than by id: the two pools have different id types, so an
-    // id-keyed `Map` couldn't span them, and the same text reachable
-    // through both (a legacy paste since re-authored as a structured
-    // entry) must not burn two of the caller's `k` slots. `push`
-    // enforces the `k` cap at write time, so the array never needs a
-    // trailing slice.
+    // Both pools accumulate here, in rank order, deduped by CHUNK ID —
+    // the pre-merge implementation's exact semantics (it kept a
+    // `Map<Id<"aiKnowledgeChunks">, string>`, so a chunk surfaced by
+    // both the semantic and the lexical arm was picked once). Convex
+    // document ids are globally unique, so ONE set spans both pools
+    // even though their id types differ.
+    //
+    // Deliberately NOT content-keyed: two distinct legacy rows with
+    // byte-identical text (this account pastes its knowledge base in by
+    // hand, so a re-pasted document or a repeated boilerplate paragraph
+    // produces exactly that) must still consume two of the caller's `k`
+    // slots, as they always have. Nor is dedup done across pools by
+    // content — compiled chunks are emitted with a `[<Service> —
+    // <Title>]` header a legacy chunk will essentially never byte-
+    // match, so the collision isn't a real case and isn't worth the
+    // behavioral subtlety.
     const pickedContents: string[] = [];
-    const seen = new Set<string>();
-    const push = (content: string) => {
-      if (pickedContents.length >= k || seen.has(content)) return;
-      seen.add(content);
+    const seenIds = new Set<string>();
+    /**
+     * Appends one chunk's content, at most once per chunk id and never
+     * past `k`. Silently no-ops on BOTH conditions — an already-picked
+     * id, or a result set that's already full — so every arm can just
+     * feed it candidates in rank order and let it hold the contract.
+     * That write-time cap is why the final array needs no trailing
+     * slice.
+     */
+    const tryPush = (id: string, content: string) => {
+      if (pickedContents.length >= k || seenIds.has(id)) return;
+      seenIds.add(id);
       pickedContents.push(content);
     };
 
@@ -544,6 +576,9 @@ export const retrieve = internalAction({
     // the hydrated rows still leaves candidates to fill `k`. Search
     // indexes are different — they DO support chained `.eq()` across
     // filter fields, which is why `searchKbChunks` narrows both inline.
+    // Those hydrated rows are PROJECTED (`_id`/`content`/`audience`
+    // only) — the 1536-float embeddings never ride back across this
+    // boundary just to be discarded here.
     try {
       if (queryEmbedding) {
         const results = await ctx.vectorSearch("kbChunks", "by_embedding", {
@@ -561,7 +596,7 @@ export const retrieve = internalAction({
             const row = rowById.get(r._id);
             if (!row) continue;
             if (audience && row.audience !== "customer") continue;
-            push(row.content);
+            tryPush(row._id, row.content);
           }
         }
       }
@@ -578,7 +613,7 @@ export const retrieve = internalAction({
           limit: k,
           audience,
         });
-        for (const row of rows) push(row.content);
+        for (const row of rows) tryPush(row._id, row.content);
       } catch {
         // Best-effort: fall through to the legacy pool.
       }
@@ -614,7 +649,7 @@ export const retrieve = internalAction({
             const contentById = new Map(chunks.map((c) => [c._id, c.content]));
             for (const r of results) {
               const content = contentById.get(r._id);
-              if (content !== undefined) push(content);
+              if (content !== undefined) tryPush(r._id, content);
             }
           }
         }
@@ -633,7 +668,7 @@ export const retrieve = internalAction({
           queryText: query,
           limit: k,
         });
-        for (const chunk of ftsChunks) push(chunk.content);
+        for (const chunk of ftsChunks) tryPush(chunk._id, chunk.content);
       } catch {
         // Best-effort: return whatever the earlier arms already found.
       }

@@ -794,7 +794,7 @@ describe("retrieve merge", () => {
     // The compiled semantic arm deliberately over-fetches `k * 2` so
     // that post-filtering `audience` in code still has candidates left.
     // Seed more than that, so an unbounded arm would blow past `k`:
-    // `push`'s cap is the ONLY thing holding the contract here (the
+    // `tryPush`'s cap is the ONLY thing holding the contract here (the
     // pre-merge implementation had a second guard — a trailing
     // `.slice(0, k)` — which this rewrite drops).
     await t.run(async (ctx) => {
@@ -836,9 +836,20 @@ describe("retrieve merge", () => {
     // of the vector query — it is post-filtered on the hydrated rows.
     // This is the arm that would leak internal content if that
     // post-filter were ever dropped.
+    //
+    // The internal rows deliberately do NOT contain the query term
+    // ("Georgia"), so the compiled LEXICAL arm can never surface them —
+    // its `search_content` match would miss. That keeps this test
+    // pinned to the arm it is named for: the only way an internal row
+    // reaches the `unfiltered` result below is the semantic arm, so the
+    // non-vacuity check at the end proves that arm ran, and the
+    // customer-safe assertion above proves its post-filter is what
+    // withheld them. (Vector search ranks by cosine over the seeded
+    // synthetic embeddings and is indifferent to the missing term, so
+    // the semantic arm still returns every row.)
     await t.run(async (ctx) => {
       for (let i = 0; i < 4; i++) {
-        const content = `INTERNAL ops sentinel ${i} — Georgia margin floor`;
+        const content = `INTERNAL ops sentinel ${i} — supplier margin floor`;
         await ctx.db.insert("kbChunks", {
           accountId,
           sourceKind: "ops",
@@ -868,7 +879,7 @@ describe("retrieve merge", () => {
       accountId,
       queryText: "Georgia",
       k: 5,
-    audience: "customer",
+      audience: "customer",
     });
     expect(customerSafe.some((c) => c.includes("INTERNAL ops sentinel"))).toBe(
       false,
@@ -915,5 +926,51 @@ describe("retrieve merge", () => {
         queryText: "alpha",
       }),
     ).toEqual(["alpha beta gamma"]);
+  });
+
+  test("two legacy chunks with identical content each still consume a slot", async () => {
+    const t = convexTest(schema, modules);
+    const { accountId } = await seedAccountMember(t, {
+      name: "A",
+      email: "a@x.co",
+      role: "admin",
+    });
+
+    // Byte-identical content across two DISTINCT rows is a real shape
+    // for this account, whose knowledge base is maintained by pasting
+    // documents in by hand: the same document pasted twice, or one
+    // boilerplate paragraph repeated across several pasted documents,
+    // chunks to exactly this.
+    //
+    // The pre-merge implementation keyed its dedup on the CHUNK ID (a
+    // `Map<Id<"aiKnowledgeChunks">, string>`), so both rows came back
+    // and each consumed one of the caller's `k` slots — the same string
+    // twice. Content-keyed dedup would instead collapse them into one
+    // and hand the freed slot to the next distinct chunk, changing both
+    // membership and count. Byte-compatibility of the legacy path means
+    // the duplicate must still appear TWICE.
+    const content = "refunds are processed within 14 days";
+    for (const title of ["Pasted once", "Pasted again"]) {
+      const documentId = await seedDocument(t, {
+        accountId,
+        title,
+        content,
+      });
+      await seedChunk(t, {
+        accountId,
+        documentId,
+        chunkIndex: 0,
+        content,
+      });
+    }
+
+    // No embeddings key and no `audience` — the lexical-only legacy
+    // path, exactly how a no-key account has always been served.
+    expect(
+      await t.action(internal.aiKnowledge.retrieve, {
+        accountId,
+        queryText: "refunds",
+      }),
+    ).toEqual([content, content]);
   });
 });
