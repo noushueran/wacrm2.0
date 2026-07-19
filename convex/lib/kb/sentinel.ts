@@ -59,13 +59,22 @@ export function parseLegacyDocument(title: string, content: string): ParsedLegac
   return { title, prose: proseLines.join("\n").trim(), sections };
 }
 
-const ITEM_RE = /^-\s*(.+?)(?:\s*\((\d+)\s*marks?\))?\s*$/;
+const ITEM_RE = /^-\s*(.+)$/;
+// Unanchored: the "(N marks)" parenthetical and the " — ask: <question>" suffix
+// (see renderOpsSentinel above) can each be followed by more line content, so
+// neither can be pinned to end-of-line. Extract marks first, then strip both
+// the marks parenthetical and any trailing ask-suffix to recover the label.
+const MARKS_RE = /\((\d+)\s*marks?\)/;
+const ASK_SUFFIX_RE = /—\s*ask:.*$/;
 export function parseChecklistLines(raw: string): { label: string; marks?: number }[] {
   const items: { label: string; marks?: number }[] = [];
   for (const line of raw.split("\n")) {
     const m = line.trim().match(ITEM_RE);
     if (!m) continue;
-    items.push(m[2] !== undefined ? { label: m[1], marks: Number(m[2]) } : { label: m[1] });
+    const rest = m[1];
+    const marksMatch = rest.match(MARKS_RE);
+    const label = rest.replace(ASK_SUFFIX_RE, "").replace(MARKS_RE, "").trim();
+    items.push(marksMatch ? { label, marks: Number(marksMatch[1]) } : { label });
   }
   return items;
 }

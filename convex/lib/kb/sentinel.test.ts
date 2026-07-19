@@ -84,3 +84,39 @@ test("parseChecklistLines + parseReportValue", () => {
   });
   expect(parseReportValue("no value here")).toEqual({});
 });
+
+describe("parseChecklistLines marks + ask-suffix recovery", () => {
+  test("plain label, no marks", () => {
+    expect(parseChecklistLines("- Travel dates")).toEqual([{ label: "Travel dates" }]);
+  });
+  test("label with marks", () => {
+    expect(parseChecklistLines("- Travel dates (20 marks)")).toEqual([
+      { label: "Travel dates", marks: 20 },
+    ]);
+  });
+  test("label with marks and a trailing ask suffix", () => {
+    expect(parseChecklistLines("- Email address (40 marks) — ask: Best email?")).toEqual([
+      { label: "Email address", marks: 40 },
+    ]);
+  });
+  test("label with a trailing ask suffix but no marks", () => {
+    expect(parseChecklistLines("- Nationality — ask: Which passport?")).toEqual([
+      { label: "Nationality" },
+    ]);
+  });
+});
+
+test("parseChecklistLines round-trips renderOpsSentinel qualification output", () => {
+  const rendered = renderOpsSentinel("Dubai Holiday Packages", {
+    kind: "qualification",
+    criteria: [
+      { key: "email", label: "Email address", marks: 40, question: "Best email?" },
+      { key: "nationality", label: "Nationality" },
+    ],
+  });
+  const body = rendered.split("\n").slice(1).join("\n");
+  expect(parseChecklistLines(body)).toEqual([
+    { label: "Email address", marks: 40 },
+    { label: "Nationality" },
+  ]);
+});
