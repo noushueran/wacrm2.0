@@ -8,6 +8,7 @@ import { useConvex, useMutation } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
 import { convexErrorMessage } from '@/lib/convex/adapters';
 import { uploadAccountMedia } from '@/lib/storage/upload-media';
+import { mediaUrlFromKey } from '@/lib/storage/media-url';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -130,6 +131,21 @@ export function ProfileForm() {
           pendingAvatar,
           'avatar',
         );
+        // Same null guard `template-manager.tsx` and `node-config-form.tsx`
+        // use after their own `uploadAccountMedia` call: without it, a save
+        // with `NEXT_PUBLIC_R2_PUBLIC_HOST` unset would still "succeed"
+        // (the mutation patches `avatarKey` fine), but `resolveMediaUrl`
+        // (`src/hooks/use-auth.tsx`) can't turn that key into a URL and
+        // falls back to the STALE previous `avatarUrl` — the user sees
+        // their old avatar after a "successful" save, with only a
+        // `console.error` to explain why. Failing loudly here instead
+        // surfaces it as the same toast error the other two upload flows
+        // already give.
+        if (!mediaUrlFromKey(key)) {
+          throw new Error(
+            "Uploaded, but the public media host isn't configured yet.",
+          );
+        }
         nextAvatarKey = key;
       } else if (removeAvatar) {
         // Clear both: a stale key would otherwise keep winning over an

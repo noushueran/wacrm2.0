@@ -957,7 +957,7 @@ export const verifyRegistration = action({
 // `internal.accounts.accountContextForUser`), but gates at "agent"
 // rather than "admin" — viewing an already-received inbox attachment
 // is a routine agent action (the same floor `convex/files.ts`'s
-// `generateUploadUrl` uses for attaching OUTBOUND media), not an
+// `startUpload` uses for attaching OUTBOUND media), not an
 // admin-only diagnostic like `verifyRegistration`.
 //
 // No DRY-RUN branch (unlike `verifyRegistration`/`metaSend.ts`): this

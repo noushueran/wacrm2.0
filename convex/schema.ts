@@ -1337,16 +1337,24 @@ export default defineSchema({
     .index("by_account_status", ["accountId", "status"])
     .index("by_conversation", ["conversationId"]),
 
-  // Ownership record tying a client-uploaded Convex storage object to the
-  // account that minted it. Convex `_storage` carries no `accountId` of
-  // its own — a storage id, once minted, resolves for anyone holding it —
-  // so this table is the ONLY place a storage id is bound to a tenant.
-  // `files.getUrl`/`files.remove` consult it (via `by_storage`) so one
-  // account can't resolve or delete another's uploads;
-  // `files.registerUpload` writes the row right after the client-upload
-  // POST hands back a storage id. `by_account` follows the section
-  // convention (every account-scoped table carries an accountId index)
-  // and supports future per-account storage GC.
+  // VESTIGIAL — the R2 media-storage migration retired every consumer of
+  // this table. It used to tie a client-uploaded Convex `_storage` object
+  // to the account that minted it (`_storage` carries no `accountId` of
+  // its own, so a storage id, once minted, resolved for anyone holding
+  // it — this table was the ONLY place a storage id was bound to a
+  // tenant). `files.getUrl` and `files.registerUpload`, the two functions
+  // that read and wrote it, are both DELETED: an R2 object key now
+  // carries its own owner in its first path segment
+  // (`convex/lib/r2/keys.ts`), minted server-side, so ownership is a
+  // string comparison rather than a lookup-table join — see
+  // `convex/files.ts`'s own header comment. `files.remove` (still live)
+  // no longer touches this table at all.
+  //
+  // Left defined here, still unused, only because Convex schema
+  // validation rejects removing a table that still holds production
+  // rows. Drop this table (and run a prod purge of any lingering rows)
+  // once the R2 migration's Plan 2 (backfill + legacy-storage cleanup)
+  // has landed.
   fileOwners: defineTable({
     accountId: v.id("accounts"),
     storageId: v.id("_storage"),

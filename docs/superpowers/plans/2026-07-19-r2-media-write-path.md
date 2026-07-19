@@ -1519,26 +1519,78 @@ Not optional, and **must precede Plan 2**. Several failure modes here are silent
 
 **Files:** none — this is a deploy-and-observe task.
 
+---
+
+🚨🚨🚨 **PRE-DEPLOY GATE — DO NOT RUN STEP 2 UNTIL EVERY ITEM BELOW IS CONFIRMED TRUE.** 🚨🚨🚨
+
+This is a hard, non-backward-compatible cutover across TWO independently-deployed
+targets (Convex backend, Netlify frontend), and getting the gate wrong fails
+**silently** — in more than one way, nothing throws where a human is looking.
+This gate is what prevents a silent production regression; do not skip or
+skim it.
+
+1. **All five Convex `R2_*` vars are set on the *production* Convex
+   deployment AND VERIFIED live** — `R2_BUCKET`, `R2_ENDPOINT`,
+   `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST`. "Verified"
+   means confirmed on the deployment itself (e.g. `npx convex env list`
+   against the production deployment), not "an owner said they set it."
+   - **Consequence if ANY is missing at the moment Step 2 deploys:**
+     `startUpload` throws on every outbound upload attempt — loud, an
+     agent notices immediately. But `convex/whatsappConfig.ts`'s
+     `resolveInboundMedia` wraps its R2 call in a try/catch that returns
+     `null` on *any* failure, including `r2ConfigFromEnv()` throwing
+     (best-effort by design) — so **every inbound voice note and photo
+     silently gets no `mediaKey` at all and renders as an "unavailable"
+     bubble in the inbox, with nothing in the logs a human is watching.**
+     This is a SILENT regression of the exact bug fixed by the
+     2026-07-11 "inbound media playback fix" — it will not look like an
+     error, it will just look like WhatsApp media quietly stopped
+     working. Check the inbox for a fresh inbound photo/voice note
+     immediately after deploy, not just outbound sends (Step 4 covers
+     this, but don't wait for it if this var check was skipped).
+2. **`NEXT_PUBLIC_R2_PUBLIC_HOST` is present in the Netlify *build*
+   environment** — see Step 1 below for the full detail on why this must
+   be a verified, already-built value and what happens if it's missing.
+3. **Convex is deployed BEFORE Netlify. Never the reverse, and never
+   "close enough."** `files.generateUploadUrl` / `registerUpload` /
+   `getUrl` are deleted in this change with **no deprecation window** —
+   there is no version of the backend that serves both the old and new
+   surface at once:
+   - Netlify (new frontend, calling `api.files.startUpload`) shipping
+     *before* Convex (still running the old functions) → every upload
+     fails immediately, loud, but user-visible and disruptive.
+   - Convex shipping first, with Netlify lagging behind → the OLD
+     frontend keeps calling `generateUploadUrl`/`registerUpload`, which
+     no longer exist on the deployed backend → also loud and disruptive,
+     but entirely avoidable: deploy Convex, confirm it is live (Step 2's
+     own commands do this), *then* trigger the Netlify build — never
+     both at once, never Netlify first.
+
+Only once all three are confirmed does Step 2 proceed.
+
+---
+
 - [ ] **Step 1: Confirm owner prerequisites are done**
 
 - `objs.holidayys.co` bound to the `wa-holidayys` bucket as a **custom domain** (not `r2.dev`).
-- `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment.
+- `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_PUBLIC_HOST` set on the Convex deployment — see gate item 1 above for the silent-failure consequence if this is skipped.
 - 🚨 **`NEXT_PUBLIC_R2_PUBLIC_HOST` must be set in the Netlify *build* environment BEFORE any writer is enabled** (i.e. before Step 2's `npx convex deploy`, and before any Task 6/7 write path can put a key into a row). This is a build-time Next.js public env var — setting it on Netlify *after* deploying a build does nothing until the next build runs. Verify it by checking the deployed build's environment, not just the Netlify UI's saved value.
   - **Consequence if it's missing when a key-bearing row is first read:** `src/lib/storage/media-url.ts`'s client resolver now degrades gracefully — it falls back to the legacy Convex-storage URL and logs a `console.error` naming the missing variable, rather than throwing. So a missing var no longer blanks the app. But the degraded behavior is still broken in its own way: **any media uploaded after the R2 cutover has no legacy URL to fall back to, so it will not load** (broken avatar / broken message attachment) until the var is set and the affected rows are re-read. Treat the `console.error` as a page-this-person signal, not background noise.
   - Before this fix (fixed in the Task 5 review pass), the same missing-var condition was worse: the resolver *threw* during render, which blanked the entire app (`AuthProvider`) or the entire message thread (`message-thread.tsx`) the instant one row carried a key — not just a missing image.
 
-- [ ] **Step 2: Owner deploys backend, then frontend**
+- [ ] **Step 2: Owner deploys backend, then frontend — in that order, never reversed (gate item 3 above)**
 
 🚨 **This step is run by the owner, not by an implementer subagent.** It is the
 only production push in this plan, and it must follow a clean whole-branch
-review.
+review. Re-confirm the PRE-DEPLOY GATE above immediately before running this —
+do not rely on a check done earlier in the day.
 
 ```bash
 git fetch origin && git merge origin/main
 npm test && npm run typecheck && npm run build   # all green before pushing
-npx convex deploy                                 # PRODUCTION — owner only
+npx convex deploy                                 # PRODUCTION — owner only, MUST complete and be confirmed live before the next line
 ```
-Then let Netlify build.
+Only after `npx convex deploy` has completed AND been confirmed live (e.g. calling `api.files.startUpload` succeeds against production), let Netlify build. Do not trigger the Netlify build preemptively "to save time" — that is exactly gate item 3's reversed-order failure mode.
 
 - [ ] **Step 3: Verify Meta can actually fetch from the custom domain**
 

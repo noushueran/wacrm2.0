@@ -6,6 +6,7 @@ import { canAccessConversation, hasMinRole } from "./lib/roles";
 import type { Id } from "./_generated/dataModel";
 import { r2ConfigFromEnv } from "./lib/r2/config";
 import { resolveMediaUrlLazy } from "./lib/r2/url";
+import { parseMediaKey } from "./lib/r2/keys";
 
 // ============================================================
 // `send` — the authed, PUBLIC entrypoint the Inbox + contact-detail
@@ -147,6 +148,28 @@ export const send = action({
       case "video":
       case "document":
       case "audio": {
+        // A client-supplied `mediaKey` must be verified to belong to the
+        // CALLING account before it is ever resolved to a URL — this
+        // action's args validator has no `accountId` field (see the
+        // handler's own opening comment), so nothing upstream stops an
+        // agent of account A from passing a key that belongs to account
+        // B. Without this check, `resolveMediaUrlLazy` below would
+        // happily resolve B's key to a real, fetchable R2 URL, Meta
+        // would fetch and deliver B's object, and B's URL would then be
+        // persisted into A's own message row (`convex/metaSend.ts`'s
+        // `sendMedia` persists `mediaUrl: args.link` unconditionally —
+        // see that module's own doc comment). A foreign key and a
+        // malformed one (`parseMediaKey` returns `null`) are BOTH
+        // `NOT_FOUND` — never `FORBIDDEN`, and never distinguishable
+        // from each other — the same non-leaky tenant-isolation contract
+        // `convex/files.ts`'s `remove` mutation already uses for the
+        // identical class of check.
+        if (
+          args.mediaKey &&
+          parseMediaKey(args.mediaKey)?.accountId !== accountId
+        ) {
+          throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+        }
         // `resolveMediaUrlLazy` only builds the R2 config (which throws
         // when R2 env vars are unset — `lib/r2/config.ts`) when
         // `args.mediaKey` is actually present, so a plain `mediaUrl` send

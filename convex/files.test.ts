@@ -342,6 +342,16 @@ test("storeFromUrl fetches a URL and PUTs the bytes to R2 under an accountId/kin
   expect(calls[0].method).toBe("PUT");
   expect(calls[0].url).toContain(result.key);
   expect(calls[0].headers.get("content-type")).toBe("image/jpeg");
+  // Byte-content assertion (restores the pre-R2 suite's own equivalent
+  // assertion on `ctx.storage.get(...)`): method/URL/content-type alone
+  // don't prove `putObject` was ever handed the DOWNLOADED bytes rather
+  // than the wrong blob or an empty one — which is exactly what would
+  // silently ship broken inbound WhatsApp media (voice notes, photos) on
+  // the live webhook path with nothing in the suite noticing. The
+  // captured object is the signed `Request` `aws4fetch` handed to
+  // `fetch`, so its body is read out the same way any `Request` body is.
+  const putBody = new Uint8Array(await calls[0]!.arrayBuffer());
+  expect(Array.from(putBody)).toEqual(Array.from(fakeBytes));
 
   vi.unstubAllGlobals();
 });
