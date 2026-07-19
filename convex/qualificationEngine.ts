@@ -2432,12 +2432,12 @@ export const routingAlertPhones = internalQuery({
 /**
  * Fans a routing-failure notice out to every configured admin number.
  *
- * Deliberately NOT gated on `adminAlertEnabled`, for the same reason
- * `askAdminContext` above is not: that toggle governs routine new-lead
- * notifications, whereas these are operational failures — "your routing
- * is broken", "this lead is stranded". Someone who muted the former
- * still needs the latter. With no admin numbers configured there is no
- * channel at all, so this no-ops.
+ * Deliberately NOT gated on `adminAlertEnabled`. `adminAlertContext`
+ * above gates the routine new-qualified-lead notification on that
+ * toggle; these alerts are a different category — operational failures
+ * ("your routing is broken", "this lead is stranded") that someone who
+ * muted routine lead alerts still needs to see. With no admin numbers
+ * configured there is no channel at all, so this no-ops.
  */
 export const alertRoutingFailure = internalAction({
   args: { accountId: v.id("accounts"), text: v.string() },
