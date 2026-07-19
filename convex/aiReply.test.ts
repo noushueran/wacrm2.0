@@ -1354,7 +1354,7 @@ test("hasKnowledgeChunks is true for EITHER pool alone and false with neither", 
 // moment the inbound lands, independent of the debounced dispatch.
 // ============================================================
 
-test("ackInbound is a no-op when auto-reply is switched off", async () => {
+test("ackInbound returns skipped_inactive when auto-reply is switched off", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Owner",
@@ -1369,21 +1369,17 @@ test("ackInbound is a no-op when auto-reply is switched off", async () => {
 
   // Must resolve without throwing and without reaching Meta. A throw
   // here would surface as an unhandled scheduled-function failure.
-  // `ackInbound` is typed `Promise<void>`, but Convex serializes an
-  // `undefined` handler return as `null` over the wire — `t.action`
-  // surfaces that same `null`, not `undefined` (see
-  // `webhookDelivery.test.ts`'s identical `dispatch` case).
-  await expect(
-    t.action(internal.aiReply.ackInbound, {
-      accountId,
-      conversationId,
-      contactId,
-      triggerWamid: "wamid.TEST_ACK_OFF",
-    }),
-  ).resolves.toBeNull();
+  const result = await t.action(internal.aiReply.ackInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.TEST_ACK_OFF",
+  });
+
+  expect(result).toBe("skipped_inactive");
 });
 
-test("ackInbound is a no-op once a human owns the thread", async () => {
+test("ackInbound returns skipped_assigned once a human owns the thread", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedAccountMember(t, {
     name: "Owner",
@@ -1400,12 +1396,36 @@ test("ackInbound is a no-op once a human owns the thread", async () => {
     await ctx.db.patch(conversationId, { assignedToUserId: userId });
   });
 
-  await expect(
-    t.action(internal.aiReply.ackInbound, {
-      accountId,
-      conversationId,
-      contactId,
-      triggerWamid: "wamid.TEST_ACK_ASSIGNED",
-    }),
-  ).resolves.toBeNull();
+  const result = await t.action(internal.aiReply.ackInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.TEST_ACK_ASSIGNED",
+  });
+
+  expect(result).toBe("skipped_assigned");
+});
+
+test("ackInbound returns acked when the conversation is eligible", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-ack-eligible@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000103",
+    messageText: "hi",
+  });
+
+  // Verify all gates pass: AI active, auto-reply enabled, unassigned, not paused
+  const result = await t.action(internal.aiReply.ackInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.TEST_ACK_ELIGIBLE",
+  });
+
+  expect(result).toBe("acked");
 });

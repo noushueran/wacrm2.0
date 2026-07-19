@@ -118,6 +118,19 @@ const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
 const MAX_TRANSCRIPTIONS_PER_DISPATCH = 3;
 
 /**
+ * Outcome of `ackInbound`: which gate (if any) fired, or success.
+ * Returned instead of void so tests can verify the action's eligibility
+ * gates without relying on side effects (which are skipped in DRY-RUN).
+ */
+export type AckOutcome =
+  | "acked" // successful blue-tick + typing indicator
+  | "skipped_inactive" // no config, or isActive/autoReplyEnabled off
+  | "skipped_no_context" // loadDispatchContext returned null
+  | "skipped_assigned" // a human owns the thread
+  | "skipped_paused" // aiAutoreplyDisabled on this conversation
+  | "failed"; // the try/catch caught something
+
+/**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
  * network entirely, same convention as `convex/aiKnowledge.ts`'s
  * `syntheticEmbedding`. Markers in the triggering customer message
@@ -540,7 +553,9 @@ async function loadAdContext(
  * is correct — a human reading along would keep the receipt current.
  *
  * Best-effort throughout. A failure here costs a read receipt, never a
- * reply, so it must never throw into the scheduler.
+ * reply, so it must never throw into the scheduler. Returns an `AckOutcome`
+ * so tests can verify the eligibility gates without relying on side effects
+ * (which are skipped in DRY-RUN).
  */
 export const ackInbound = internalAction({
   args: {
@@ -549,12 +564,14 @@ export const ackInbound = internalAction({
     contactId: v.id("contacts"),
     triggerWamid: v.string(),
   },
-  handler: async (ctx, args): Promise<void> => {
+  handler: async (ctx, args): Promise<AckOutcome> => {
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
       });
-      if (!config || !config.isActive || !config.autoReplyEnabled) return;
+      if (!config || !config.isActive || !config.autoReplyEnabled) {
+        return "skipped_inactive";
+      }
 
       const dispatchContext: { conversation: Doc<"conversations">; to: string } | null =
         await ctx.runQuery(internal.aiReply.loadDispatchContext, {
@@ -562,19 +579,27 @@ export const ackInbound = internalAction({
           conversationId: args.conversationId,
           contactId: args.contactId,
         });
-      if (!dispatchContext) return;
+      if (!dispatchContext) {
+        return "skipped_no_context";
+      }
 
       const { conversation } = dispatchContext;
-      if (conversation.assignedToUserId) return; // a human owns this thread
-      if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
+      if (conversation.assignedToUserId) {
+        return "skipped_assigned"; // a human owns this thread
+      }
+      if (conversation.aiAutoreplyDisabled) {
+        return "skipped_paused"; // handed off / turned off here
+      }
 
       await ctx.runAction(internal.metaSend.markRead, {
         accountId: args.accountId,
         whatsappMessageId: args.triggerWamid,
         typingIndicator: true,
       });
+      return "acked";
     } catch (err) {
       console.warn("[ai auto-reply] ack failed:", err);
+      return "failed";
     }
   },
 });
