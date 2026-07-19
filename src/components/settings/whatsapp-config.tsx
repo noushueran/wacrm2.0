@@ -16,6 +16,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+import { useAuth } from '@/hooks/use-auth';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -39,6 +40,7 @@ type ResetReason = 'token_corrupted' | 'meta_api_error' | null;
 
 export function WhatsAppConfig() {
   const t = useTranslations('Settings.whatsapp');
+  const { canEditSettings, profileLoading } = useAuth();
 
   // Config CRUD (Phase 8, Task 3) — `whatsappConfig` is one row per
   // account, scoped server-side via the caller's own membership
@@ -46,7 +48,17 @@ export function WhatsAppConfig() {
   // so unlike the old Supabase-backed version there is no explicit
   // `accountId` to key the query on or an account-switch effect to
   // guard — `useQuery` just reactively tracks the caller's own row.
-  const configDoc = useQuery(api.whatsappConfig.get);
+  // Skip until the role is BOTH known and sufficient: `api.whatsappConfig
+  // .get` is admin-gated server-side, and firing it as a non-admin
+  // returns FORBIDDEN, which `useQuery` re-throws synchronously during
+  // render — this app has no Error Boundary, so a non-admin hard-
+  // navigating here would crash instead of being redirected by
+  // `RequireSection`. Same 'skip' idiom as `settings-overview.tsx`'s
+  // members query.
+  const configDoc = useQuery(
+    api.whatsappConfig.get,
+    !profileLoading && canEditSettings ? {} : 'skip',
+  );
   const loading = configDoc === undefined;
   const config = configDoc ? toUiWhatsappConfig(configDoc) : null;
 

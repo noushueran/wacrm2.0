@@ -73,7 +73,15 @@ export function AiConfig() {
   const { canEditSettings: canEdit, profileLoading } = useAuth();
   const t = useTranslations('Settings.aiConfig');
 
-  const configDoc = useQuery(api.aiConfig.getFull);
+  // Skip until the role is BOTH known and sufficient — same reasoning as
+  // `agents/page.tsx`'s own `configDoc`: `api.aiConfig.getFull` is
+  // admin-gated server-side, and a synchronous FORBIDDEN throw here
+  // would crash the page (no Error Boundary) instead of letting the
+  // route guard redirect a non-admin away.
+  const configDoc = useQuery(
+    api.aiConfig.getFull,
+    !profileLoading && canEdit ? {} : 'skip',
+  );
   const loading = configDoc === undefined;
   const configured = configDoc != null;
   const config = useMemo(
