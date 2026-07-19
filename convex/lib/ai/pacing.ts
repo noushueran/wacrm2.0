@@ -26,6 +26,13 @@ const DEFAULT_TYPING_JITTER = 0.25;
 const DEFAULT_TYPING_MIN_MS = 3_000;
 const DEFAULT_TYPING_MAX_MS = 15_000;
 
+/** Absolute upper bound on the delivery target, regardless of env
+ *  configuration. Meta auto-dismisses the typing indicator at 25s with no
+ *  documented refresh, so a larger value would leave the customer watching
+ *  "typing…" vanish into silence — the exact failure this module exists to
+ *  avoid. Env may lower the max, never raise it past this. */
+const TYPING_CEILING_MS = 20_000;
+
 /** Terminal punctuation across the languages this CRM actually serves
  *  (Latin, Arabic, CJK) — a message ending in one reads as finished. */
 const TERMINAL_PUNCTUATION = /[.!?。！？؟…]$/u;
@@ -104,7 +111,10 @@ export function deliveryDelayMs(args: {
     DEFAULT_TYPING_CHARS_PER_SEC;
   const jitter = envNumber("AI_TYPING_JITTER", DEFAULT_TYPING_JITTER, false);
   const minMs = envNumber("AI_TYPING_MIN_MS", DEFAULT_TYPING_MIN_MS, true);
-  const maxMs = envNumber("AI_TYPING_MAX_MS", DEFAULT_TYPING_MAX_MS, true);
+  const maxMs = Math.min(
+    TYPING_CEILING_MS,
+    envNumber("AI_TYPING_MAX_MS", DEFAULT_TYPING_MAX_MS, true),
+  );
 
   const baseMs = (Math.max(0, replyLength) / charsPerSec) * 1_000;
   // random() ∈ [0,1) → factor ∈ [1-jitter, 1+jitter)
