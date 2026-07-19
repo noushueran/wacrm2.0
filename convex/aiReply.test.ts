@@ -603,6 +603,66 @@ test("a persistent failure stops after the single retry — no reply, no endless
   expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
 }, 20_000);
 
+test("a provider failure's scheduled retry also re-acks (whole-branch review Fix F1): Meta's original typing indicator has expired by the time a 30s-later retry fires, so the retry must re-acknowledge, not run silent", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice-retry-ack@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234598",
+    messageText: "[[FAIL]] what are your opening hours?",
+  });
+
+  const before = Date.now();
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.RETRYACK",
+  });
+
+  // Right after the first (failed) attempt: a retry AND a re-ack must
+  // both be scheduled — the ack at delay 0 (re-acking must not itself
+  // make the customer wait), carrying the SAME triggerWamid forward so
+  // it re-marks the SAME inbound as read/typing.
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  const ackRows = scheduled.filter((s) => s.name === "aiReply:ackInbound");
+  expect(ackRows).toHaveLength(1);
+  expect(ackRows[0]!.args[0]).toMatchObject({
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.RETRYACK",
+  });
+  expect(ackRows[0]!.scheduledTime - before).toBeLessThan(1000);
+
+  const dispatchRetryRows = scheduled.filter((s) => s.name === "aiReply:dispatchInbound");
+  expect(dispatchRetryRows).toHaveLength(1);
+  expect(dispatchRetryRows[0]!.args[0]).toMatchObject({ attempt: 2 });
+
+  // The transient failure clears before the retry fires — the reply
+  // still lands normally, same as the existing (pre-F1) retry test above.
+  await t.run(async (ctx) => {
+    const inbound = (await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect())[0]!;
+    await ctx.db.patch(inbound._id, { contentText: "what are your opening hours?" });
+  });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1);
+}, 20_000);
+
 // ============================================================
 // Handoff
 // ============================================================
@@ -1525,4 +1585,78 @@ test("deliverReply stands down when a newer inbound has arrived", async () => {
   expect(
     messages.some((m) => m.contentText === "stale reply that must not send"),
   ).toBe(false);
+});
+
+// ============================================================
+// deliverReply re-checks human takeover (whole-branch review Fix F2).
+// `dispatchInbound` checks `assignedToUserId`/`aiAutoreplyDisabled`
+// BEFORE scheduling delivery, but delivery can now fire up to
+// `deliveryDelayMs`'s max (~15s) later — long enough for an agent to
+// claim or pause the conversation from the dashboard in between. Manual
+// takeover is documented (this file's own header) as the ONLY stop the
+// bot recognizes, so `deliverReply` must re-check both gates itself
+// rather than trust a stale pre-delay read.
+// ============================================================
+
+test("deliverReply stands down when a human claims the conversation after dispatch already scheduled delivery", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-takeover@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000203",
+    messageText: "how much for the August package?",
+  });
+
+  // Simulates an agent claiming the chat from the dashboard during the
+  // artificial typing delay `dispatchInbound` already scheduled this
+  // delivery behind.
+  await t.run((ctx) => ctx.db.patch(conversationId, { assignedToUserId: userId }));
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000203",
+    replyText: "must not send — a human just took over",
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.some((m) => m.senderType === "bot")).toBe(false);
+  // No bookkeeping either — this send never happened.
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+});
+
+test("deliverReply stands down when auto-reply is paused on the conversation after dispatch already scheduled delivery", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-paused@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000204",
+    messageText: "how much for the August package?",
+  });
+
+  // Simulates a manual pause (or a handoff marker resolved elsewhere)
+  // landing during the artificial typing delay.
+  await t.run((ctx) => ctx.db.patch(conversationId, { aiAutoreplyDisabled: true }));
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000204",
+    replyText: "must not send — auto-reply was paused",
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.some((m) => m.senderType === "bot")).toBe(false);
 });

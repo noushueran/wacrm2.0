@@ -771,17 +771,31 @@ export const dispatchInbound = internalAction({
       // Independent of each other — the knowledge lookup makes a network
       // call for embeddings, so overlapping them saves real wall-clock
       // inside a window the customer is now watching.
+      const knowledgePromise = (async (): Promise<string[]> => {
+        const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
+          accountId: args.accountId,
+        });
+        if (!hasKb) return [];
+        return await ctx.runAction(internal.aiKnowledge.retrieve, {
+          accountId: args.accountId,
+          queryText,
+        });
+      })();
+      // Unhandled-rejection guard (whole-branch review Fix F8): if
+      // `qualification` below rejects FIRST, `Promise.all` settles on ITS
+      // reason and stops awaiting `knowledgePromise` — but that promise
+      // is still running, and if it later ALSO rejects, nothing is left
+      // listening to it, so Node flags it as an unhandled rejection (a
+      // runtime warning) even though the outer try/catch already has the
+      // failure covered via `Promise.all`'s own rejection. This no-op
+      // `.catch` just registers a handler so that warning never fires;
+      // `Promise.all` below still listens to this SAME promise directly,
+      // so it still rejects (and the outer catch still fires) exactly as
+      // before if `knowledgePromise` itself fails — behaviour is
+      // unchanged, only the spurious warning is gone.
+      knowledgePromise.catch(() => {});
       const [knowledgeResult, qualification] = await Promise.all([
-        (async (): Promise<string[]> => {
-          const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
-            accountId: args.accountId,
-          });
-          if (!hasKb) return [];
-          return await ctx.runAction(internal.aiKnowledge.retrieve, {
-            accountId: args.accountId,
-            queryText,
-          });
-        })(),
+        knowledgePromise,
         ctx.runQuery(internal.qualificationEngine.getObjectives, {
           accountId: args.accountId,
           conversationId: args.conversationId,
@@ -911,6 +925,33 @@ export const dispatchInbound = internalAction({
               inboundAt: args.inboundAt,
             },
           );
+          // Re-ack on retry (whole-branch review Fix F1): Meta's typing
+          // indicator auto-dismisses after 25s with no documented refresh,
+          // so by the time this retry fires (DISPATCH_RETRY_DELAY_MS =
+          // 30s later) the ORIGINAL ack from `ingest.ts` has long since
+          // expired. Without this, a retry runs completely silent — the
+          // customer watches "typing…" die and then hears nothing for the
+          // whole retry window, exactly the failure this branch exists to
+          // eliminate. This is what makes `triggerWamid` a live argument
+          // (see its own declaration comment above) rather than dead
+          // weight only ever forwarded, never read.
+          //
+          // Scheduled AFTER the dispatch retry above (not before) and in
+          // its own try/catch: a failure acking must never cost the
+          // customer the retry itself — same reasoning as Fix F7's
+          // `ingest.ts` guard around the very same call.
+          if (args.triggerWamid) {
+            try {
+              await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
+                accountId: args.accountId,
+                conversationId: args.conversationId,
+                contactId: args.contactId,
+                triggerWamid: args.triggerWamid,
+              });
+            } catch (ackErr) {
+              console.warn("[ai auto-reply] retry re-ack scheduling failed:", ackErr);
+            }
+          }
         } catch (schedErr) {
           // Preserve this action's never-throws contract even here.
           console.error("[ai auto-reply] retry scheduling failed:", schedErr);
@@ -927,8 +968,9 @@ export const dispatchInbound = internalAction({
  * instead of the instant the model finishes.
  *
  * Split out rather than sleeping inside `dispatchInbound`: an in-action
- * sleep would hold an action slot and bill up to ~12s of idle compute on
- * every single reply.
+ * sleep would hold an action slot and bill up to ~15s of idle compute on
+ * every single reply (`DEFAULT_TYPING_MAX_MS` in `lib/ai/pacing.ts` —
+ * the 12s flat debounce this replaced is gone).
  *
  * The debounce token is re-checked HERE, at the last possible moment —
  * more time has passed than at any earlier gate, so this is where a
@@ -966,6 +1008,25 @@ export const deliverReply = internalAction({
         });
         if (latestNow && latestNow !== args.triggerMessageId) return;
       }
+
+      // Re-check human takeover (whole-branch review Fix F2): delivery
+      // can be scheduled up to `deliveryDelayMs`'s max (~15s) after
+      // `dispatchInbound` already checked `assignedToUserId`/
+      // `aiAutoreplyDisabled` — long enough for an agent to claim or
+      // pause the conversation from the dashboard in between. Before this
+      // branch the send happened right after generation (~2-6s of
+      // exposure); the scheduled delay widened that window, and manual
+      // takeover is the ONLY stop the bot recognizes (see this file's
+      // header) — re-checking here, at the last possible moment before
+      // sending, is what keeps that guarantee true.
+      const dispatchContext = await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+      });
+      if (!dispatchContext) return;
+      if (dispatchContext.conversation.assignedToUserId) return;
+      if (dispatchContext.conversation.aiAutoreplyDisabled) return;
 
       const sendResult = await ctx.runAction(internal.metaSend.sendText, {
         accountId: args.accountId,

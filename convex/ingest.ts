@@ -791,12 +791,25 @@ export const processInbound = internalAction({
         // Acknowledge instantly — blue tick + "typing…" within a second,
         // rather than after the debounce. Separate from the dispatch
         // because the whole point is that it does NOT wait.
-        await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
-          accountId,
-          conversationId: res.conversationId,
-          contactId: res.contactId,
-          triggerWamid: message.wamid,
-        });
+        //
+        // Isolated in its own try/catch (whole-branch review Fix F7):
+        // this whole callback already runs inside `runBestEffort`, whose
+        // try/catch wraps the ENTIRE callback — without this inner
+        // guard, a failure scheduling the ack would throw PAST the
+        // dispatch scheduling below it and cost the customer their reply
+        // entirely, not just the read receipt. The inline `markRead`
+        // this replaced had its own try/catch for exactly this reason
+        // (an ack failure must never be able to cost a reply).
+        try {
+          await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
+            accountId,
+            conversationId: res.conversationId,
+            contactId: res.contactId,
+            triggerWamid: message.wamid,
+          });
+        } catch (ackErr) {
+          console.error("[ingest] ackInbound scheduling failed:", ackErr);
+        }
         // Debounced, not inline: WhatsApp users fragment one thought
         // across quick messages, and one racy dispatch per fragment
         // used to produce multiple partial replies. Each inbound

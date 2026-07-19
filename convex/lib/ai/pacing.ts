@@ -12,9 +12,19 @@
 //      evidence a thought is finished, so the debounce window is a
 //      guess made from message SHAPE.
 //   2. The typing indicator auto-dismisses after 25s, with no
-//      documented way to refresh it. `DEFAULT_TYPING_MAX_MS` keeps
-//      every reply well inside that ceiling by construction; raising
-//      it past ~20s means customers watch "typing…" die into silence.
+//      documented way to refresh it. `DEFAULT_TYPING_MAX_MS` /
+//      `TYPING_CEILING_MS` below bound only the ARTIFICIAL wait this
+//      module adds AFTER generation finishes (`deliveryDelayMs`'s
+//      clamped target) — NOT the total time to reply. Actual
+//      time-to-reply is `max(debounce + generation, target)`, and
+//      generation time is bounded elsewhere entirely (the caller's own
+//      `AI_REQUEST_TIMEOUT_MS`, default 30s) — this file has no say
+//      over it. A generation call — including any media
+//      transcription/description ahead of it — that runs past roughly
+//      19s will make the total outlive Meta's 25s indicator regardless
+//      of anything this module does; keeping `target` itself under
+//      ~20s only avoids ADDING to that risk on top of a fast
+//      generation, it does not remove it.
 // ============================================================
 
 const DEFAULT_DEBOUNCE_BASE_MS = 3_000;
