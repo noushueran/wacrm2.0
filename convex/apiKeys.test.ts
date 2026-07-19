@@ -62,20 +62,24 @@ async function seedTeammate(
     role: AccountRole;
   },
 ) {
-  return await t.run(async (ctx) => {
-    const userId = await ctx.db.insert("users", {
+  const userId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("users", {
       name: opts.name,
       email: opts.email,
     });
     await ctx.db.insert("memberships", {
-      userId,
+      userId: id,
       accountId: opts.accountId,
       role: opts.role,
       fullName: opts.name,
       email: opts.email,
     });
-    return userId;
+    return id;
   });
+  const asUser = t.withIdentity({
+    subject: `${userId}|session-${opts.name}`,
+  });
+  return { userId, asUser };
 }
 
 // ============================================================
@@ -189,24 +193,40 @@ test("list never returns keyHash for any key", async () => {
   expect(keys[0]!.name).toBe("CI bot");
 });
 
-test("list is visible to a non-admin member of the same account", async () => {
+test("list throws FORBIDDEN for a caller below the admin role", async () => {
   const t = convexTest(schema, modules);
-  const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
-    name: "Alice",
-    email: "alice@example.com",
-    role: "admin",
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
   });
-  await asAdmin.mutation(api.apiKeys.create, { name: "CI bot", scopes: [] });
-  const viewerId = await seedTeammate(t, {
+  const { asUser: asSupervisor } = await seedTeammate(t, {
     accountId,
-    name: "Vic",
-    email: "vic@example.com",
-    role: "viewer",
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
   });
-  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
 
-  const keys = await asViewer.query(api.apiKeys.list, {});
+  await expect(
+    asSupervisor.query(api.apiKeys.list, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("list still returns keys for an admin", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.apiKeys.create, {
+    name: "Test key",
+    scopes: ["messages:send"],
+  });
+
+  const keys = await asOwner.query(api.apiKeys.list, {});
   expect(keys).toHaveLength(1);
+  expect(keys[0]).not.toHaveProperty("keyHash");
 });
 
 // ============================================================
@@ -224,13 +244,12 @@ test("revoke throws FORBIDDEN for a caller below the admin role", async () => {
     name: "CI bot",
     scopes: [],
   });
-  const viewerId = await seedTeammate(t, {
+  const { asUser: asViewer } = await seedTeammate(t, {
     accountId,
     name: "Vic",
     email: "vic@example.com",
     role: "viewer",
   });
-  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
 
   await expect(
     asViewer.mutation(api.apiKeys.revoke, { apiKeyId }),
