@@ -284,9 +284,16 @@ This is strictly better here:
   metadata table and pagination are redundant, since keys live in our own rows.
 
 **Contract that must be honored:** `Content-Type` is part of the presigned
-signature. Per Cloudflare's own example, the header is set on the `Request`
-passed to `sign()`, and **the upload fails if the client then sends a different
-`Content-Type` than the one signed**. So the client's MIME type must round-trip:
+signature, and **the upload fails if the client then sends a different
+`Content-Type` than the one signed**.
+
+🚨 Setting the header on the `Request` passed to `sign()` is NOT sufficient —
+that is all Cloudflare's documented example does, and it leaves the header
+unsigned. aws4fetch keeps `content-type` in its `UNSIGNABLE_HEADERS` set and
+filters on `allHeaders || !UNSIGNABLE_HEADERS.has(header)`, so the signing
+call must pass **`{ aws: { signQuery: true, allHeaders: true } }`**. Verified
+against `aws4fetch`'s source during implementation (Task 3, 2026-07-19); the
+first draft of this design had the bug. So the client's MIME type must round-trip:
 browser reports `file.type` → server presigns with exactly that → browser PUTs
 with exactly that. `src/lib/storage/upload-media.ts:78` already sends
 `"Content-Type": file.type`, so this falls out naturally — but it means

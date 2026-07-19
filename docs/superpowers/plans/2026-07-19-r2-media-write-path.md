@@ -773,7 +773,12 @@ export async function presignPut(
       method: "PUT",
       headers: { "Content-Type": args.contentType },
     }),
-    { aws: { signQuery: true } },
+    // `allHeaders: true` is REQUIRED, not optional. aws4fetch keeps
+    // `content-type` in its UNSIGNABLE_HEADERS set and filters on
+    // `allHeaders || !UNSIGNABLE_HEADERS.has(header)`, so without this the
+    // header is set on the request but NEVER SIGNED — silently defeating
+    // the contract above. (Cloudflare's own documented example omits it.)
+    { aws: { signQuery: true, allHeaders: true } },
   );
   return signed.url;
 }
