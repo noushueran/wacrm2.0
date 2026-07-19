@@ -2039,3 +2039,73 @@ test("PS: completing qualification schedules the first purchase evaluation autom
     vi.useRealTimers();
   }
 });
+
+test("PS: sendPurchaseSignal — supervisor+ fires manually (works with auto toggle OFF), agents rejected, organic rejected", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t); // asUser = admin; purchase toggle stays OFF
+  await qualifySession(t, base);
+  const [s] = await sessionsFor(t, base.conversationId);
+
+  // Below supervisor → FORBIDDEN.
+  const agentUserId = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "Agent", email: "agent@example.com" });
+    await ctx.db.insert("memberships", {
+      userId, accountId: base.accountId, role: "agent", fullName: "Agent", email: "agent@example.com",
+    });
+    return userId;
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|s2` });
+  await expect(
+    asAgent.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id }),
+  ).rejects.toThrow();
+
+  // Admin fires — even though purchaseSignalsEnabled is false (manual is
+  // explicit human intent, the toggle only governs the automatic judge).
+  await base.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id });
+  const events = await purchasedEventsFor(t, base.conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0].eventName).toBe("Purchase");
+  const [after] = await sessionsFor(t, base.conversationId);
+  expect(after.purchase?.status).toBe("sent");
+  expect(after.purchase?.manual).toBe(true);
+
+  // Firing twice is rejected cleanly.
+  await expect(
+    base.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id }),
+  ).rejects.toThrow();
+
+  // Organic conversation → BAD_REQUEST not_attributed.
+  const organic = await seed(t);
+  await configureAi(organic.asUser);
+  await qualifySession(t, organic);
+  const [os] = await sessionsFor(t, organic.conversationId);
+  await expect(
+    organic.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: os._id }),
+  ).rejects.toThrow();
+});
+
+test("PS: leadsBoard and getSessionForConversation expose the purchase verdict", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await enablePurchaseSignals(t, base.accountId);
+  await qualifySession(t, base);
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[PURCHASE]] pvalue:9000; pcurrency:AED;");
+  await t.action(internal.qualificationEngine.evaluatePurchase, {
+    accountId: base.accountId, conversationId: base.conversationId,
+  });
+
+  const board = await base.asUser.query(api.qualification.leadsBoard, {});
+  const [ls] = await sessionsFor(t, base.conversationId);
+  const row = board.leads.find((l) => l.sessionId === ls._id);
+  expect(row?.purchase?.status).toBe("sent");
+  expect(row?.purchase?.value).toBe(9000);
+  expect(row?.purchase?.currency).toBe("AED");
+  expect(row?.purchase?.manual).toBe(false);
+
+  const chip = await base.asUser.query(api.qualification.getSessionForConversation, {
+    conversationId: base.conversationId,
+  });
+  expect(chip?.purchase?.status).toBe("sent");
+  expect(chip?.purchase?.confidence).toBe(90);
+});

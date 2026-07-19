@@ -1,5 +1,6 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
+import type { Doc } from "./_generated/dataModel";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { holidayysDefaultConfig } from "./lib/qualification/defaults";
 import {
@@ -7,6 +8,23 @@ import {
   CONFIG_PATCH_KEYS,
   type QualificationConfigPatch,
 } from "./lib/qualification/validate";
+import { seedStageConversionEvent } from "./funnel";
+
+/** The purchase verdict shape the board/chip render — one projection so
+ *  the two surfaces can never drift. */
+function purchaseProjection(session: Doc<"qualificationSessions">) {
+  const p = session.purchase;
+  if (!p) return null;
+  return {
+    status: p.status,
+    confidence: p.confidence,
+    reasons: p.reasons,
+    value: p.value ?? null,
+    currency: p.currency ?? null,
+    sentAt: p.sentAt ?? null,
+    manual: p.manual ?? false,
+  };
+}
 
 // ============================================================
 // Lead-qualification config CRUD (P0 — spec §11/§12). Admin-gated on
@@ -127,7 +145,79 @@ export const getSessionForConversation = accountQuery({
       serviceName: session.serviceName ?? null,
       ready: !!session.checklistSatisfiedAt,
       missingHint,
+      purchase: purchaseProjection(session),
     };
+  },
+});
+
+/**
+ * Manual purchase signal (purchase-signals spec §3.4): a supervisor+
+ * judges a qualified lead purchase-worthy case-by-case — even when the
+ * automatic judge said not-met, and even when `purchaseSignalsEnabled`
+ * is off (the toggle governs the AUTOMATIC judge; a manual fire is
+ * explicit human intent). Seeds the same deduped
+ * `${conversationId}:purchased` outbox row the automatic path uses, so
+ * it can never double-send against the judge or a later real sale.
+ */
+export const sendPurchaseSignal = accountMutation({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("supervisor");
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.accountId !== ctx.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", reason: "session" });
+    }
+    if (session.status !== "qualified") {
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "not_qualified" });
+    }
+    if (session.purchase?.status === "sent") {
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "already_sent" });
+    }
+    const conversation = await ctx.db.get(session.conversationId);
+    if (!conversation || conversation.accountId !== ctx.accountId) {
+      throw new ConvexError({ code: "NOT_FOUND", reason: "conversation" });
+    }
+    const attribution = conversation.attribution;
+    const identifier =
+      attribution &&
+      (attribution.lane === "code" ? attribution.code : attribution.ctwaClid);
+    if (!identifier) {
+      // Organic chat: there is no ad click / website code to attribute
+      // the Purchase to — Meta has nothing to receive.
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "not_attributed" });
+    }
+
+    const account = await ctx.db.get(ctx.accountId);
+    const prior = session.purchase;
+    const value = prior?.value;
+    const currency =
+      value !== undefined
+        ? (prior?.currency ?? account?.defaultCurrency ?? "USD")
+        : undefined;
+    const { conversionEventId } = await seedStageConversionEvent(ctx, {
+      accountId: ctx.accountId,
+      conversation,
+      stage: "purchased",
+      ...(value !== undefined ? { value, currency } : {}),
+    });
+    if (!conversionEventId) {
+      throw new ConvexError({ code: "BAD_REQUEST", reason: "not_attributed" });
+    }
+
+    const now = Date.now();
+    await ctx.db.patch(session._id, {
+      purchase: {
+        status: "sent",
+        evaluatedAt: prior?.evaluatedAt ?? now,
+        confidence: prior?.confidence ?? 100,
+        reasons: ["Manually sent (supervisor override)", ...(prior?.reasons ?? [])],
+        ...(value !== undefined ? { value, currency } : {}),
+        sentAt: now,
+        conversionEventId,
+        manual: true,
+      },
+    });
+    return session._id;
   },
 });
 
@@ -209,6 +299,15 @@ export const leadsBoard = accountQuery({
       funnelStageUpdatedAt: number | null;
       saleValue: number | null;
       saleCurrency: string | null;
+      purchase: {
+        status: "sent" | "not_met";
+        confidence: number;
+        reasons: string[];
+        value: number | null;
+        currency: string | null;
+        sentAt: number | null;
+        manual: boolean;
+      } | null;
       checklist: {
         checklistId: string;
         source: "kb" | "default";
@@ -310,6 +409,7 @@ export const leadsBoard = accountQuery({
           funnelStageUpdatedAt: conversation.funnel?.stageUpdatedAt ?? null,
           saleValue: conversation.funnel?.saleValue ?? null,
           saleCurrency: conversation.funnel?.saleCurrency ?? null,
+          purchase: purchaseProjection(s),
           checklist: checklistRow
             ? {
                 checklistId: checklistRow._id,
