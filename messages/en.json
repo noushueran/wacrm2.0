@@ -297,6 +297,10 @@
       "unsupported": "[Unsupported message type]",
       "aiBadge": "AI",
       "aiBadgeTitle": "Sent automatically by the AI assistant",
+      "aiTranscript": "AI transcript",
+      "aiTranscriptTitle": "Transcribed automatically from the voice note — may contain errors",
+      "transcriptShowMore": "Show more",
+      "transcriptShowLess": "Show less",
       "fromAd": "From an ad",
       "viewAd": "View ad",
       "contactCard": "Contact card"

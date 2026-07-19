@@ -22,6 +22,7 @@ import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
 import { MessageReactions } from "./message-reactions";
 import { AdReferralCard } from "./ad-referral-card";
+import { VoiceTranscript } from "./voice-transcript";
 import { InteractivePreview } from "@/components/interactive/interactive-preview";
 import { useTranslations } from "next-intl";
 
@@ -190,6 +191,19 @@ function MessageContentBody({ message, t, isAgent }: { message: Message, t: Retu
             <audio src={message.media_url} controls className="max-w-60" />
           ) : (
             <MediaUnavailable label={t("audio")} t={t} />
+          )}
+          {/* Whisper already transcribed this on the way in (see
+              `convex/aiReply.ts`); until now only the bot could read
+              it. Audio only — the same column holds image
+              descriptions, which stay hidden by design. */}
+          {message.ai_transcription && (
+            <VoiceTranscript
+              text={message.ai_transcription}
+              label={t("aiTranscript")}
+              labelTitle={t("aiTranscriptTitle")}
+              moreLabel={t("transcriptShowMore")}
+              lessLabel={t("transcriptShowLess")}
+            />
           )}
         </div>
       );
