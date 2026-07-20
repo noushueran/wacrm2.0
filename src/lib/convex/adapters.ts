@@ -130,6 +130,9 @@ export function toUiContact(
     country: doc.country,
     nationality: doc.nationality,
     preferred_destination: doc.preferredDestination,
+    travel_dates: doc.travelDates,
+    travelers: doc.travelers,
+    budget: doc.budget,
     notes: doc.notes,
     avatar_url: doc.avatarUrl,
     created_at: createdAt,
@@ -347,6 +350,7 @@ export function toUiMessage(doc: Doc<"messages">): Message {
     sender_id: doc.senderId,
     content_type: doc.contentType,
     content_text: doc.contentText,
+    ai_transcription: doc.aiTranscription,
     // `mediaKey` over the legacy `mediaUrl` (Task 5 of the R2 migration:
     // dual-read). `Message.media_url` is `string | undefined` (see
     // `src/types/index.ts`), so `resolveMediaUrl`'s `string | null`

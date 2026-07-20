@@ -53,6 +53,9 @@ type EditForm = {
   country: string;
   nationality: string;
   preferredDestination: string;
+  travelDates: string;
+  travelers: string;
+  budget: string;
   notes: string;
 };
 
@@ -67,6 +70,9 @@ function formToState(c: Contact): EditForm {
     country: c.country ?? "",
     nationality: c.nationality ?? "",
     preferredDestination: c.preferred_destination ?? "",
+    travelDates: c.travel_dates ?? "",
+    travelers: c.travelers ?? "",
+    budget: c.budget ?? "",
     notes: c.notes ?? "",
   };
 }
@@ -175,6 +181,9 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
         country: form.country.trim() || undefined,
         nationality: form.nationality.trim() || undefined,
         preferredDestination: form.preferredDestination.trim() || undefined,
+        travelDates: form.travelDates.trim() || undefined,
+        travelers: form.travelers.trim() || undefined,
+        budget: form.budget.trim() || undefined,
         notes: form.notes.trim() || undefined,
       });
       toast.success(tSidebar("saved"));
@@ -440,6 +449,33 @@ export function ContactSidebar({ contact, conversationId }: ContactSidebarProps)
               display={contact.preferred_destination ?? ""}
               onChange={set("preferredDestination")}
               placeholder={tSidebar("preferredDestination")}
+              notFilled={tSidebar("notFilled")}
+            />
+            <Field
+              label={tSidebar("travelDates")}
+              editing={editing}
+              value={form?.travelDates ?? ""}
+              display={contact.travel_dates ?? ""}
+              onChange={set("travelDates")}
+              placeholder={tSidebar("travelDates")}
+              notFilled={tSidebar("notFilled")}
+            />
+            <Field
+              label={tSidebar("travelers")}
+              editing={editing}
+              value={form?.travelers ?? ""}
+              display={contact.travelers ?? ""}
+              onChange={set("travelers")}
+              placeholder={tSidebar("travelers")}
+              notFilled={tSidebar("notFilled")}
+            />
+            <Field
+              label={tSidebar("budget")}
+              editing={editing}
+              value={form?.budget ?? ""}
+              display={contact.budget ?? ""}
+              onChange={set("budget")}
+              placeholder={tSidebar("budget")}
               notFilled={tSidebar("notFilled")}
             />
           </Section>

@@ -447,6 +447,9 @@ export const update = accountMutation({
     country: v.optional(v.string()),
     nationality: v.optional(v.string()),
     preferredDestination: v.optional(v.string()),
+    travelDates: v.optional(v.string()),
+    travelers: v.optional(v.string()),
+    budget: v.optional(v.string()),
     notes: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
@@ -466,6 +469,9 @@ export const update = accountMutation({
       country: string;
       nationality: string;
       preferredDestination: string;
+      travelDates: string;
+      travelers: string;
+      budget: string;
       notes: string;
     }> = { ...rest };
 

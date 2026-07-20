@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toUiMember, toUiMessage, toUiTemplate } from "./adapters";
+import { toUiContact, toUiMember, toUiMessage, toUiTemplate } from "./adapters";
 import type { Doc, Id } from "../../../convex/_generated/dataModel";
 
 // ============================================================
@@ -167,5 +167,84 @@ describe("toUiTemplate — header_media_url", () => {
     expect(toUiTemplate(doc).header_media_key).toBe(
       "acc1/templates/sample.jpg",
     );
+  });
+});
+
+/**
+ * `messages.aiTranscription` is written for every inbound voice note
+ * (Whisper) and image (vision), but had NO reader under `src/` — the
+ * projection layer simply dropped it, so no component could ever show
+ * it. These pin that it now survives the trip to the client.
+ */
+function messageDoc(over: Partial<Doc<"messages">> = {}): Doc<"messages"> {
+  return {
+    _id: "m1" as Doc<"messages">["_id"],
+    _creationTime: 1_700_000_000_000,
+    accountId: "a1" as Doc<"messages">["accountId"],
+    conversationId: "c1" as Doc<"messages">["conversationId"],
+    senderType: "customer",
+    contentType: "audio",
+    status: "delivered",
+    ...over,
+  } satisfies Doc<"messages">;
+}
+
+describe("toUiMessage carries the AI transcription", () => {
+  it("maps aiTranscription to ai_transcription", () => {
+    const ui = toUiMessage(messageDoc({ aiTranscription: "Hello, I want a Dubai package." }));
+    expect(ui.ai_transcription).toBe("Hello, I want a Dubai package.");
+  });
+
+  it("leaves ai_transcription undefined when the document has none", () => {
+    expect(toUiMessage(messageDoc()).ai_transcription).toBeUndefined();
+  });
+});
+
+// ============================================================
+// `toUiContact` — the travel-profile columns the qualification engine
+// writes (`travelDates`/`travelers`/`budget`, added alongside the
+// existing extended CRM detail).
+//
+// This adapter is typed `(doc) => Contact` with every one of these props
+// optional, so tsc catches NEITHER an omitted mapping nor a swapped
+// assignment — a value would land in the DB and silently never reach the
+// contact panel. The engine-side write is well covered; this is the one
+// seam between it and what a rep actually sees.
+// ============================================================
+
+describe("toUiContact — travel profile", () => {
+  const contactDoc = (over: Partial<Doc<"contacts">> = {}) =>
+    ({
+      _id: "c1" as Id<"contacts">,
+      _creationTime: 1_700_000_000_000,
+      accountId: "a1" as Id<"accounts">,
+      phone: "+971500000001",
+      phoneNormalized: "971500000001",
+      ...over,
+    }) as Doc<"contacts">;
+
+  it("maps each travel-profile column to its snake_case counterpart", () => {
+    const ui = toUiContact(
+      contactDoc({
+        travelDates: "mid December",
+        travelers: "2 adults + 1 child aged 9",
+        budget: "around AED 3,000 per person",
+        preferredDestination: "Dubai",
+      }),
+    );
+    // asserted per field rather than as one object: a swapped assignment
+    // (travel_dates <- doc.travelers) is exactly what this guards, and
+    // distinct values are what make the swap visible.
+    expect(ui.travel_dates).toBe("mid December");
+    expect(ui.travelers).toBe("2 adults + 1 child aged 9");
+    expect(ui.budget).toBe("around AED 3,000 per person");
+    expect(ui.preferred_destination).toBe("Dubai");
+  });
+
+  it("leaves them undefined when the document has none", () => {
+    const ui = toUiContact(contactDoc());
+    expect(ui.travel_dates).toBeUndefined();
+    expect(ui.travelers).toBeUndefined();
+    expect(ui.budget).toBeUndefined();
   });
 });

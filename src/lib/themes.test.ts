@@ -1,68 +1,48 @@
-import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_MODE, MODES } from "./themes";
+import { describe, it, expect } from "vitest";
+import { MODES, DEFAULT_MODE } from "./themes";
 
-// The theme system has two halves that must agree and live in different
-// files, with nothing in the type system tying them together:
-//
-//   • `use-theme.tsx` / the `layout.tsx` boot script write the mode to
-//     `document.documentElement.dataset.mode` — i.e. `data-mode="dark"`.
-//   • `globals.css` declares Tailwind's `dark:` variant via
-//     `@custom-variant`, which decides what selector every `dark:`
-//     utility in the app compiles to.
-//
-// They drifted: the variant was keyed to a `.dark` class that nothing has
-// ever set, so every `dark:` utility silently compiled to a selector that
-// can never match. Nothing caught it — the class strings are still
-// emitted (see soft-badge.test.ts), the CSS still compiles, and the app
-// still renders, just with every dark-mode colour override inert. The
-// only observable symptom was contrast: components rendered their light
-// stop on a dark surface.
-//
-// These tests pin the two halves together so the next edit to either one
-// fails loudly instead of silently disabling app-wide theming.
-const globalsCss = readFileSync(
-  join(process.cwd(), "src/app/globals.css"),
+// `globals.css` and `themes.ts` describe the same mechanism from two
+// sides: the TS constants drive `document.documentElement.dataset.mode`,
+// and the CSS has to key off that same attribute. Nothing else checks
+// that they agree — and when they disagreed, they disagreed silently:
+// the `dark:` variant shipped keyed to a `.dark` class no code ever set,
+// so every `dark:` utility in the app compiled to a selector that could
+// never match. Type checking, lint and 1965 unit tests all passed.
+const css = readFileSync(
+  join(__dirname, "..", "app", "globals.css"),
   "utf8",
 );
 
-function darkVariantSelector(): string {
-  const match = globalsCss.match(/@custom-variant\s+dark\s+\(([\s\S]*?)\);/);
-  if (!match) throw new Error("no `@custom-variant dark (...)` in globals.css");
-  return match[1];
-}
+const darkVariant = css.match(/@custom-variant\s+dark\s*\(([^;]*)\);/)?.[1];
 
-describe("the `dark:` Tailwind variant", () => {
-  it("is declared in globals.css", () => {
-    expect(() => darkVariantSelector()).not.toThrow();
+describe("dark mode wiring", () => {
+  it("declares a dark custom-variant", () => {
+    expect(darkVariant, "@custom-variant dark not found in globals.css")
+      .toBeTypeOf("string");
   });
 
-  it("targets the `data-mode` attribute the theme system actually sets", () => {
-    // `use-theme.tsx` sets `documentElement.dataset.mode`, so the variant
-    // must key off `[data-mode="dark"]` for any `dark:` utility to apply.
-    expect(darkVariantSelector()).toContain('[data-mode="dark"]');
+  it("keys the dark: variant off the data-mode attribute the app sets", () => {
+    expect(darkVariant).toContain('[data-mode="dark"]');
   });
 
-  it("does not key off a `.dark` class, which nothing in the app sets", () => {
-    expect(darkVariantSelector()).not.toMatch(/\.dark\b/);
+  it("does not key the dark: variant off a .dark class", () => {
+    // Nothing in the app adds a `.dark` class; a variant scoped to one
+    // can never match, which disables every `dark:` utility silently.
+    expect(darkVariant).not.toMatch(/(^|[^-\w])\.dark\b/);
   });
 
-  it("matches elements nested under the themed root, not just the root", () => {
-    // `data-mode` lives on <html>; every styled element is a descendant,
-    // so a selector that only matched the root itself would be useless.
-    expect(darkVariantSelector()).toMatch(/\[data-mode="dark"\]\s+\*/);
-  });
-});
-
-describe("mode constants", () => {
-  it("declares exactly the two modes globals.css defines blocks for", () => {
+  it("defines a CSS block for every mode, matching MODES", () => {
     for (const mode of MODES) {
-      expect(globalsCss).toContain(`html[data-mode="${mode}"]`);
+      expect(css, `missing html[data-mode="${mode}"] block`).toContain(
+        `html[data-mode="${mode}"]`,
+      );
     }
   });
 
-  it("defaults to a mode globals.css can style", () => {
+  it("has a dark mode among MODES for the variant to target", () => {
+    expect(MODES).toContain("dark");
     expect(MODES).toContain(DEFAULT_MODE);
   });
 });

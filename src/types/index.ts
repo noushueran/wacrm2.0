@@ -122,6 +122,11 @@ export interface Contact {
   country?: string;
   nationality?: string;
   preferred_destination?: string;
+  /** Travel-profile detail — free text, written by the qualification
+   *  engine (blanks only) and editable in the contact panel. */
+  travel_dates?: string;
+  travelers?: string;
+  budget?: string;
   notes?: string;
   /** Lead-acquisition provenance (set once). */
   acquisition_source?: 'ad';
@@ -325,6 +330,15 @@ export interface Message {
   sender_id?: string;
   content_type: ContentType;
   content_text?: string;
+  /**
+   * Whisper's transcript of an inbound voice note, or gpt-4o-mini's
+   * description of an inbound image — both written to
+   * `messages.aiTranscription` by the assistant's media pipeline
+   * (`convex/aiReply.ts`). The inbox renders it for AUDIO only; image
+   * descriptions stay hidden by design (they describe a picture the
+   * agent can already see).
+   */
+  ai_transcription?: string;
   media_url?: string;
   template_name?: string;
   message_id?: string;

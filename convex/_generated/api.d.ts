@@ -89,6 +89,7 @@ import type * as lib_phone from "../lib/phone.js";
 import type * as lib_pushPayload from "../lib/pushPayload.js";
 import type * as lib_pushRecipients from "../lib/pushRecipients.js";
 import type * as lib_qualification_analyze from "../lib/qualification/analyze.js";
+import type * as lib_qualification_contactFields from "../lib/qualification/contactFields.js";
 import type * as lib_qualification_defaults from "../lib/qualification/defaults.js";
 import type * as lib_qualification_purchase from "../lib/qualification/purchase.js";
 import type * as lib_qualification_schedule from "../lib/qualification/schedule.js";
@@ -217,6 +218,7 @@ declare const fullApi: ApiFromModules<{
   "lib/pushPayload": typeof lib_pushPayload;
   "lib/pushRecipients": typeof lib_pushRecipients;
   "lib/qualification/analyze": typeof lib_qualification_analyze;
+  "lib/qualification/contactFields": typeof lib_qualification_contactFields;
   "lib/qualification/defaults": typeof lib_qualification_defaults;
   "lib/qualification/purchase": typeof lib_qualification_purchase;
   "lib/qualification/schedule": typeof lib_qualification_schedule;
