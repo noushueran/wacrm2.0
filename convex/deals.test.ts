@@ -727,3 +727,76 @@ test("create throws FORBIDDEN for a caller below the agent role", async () => {
   const all = await t.run((ctx) => ctx.db.query("deals").collect());
   expect(all).toHaveLength(0);
 });
+
+// ============================================================
+// Read-side role floor
+//
+// `require-section.tsx` states in comment that "server queries already
+// reject; this is UX." It was not true here — these reads carried no role
+// check at all, so a viewer (conversation scope: "unassigned only") could
+// call them directly and read data the nav hides. The floor below matches
+// `SUPERVISOR_NAV` in src/lib/auth/roles.ts, which is what already gates
+// the pages these queries back.
+// ============================================================
+
+async function seedRole(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  role: "viewer" | "agent" | "supervisor",
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@floor.test` }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role,
+      fullName: role,
+      email: `${role}@floor.test`,
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-${role}` });
+}
+
+// Only `listByPipeline` moves. `listByContact` deliberately stays open to
+// agents: the inbox contact sidebar (`src/components/inbox/contact-sidebar.tsx`)
+// renders a contact's deals for whoever is handling the thread. Its real
+// defect is a different one — it gates on `requireOwnContact` (account
+// match) rather than conversation scope — and is tracked separately.
+test("deals.listByPipeline throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const { pipelineId } = await seedPipelineWithStages(t, asOwner);
+
+  const asAgent = await seedRole(t, accountId, "agent");
+  await expect(
+    asAgent.query(api.deals.listByPipeline, { pipelineId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+
+  const asSupervisor = await seedRole(t, accountId, "supervisor");
+  await expect(
+    asSupervisor.query(api.deals.listByPipeline, { pipelineId }),
+  ).resolves.toBeDefined();
+});
+
+test("deals.listByContact stays reachable by an agent — the inbox sidebar depends on it", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const contactId = await asOwner.mutation(api.contacts.create, {
+    phone: "+15550009999",
+  });
+
+  const asAgent = await seedRole(t, accountId, "agent");
+  await expect(
+    asAgent.query(api.deals.listByContact, { contactId }),
+  ).resolves.toBeDefined();
+});

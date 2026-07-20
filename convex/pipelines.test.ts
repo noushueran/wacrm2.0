@@ -683,3 +683,56 @@ test("remove throws FORBIDDEN for a caller below the supervisor role", async () 
 
   expect(await t.run((ctx) => ctx.db.get(pipelineId))).not.toBeNull();
 });
+
+// ============================================================
+// Read-side role floor
+//
+// `require-section.tsx` states in comment that "server queries already
+// reject; this is UX." It was not true here — these reads carried no role
+// check at all, so a viewer (conversation scope: "unassigned only") could
+// call them directly and read data the nav hides. The floor below matches
+// `SUPERVISOR_NAV` in src/lib/auth/roles.ts, which is what already gates
+// the pages these queries back.
+// ============================================================
+
+async function seedRole(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  role: "viewer" | "agent" | "supervisor",
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@floor.test` }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role,
+      fullName: role,
+      email: `${role}@floor.test`,
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-${role}` });
+}
+
+test("pipelines.list throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+
+  const asAgent = await seedRole(t, accountId, "agent");
+  await expect(asAgent.query(api.pipelines.list, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "supervisor" },
+  });
+
+  const asViewer = await seedRole(t, accountId, "viewer");
+  await expect(asViewer.query(api.pipelines.list, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "supervisor" },
+  });
+
+  const asSupervisor = await seedRole(t, accountId, "supervisor");
+  await expect(asSupervisor.query(api.pipelines.list, {})).resolves.toBeDefined();
+});

@@ -299,6 +299,10 @@ function assertActivatable(
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
+    // Admin+: `/automations` is absent from `SUPERVISOR_NAV`, so
+    // `canAccessNav` already admits only admin/owner in the UI. `get` and
+    // `logs` share the floor so the list can't be walked around.
+    ctx.requireRole("admin");
     const automations = await ctx.db
       .query("automations")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
@@ -320,6 +324,7 @@ export const list = accountQuery({
 export const get = accountQuery({
   args: { automationId: v.id("automations") },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin"); // same floor as `list`
     const automation = await requireOwnAutomation(ctx, args.automationId);
     const rows = await loadOrderedSteps(ctx, args.automationId);
     const steps = buildStepsTree(rows.map(toStepRow));
@@ -662,6 +667,7 @@ export const logs = accountQuery({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin"); // same floor as `list`
     // Clamp before it reaches `.take()`: a negative throws, and a huge value
     // makes either branch's read as heavy as the `.collect()` this replaced.
     const limit = clampLimit(args.limit, 100, 200);

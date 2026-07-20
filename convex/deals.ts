@@ -87,6 +87,11 @@ async function requireOwnContact(
 export const listByPipeline = accountQuery({
   args: { pipelineId: v.id("pipelines") },
   handler: async (ctx, args) => {
+    // Supervisor+, matching `SUPERVISOR_NAV`'s `/pipelines` — the deal
+    // board with every deal's value is not agent-facing. Deliberately NOT
+    // applied to `listByContact` below, which the inbox contact sidebar
+    // renders for the agent handling the thread.
+    ctx.requireRole("supervisor");
     await requireOwnPipeline(ctx, args.pipelineId);
 
     // `by_pipeline` isn't itself account-scoped (see schema.ts), so the

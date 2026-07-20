@@ -145,7 +145,7 @@ test("create seeds one broadcastRecipients row per contact, all counts zeroed, s
   const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 3);
 
@@ -183,7 +183,7 @@ test("create accepts an explicit status, templateVariables, and audienceFilter",
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
 
@@ -206,12 +206,12 @@ test("create throws NOT_FOUND when Bob supplies Alice's contactId, and creates n
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
   const bobContactIds = await seedContacts(asBob, 1);
@@ -267,7 +267,7 @@ test("setRecipientStatus advances counts one column at a time through pending ->
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -338,7 +338,7 @@ test("setRecipientStatus on a separate recipient -> failed bumps only failedCoun
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -376,7 +376,7 @@ test("setRecipientStatus is a total no-op when the status is unchanged — count
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -414,12 +414,12 @@ test("setRecipientStatus throws NOT_FOUND for a recipient belonging to a differe
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -460,12 +460,12 @@ test("list never returns another account's broadcasts, newest first", async () =
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
   const first = await asAlice.mutation(api.broadcasts.create, {
@@ -490,12 +490,12 @@ test("get throws NOT_FOUND for a broadcast belonging to a different account", as
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -517,7 +517,7 @@ test("listRecipients returns the broadcast's recipients, scoped to the caller's 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -541,12 +541,12 @@ test("listRecipients throws NOT_FOUND for a broadcast belonging to a different a
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -575,7 +575,7 @@ test("setStatus patches status and bumps updatedAt", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -599,12 +599,12 @@ test("setStatus throws NOT_FOUND for a broadcast belonging to a different accoun
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -637,7 +637,7 @@ test("remove cascades: deletes the broadcast's recipients along with it", async 
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -668,12 +668,12 @@ test("remove throws NOT_FOUND for a broadcast belonging to a different account, 
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 2);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -734,7 +734,7 @@ test("recordRecipientStatusByWamid finds the recipient by wamid, advances its st
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -778,7 +778,7 @@ test("recordRecipientStatusByWamid refuses an out-of-order regression: 'sent' ar
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -819,7 +819,7 @@ test("recordRecipientStatusByWamid records an errorMessage on 'failed' and bumps
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -853,12 +853,12 @@ test("recordRecipientStatusByWamid targets exactly the matching recipient: a dif
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
   const aliceBroadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -917,7 +917,7 @@ test("send schedules one deliverOne per pending recipient and flips the broadcas
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 3);
   // Created as "draft" so the assertion below actually demonstrates
@@ -959,7 +959,7 @@ test("deliverOne in DRY-RUN sends the template, stamps the recipient 'sent', rec
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const [contactId] = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -1021,7 +1021,7 @@ test("a per-recipient failure (its contact deleted before delivery) stamps 'fail
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const [okContactId, goneContactId] = await seedContacts(asUser, 2);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -1060,7 +1060,7 @@ test("finalizes 'failed' when every recipient fails", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -1089,7 +1089,7 @@ test("send with zero pending recipients finalizes immediately rather than stayin
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const broadcastId = await t.run((ctx) =>
     ctx.db.insert("broadcasts", {
@@ -1122,12 +1122,12 @@ test("send throws NOT_FOUND for a broadcast belonging to a different account, an
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
   const broadcastId = await asAlice.mutation(api.broadcasts.create, {
@@ -1150,7 +1150,7 @@ test("send throws UNAUTHENTICATED when there is no identity", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
   const broadcastId = await asUser.mutation(api.broadcasts.create, {
@@ -1191,4 +1191,74 @@ test("send throws FORBIDDEN for a viewer (below the agent floor)", async () => {
   await expect(
     asUser.action(api.broadcasts.send, { broadcastId }),
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+});
+
+// ============================================================
+// Read-side role floor
+//
+// `require-section.tsx` states in comment that "server queries already
+// reject; this is UX." It was not true here — these reads carried no role
+// check at all, so a viewer (conversation scope: "unassigned only") could
+// call them directly and read data the nav hides. The floor below matches
+// `SUPERVISOR_NAV` in src/lib/auth/roles.ts, which is what already gates
+// the pages these queries back.
+// ============================================================
+
+async function seedRole(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  role: "viewer" | "agent" | "supervisor",
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@floor.test` }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role,
+      fullName: role,
+      email: `${role}@floor.test`,
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-${role}` });
+}
+
+test("broadcasts.list throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+
+  const asAgent = await seedRole(t, accountId, "agent");
+  await expect(asAgent.query(api.broadcasts.list, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "supervisor" },
+  });
+
+  const asSupervisor = await seedRole(t, accountId, "supervisor");
+  await expect(asSupervisor.query(api.broadcasts.list, {})).resolves.toBeDefined();
+});
+
+test("broadcasts.get and listRecipients throw FORBIDDEN below supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const contactIds = await seedContacts(asOwner, 1);
+  const broadcastId = await asOwner.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+
+  const asAgent = await seedRole(t, accountId, "agent");
+  await expect(
+    asAgent.query(api.broadcasts.get, { broadcastId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+  await expect(
+    asAgent.query(api.broadcasts.listRecipients, { broadcastId, ...onePage }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });

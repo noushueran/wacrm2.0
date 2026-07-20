@@ -68,6 +68,10 @@ async function requireOwnStage(
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
+    // Supervisor+, matching `SUPERVISOR_NAV`'s `/pipelines`. Both callers
+    // already sit at or above that floor: the pipelines page (supervisor)
+    // and the automation builder's stage picker (admin).
+    ctx.requireRole("supervisor");
     const pipelines = await ctx.db
       .query("pipelines")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
