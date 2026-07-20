@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@/lib/convex/cached'
 import { api } from '../../../../convex/_generated/api'
 import { useAuth } from '@/hooks/use-auth'
+import { canAccessNav } from '@/lib/auth/roles'
 import { formatCurrency } from '@/lib/currency'
 import {
   MessageSquare,
@@ -97,7 +98,16 @@ export default function DashboardPage() {
   const responseTimeData = useQuery(api.dashboard.responseTime, responseTimeArgs)
   // Fetch up to 50 so the biggest page-size option in the feed (50 rows)
   // is already in memory — switching sizes is then a pure client slice.
-  const activityData = useQuery(api.dashboard.activity, accountId ? { limit: 50 } : 'skip')
+  //
+  // Skip until the role is BOTH known and sufficient. `api.dashboard
+  // .activity` is supervisor-gated server-side (it returns per-row
+  // detail, unlike the aggregates beside it); firing it below that floor
+  // throws FORBIDDEN synchronously inside `useQuery` (no Error Boundary
+  // in this app), which would crash the page before `RequireSection` can
+  // redirect. Same `canAccessNav` + 'skip' idiom as `campaigns/page.tsx`,
+  // which keeps the nav floor and the query floor coupled.
+  const canReadActivity = !!accountId && !!accountRole && canAccessNav(accountRole, '/dashboard')
+  const activityData = useQuery(api.dashboard.activity, canReadActivity ? { limit: 50 } : 'skip')
   // Exact, role-scoped count of conversations awaiting a reply — powers the
   // lead "Waiting on reply" KPI. Already deployed (backs the sidebar badge).
   const unreadData = useQuery(api.conversations.unreadTotal, accountId ? {} : 'skip')
@@ -150,7 +160,14 @@ export default function DashboardPage() {
           <>
             <MetricCard
               title={t('activeConversations')}
-              value={metrics.activeConversations.current.toLocaleString()}
+              // `capped` means the backend stopped counting at its ceiling
+              // rather than reading the whole table (see
+              // ACTIVE_CONVERSATIONS_CAP in convex/dashboard.ts), so the
+              // real figure is higher than `current`. Render "500+" — a
+              // bare "500" would read as exact and be wrong.
+              value={`${metrics.activeConversations.current.toLocaleString()}${
+                metrics.activeConversations.capped ? '+' : ''
+              }`}
               icon={MessageSquare}
               delta={{
                 sign: metrics.activeConversations.previous,

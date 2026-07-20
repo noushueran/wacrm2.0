@@ -1,8 +1,10 @@
 /// <reference types="vite/client" />
-import { convexTest } from "convex-test";
+import { convexTest, type TestConvex } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { ACTIVE_CONVERSATIONS_CAP } from "./dashboard";
+import { hourStartMs } from "./lib/messageStats";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 
@@ -134,24 +136,64 @@ async function seedConversation(
   );
 }
 
+// `TestConvex<typeof schema>` rather than this file's usual
+// `ReturnType<typeof convexTest>`: the latter erases the schema type
+// argument, so `ctx.db.query("messageHourlyStats")` degrades to the
+// system-table overload and the index below stops typechecking. Same
+// typed form `aiReply.test.ts` already uses.
 async function seedMessage(
-  t: ReturnType<typeof convexTest>,
+  t: TestConvex<typeof schema>,
   opts: {
     accountId: Id<"accounts">;
     conversationId: Id<"conversations">;
     senderType: "customer" | "agent" | "bot";
   },
 ) {
-  return await t.run((ctx) =>
-    ctx.db.insert("messages", {
+  return await t.run(async (ctx) => {
+    const messageId = await ctx.db.insert("messages", {
       accountId: opts.accountId,
       conversationId: opts.conversationId,
       senderType: opts.senderType,
       contentType: "text",
       contentText: "hello",
       status: "sent",
-    }),
-  );
+    });
+
+    // `conversationsSeries` reads the hourly rollup rather than raw
+    // messages (see `messageHourlyStats` in schema.ts), so a seeded
+    // message has to fold into it the way production's single
+    // `insert("messages")` choke point does — otherwise these tests would
+    // assert against a chart with no data behind it.
+    //
+    // Bucketed on the row's own `_creationTime`, not `Date.now()`: this
+    // suite drives a fake clock (`makeClock`) to place messages on
+    // specific days, and the whole point of the day-bucketing tests is
+    // that those placements land where they should.
+    const row = (await ctx.db.get(messageId))!;
+    const bucketStart = hourStartMs(row._creationTime);
+    const inbound = opts.senderType === "customer";
+    const existing = await ctx.db
+      .query("messageHourlyStats")
+      .withIndex("by_account_hour", (q) =>
+        q.eq("accountId", opts.accountId).eq("hourStartMs", bucketStart),
+      )
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        incoming: existing.incoming + (inbound ? 1 : 0),
+        outgoing: existing.outgoing + (inbound ? 0 : 1),
+      });
+    } else {
+      await ctx.db.insert("messageHourlyStats", {
+        accountId: opts.accountId,
+        hourStartMs: bucketStart,
+        incoming: inbound ? 1 : 0,
+        outgoing: inbound ? 0 : 1,
+      });
+    }
+
+    return messageId;
+  });
 }
 
 async function seedPipelineWithStages(
@@ -360,7 +402,11 @@ test("metrics reports active/new conversations, contacts, open deals, and agent 
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
-  expect(aliceResult.activeConversations).toEqual({ current: 5, previous: 1 });
+  expect(aliceResult.activeConversations).toEqual({
+    current: 5,
+    previous: 1,
+    capped: false, // well under ACTIVE_CONVERSATIONS_CAP, so `current` is exact
+  });
   expect(aliceResult.newContactsToday).toEqual({ current: 3, previous: 2 });
   expect(aliceResult.openDealsValue).toBe(350);
   expect(aliceResult.openDealsCount).toBe(2);
@@ -590,10 +636,12 @@ test("activity interleaves messages/contacts/deals/broadcasts/automation logs by
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
+  // Supervisor because `activity` gates there (see its own role test
+  // below); this test is about interleaving and scoping, not policy.
   const { asUser: asAlice, accountId: aliceId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor",
   });
   const { accountId: bobId } = await seedAccountMember(t, {
     name: "Bob",
@@ -782,7 +830,7 @@ test("activity drops a deal with no updatedAt from the fetched window rather tha
   const { asUser: asAlice, accountId: aliceId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // `activity` gates on supervisor
   });
   const { pipelineId, stageIds } = await seedPipelineWithStages(t, {
     accountId: aliceId,
@@ -837,7 +885,7 @@ test("activity surfaces only customer messages (not bot/agent) via by_account_se
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // `activity` gates on supervisor
   });
   const contactId = await seedContact(t, {
     accountId,
@@ -894,4 +942,139 @@ test("activity throws UNAUTHENTICATED when there is no identity", async () => {
   await expect(
     t.query(api.dashboard.activity, { limit: 10 }),
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
+});
+
+// `activity` returns account-wide rows — the newest customer messages
+// with their `/inbox?c=<id>` deep links, plus contact names (falling
+// back to the RAW phone when a contact has no name). It applied neither
+// `conversationScope` nor `maskContactPhone`, so an agent or viewer
+// could call it directly and learn which contacts have live threads —
+// including colleagues' assigned conversations that
+// `messages.listByConversation` would refuse them.
+//
+// `/dashboard` is supervisor+ in `SUPERVISOR_NAV` (src/lib/auth/roles.ts),
+// so the floor matches the nav. This is the same nav-vs-query gap already
+// closed for `campaigns.overview` — there the query was stricter than the
+// nav; here it ran the other way. Pins BOTH ends: a supervisor succeeds,
+// and the next role down gets FORBIDDEN rather than just "some error".
+test("activity allows a supervisor and rejects an agent with FORBIDDEN", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asSupervisor, accountId } = await seedAccountMember(t, {
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  await expect(
+    asSupervisor.query(api.dashboard.activity, { limit: 10 }),
+  ).resolves.toEqual([]);
+
+  const agentId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Ag", email: "ag@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: agentId,
+      accountId,
+      role: "agent",
+      fullName: "Ag",
+      email: "ag@example.com",
+    }),
+  );
+  const asAgent = t.withIdentity({ subject: `${agentId}|s-Ag` });
+  await expect(
+    asAgent.query(api.dashboard.activity, { limit: 10 }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+// ============================================================
+// metrics: the open-conversation count is bounded
+//
+// `openConversations` was a `.collect()` over `by_account_status`
+// (accountId, "open"). The in-code comment claimed that bounded it
+// because "the closed set grows forever" — but nothing in the app ever
+// auto-closes a conversation (the only writers are an optional automation
+// action and a manual per-thread control), so in practice essentially
+// every conversation stays open and this collected the entire table, on
+// the landing page.
+//
+// It is a COUNT, so it does not need the rows. `.take(CAP + 1)` on the
+// same index is genuinely bounded — every row in that range is a match,
+// so there is no `.filter()` starvation — and the extra row is what
+// distinguishes "exactly CAP" from "more than CAP".
+// ============================================================
+
+test("metrics returns an exact open-conversation count below the cap", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000000" });
+  clock(NOW);
+  for (let i = 0; i < 3; i++) {
+    await seedConversation(t, { accountId, contactId });
+  }
+
+  const result = await asUser.query(api.dashboard.metrics, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  expect(result.activeConversations.current).toBe(3);
+  expect(result.activeConversations.capped).toBe(false);
+});
+
+test("metrics caps the open-conversation count rather than collecting the table", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000000" });
+  clock(NOW);
+  for (let i = 0; i < ACTIVE_CONVERSATIONS_CAP + 5; i++) {
+    await seedConversation(t, { accountId, contactId });
+  }
+
+  const result = await asUser.query(api.dashboard.metrics, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  // Reported as "CAP+" by the UI rather than a wrong exact number.
+  expect(result.activeConversations.current).toBe(ACTIVE_CONVERSATIONS_CAP);
+  expect(result.activeConversations.capped).toBe(true);
+}, 60_000);
+
+test("metrics still derives today-vs-yesterday from a bounded window when capped", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000000" });
+
+  // Old, still-open conversations — these must NOT count as "new today",
+  // and must not be needed in memory to work that out.
+  clock(BEFORE_YESTERDAY);
+  for (let i = 0; i < 4; i++) await seedConversation(t, { accountId, contactId });
+  clock(YESTERDAY_START);
+  await seedConversation(t, { accountId, contactId });
+  clock(TODAY_START);
+  for (let i = 0; i < 3; i++) await seedConversation(t, { accountId, contactId });
+
+  const result = await asUser.query(api.dashboard.metrics, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  expect(result.activeConversations.current).toBe(8);
+  expect(result.activeConversations.capped).toBe(false);
+  expect(result.activeConversations.previous).toBe(2); // 3 today - 1 yesterday
 });

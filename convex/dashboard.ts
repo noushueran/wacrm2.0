@@ -1,7 +1,9 @@
 import { accountQuery } from "./lib/auth";
 import { v } from "convex/values";
+import { hourStartMs, foldHoursIntoDays } from "./lib/messageStats";
+// `localDayKeyFromMs` is no longer imported here: day-bucketing for the
+// messages chart moved into `foldHoursIntoDays`, which owns it now.
 import {
-  localDayKeyFromMs,
   localMidnightMsDaysAgo,
   localMondayIndexFromMs,
 } from "./lib/dashboardDate";
@@ -12,11 +14,21 @@ import {
 // aggregations. Every function here is built on `accountQuery` (never
 // the raw `query`), so `ctx.accountId` always comes from the caller's
 // own `memberships` row, never a client-supplied argument — there is no
-// `accountId` field in any args validator below. None of these call
-// `ctx.requireRole`: reading your own account's dashboard is the
+// `accountId` field in any args validator below. The aggregations are
+// otherwise ungated: reading your own account's *counts* is the
 // lowest-privilege operation in the app, same treatment as
-// `conversations.list`/`contacts.list` (no other read-only accountQuery
-// in the codebase gates on role either).
+// `conversations.list`/`contacts.list`.
+//
+// `activity` is the one exception and gates on `supervisor`. It is the
+// only function here that returns per-row detail rather than an
+// aggregate — customer-message rows with their `/inbox?c=<id>` deep
+// links, and contact names that fall back to the RAW phone — and it
+// applies neither `conversationScope` nor `maskContactPhone`. Ungated,
+// an agent or viewer could call it directly and enumerate which
+// contacts have live threads, including colleagues' assigned
+// conversations `messages.listByConversation` would refuse them. The
+// floor matches `SUPERVISOR_NAV` in `src/lib/auth/roles.ts`, which is
+// what already restricts `/dashboard` in the UI.
 //
 // Local-day boundaries (what "today"/"this week" means) can only be
 // computed by whoever knows the caller's timezone — a Convex function
@@ -37,14 +49,34 @@ import {
 // messages)".
 //
 // Every read here is now bounded by something that does not grow
-// forever — a time window (`contacts`, `messages`), a fixed take
-// (`activity`'s sources), or a status range (`metrics`'s open
-// conversations and deals). None of them still scan a whole
-// account partition. The status-ranged collects remain unbounded in the
-// size of the OPEN set, which tracks current workload rather than
-// accumulated history; bounding those further would need a denormalised
-// counter, since a count cannot be taken from a window.
+// forever — a time window (`contacts`, `messages`, and the
+// today-vs-yesterday conversation deltas), a fixed take (`activity`'s
+// sources, and `metrics`'s open-conversation count), or a status range.
+//
+// The claim that a status range bounds the open-conversation count was
+// wrong in practice: nothing in the app auto-closes a conversation — the
+// only writers of `status: "closed"` are an optional automation action
+// and a manual per-thread control — so the "open" partition asymptotically
+// equals the whole table. That count is now a `.take()` instead, which is
+// a genuine read bound because the range pins `status` and every document
+// read is therefore a match.
+//
+// `metrics`'s open DEALS collect is knowingly left as-is. It needs the
+// rows (it sums `value`, and a silently truncated sum is worse than a
+// truncated count), and unlike conversations the open-deal set really is
+// bounded in practice — the pipeline closes deals won/lost, so it tracks
+// active pipeline size rather than accumulating forever.
 // ============================================================
+
+/**
+ * Ceiling on the open-conversation count reported by `metrics`.
+ *
+ * Chosen to be far above any number a human reads as a precise figure —
+ * past a few hundred the card communicates "a lot", not a quantity — while
+ * keeping the read cost fixed regardless of account size. Exported so the
+ * test suite asserts against the real bound rather than a copy of it.
+ */
+export const ACTIVE_CONVERSATIONS_CAP = 500;
 
 // --- 1. Metric cards ----------------------------------------------------
 
@@ -66,17 +98,42 @@ export const metrics = accountQuery({
     // index this comment used to say did not exist. Still unbounded in
     // the number of OPEN conversations, but no longer in the number of
     // closed ones, which is the half that grows without limit.
-    const openConversations = await ctx.db
+    // The headline number is a COUNT, so it never needed the rows. Take
+    // CAP + 1: every document in this index range is a match (the range
+    // pins `status`, so there is no `.filter()` to starve), which makes
+    // this a real read bound. The +1 is what separates "exactly CAP" from
+    // "more than CAP" — reported as `capped` so the UI can render "500+"
+    // rather than a confidently wrong exact figure.
+    const openSample = await ctx.db
       .query("conversations")
       .withIndex("by_account_status", (q) =>
         q.eq("accountId", ctx.accountId).eq("status", "open"),
       )
+      .take(ACTIVE_CONVERSATIONS_CAP + 1);
+    const openCapped = openSample.length > ACTIVE_CONVERSATIONS_CAP;
+    const openCount = openCapped ? ACTIVE_CONVERSATIONS_CAP : openSample.length;
+
+    // Today/yesterday can't come from that sample — it is truncated, and
+    // truncated at the wrong end (the index orders by status then
+    // `_creationTime`, so the newest conversations are exactly the ones a
+    // `.take()` drops). Read them instead from the same bounded 2-day
+    // `by_account` range that contacts and messages below already use, and
+    // apply `status` in JS: the window is two days of conversation
+    // creation, so it stays small no matter how large the account grows.
+    const recentConversations = await ctx.db
+      .query("conversations")
+      .withIndex("by_account", (q) =>
+        q.eq("accountId", ctx.accountId).gte("_creationTime", yesterdayStartMs),
+      )
       .collect();
-    const newOpenToday = openConversations.filter(
-      (c) => c._creationTime >= todayStartMs,
+    const newOpenToday = recentConversations.filter(
+      (c) => c.status === "open" && c._creationTime >= todayStartMs,
     ).length;
-    const newOpenYesterday = openConversations.filter(
-      (c) => c._creationTime >= yesterdayStartMs && c._creationTime < todayStartMs,
+    const newOpenYesterday = recentConversations.filter(
+      (c) =>
+        c.status === "open" &&
+        c._creationTime >= yesterdayStartMs &&
+        c._creationTime < todayStartMs,
     ).length;
 
     // Contacts: bounded to a 2-day window (only ever need today's +
@@ -154,8 +211,11 @@ export const metrics = accountQuery({
 
     return {
       activeConversations: {
-        current: openConversations.length,
+        current: openCount,
         previous: newOpenToday - newOpenYesterday,
+        // True when the real number exceeds `current`. The UI renders
+        // "500+" rather than pretending 500 is exact.
+        capped: openCapped,
       },
       newContactsToday: {
         current: newContactsTodayCount,
@@ -183,29 +243,27 @@ export const conversationsSeries = accountQuery({
   handler: async (ctx, args) => {
     const { sinceMs, dayKeys, tzOffsetMinutes } = args;
 
-    // Bounded by the requested time window via a genuine index range
-    // scan (`.gte("_creationTime", sinceMs)`), same shape as `metrics`'s
-    // `recentMessages` above — NOT bounded by row count within that
-    // window, so a very chatty account's requested range still reads
-    // every message sent in it (matches the original's own "pull every
-    // message since `start` in one shot" strategy).
-    const messages = await ctx.db
-      .query("messages")
-      .withIndex("by_account", (q) =>
-        q.eq("accountId", ctx.accountId).gte("_creationTime", sinceMs),
+    // Reads the hourly rollup, not raw messages. Collecting every message
+    // in the window was bounded by the WINDOW but not by traffic: against
+    // the 4096-read ceiling that broke at ~137 msg/day on the default
+    // 30-day view and ~45 msg/day on the 90-day one. The rollup makes the
+    // read a function of the window alone — 24 rows per day, ~2160 for 90
+    // days — no matter how busy the account gets.
+    //
+    // `hourStartMs(sinceMs)` rather than `sinceMs`: the bucket containing
+    // `sinceMs` starts before it, so ranging on the raw value would drop
+    // the first partial hour. Extra hours at the edges are harmless —
+    // `foldHoursIntoDays` discards anything outside `dayKeys`.
+    const hours = await ctx.db
+      .query("messageHourlyStats")
+      .withIndex("by_account_hour", (q) =>
+        q
+          .eq("accountId", ctx.accountId)
+          .gte("hourStartMs", hourStartMs(sinceMs)),
       )
       .collect();
 
-    const buckets = new Map<string, { incoming: number; outgoing: number }>();
-    for (const key of dayKeys) buckets.set(key, { incoming: 0, outgoing: 0 });
-
-    for (const message of messages) {
-      const key = localDayKeyFromMs(message._creationTime, tzOffsetMinutes);
-      const bucket = buckets.get(key);
-      if (!bucket) continue; // outside the caller's requested day-key range
-      if (message.senderType === "customer") bucket.incoming += 1;
-      else bucket.outgoing += 1; // agent + bot both count as outgoing
-    }
+    const buckets = foldHoursIntoDays(hours, dayKeys, tzOffsetMinutes);
 
     return dayKeys.map((day) => ({
       day,
@@ -337,6 +395,9 @@ export const responseTime = accountQuery({
 export const activity = accountQuery({
   args: { limit: v.number() },
   handler: async (ctx, args) => {
+    // Per-row detail, unscoped and unmasked — supervisor+ only. See the
+    // module header for why this one query differs from the aggregates.
+    ctx.requireRole("supervisor");
     const { limit } = args;
 
     type Item = {

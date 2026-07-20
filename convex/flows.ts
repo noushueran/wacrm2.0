@@ -4,6 +4,8 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 import { validateFlowForActivation, type ValidationIssue } from "./lib/flows/validate";
 import { clampLimit } from "./lib/cronSummary";
+import { maskPhone } from "./lib/phone";
+import { hasMinRole } from "./lib/roles";
 
 // ============================================================
 // Flows config CRUD — the account-scoped builder-facing counterpart to
@@ -298,6 +300,10 @@ async function nodesForFlow(ctx: { db: QueryCtx["db"] }, flowId: Id<"flows">) {
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
+    // Admin+: `/flows` is absent from `SUPERVISOR_NAV`, so `canAccessNav`
+    // already admits only admin/owner in the UI. `get`, `templates` and
+    // `runs` share the floor so the list can't be walked around.
+    ctx.requireRole("admin");
     const flows = await ctx.db
       .query("flows")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
@@ -316,6 +322,7 @@ export const list = accountQuery({
 export const get = accountQuery({
   args: { flowId: v.id("flows") },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin"); // same floor as `list`
     const flow = await requireOwnFlow(ctx, args.flowId);
     const nodes = await nodesForFlow(ctx, args.flowId);
     return { flow, nodes };
@@ -578,12 +585,27 @@ export const runs = accountQuery({
     // Embed a lightweight contact snapshot per run — same
     // "fetch-once-then-Promise.all" embedding style as
     // `deals.ts`'s own stage embedding.
+    //
+    // The phone is masked below supervisor, matching the policy
+    // `lib/roles.ts`'s `canSeeContactPhone` states and that
+    // `contacts.ts`/`conversations.ts` already enforce. A flow run has no
+    // "assigned to caller" notion for the agent half of that rule, so
+    // supervisor is the floor. Read access itself stays where the module
+    // header puts it — this closes the PII leak without changing who may
+    // open a flow's run history.
+    const canSeePhone = hasMinRole(ctx.role, "supervisor");
     const runsWithContact = await Promise.all(
       runRows.map(async (run) => {
         const contact = run.contactId ? await ctx.db.get(run.contactId) : null;
         return {
           ...run,
-          contact: contact ? { _id: contact._id, name: contact.name, phone: contact.phone } : null,
+          contact: contact
+            ? {
+                _id: contact._id,
+                name: contact.name,
+                phone: canSeePhone ? contact.phone : maskPhone(contact.phone),
+              }
+            : null,
         };
       }),
     );
@@ -609,7 +631,12 @@ export const runs = accountQuery({
 
 export const templates = accountQuery({
   args: {},
-  handler: async () => {
+  // `ctx` is unused for data — the catalogue is a module constant — but is
+  // taken so the admin floor can be enforced, matching `list`/`get`. Its
+  // only caller is the flow-builder template picker on the admin-only
+  // `/flows` page.
+  handler: async (ctx) => {
+    ctx.requireRole("admin");
     return Object.entries(FLOW_TEMPLATES).map(([slug, tpl]) => ({
       slug,
       name: tpl.name,
