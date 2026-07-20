@@ -1,5 +1,6 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { internalMutation, internalQuery } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { requireConversationAccess } from "./lib/conversationAccess";
@@ -7,6 +8,7 @@ import { loadEnabledConfig, recordOutboundSend } from "./lib/qualification/track
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import type { AdReferral } from "./lib/whatsapp/webhookParse";
+import { hourStartMs, HOUR_MS } from "./lib/messageStats";
 
 // ============================================================
 // Messages — the Inbox thread view (`listByConversation`) plus the
@@ -122,6 +124,53 @@ export interface AppendMessageArgs {
   replyToMessageId?: Id<"messages">;
 }
 
+/**
+ * Fold one message into the account's hourly rollup, the read-bounded
+ * source for the dashboard's messages-per-day chart (see
+ * `lib/messageStats.ts` and the `messageHourlyStats` comment in schema.ts).
+ *
+ * PATCHes an open bucket rather than inserting per message — a row per
+ * message would just reproduce the unbounded read this exists to remove.
+ *
+ * Keyed off `Date.now()` rather than the row's `_creationTime`, which is
+ * not known until after the insert and would cost a read-back to obtain.
+ * The two differ by microseconds; the only way that matters is a message
+ * landing within a hair of an hour boundary, which misplaces that single
+ * message by one hour in the chart.
+ */
+async function recordMessageInHourlyStats(
+  ctx: { db: MutationCtx["db"] },
+  accountId: Id<"accounts">,
+  senderType: AppendMessageArgs["senderType"],
+): Promise<void> {
+  const bucketStart = hourStartMs(Date.now());
+  // `senderType === "customer"` is inbound; agent and bot are both
+  // outgoing, matching what the chart counted when it read raw messages.
+  const inbound = senderType === "customer";
+
+  const existing = await ctx.db
+    .query("messageHourlyStats")
+    .withIndex("by_account_hour", (q) =>
+      q.eq("accountId", accountId).eq("hourStartMs", bucketStart),
+    )
+    .unique();
+
+  if (existing) {
+    await ctx.db.patch(existing._id, {
+      incoming: existing.incoming + (inbound ? 1 : 0),
+      outgoing: existing.outgoing + (inbound ? 0 : 1),
+    });
+    return;
+  }
+
+  await ctx.db.insert("messageHourlyStats", {
+    accountId,
+    hourStartMs: bucketStart,
+    incoming: inbound ? 1 : 0,
+    outgoing: inbound ? 0 : 1,
+  });
+}
+
 export async function insertMessageAndUpdateConversation(
   ctx: { db: MutationCtx["db"] },
   args: AppendMessageArgs,
@@ -163,6 +212,11 @@ export async function insertMessageAndUpdateConversation(
     replyToMessageId,
     status: "sent",
   });
+
+  // Maintained here because this is the single `insert("messages")` in the
+  // backend — every path funnels through it, so the rollup cannot drift
+  // from the raw rows unless a second insert site is added without one.
+  await recordMessageInHourlyStats(ctx, accountId, senderType);
 
   // Denormalized preview fields the Inbox list reads directly off
   // `conversations` (see `conversations.ts`'s `list`) so it never has
@@ -519,5 +573,132 @@ export const setAdReferralImage = internalMutation({
         referral: { ...message.referral, storedImageKey: args.storedImageKey },
       });
     }
+  },
+});
+
+// ============================================================
+// One-shot backfill for `messageHourlyStats`.
+//
+// The rollup is maintained going forward by
+// `recordMessageInHourlyStats`, so without this the dashboard chart is
+// simply empty for everything that happened before deploy. Run manually:
+//
+//   npx convex run messages:backfillMessageHourlyStats
+//
+// Batched, because `messages` is the largest table in the schema and a
+// `.collect()` over it is the very thing this whole change exists to
+// avoid — it reschedules itself until every account is done.
+//
+// IDEMPOTENT, by rebuilding whole hours rather than incrementing: each
+// pass SETS a bucket to the count it just measured. A batch that ends
+// mid-hour drops that partial hour and rewinds the cursor to its start, so
+// the hour is only ever written once it has been seen in full. Re-running
+// the whole backfill therefore converges on the same numbers instead of
+// doubling them, which an increment-based version would not.
+// ============================================================
+
+/** Messages read per batch. Comfortably under the 4096 read limit while
+ *  leaving room for the bucket upserts in the same mutation. */
+const BACKFILL_BATCH = 500;
+
+export const backfillMessageHourlyStats = internalMutation({
+  args: {
+    // Absent = start at the first account. Threaded by the self-schedule.
+    accountId: v.optional(v.id("accounts")),
+    cursorMs: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    const accounts = await ctx.db.query("accounts").collect();
+    if (accounts.length === 0) return;
+
+    const index = args.accountId
+      ? accounts.findIndex((a) => a._id === args.accountId)
+      : 0;
+    if (index < 0) return; // account vanished mid-backfill; nothing to resume
+    const account = accounts[index]!;
+
+    const advanceToNextAccount = async () => {
+      const next = accounts[index + 1];
+      if (!next) return; // all accounts done
+      await ctx.scheduler.runAfter(0, internal.messages.backfillMessageHourlyStats, {
+        accountId: next._id,
+      });
+    };
+
+    const batch = await ctx.db
+      .query("messages")
+      .withIndex("by_account", (q) =>
+        args.cursorMs === undefined
+          ? q.eq("accountId", account._id)
+          : q.eq("accountId", account._id).gte("_creationTime", args.cursorMs),
+      )
+      .take(BACKFILL_BATCH);
+
+    if (batch.length === 0) {
+      await advanceToNextAccount();
+      return;
+    }
+
+    // Group this batch into hour buckets.
+    const hours = new Map<number, { incoming: number; outgoing: number }>();
+    for (const m of batch) {
+      const key = hourStartMs(m._creationTime);
+      const bucket = hours.get(key) ?? { incoming: 0, outgoing: 0 };
+      if (m.senderType === "customer") bucket.incoming += 1;
+      else bucket.outgoing += 1;
+      hours.set(key, bucket);
+    }
+
+    const sortedHours = [...hours.keys()].sort((a, b) => a - b);
+    const isFullBatch = batch.length === BACKFILL_BATCH;
+
+    // A full batch almost certainly stops mid-hour. Withhold that last
+    // hour and resume from its start so it gets written only once it has
+    // been observed end-to-end — that is what keeps SET idempotent.
+    //
+    // Unless the whole batch is ONE hour: withholding it would rewind the
+    // cursor to where it already is and loop forever. That needs >500
+    // messages in a single hour (>12k/day) — far beyond this deployment —
+    // so it is handled by writing what was measured and stepping past the
+    // hour, with a warning, rather than by growing the batch unboundedly.
+    const singleHourOverflow = isFullBatch && sortedHours.length === 1;
+    const hoursToWrite =
+      isFullBatch && !singleHourOverflow ? sortedHours.slice(0, -1) : sortedHours;
+
+    if (singleHourOverflow) {
+      console.warn(
+        `[backfill] account ${account._id}: hour ${new Date(sortedHours[0]!).toISOString()} has more than ${BACKFILL_BATCH} messages; its chart bucket may undercount`,
+      );
+    }
+
+    for (const hour of hoursToWrite) {
+      const totals = hours.get(hour)!;
+      const existing = await ctx.db
+        .query("messageHourlyStats")
+        .withIndex("by_account_hour", (q) =>
+          q.eq("accountId", account._id).eq("hourStartMs", hour),
+        )
+        .unique();
+      if (existing) await ctx.db.patch(existing._id, totals);
+      else
+        await ctx.db.insert("messageHourlyStats", {
+          accountId: account._id,
+          hourStartMs: hour,
+          ...totals,
+        });
+    }
+
+    if (!isFullBatch) {
+      await advanceToNextAccount();
+      return;
+    }
+
+    const nextCursor = singleHourOverflow
+      ? sortedHours[0]! + HOUR_MS // step past the oversized hour
+      : sortedHours[sortedHours.length - 1]!; // rewind to the withheld hour
+    await ctx.scheduler.runAfter(0, internal.messages.backfillMessageHourlyStats, {
+      accountId: account._id,
+      cursorMs: nextCursor,
+    });
   },
 });
