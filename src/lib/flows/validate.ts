@@ -246,6 +246,7 @@ function validateNode(
       const cfg = node.config as {
         media_type?: "image" | "video" | "document";
         media_url?: string;
+        media_key?: string;
         caption?: string;
         next_node_key?: string;
       };
@@ -261,7 +262,7 @@ function validateNode(
           message: "Send-media node needs a media type (image, video, or document).",
         });
       }
-      if (!cfg.media_url?.trim()) {
+      if (!cfg.media_key?.trim() && !cfg.media_url?.trim()) {
         issues.push({
           severity: "error",
           scope: "node",
