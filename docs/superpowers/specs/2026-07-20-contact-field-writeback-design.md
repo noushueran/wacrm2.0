@@ -85,10 +85,10 @@ non-alphanumerics stripped) and looked up in an alias table:
 
 | Column | Aliases |
 |---|---|
-| `email` | email, emailaddress, mail |
+| `email` | email, emailaddress |
 | `nationality` | nationality, citizenship |
 | `preferredDestination` | destination, destinationcountry, preferreddestination, travellingto |
-| `travelDates` | traveldates, dates, travelmonth, when |
+| `travelDates` | traveldates, dates, travelmonth |
 | `travelers` | travelers, travellers, pax, passengers, numberoftravelers |
 | `budget` | budget, budgetperperson, perpersonbudget, tripbudget |
 
@@ -116,6 +116,16 @@ would produce two different implementations:**
    earliest in the conversation*, carrying its most recent value — which is
    both deterministic and the sensible reading.
 
+**The table is a conservative allowlist, and that is the point.** Because the
+mapper only ever fills blanks, a wrong write is **permanent** — nothing later
+corrects it. An unmapped field is therefore strictly better than a mis-mapped
+one: it simply stays in the session, where the rep can still read it. Two
+entries from the first draft — `when` for `travelDates` and `mail` for `email`
+— were removed in review on exactly this ground: both are generic English
+words absent from the documented checklist vocabulary, and a visa-approval
+deadline extracted as `when`, or a physical mailing address as `mail`, would
+have been misfiled forever.
+
 **`country` is deliberately unmapped.** In a travel CRM "country" reads as the
 destination at least as often as the customer's residence. Guessing wrong
 writes a permanent wrong value into a blank field that nothing will ever
@@ -138,6 +148,19 @@ already lands on `session.serviceName` and drives tag routing.
 ### 4. When it runs
 
 **Once, at `completeQualification`** — not on every analysis pass.
+
+**Scoped to the write, never gating the pipeline.** The contact load must not
+be allowed to abort completion. `conversations.contactId` can dangle after a
+contact delete — `convex/contacts.ts:550-561` documents this and notes the read
+layer tolerates it on purpose, and `adminAlertContext` handles it by no-opping
+inside its own scope rather than returning from its caller. An early
+`if (!contact) return;` in `completeQualification` would skip the session
+status patch, the funnel transition, the Meta conversion event and the
+notifications — turning "we cannot fill a contact that no longer exists" into a
+silently, permanently lost qualified lead. The first implementation did exactly
+that and it was caught in review; the write is now wrapped in `if (contact)`
+with a regression test pinning that a session whose contact is gone still
+reaches `qualified`.
 
 This follows from the overwrite rule, and the interaction is the reason it is
 worth stating: with fill-blanks-only, whatever lands *first* wins permanently.
