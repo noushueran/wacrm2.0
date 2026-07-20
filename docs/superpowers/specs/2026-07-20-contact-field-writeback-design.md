@@ -29,9 +29,23 @@ assuming. Two sources feed `fields[]`:
    shipped default (`convex/lib/qualification/defaults.ts`) is four keys:
    `looking_for`, `travel_dates`, `travelers`, `email`.
 2. Per-service `QUALIFICATION CHECKLIST` sections in the KB documents, which
-   are where the real questions live. Their recurring items are: destination /
-   destination country, nationality, travel dates, travellers (adults + child
-   ages), budget per person, email, and visa type/duration.
+   are where the real questions live. Across the six services in
+   `holidayys-ai-agent/agent-content.md` the declared keys are: destination /
+   destination country / `destination_or_interest`, nationality, travel dates,
+   travellers / `group_size`, email, visa type/duration, and `route_or_city`.
+
+> **Correction (final whole-branch review).** An earlier draft listed "budget
+> per person" among these. **It is not a checklist item in any of the six
+> services** — `budget` appears in the KB only inside `PURCHASE CRITERIA`
+> prose, which `purchase.ts` *reads* to build a judge prompt and never adds to
+> `fields[]`. So nothing ever asks for budget, and the column fills only if a
+> customer volunteers it unprompted. The column is still worth having (a rep
+> can type it, and the alias is ready if budget ever becomes a checklist item),
+> but **expect it to look permanently empty**, and do not read that as a bug.
+>
+> The same review found the table missed `destination_or_interest` and
+> `group_size` — the two required facts of the Ladies-Only Group Tours service,
+> whose coverage was consequently 2 of 6. Both are now mapped.
 
 Against `contacts`' existing columns, only **three** of those have a home:
 `email`, `nationality`, `preferredDestination`.
