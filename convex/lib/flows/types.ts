@@ -100,6 +100,14 @@ export interface SendMediaNodeConfig {
   media_type: "image" | "video" | "document";
   /** Public URL Meta will fetch. Uploaded via the builder's file picker. */
   media_url: string;
+  /**
+   * R2 object key for this node's media — the durable replacement for
+   * `media_url` (see `convex/lib/r2/url.ts`). Optional/dormant: no
+   * builder-UI write path sets this yet (Task 5 of the R2 migration is
+   * dual-read only — see `docs/superpowers/plans/2026-07-19-r2-media-write-path.md`);
+   * `flowsEngine.ts` resolves `media_key ?? media_url` at send time.
+   */
+  media_key?: string;
   /** Optional caption shown under the media (Meta caps at 1024 chars). */
   caption?: string;
   /**

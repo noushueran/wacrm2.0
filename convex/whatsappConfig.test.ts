@@ -1882,3 +1882,76 @@ test("resolveInboundMedia returns null when the account has no WhatsApp config",
   });
   expect(result).toBeNull();
 });
+
+test("resolveInboundMedia downloads Meta media into R2 and returns its key (not a URL)", async () => {
+  // R2-migration cutover (Task 7): `resolveInboundMedia` used to resolve
+  // the R2 key it got from `files.storeFromUrl` (Task 6) straight into a
+  // public URL (`publicUrl(r2ConfigFromEnv(), key)`) as a behavior-
+  // preserving shim. That shim is retired — this test locks in the new
+  // `{ key }` contract directly, independent of `ingest.test.ts`'s own
+  // full `processInbound` coverage of the same path.
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAdmin.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  // Same three-leg mock `ingest.test.ts`'s voice-note test uses: Meta's
+  // getMediaUrl (id -> CDN url + mime), the authenticated CDN download,
+  // then the R2 PUT `files.storeFromUrl` now makes — that PUT goes
+  // through `aws4fetch`, which signs a `Request` and invokes the global
+  // `fetch` with that single `Request` object as its only argument, so
+  // this mock must handle both calling conventions.
+  const bytes = new TextEncoder().encode("png-bytes");
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    if (input instanceof Request) {
+      return new Response(null, { status: 200 });
+    }
+    const url = String(input);
+    if (url.includes("graph.facebook.com")) {
+      return new Response(
+        JSON.stringify({ url: "https://cdn.example.com/media/abc", mime_type: "image/png" }),
+        { status: 200 },
+      );
+    }
+    return new Response(bytes, {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await t.action(internal.whatsappConfig.resolveInboundMedia, {
+    accountId,
+    mediaId: "media-123",
+  });
+
+  // The fix (Task 7): a raw R2 object key, shaped
+  // `<accountId>/inbound/<random><ext>` (`convex/lib/r2/keys.ts`'s
+  // `buildMediaKey`) — NOT a resolved `{ url }`. The caller
+  // (`convex/ingest.ts`) persists this key directly; resolving it to a
+  // public URL is left entirely to the read path
+  // (`convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5).
+  expect(result).not.toBeNull();
+  expect(result!.key).toMatch(/^[^/]+\/inbound\//);
+  expect(Object.keys(result!)).toEqual(["key"]);
+
+  vi.unstubAllGlobals();
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});

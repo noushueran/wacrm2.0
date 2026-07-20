@@ -676,15 +676,24 @@ test("agent cannot read messages of another agent's conversation; viewer can rea
 });
 
 // ============================================================
-// setMediaUrl — attaches a resolved media URL to an already-persisted
-// message. Second half of inbound-media resolution: ingest persists an
-// inbound media message with no URL (the webhook carries only Meta's raw
-// mediaId), then convex/ingest.ts's processInbound downloads the bytes
-// via whatsappConfig.resolveInboundMedia and calls this to attach the
-// resulting Convex-storage URL.
+// setMediaKey — attaches a resolved R2 object key to an already-
+// persisted message. Second half of inbound-media resolution: ingest
+// persists an inbound media message with no key/url (the webhook carries
+// only Meta's raw mediaId), then convex/ingest.ts's processInbound
+// downloads the bytes via whatsappConfig.resolveInboundMedia (which PUTs
+// them to R2) and calls this to attach the resulting key.
+//
+// R2-migration cutover (this module's Task 7, NOT the role-scoped-access
+// "Task 7" this file's other helpers reference): renamed from
+// `setMediaUrl`, which took an already-resolved URL and patched
+// `mediaUrl`. Its only caller (`convex/ingest.ts`) now has a key, not a
+// URL, to give it — `resolveInboundMedia` itself stopped resolving one.
+// Readers still fall back to the legacy `mediaUrl` column for
+// pre-cutover rows (`convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5);
+// this mutation itself never writes that column anymore.
 // ============================================================
 
-test("setMediaUrl attaches a mediaUrl to a message that had none", async () => {
+test("setMediaKey attaches a mediaKey to a message that had none", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -694,7 +703,7 @@ test("setMediaUrl attaches a mediaUrl to a message that had none", async () => {
   const contactId = await asUser.mutation(api.contacts.create, { phone: "111" });
   const conversationId = await seedConversation(t, { accountId, contactId });
 
-  // An inbound audio message as ingest first persists it: no mediaUrl.
+  // An inbound audio message as ingest first persists it: no mediaKey.
   const messageId = await t.run((ctx) =>
     ctx.db.insert("messages", {
       accountId,
@@ -704,16 +713,82 @@ test("setMediaUrl attaches a mediaUrl to a message that had none", async () => {
       status: "delivered",
     }),
   );
-  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaUrl).toBeUndefined();
+  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaKey).toBeUndefined();
 
-  await t.mutation(internal.messages.setMediaUrl, {
+  await t.mutation(internal.messages.setMediaKey, {
     messageId,
-    mediaUrl: "https://convex.test/api/storage/voice-1",
+    mediaKey: "acct123/inbound/voice-1.ogg",
   });
 
-  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaUrl).toBe(
-    "https://convex.test/api/storage/voice-1",
+  expect((await t.run((ctx) => ctx.db.get(messageId)))!.mediaKey).toBe(
+    "acct123/inbound/voice-1.ogg",
   );
+});
+
+// ============================================================
+// setAdReferralImage — attaches the R2 object key of a downloaded ad
+// image to the message's OWN `referral`. R2-migration cutover: takes
+// `storedImageKey` (not a pre-resolved URL), and — unlike before — no
+// longer echoes anything onto `conversation.adReferral`: that field has
+// no `storedImageKey` counterpart in the schema (only `messages.referral`
+// got one — see the R2-migration design spec's "Schema changes" table),
+// and nothing in `src/` ever reads `conversation.adReferral.storedImageUrl`
+// (the inbox's ad-lead badge only checks presence/`startedAt`;
+// `AdReferralCard`, the one place an ad image actually renders, takes the
+// MESSAGE-level referral this mutation still patches). Keeping that
+// second write alive would mean re-resolving a URL from the key inside
+// this mutation, reintroducing the exact eager R2-config-at-write-time
+// dependency this cutover retires, for a field nothing consumes.
+// `convex/ingest.test.ts`'s ad-referral tests cover this through the full
+// `processInbound` fan-out; this is the direct, narrow unit test for the
+// mutation itself.
+// ============================================================
+
+test("setAdReferralImage patches the message's referral.storedImageKey and leaves the conversation's adReferral untouched", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "111" });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  // The conversation already carries a set-once `adReferral` denorm
+  // (written by `ingestInbound`, unrelated to this mutation) — asserting
+  // it stays byte-for-byte unchanged proves `setAdReferralImage` truly
+  // never touches the conversation anymore, not just that it doesn't set
+  // `storedImageUrl`.
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, {
+      adReferral: { headline: "Ad A", startedAt: 1_700_000_000_000 },
+    }),
+  );
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "text",
+      status: "delivered",
+      referral: { sourceType: "ad", headline: "Ad A" },
+    }),
+  );
+
+  await t.mutation(internal.messages.setAdReferralImage, {
+    messageId,
+    storedImageKey: "acct123/ad/banner-1.jpg",
+  });
+
+  const message = await t.run((ctx) => ctx.db.get(messageId));
+  expect(message!.referral?.storedImageKey).toBe("acct123/ad/banner-1.jpg");
+  expect(message!.referral?.storedImageUrl).toBeUndefined();
+
+  const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conversation!.adReferral).toEqual({
+    headline: "Ad A",
+    startedAt: 1_700_000_000_000,
+  });
 });
 
 test("appendInternal persists replyToMessageId (reply linkage)", async () => {

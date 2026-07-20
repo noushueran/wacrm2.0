@@ -67,4 +67,37 @@ describe('serializeMessage', () => {
     const agent = { ...inbound, senderType: 'agent' };
     expect(serializeMessage(agent).direction).toBe('outbound');
   });
+
+  it('prefers mediaKey over a legacy mediaUrl, resolved to a public R2 URL (Task 5: dual-read)', () => {
+    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.holidayys.co';
+    const withKey: ConvexApiMessage = {
+      _id: 'm2',
+      _creationTime: Date.parse('2026-01-01T00:00:00Z'),
+      conversationId: 'conv1',
+      senderType: 'customer',
+      contentType: 'image',
+      mediaUrl: 'https://convex-api.holidayys.co/api/storage/old',
+      mediaKey: 'acc1/inbound/photo.jpg',
+      status: 'delivered',
+    };
+    expect(serializeMessage(withKey).media_url).toBe(
+      'https://objs.holidayys.co/acc1/inbound/photo.jpg',
+    );
+    delete process.env.NEXT_PUBLIC_R2_PUBLIC_HOST;
+  });
+
+  it('falls back to the legacy mediaUrl when there is no mediaKey', () => {
+    const withoutKey: ConvexApiMessage = {
+      _id: 'm3',
+      _creationTime: Date.parse('2026-01-01T00:00:00Z'),
+      conversationId: 'conv1',
+      senderType: 'customer',
+      contentType: 'image',
+      mediaUrl: 'https://example.com/photo.jpg',
+      status: 'delivered',
+    };
+    expect(serializeMessage(withoutKey).media_url).toBe(
+      'https://example.com/photo.jpg',
+    );
+  });
 });

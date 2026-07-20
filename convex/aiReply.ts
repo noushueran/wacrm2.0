@@ -27,6 +27,8 @@ import {
 } from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
 // AI auto-reply dispatch (Phase 7, Task 3 — the final Convex-backend
@@ -267,8 +269,17 @@ export const latestInboundMessageId = internalQuery({
 /**
  * Customer media rows (voice notes / images) still awaiting an AI
  * transcription/description — newest first, bounded by `limit`. Only
- * rows whose media already resolved into storage (`mediaUrl` set)
- * qualify; the rest keep their placeholder until a later dispatch.
+ * rows whose media already resolved into storage (`mediaKey` OR
+ * `mediaUrl` set) qualify; the rest keep their placeholder until a later
+ * dispatch.
+ *
+ * Returns the RAW `mediaKey`/`mediaUrl` pair rather than a resolved URL:
+ * this is a `query`, and resolving requires `r2ConfigFromEnv()` — Convex
+ * codebase convention here (see `conversionEvents.ts`/`campaignAds.ts`'s
+ * own "only an action can read process.env" comments) is that only an
+ * action reads deployment env, so resolution happens in the caller
+ * (`dispatchInbound`, an `internalAction`) instead, inside its own
+ * per-row try/catch — see that call site's comment for why.
  */
 export const untranscribedMediaRows = internalQuery({
   args: {
@@ -280,7 +291,13 @@ export const untranscribedMediaRows = internalQuery({
     ctx,
     args,
   ): Promise<
-    { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
+    {
+      messageId: Id<"messages">;
+      contentType: "audio" | "image";
+      mediaKey: string | null;
+      mediaUrl: string | null;
+      caption: string | null;
+    }[]
   > => {
     // BOUNDED raw window, filtered in JS: a DB-level contentType filter
     // would stream the index until it found `limit` media matches —
@@ -304,14 +321,15 @@ export const untranscribedMediaRows = internalQuery({
           m.senderType === "customer" &&
           (m.contentType === "audio" || m.contentType === "image") &&
           m._creationTime > cutoff &&
-          m.mediaUrl &&
+          (m.mediaKey || m.mediaUrl) &&
           !m.aiTranscription,
       )
       .slice(0, args.limit)
       .map((m) => ({
         messageId: m._id,
         contentType: m.contentType as "audio" | "image",
-        mediaUrl: m.mediaUrl!,
+        mediaKey: m.mediaKey ?? null,
+        mediaUrl: m.mediaUrl ?? null,
         caption: m.contentText?.trim() || null,
       }));
   },
@@ -616,15 +634,31 @@ export const dispatchInbound = internalAction({
         let transcribedAny = false;
         for (const row of pendingMedia) {
           try {
+            // Resolved HERE, inside the per-row try — not in the query
+            // above, and not hoisted above this `try` — so that
+            // `r2ConfigFromEnv()`'s throw (only reachable when
+            // `row.mediaKey` is actually present; see
+            // `resolveMediaUrlLazy`'s doc comment) is caught by the same
+            // best-effort per-row handling as any other transcription
+            // failure, rather than aborting the whole dispatch. The
+            // query's widened filter (`mediaKey || mediaUrl`) guarantees
+            // at least one is truthy for every row reaching this loop,
+            // so `link` is only ever null if that invariant is somehow
+            // violated — the `continue` guard below is belt-and-braces.
+            const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+              key: row.mediaKey,
+              url: row.mediaUrl,
+            });
+            if (!link) continue;
             const text = isDryRun()
               ? DRY_RUN_TRANSCRIPT
               : row.contentType === "audio"
-                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: row.mediaUrl })
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: link })
                 : await describeImageFromUrl({
                     apiKey: openAiKey,
                     model:
                       config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
-                    mediaUrl: row.mediaUrl,
+                    mediaUrl: link,
                     caption: row.caption ?? undefined,
                   });
             if (text) {

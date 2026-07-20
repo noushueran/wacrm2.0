@@ -2,6 +2,7 @@ import { mutation, query, internalQuery } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
 import { hasMinRole } from "./lib/roles";
+import { parseMediaKey } from "./lib/r2/keys";
 
 /**
  * First-login bootstrap: gives the current user exactly one account (as
@@ -99,6 +100,20 @@ export const me = query({
       name: membership.fullName ?? user?.name ?? null,
       email: membership.email ?? user?.email ?? null,
       avatarUrl: membership.avatarUrl ?? user?.image ?? null,
+      // R2 object key for this member's avatar (Task 5 of the R2
+      // migration: dual-read) — the durable replacement for `avatarUrl`
+      // above, which is left UNCHANGED here on purpose. `me` is a Convex
+      // `query`, and this codebase's convention (see
+      // `conversionEvents.ts`/`campaignAds.ts`'s own "only an action can
+      // read process.env" comments) is that only an action reads
+      // deployment env, so resolving `avatarKey` into a public R2 URL
+      // here would need `r2ConfigFromEnv()`/`resolveMediaUrl`
+      // (`convex/lib/r2/*`) inside a query, which this file avoids.
+      // `src/hooks/use-auth.tsx` resolves `avatarKey ?? avatarUrl`
+      // client-side instead, via `src/lib/storage/media-url.ts` — same
+      // pattern `adapters.ts` already uses for every other client-facing
+      // avatar/media field.
+      avatarKey: membership.avatarKey ?? null,
       accountId: membership.accountId,
       accountRole: membership.role,
       account: {
@@ -113,27 +128,40 @@ export const me = query({
 
 /**
  * The caller updates their OWN account membership's display profile —
- * `fullName`/`avatarUrl`, the same denormalized snapshot `me` above
- * reads back (Phase 8, Task 3: the settings "profile" form). A plain
- * `mutation` (not `accountMutation`) — matches this file's existing
- * `bootstrapAccount`/`currentUser`/`me` style of deriving identity via
- * `getAuthUserId` + a direct `memberships.by_user` lookup, rather than
- * scoping by `ctx.accountId`: there's no cross-tenant reach to guard
- * here, since a user only ever has the one membership row this looks
- * up, and this mutation never takes an accountId/userId argument a
+ * `fullName`/`avatarUrl`/`avatarKey`, the same denormalized snapshot
+ * `me` above reads back (Phase 8, Task 3: the settings "profile" form).
+ * A plain `mutation` (not `accountMutation`) — matches this file's
+ * existing `bootstrapAccount`/`currentUser`/`me` style of deriving
+ * identity via `getAuthUserId` + a direct `memberships.by_user` lookup,
+ * rather than scoping by `ctx.accountId`: there's no cross-tenant reach
+ * to guard here, since a user only ever has the one membership row this
+ * looks up, and this mutation never takes an accountId/userId argument a
  * client could supply to target anyone else's.
  *
- * `avatarUrl` is patched only when supplied — the same "omitted
- * optional arg carries no key at all" idiom `whatsappConfig.upsert`/
- * `aiConfig.upsert` use for their own optional fields, so clearing the
- * avatar field is never an accidental side effect of a name-only save.
- * `name` is required on every call, mirroring `me`'s own "the profile
- * form always has a name field" shape.
+ * `avatarUrl`/`avatarKey` are each patched only when supplied — the same
+ * "omitted optional arg carries no key at all" idiom
+ * `whatsappConfig.upsert`/`aiConfig.upsert` use for their own optional
+ * fields, so clearing the avatar is never an accidental side effect of a
+ * name-only save. `name` is required on every call, mirroring `me`'s own
+ * "the profile form always has a name field" shape.
+ *
+ * `avatarKey` (R2 migration: write path) is the durable replacement for
+ * `avatarUrl` — `src/components/settings/profile-form.tsx` uploads
+ * straight to R2 via `api.files.startUpload` and passes the resulting
+ * key here directly; it no longer resolves an `avatarUrl` itself (that
+ * resolution now happens client-side, at read time, via
+ * `src/hooks/use-auth.tsx`'s `resolveMediaUrl({ key: me.avatarKey, url:
+ * me.avatarUrl })`). `avatarUrl` is left in the args/patch shape
+ * unchanged — both fields can still be set independently, matching every
+ * other row in this migration (`messages.mediaKey`,
+ * `messageTemplates.headerMediaKey`) where the old URL column is kept
+ * dual-write/dual-read until the Plan 2 backfill.
  */
 export const updateProfile = mutation({
   args: {
     name: v.string(),
     avatarUrl: v.optional(v.string()),
+    avatarKey: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
@@ -145,10 +173,35 @@ export const updateProfile = mutation({
       .first();
     if (!membership) throw new ConvexError({ code: "NO_ACCOUNT" });
 
-    const patch: { fullName: string; avatarUrl?: string } = {
+    // A client-supplied `avatarKey` must be verified to belong to the
+    // CALLER's own account before it's ever written to their membership
+    // row: `updateProfile` has no accountId-vs-key check of its own the
+    // way `accountMutation`-built mutations get from `ctx.accountId`
+    // being derived server-side, and `avatarKey` is a plain client
+    // argument. Without this, a caller could patch their own profile
+    // with a key belonging to a DIFFERENT account, and every teammate's
+    // `me` query would then resolve and display that foreign object as
+    // this user's avatar — `resolveMediaUrl` (`convex/lib/r2/url.ts`)
+    // has no owner awareness of its own; it just builds a URL from
+    // whatever key it's given. A foreign key and a malformed one
+    // (`parseMediaKey` returns `null`) are BOTH `NOT_FOUND` — never
+    // `FORBIDDEN`, and never distinguishable from each other — the same
+    // non-leaky tenant-isolation contract `convex/files.ts`'s `remove`
+    // mutation and `convex/send.ts`'s media guard already use for this
+    // exact class of check. Runs BEFORE the patch below so a rejected
+    // call changes nothing at all, not even the name.
+    if (
+      args.avatarKey !== undefined &&
+      parseMediaKey(args.avatarKey)?.accountId !== membership.accountId
+    ) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+    }
+
+    const patch: { fullName: string; avatarUrl?: string; avatarKey?: string } = {
       fullName: args.name,
     };
     if (args.avatarUrl !== undefined) patch.avatarUrl = args.avatarUrl;
+    if (args.avatarKey !== undefined) patch.avatarKey = args.avatarKey;
 
     await ctx.db.patch(membership._id, patch);
     return membership._id;
