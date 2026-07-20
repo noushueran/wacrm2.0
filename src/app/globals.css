@@ -2,7 +2,16 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
-@custom-variant dark (&:is(.dark *));
+/* Keyed to `data-mode`, which is what actually gets set on <html> — by the
+   boot script in layout.tsx and by use-theme.tsx's setMode. This shipped as
+   `&:is(.dark *)` (shadcn's default) against a `.dark` class the app has
+   never set, so every `dark:` utility compiled to a selector that could not
+   match and silently did nothing. `:where()` rather than `:is()` so the
+   variant contributes zero specificity: a `dark:` utility should override
+   its light counterpart by source order, not by outranking it. Both the
+   root and its descendants are matched — `data-mode` lives on <html>, but
+   utilities are applied to elements far below it. Pinned by themes.test.ts. */
+@custom-variant dark (&:where([data-mode="dark"], [data-mode="dark"] *));
 
 @theme inline {
   --color-background: var(--background);
