@@ -167,6 +167,8 @@ describe("toUiTemplate — header_media_url", () => {
     expect(toUiTemplate(doc).header_media_key).toBe(
       "acc1/templates/sample.jpg",
     );
+  });
+});
 
 /**
  * `messages.aiTranscription` is written for every inbound voice note
