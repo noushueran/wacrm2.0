@@ -148,6 +148,45 @@ describe('buildSendComponents — header', () => {
       buildSendComponents(row({ header_type: 'image' })),
     ).toThrow(/requires a media link or id/);
   });
+
+  it('prefers header_media_key over header_media_url, resolved to a public R2 URL', () => {
+    // Task 5 of the R2 migration: dual-read. `NEXT_PUBLIC_R2_PUBLIC_HOST`
+    // is the client resolver's config source (`src/lib/storage/media-url.ts`).
+    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.holidayys.co';
+    const components = buildSendComponents(
+      row({
+        header_type: 'image',
+        header_media_url: 'https://convex-api.holidayys.co/api/storage/old',
+        header_media_key: 'acc1/templates/sample.jpg',
+      }),
+    );
+    expect(components[0]).toEqual({
+      type: 'header',
+      parameters: [
+        {
+          type: 'image',
+          image: { link: 'https://objs.holidayys.co/acc1/templates/sample.jpg' },
+        },
+      ],
+    });
+    delete process.env.NEXT_PUBLIC_R2_PUBLIC_HOST;
+  });
+
+  it('a caller override URL still wins over header_media_key (short-circuits before resolving, so no R2 config is needed)', () => {
+    const components = buildSendComponents(
+      row({
+        header_type: 'video',
+        header_media_key: 'acc1/templates/sample.mp4',
+      }),
+      { headerMediaUrl: 'https://example.com/custom.mp4' },
+    );
+    expect(components[0]).toEqual({
+      type: 'header',
+      parameters: [
+        { type: 'video', video: { link: 'https://example.com/custom.mp4' } },
+      ],
+    });
+  });
 });
 
 describe('buildSendComponents — buttons', () => {

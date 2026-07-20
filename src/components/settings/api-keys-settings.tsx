@@ -64,10 +64,18 @@ function keyStatus(k: ApiKey): 'active' | 'revoked' | 'expired' {
 }
 
 export function ApiKeysSettings() {
-  const { canEditSettings } = useAuth();
+  const { canEditSettings, profileLoading } = useAuth();
   const t = useTranslations('Settings.apiKeys');
 
-  const keysResult = useQuery(api.apiKeys.list);
+  // Skip until the role is BOTH known and sufficient — `api.apiKeys.list`
+  // is admin-gated server-side and `useQuery` re-throws a FORBIDDEN
+  // synchronously during render; this app has no Error Boundary, so a
+  // non-admin hard-navigating to /settings?tab=api would otherwise crash
+  // instead of being redirected by `RequireSection`.
+  const keysResult = useQuery(
+    api.apiKeys.list,
+    !profileLoading && canEditSettings ? {} : 'skip',
+  );
   const keys = useMemo(() => (keysResult ?? []).map(toUiApiKey), [keysResult]);
   const loading = keysResult === undefined;
 

@@ -1,5 +1,6 @@
 import { ConvexError } from "convex/values";
 import type { Doc, Id } from "../../../convex/_generated/dataModel";
+import { resolveMediaUrl } from "@/lib/storage/media-url";
 import type {
   AccountInvitation,
   AccountMember,
@@ -234,7 +235,10 @@ export function toUiMember(
     user_id: doc.userId,
     full_name: doc.fullName ?? doc.email ?? "",
     email: doc.email ?? null,
-    avatar_url: doc.avatarUrl ?? null,
+    // `avatarKey` over the legacy `avatarUrl` (Task 5 of the R2
+    // migration: dual-read) — `AccountMember.avatar_url` is already
+    // `string | null`, matching `resolveMediaUrl`'s return exactly.
+    avatar_url: resolveMediaUrl({ key: doc.avatarKey, url: doc.avatarUrl }),
     role: doc.role,
     joined_at: new Date(doc._creationTime).toISOString(),
     phone: doc.phone ?? null,
@@ -346,7 +350,12 @@ export function toUiMessage(doc: Doc<"messages">): Message {
     sender_id: doc.senderId,
     content_type: doc.contentType,
     content_text: doc.contentText,
-    media_url: doc.mediaUrl,
+    // `mediaKey` over the legacy `mediaUrl` (Task 5 of the R2 migration:
+    // dual-read). `Message.media_url` is `string | undefined` (see
+    // `src/types/index.ts`), so `resolveMediaUrl`'s `string | null`
+    // return is coerced back to `undefined` here — same convention as
+    // every other optional-string UI field in this file.
+    media_url: resolveMediaUrl({ key: doc.mediaKey, url: doc.mediaUrl }) ?? undefined,
     template_name: doc.templateName,
     // Meta wamid — the UI type names this `message_id` (there is no
     // separate `whatsapp_message_id` field on `Message`; checked
@@ -377,7 +386,17 @@ export function toUiMessage(doc: Doc<"messages">): Message {
           image_url: doc.referral.imageUrl,
           video_url: doc.referral.videoUrl,
           thumbnail_url: doc.referral.thumbnailUrl,
-          stored_image_url: doc.referral.storedImageUrl,
+          // `storedImageKey` over the legacy `storedImageUrl` (Task 5 of
+          // the R2 migration: dual-read) — unlike `image_url`/
+          // `video_url`/`thumbnail_url` above (Meta's raw ad-creative
+          // CDN urls, which have no key counterpart in the schema and
+          // are correctly left untouched), this field DOES have one
+          // (`messages.referral.storedImageKey`, schema.ts).
+          stored_image_url:
+            resolveMediaUrl({
+              key: doc.referral.storedImageKey,
+              url: doc.referral.storedImageUrl,
+            }) ?? undefined,
         }
       : undefined,
   };
@@ -564,7 +583,25 @@ export function toUiTemplate(doc: Doc<"messageTemplates">): MessageTemplate {
     header_type: doc.headerType,
     header_content: doc.headerContent,
     header_handle: doc.headerHandle,
-    header_media_url: doc.headerMediaUrl,
+    // `headerMediaKey` over the legacy `headerMediaUrl` (Task 5 of the
+    // R2 migration: dual-read) — resolved here so every display
+    // consumer (template-manager.tsx's preview, broadcasts/
+    // step3-personalize.tsx) gets the right URL without each needing to
+    // know about the key; `template-send-builder.ts` ALSO resolves
+    // independently at send time as a defensive second layer (see that
+    // file's own comment).
+    header_media_url:
+      resolveMediaUrl({ key: doc.headerMediaKey, url: doc.headerMediaUrl }) ??
+      undefined,
+    // Passed through as-is (not resolved) so `template-send-builder.ts`'s
+    // own defensive second resolution — which reads `template
+    // .header_media_key` directly — has a real value to prefer instead
+    // of always falling through to the already-resolved `header_media_url`
+    // above. Final-review fix: before this, `toUiTemplate` never set this
+    // field at all, so `header_media_key` was permanently `undefined` on
+    // every `MessageTemplate` built through this adapter, making that
+    // send-time resolution dead code in practice.
+    header_media_key: doc.headerMediaKey,
     body_text: doc.bodyText,
     footer_text: doc.footerText,
     buttons: doc.buttons as TemplateButton[] | undefined,
@@ -626,7 +663,18 @@ export function toUiQuickReply(doc: Doc<"quickReplies">): QuickReply {
  *  verbatim by reading the raw `useQuery` result directly, not through
  *  this adapter. A fixed placeholder satisfies the (required,
  *  non-optional) UI field without ever surfacing whatever the row
- *  actually holds. */
+ *  actually holds.
+ *
+ *  As of Task 5 (supervisor-lockdown series), `whatsappConfig.get` is
+ *  admin-only (`ctx.requireRole("admin")`) — this adapter is therefore
+ *  only ever fed a doc an admin+ caller was allowed to fetch in the
+ *  first place, and `whatsapp-config.tsx` (the only caller, the
+ *  admin-only WhatsApp settings tab) is the only place this runs.
+ *  Non-admin surfaces that used to read `get` (the inbox header,
+ *  `settings-overview.tsx`'s WhatsApp tile) now read the member-safe
+ *  `whatsappConfig.connectionState` query instead — a `{ status,
+ *  isConfigured }` projection with no adapter of its own, since it's
+ *  already UI-shaped. */
 export function toUiWhatsappConfig(doc: Doc<"whatsappConfig">): WhatsAppConfig {
   return {
     id: doc._id,
@@ -688,7 +736,7 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
 // (`aiKnowledgeDocuments`).
 // ============================================================
 
-/** `aiConfig.get`'s return shape, mapped almost unchanged — it is
+/** `aiConfig.getFull`'s return shape, mapped almost unchanged — it is
  *  already a flat camelCase POJO, NOT a raw `Doc<"aiConfigs">`: that
  *  query deliberately never selects `apiKey`/`embeddingsApiKey` into
  *  its return value at all (see its own doc comment), only the derived
@@ -699,7 +747,14 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
  *  `ApiKeyView` above, this UI-facing type is declared here instead.
  *  `autoReplyMaxPerConversation`/`handoffAgentId` are NOT part of this
  *  view (Task B7 removed the deprecated reply-cap/handoff plumbing —
- *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`). */
+ *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`).
+ *
+ *  This mapper is `getFull`-shaped, not `get`-shaped (RBAC lockdown
+ *  split — `aiConfig.ts`'s own doc comments on both exports): `get`'s
+ *  narrower, member-safe payload has no `systemPrompt` field at all, so
+ *  a `configDoc` from `get` is not a valid input here. The only caller
+ *  (`ai-config.tsx`, the admin settings form that edits the prompt)
+ *  already reads `getFull`. */
 export interface AiConfigView {
   provider: "openai" | "anthropic";
   model: string;
@@ -713,7 +768,7 @@ export interface AiConfigView {
 export function toUiAiConfig(config: {
   provider: "openai" | "anthropic";
   model: string;
-  systemPrompt: string | undefined;
+  systemPrompt: string | null;
   isActive: boolean;
   autoReplyEnabled: boolean;
   hasKey: boolean;

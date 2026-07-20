@@ -89,18 +89,23 @@ export const create = accountMutation({
 });
 
 /**
- * Any member lists the caller's own account's API keys, newest-first.
- * The roster (name/prefix/scopes/liveness) is not secret — only the key
- * itself is, and it was never stored — so this is open to viewer+,
- * mirroring migration 026's own `api_keys_select` RLS policy. `keyHash`
- * is explicitly never selected below (explicit field selection, not a
- * destructure-and-omit — mirrors `invitations.list`'s own convention,
- * chosen there specifically to dodge an eslint `no-unused-vars`
- * warning on the omitted field).
+ * Admin+ lists the caller's own account's API keys, newest-first.
+ *
+ * This was previously open to viewer+, on the reasoning that the roster
+ * (name/prefix/scopes/liveness) is not itself secret — the key is, and
+ * it was never stored. That reasoning still holds technically, but the
+ * account owner requires API keys hidden from supervisors and below, so
+ * the roster is now admin-only. `keyHash` remains explicitly unselected
+ * below regardless.
  */
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
+    // Admin+ only. The key INVENTORY (names, prefixes, scopes, last-used)
+    // is itself sensitive even though `keyHash` is withheld below — it
+    // maps out the account's integration surface. The sole consumer is
+    // the admin-gated API keys settings tab.
+    ctx.requireRole("admin");
     const keys = await ctx.db
       .query("apiKeys")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))

@@ -390,6 +390,98 @@ test("an inbound image is described the same way", async () => {
   expect(imageRow!.aiTranscription).toBe("[dry-run transcript]");
 }, 20_000);
 
+test("a customer media row with only mediaKey (no mediaUrl) is still picked up and transcribed", async () => {
+  // Task 5 of the R2 migration: `untranscribedMediaRows`' filter widens
+  // from `m.mediaUrl` alone to `m.mediaKey || m.mediaUrl` — without that
+  // widening, a key-only row (the post-cutover shape) would be silently
+  // excluded from the query and never transcribed at all.
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaKey: "acc1/inbound/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBe("[dry-run transcript]");
+
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+}, 20_000);
+
+test("a customer media row with mediaKey and R2 unconfigured is skipped (best-effort) rather than crashing the dispatch", async () => {
+  // The exact trap this task's brief calls out: `r2ConfigFromEnv()`
+  // throws when R2 env vars are unset. This row's `mediaKey` forces
+  // `resolveMediaUrlLazy` to actually build the config, which throws
+  // here (no R2_* env vars set anywhere in this suite) — that throw must
+  // be caught per-row (matching the existing "best-effort per row"
+  // design already documented on `untranscribedMediaRows`) and must not
+  // take down the rest of the dispatch (the reply still sends).
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaKey: "acc1/inbound/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBeUndefined();
+  const botMessages = (await messagesFor(t, conversationId)).filter(
+    (m) => m.senderType === "bot",
+  );
+  expect(botMessages).toHaveLength(1); // dispatch completes and still replies
+}, 20_000);
+
 test("no usable OpenAI key (anthropic provider, no embeddings key) skips transcription but still replies", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
@@ -744,7 +836,14 @@ test("playground returns an error (never throws) when every message is blank", a
   expect(result).toEqual({ error: "Send a message to test the agent." });
 });
 
-test("playground throws FORBIDDEN for a viewer (below the agent role floor)", async () => {
+// Whole-branch review Fix 3: `playground` loads the DECRYPTED account
+// config (including `systemPrompt`) and spends the account's own BYO
+// provider budget, so its floor was raised from agent+ to admin+ — its
+// only UI (`/agents`'s Playground tab) is already admin/owner-only. This
+// pins the new floor at BOTH ends: a supervisor (who now sees Campaigns
+// and much of the dashboard on this branch, but must NOT reach the AI
+// config) is rejected, same as a plain viewer.
+test("playground throws FORBIDDEN for a viewer (below the admin role floor)", async () => {
   const t = convexTest(schema, modules);
   const { accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -762,7 +861,28 @@ test("playground throws FORBIDDEN for a viewer (below the agent role floor)", as
     asVic.action(api.aiReply.playground, {
       messages: [{ role: "user", content: "Hello?" }],
     }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("playground throws FORBIDDEN for a supervisor (raised from agent+ to admin+ by Fix 3 — supervisors must not reach the decrypted config or spend the account's AI budget)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const supUserId = await seedTeammate(t, {
+    accountId,
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  const asSam = t.withIdentity({ subject: `${supUserId}|session-Sam` });
+
+  await expect(
+    asSam.action(api.aiReply.playground, {
+      messages: [{ role: "user", content: "Hello?" }],
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
 
 test("playground throws UNAUTHENTICATED when there is no identity", async () => {

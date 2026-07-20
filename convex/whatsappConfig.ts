@@ -65,14 +65,47 @@ const WABA_EQUALS_PHONE_NUMBER_MESSAGE =
  * index `upsert` below relies on for its find-or-insert check — there
  * is no `configId` argument anywhere in this module, so a caller can
  * never address another account's row even by guessing an id.
+ *
+ * Admin+ only (Task 5, supervisor-lockdown series): this returns the
+ * FULL raw row — phone number id, WABA id, verify token, encrypted
+ * access token — which is far more than any non-admin surface needs.
+ * Both non-admin consumers (`src/app/(dashboard)/inbox/page.tsx` and
+ * `settings-overview.tsx`) have been migrated onto `connectionState`
+ * below, which exposes only the two booleans they actually read.
  */
 export const get = accountQuery({
   args: {},
   handler: async (ctx) => {
+    ctx.requireRole("admin");
     return await ctx.db
       .query("whatsappConfig")
       .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
       .first();
+  },
+});
+
+/**
+ * Member-safe connection state. `get` above returns the FULL raw row —
+ * phone number id, WABA id, verify token, encrypted access token — which
+ * is far more than the two non-admin surfaces that read it actually
+ * need: the inbox wants "are we connected?", and the settings overview
+ * tile wants "is this set up at all?".
+ *
+ * Those two booleans are what this returns, so `get` can be gated to
+ * admin without breaking either surface. Never throws for an
+ * unconfigured account — absence is a legitimate state to render.
+ */
+export const connectionState = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    const config = await ctx.db
+      .query("whatsappConfig")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .first();
+    return {
+      status: config?.status ?? null,
+      isConfigured: !!config?.phoneNumberId,
+    };
   },
 });
 
@@ -693,23 +726,25 @@ interface ConnectionStatusResult {
 
 /**
  * Health-check backing the settings form's connection banner/"Test API
- * Connection" button and `settings-overview.tsx`'s WhatsApp tile.
- * Convex port of `GET /api/whatsapp/config` — mirrors its exact
- * branches: no config saved yet (`no_config`), a token that can't be
- * decrypted with the current `ENCRYPTION_KEY` (`token_corrupted`,
- * `needs_reset: true` — surfaces the Reset Configuration flow), Meta
- * rejecting the credentials (`meta_api_error`), or a genuine
- * `{ connected: true, phone_info }`. Always resolves (never throws)
- * for every one of those diagnostic outcomes, exactly like the source
- * route's own "200 in all non-auth cases" contract.
+ * Connection" button. Convex port of `GET /api/whatsapp/config` —
+ * mirrors its exact branches: no config saved yet (`no_config`), a
+ * token that can't be decrypted with the current `ENCRYPTION_KEY`
+ * (`token_corrupted`, `needs_reset: true` — surfaces the Reset
+ * Configuration flow), Meta rejecting the credentials
+ * (`meta_api_error`), or a genuine `{ connected: true, phone_info }`.
+ * Always resolves (never throws) for every one of those diagnostic
+ * outcomes, exactly like the source route's own "200 in all non-auth
+ * cases" contract.
  *
- * Unlike `connectAndSave`/`verifyRegistration` (both admin+), the
- * source route has NO role check at all — any authenticated member of
- * the account can view this diagnostic. Gated here at `viewer` (the
- * lowest rank) rather than left ungated, so `settings-overview.tsx`'s
- * health tile still renders correctly for non-admin teammates
- * (matching the route's own "any authenticated member" floor) while
- * still requiring genuine account membership.
+ * The source route has NO role check at all — any authenticated member
+ * of the account can view this diagnostic. Task 5 of the
+ * supervisor-lockdown series deliberately tightens that here to
+ * admin+, matching `whatsappConfig.get` (this performs a LIVE Meta API
+ * call against the account's own credentials on every invocation, and
+ * the settings tile that used to drive it for non-admins now reads the
+ * member-safe `connectionState` query instead — see that query's own
+ * doc comment). `verifyRegistration` below made the same admin+
+ * tightening earlier.
  *
  * DRY-RUN aware (`CONVEX_META_DRY_RUN`): the one outbound Meta call
  * (`verifyPhoneNumber`) is skipped and replaced with a synthetic
@@ -726,8 +761,11 @@ export const connectionStatus = action({
       { userId },
     );
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "viewer")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "viewer" });
+    // Admin+ only: this performs a live Meta health check against the
+    // account's own credentials, and the settings tile it feeds is
+    // itself admin-gated. Supervisors and below use `connectionState`.
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
     }
     const { accountId } = context;
 
@@ -955,7 +993,7 @@ export const verifyRegistration = action({
 // `internal.accounts.accountContextForUser`), but gates at "agent"
 // rather than "admin" — viewing an already-received inbox attachment
 // is a routine agent action (the same floor `convex/files.ts`'s
-// `generateUploadUrl` uses for attaching OUTBOUND media), not an
+// `startUpload` uses for attaching OUTBOUND media), not an
 // admin-only diagnostic like `verifyRegistration`.
 //
 // No DRY-RUN branch (unlike `verifyRegistration`/`metaSend.ts`): this
@@ -1031,21 +1069,33 @@ export const fetchMedia = action({
 // design `fetchMedia` documents): it decrypts, resolves the Meta media
 // id to its short-lived CDN URL (`getMediaUrl`), then hands that URL plus
 // a `Bearer` header to `files.storeFromUrl`, which downloads the bytes
-// into Convex storage. Only the resulting DURABLE storage URL comes back
-// out — so the inbox `<audio>`/`<video>`/`<img>` can fetch it directly,
-// forever, exactly like agent-sent (outbound) media, with no auth proxy
-// and no dependence on Meta's media-retention window.
+// and PUTs them to Cloudflare R2 under a key scoped to this account.
+//
+// Returns `{ key }`, NOT a resolved URL (R2-migration cutover, Task 7):
+// `convex/ingest.ts`'s caller persists this key directly onto the
+// message row (`messages.setMediaKey`) instead of eagerly resolving it
+// to R2's public URL here — the inbox `<audio>`/`<video>`/`<img>`
+// resolves `mediaKey ?? mediaUrl` lazily, at render time, instead
+// (`src/lib/convex/adapters.ts`'s `toUiMessage`, Task 5). Task 6 already
+// moved the underlying primitive (`storeFromUrl`) from a Convex-storage
+// upload returning `{ storageId }` to an R2 PUT returning `{ key }`; this
+// action briefly kept resolving that key to a URL itself (`publicUrl`)
+// as a behavior-preserving shim while `ingest.ts`'s caller still expected
+// one — Task 7 retires that shim now that the caller has been cut over
+// too.
 //
 // Best-effort by contract: returns `null` (never throws) for a missing
-// config, an undecryptable token, or any failing Meta/storage step, so
-// one media that can't be fetched degrades to an "unavailable" bubble
-// rather than derailing `ingest.processInbound`'s whole fan-out. The
-// caller reads `null` as "leave this message without a mediaUrl".
+// config, an undecryptable token, or any failing Meta/R2 step —
+// including R2 being unconfigured (`r2ConfigFromEnv()` throwing inside
+// `storeFromUrl`) — so one media that can't be fetched degrades to an
+// "unavailable" bubble rather than derailing `ingest.processInbound`'s
+// whole fan-out. The caller reads `null` as "leave this message without
+// a mediaKey".
 // ============================================================
 
 export const resolveInboundMedia = internalAction({
   args: { accountId: v.id("accounts"), mediaId: v.string() },
-  handler: async (ctx, args): Promise<{ url: string } | null> => {
+  handler: async (ctx, args): Promise<{ key: string } | null> => {
     const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
       accountId: args.accountId,
     });
@@ -1057,12 +1107,13 @@ export const resolveInboundMedia = internalAction({
         mediaId: args.mediaId,
         accessToken,
       });
-      const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+      const { key } = await ctx.runAction(internal.files.storeFromUrl, {
         url: mediaInfo.url,
         headers: { Authorization: `Bearer ${accessToken}` },
+        accountId: args.accountId,
+        kind: "inbound",
       });
-      const url = await ctx.storage.getUrl(storageId);
-      return url ? { url } : null;
+      return { key };
     } catch (err) {
       console.error(
         "[resolveInboundMedia] failed to resolve media",

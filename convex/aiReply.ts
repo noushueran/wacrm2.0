@@ -27,6 +27,8 @@ import {
 } from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
 // AI auto-reply dispatch (Phase 7, Task 3 — the final Convex-backend
@@ -267,8 +269,17 @@ export const latestInboundMessageId = internalQuery({
 /**
  * Customer media rows (voice notes / images) still awaiting an AI
  * transcription/description — newest first, bounded by `limit`. Only
- * rows whose media already resolved into storage (`mediaUrl` set)
- * qualify; the rest keep their placeholder until a later dispatch.
+ * rows whose media already resolved into storage (`mediaKey` OR
+ * `mediaUrl` set) qualify; the rest keep their placeholder until a later
+ * dispatch.
+ *
+ * Returns the RAW `mediaKey`/`mediaUrl` pair rather than a resolved URL:
+ * this is a `query`, and resolving requires `r2ConfigFromEnv()` — Convex
+ * codebase convention here (see `conversionEvents.ts`/`campaignAds.ts`'s
+ * own "only an action can read process.env" comments) is that only an
+ * action reads deployment env, so resolution happens in the caller
+ * (`dispatchInbound`, an `internalAction`) instead, inside its own
+ * per-row try/catch — see that call site's comment for why.
  */
 export const untranscribedMediaRows = internalQuery({
   args: {
@@ -280,7 +291,13 @@ export const untranscribedMediaRows = internalQuery({
     ctx,
     args,
   ): Promise<
-    { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
+    {
+      messageId: Id<"messages">;
+      contentType: "audio" | "image";
+      mediaKey: string | null;
+      mediaUrl: string | null;
+      caption: string | null;
+    }[]
   > => {
     // BOUNDED raw window, filtered in JS: a DB-level contentType filter
     // would stream the index until it found `limit` media matches —
@@ -304,14 +321,15 @@ export const untranscribedMediaRows = internalQuery({
           m.senderType === "customer" &&
           (m.contentType === "audio" || m.contentType === "image") &&
           m._creationTime > cutoff &&
-          m.mediaUrl &&
+          (m.mediaKey || m.mediaUrl) &&
           !m.aiTranscription,
       )
       .slice(0, args.limit)
       .map((m) => ({
         messageId: m._id,
         contentType: m.contentType as "audio" | "image",
-        mediaUrl: m.mediaUrl!,
+        mediaKey: m.mediaKey ?? null,
+        mediaUrl: m.mediaUrl ?? null,
         caption: m.contentText?.trim() || null,
       }));
   },
@@ -616,15 +634,31 @@ export const dispatchInbound = internalAction({
         let transcribedAny = false;
         for (const row of pendingMedia) {
           try {
+            // Resolved HERE, inside the per-row try — not in the query
+            // above, and not hoisted above this `try` — so that
+            // `r2ConfigFromEnv()`'s throw (only reachable when
+            // `row.mediaKey` is actually present; see
+            // `resolveMediaUrlLazy`'s doc comment) is caught by the same
+            // best-effort per-row handling as any other transcription
+            // failure, rather than aborting the whole dispatch. The
+            // query's widened filter (`mediaKey || mediaUrl`) guarantees
+            // at least one is truthy for every row reaching this loop,
+            // so `link` is only ever null if that invariant is somehow
+            // violated — the `continue` guard below is belt-and-braces.
+            const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+              key: row.mediaKey,
+              url: row.mediaUrl,
+            });
+            if (!link) continue;
             const text = isDryRun()
               ? DRY_RUN_TRANSCRIPT
               : row.contentType === "audio"
-                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: row.mediaUrl })
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: link })
                 : await describeImageFromUrl({
                     apiKey: openAiKey,
                     model:
                       config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
-                    mediaUrl: row.mediaUrl,
+                    mediaUrl: link,
                     caption: row.caption ?? undefined,
                   });
             if (text) {
@@ -860,7 +894,7 @@ const playgroundMessageValidator = v.object({
 type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; code?: string };
 
 /**
- * Agent+ "test-chat with the agent" action — Convex port of `POST
+ * Admin+ "test-chat with the agent" action — Convex port of `POST
  * /api/ai/playground`. Runs the EXACT path the auto-reply bot uses
  * (knowledge retrieval + `auto_reply` system prompt + the account's
  * configured provider) against a client-supplied transcript, so what's
@@ -873,6 +907,17 @@ type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; c
  * The route accepts no config/system-prompt overrides beyond `messages`
  * (checked against the actual route, not just the task brief's
  * paraphrase) — so neither does this action.
+ *
+ * Raised from Agent+ to Admin+ (whole-branch review Fix 3): this loads
+ * the account's DECRYPTED config — including `systemPrompt`, which Task
+ * 3 of this branch deliberately stopped exposing to the member-facing
+ * config query — and spends the account's own BYO provider budget on
+ * every call. Its only UI is the Playground tab on `/agents`, which is
+ * already admin/owner-only (`/agents` is absent from `SUPERVISOR_NAV`/
+ * `AGENT_NAV`/`VIEWER_NAV` in `src/lib/auth/roles.ts`); this closes the
+ * matching backend gap. Contrast with `draft` below, which stays
+ * Agent+ — the inbox "suggest a reply" action every agent uses daily —
+ * see ITS doc comment for why raising that one would be wrong.
  */
 export const playground = action({
   args: { messages: v.array(playgroundMessageValidator) },
@@ -883,8 +928,8 @@ export const playground = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "agent")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
     }
     const { accountId } = context;
 
@@ -969,6 +1014,18 @@ type DraftResult = { draft: string } | { error: string; code?: string };
  * lifecycle ends when its handler returns, same reasoning as
  * `dispatchInbound`'s own usage-log comment) but best-effort, matching
  * the route's own resilience around `logAiUsage`.
+ *
+ * Deliberately KEPT at Agent+ (whole-branch review Fix 3 — verified, not
+ * changed): this backs the inbox message composer's "suggest a reply"
+ * button (`src/components/inbox/message-composer.tsx`), which every
+ * agent uses on every conversation they're allowed to see. It never
+ * returns the raw config or `systemPrompt` to the caller (only the
+ * generated `draft` text) and per-conversation RBAC below already keeps
+ * an agent to their own/pool conversations. Raising this floor would
+ * break the inbox for agents, which is out of scope for this branch —
+ * contrast with `playground` above (raised to Admin+), which is a
+ * different surface (the admin-only `/agents` page) with a different
+ * blast radius (the decrypted config + the account's AI spend).
  */
 export const draft = action({
   args: { conversationId: v.id("conversations") },

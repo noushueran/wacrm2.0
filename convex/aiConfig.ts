@@ -38,9 +38,11 @@ import { AiError } from "./lib/ai/types";
 const providerValidator = v.union(v.literal("openai"), v.literal("anthropic"));
 
 /**
- * The caller's own account's AI config, or `null` if never configured.
- * Any member may read it (mirrors the Next.js GET route's own comment:
- * "so the inbox/settings can reflect whether AI is set up"). The
+ * The caller's own account's AI config, or `null` if never configured —
+ * the member-safe projection. Any member may read it (mirrors the
+ * Next.js GET route's own comment: "so the inbox/settings can reflect
+ * whether AI is set up"): the inbox's `AiThreadBanner` needs
+ * `isActive`/`autoReplyEnabled` for every role, agent included. The
  * encrypted `apiKey`/`embeddingsApiKey` columns are NEVER selected into
  * the return value — only `hasKey`/`hasEmbeddingsKey` booleans derived
  * from them, exactly like the GET route's own `has_key`/
@@ -48,6 +50,12 @@ const providerValidator = v.union(v.literal("openai"), v.literal("anthropic"));
  * derive the flags then destructured back out before the response is
  * built; here, the fields are simply never referenced in the object
  * literal below, so there's no destructure-then-omit step to get wrong).
+ *
+ * `systemPrompt` is deliberately NOT part of this shape — it is the
+ * business's own behaviour engineering (RBAC lockdown), and lives only
+ * in the admin-only `getFull` below. A supervisor (or any sub-admin
+ * role) calling this query gets everything the banner needs and nothing
+ * more.
  */
 export const get = accountQuery({
   args: {},
@@ -61,7 +69,39 @@ export const get = accountQuery({
     return {
       provider: config.provider,
       model: config.model,
-      systemPrompt: config.systemPrompt,
+      isActive: config.isActive,
+      autoReplyEnabled: config.autoReplyEnabled,
+      hasKey: !!config.apiKey,
+      hasEmbeddingsKey: !!config.embeddingsApiKey,
+      // `systemPrompt` deliberately omitted — see `getFull` below.
+    };
+  },
+});
+
+/**
+ * Admin+ view of the same row, including `systemPrompt`. Split from
+ * `get` because the inbox's AI banner needs `isActive`/`autoReplyEnabled`
+ * for EVERY member, while the prompt itself is the business's own
+ * behaviour engineering and belongs with the other admin-only settings.
+ *
+ * The encrypted `apiKey`/`embeddingsApiKey` columns are still never
+ * selected here — only the `hasKey`/`hasEmbeddingsKey` booleans, exactly
+ * as in `get`.
+ */
+export const getFull = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    ctx.requireRole("admin");
+    const config = await ctx.db
+      .query("aiConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .first();
+    if (!config) return null;
+
+    return {
+      provider: config.provider,
+      model: config.model,
+      systemPrompt: config.systemPrompt ?? null,
       isActive: config.isActive,
       autoReplyEnabled: config.autoReplyEnabled,
       hasKey: !!config.apiKey,
