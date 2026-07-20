@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, type JSX } from 'react';
+import { useEffect, useRef, useState, type JSX } from 'react';
 import { useTranslations } from 'next-intl';
 import { ConvexError } from 'convex/values';
 import { Loader2 } from 'lucide-react';
@@ -132,20 +132,40 @@ export function ServiceForm({
   const [deleting, setDeleting] = useState(false);
   const [submitError, setSubmitError] = useState<SubmitError | null>(null);
 
-  // Re-seed every field whenever the dialog opens — it stays mounted
-  // across opens/closes (the studio just flips `open`), so `useState`
-  // initializers alone would only ever apply once.
+  // `initial` is a fresh object every time `knowledge-studio.tsx`'s
+  // `studioOverview` query recomputes — which fires on ANY write to
+  // kbServices/kbEntries/kbOpsBlocks anywhere in the account, not just
+  // the row being edited. Keying the re-seed effect below on `initial`
+  // itself would re-fire on every such reactive update, silently
+  // overwriting whatever the admin has half-typed while the dialog is
+  // still open. `key` is the service's one immutable field (see the
+  // module doc comment above), so it's the right re-seed trigger. This
+  // ref just keeps the latest field values on hand for when that
+  // trigger *does* fire — it's updated every render (a plain field
+  // write, not effectful) so the effect always reads fresh data
+  // without pulling `initial`, or its never-referentially-stable
+  // `aliases` array, into its dependency array.
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
+
+  // Re-seed every field whenever the dialog opens for a (possibly
+  // different) service — it stays mounted across opens/closes (the
+  // studio just flips `open`), so `useState` initializers alone would
+  // only ever apply once. Keyed on `initial?.key`, not `initial`
+  // itself: a reactive re-render that hands us a new `initial` object
+  // for the *same* service must not clobber in-progress edits.
   useEffect(() => {
     if (!open) return;
-    setName(initial?.name ?? '');
-    setKey(initial?.key ?? '');
+    const seed = initialRef.current;
+    setName(seed?.name ?? '');
+    setKey(seed?.key ?? '');
     setKeyTouched(false);
-    setAliasesRaw((initial?.aliases ?? []).join(', '));
-    setRoutingTagName(initial?.routingTagName ?? '');
-    setStatus(initial?.status ?? 'active');
-    setSortOrder(initial?.sortOrder ?? 0);
+    setAliasesRaw((seed?.aliases ?? []).join(', '));
+    setRoutingTagName(seed?.routingTagName ?? '');
+    setStatus(seed?.status ?? 'active');
+    setSortOrder(seed?.sortOrder ?? 0);
     setSubmitError(null);
-  }, [open, initial]);
+  }, [open, initial?.key]);
 
   const aliases = parseAliases(aliasesRaw);
   // The service's own key must never count against itself as "taken"
