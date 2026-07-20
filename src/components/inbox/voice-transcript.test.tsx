@@ -3,6 +3,8 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { VoiceTranscript } from "./voice-transcript";
+import { MessageContentBody } from "./message-bubble";
+import type { Message } from "@/types";
 
 /**
  * Static-render tests, matching this repo's only other component test
@@ -66,5 +68,69 @@ describe("VoiceTranscript", () => {
 
   it("reports its collapsed state to assistive tech", () => {
     expect(render({ text: LONG })).toContain('aria-expanded="false"');
+  });
+});
+
+/**
+ * `messages.aiTranscription` (`ai_transcription` on the client) holds
+ * TWO different things depending on `content_type`: Whisper's voice
+ * transcript for `"audio"`, and gpt-4o-mini's image description for
+ * `"image"` (see the comment above `ai_transcription` in `@/types` and
+ * the one above the `<VoiceTranscript>` call in `message-bubble.tsx`).
+ * Only the audio one may ever reach the DOM. Today that guarantee is
+ * enforced solely by which `switch` case in `MessageContentBody` the
+ * `<VoiceTranscript>` JSX happens to sit inside — nothing pins it down,
+ * so a future edit that "helpfully" hoists the block out of the case
+ * (to dedupe it, say) would leak an image's description into the
+ * bubble unnoticed. These two tests pin it.
+ *
+ * `MessageContentBody` (`message-bubble.tsx`) takes `t` as a plain prop
+ * rather than reading next-intl from context, so — like
+ * `VoiceTranscript` above — it renders with no provider needed. None of
+ * these assertions depend on translated copy, only on whether the
+ * transcript text itself made it into the markup, so the stub below
+ * just echoes the key back.
+ */
+const TRANSCRIPT = "I would like to book a family holiday to Dubai in December.";
+
+function messageFixture(over: Partial<Message> = {}): Message {
+  return {
+    id: "m1",
+    conversation_id: "c1",
+    sender_type: "customer",
+    content_type: "audio",
+    status: "delivered",
+    created_at: "2026-07-20T00:00:00.000Z",
+    ...over,
+  } satisfies Message;
+}
+
+function renderBody(props: Partial<React.ComponentProps<typeof MessageContentBody>> = {}) {
+  const stubT = ((key: string) => key) as unknown as React.ComponentProps<
+    typeof MessageContentBody
+  >["t"];
+  return renderToStaticMarkup(
+    React.createElement(MessageContentBody, {
+      message: messageFixture(),
+      t: stubT,
+      isAgent: false,
+      ...props,
+    }),
+  );
+}
+
+describe("MessageContentBody keeps the transcript audio-only", () => {
+  it("never renders an image's transcription, even though it shares the same field", () => {
+    const html = renderBody({
+      message: messageFixture({ content_type: "image", ai_transcription: TRANSCRIPT }),
+    });
+    expect(html).not.toContain(TRANSCRIPT);
+  });
+
+  it("renders an audio message's transcription", () => {
+    const html = renderBody({
+      message: messageFixture({ content_type: "audio", ai_transcription: TRANSCRIPT }),
+    });
+    expect(html).toContain(TRANSCRIPT);
   });
 });

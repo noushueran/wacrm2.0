@@ -8,13 +8,26 @@ import { cn } from "@/lib/utils";
  * Below this many characters a transcript cannot fill three clamped
  * lines at the bubble's width, so a toggle would be pure noise.
  *
+ * Measured against the real geometry, not guessed: the bubble is
+ * `max-w-[75%]` with `min-w-0`, and at `text-xs` on a wide desktop
+ * thread pane three clamped lines hold roughly 300+ characters. A
+ * 20-30 second voice note routinely lands in that range, so this is
+ * the common case, not an edge to round down for.
+ *
  * A character count is a deliberate approximation: measuring real
  * overflow needs `scrollHeight` from a live DOM, and this repo has no
- * jsdom to test that with. Being slightly wrong here costs a visible
- * "Show more" that expands to nothing — cheap, and testable as a pure
- * function of the text.
+ * jsdom to test that with. Given that approximation, err HIGH. The two
+ * ways to be wrong are not symmetric:
+ *   - too high: the text simply renders in full across a few extra
+ *     lines — harmless.
+ *   - too low: the toggle appears and clicking "Show more" produces
+ *     zero visible change — reads as a bug, not a rounding error.
+ * Resist tuning this back down without re-measuring the real layout.
+ * Whatever this number is, `line-clamp` below and the toggle share the
+ * same `canOverflow` boolean, so text can never be clamped without an
+ * escape hatch to read the rest.
  */
-const OVERFLOW_THRESHOLD = 180;
+const OVERFLOW_THRESHOLD = 300;
 
 interface VoiceTranscriptProps {
   /** The transcript itself. Callers guard against empty strings. */

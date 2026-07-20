@@ -139,7 +139,7 @@ function MessageContent({ message, t, isAgent }: { message: Message, t: ReturnTy
   );
 }
 
-function MessageContentBody({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
+export function MessageContentBody({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
   switch (message.content_type) {
     case "text":
       return (
