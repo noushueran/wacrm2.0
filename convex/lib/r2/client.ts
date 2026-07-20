@@ -41,11 +41,25 @@ export async function putObject(
   cfg: R2Config,
   args: { key: string; body: Blob; contentType: string },
 ): Promise<void> {
+  // R2's S3 API answers `411 Length Required` to a chunked upload, and a
+  // `Blob` handed straight to `fetch` is streamed WITHOUT a Content-Length
+  // once it is big enough. That is why this failed only on real inbound
+  // media (a 1.1 MB photo) while a 3 KB probe and every stubbed-fetch test
+  // passed — small bodies happened to go out with a length.
+  //
+  // Reading into a fixed-length view and stating the length explicitly
+  // removes the dependency on the runtime's streaming heuristic entirely.
+  // Note this interacts with the `X-Amz-Content-Sha256` header below:
+  // that header tells aws4fetch to skip hashing the body, which also skips
+  // the internal buffering that used to mask this. The two are only safe
+  // together because the bytes are materialized here first.
+  const bytes = new Uint8Array(await args.body.arrayBuffer());
   const res = await awsClient(cfg).fetch(objectUrl(cfg, args.key), {
     method: "PUT",
-    body: args.body,
+    body: bytes,
     headers: {
       "Content-Type": args.contentType,
+      "Content-Length": String(bytes.byteLength),
       // Without an `X-Amz-Content-Sha256` header, aws4fetch has to read
       // the whole body to SHA-256-hash it for the signature — for the
       // Blob this call is handed (an inbound WhatsApp document, already
