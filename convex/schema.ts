@@ -85,6 +85,15 @@ export default defineSchema({
     country: v.optional(v.string()),
     nationality: v.optional(v.string()),
     preferredDestination: v.optional(v.string()),
+    // Travel-profile detail the qualification engine extracts and the
+    // contact panel edits. FREE TEXT on purpose: the extractor returns
+    // prose ("mid December", "2 adults + 1 child aged 9", "around AED
+    // 3,000 per person"), and parsing that into dates/numbers is a
+    // separate problem with its own failure modes. Same additive,
+    // no-migration shape as the extended CRM detail above.
+    travelDates: v.optional(v.string()),
+    travelers: v.optional(v.string()),
+    budget: v.optional(v.string()),
     notes: v.optional(v.string()),
     // Lead-acquisition provenance. Set ONCE, the first time a contact
     // arrives via a Click-to-WhatsApp ad referral; never overwritten.

@@ -122,6 +122,11 @@ export interface Contact {
   country?: string;
   nationality?: string;
   preferred_destination?: string;
+  /** Travel-profile detail — free text, written by the qualification
+   *  engine (blanks only) and editable in the contact panel. */
+  travel_dates?: string;
+  travelers?: string;
+  budget?: string;
   notes?: string;
   /** Lead-acquisition provenance (set once). */
   acquisition_source?: 'ad';
