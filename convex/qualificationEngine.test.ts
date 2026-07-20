@@ -790,6 +790,7 @@ test("REVIEW-6: updateConfig rejects wrong-typed and invalid values cleanly, and
 // ---- v3: ask-admin relay ----
 
 test("V3-B: unknown info → holding reply to customer + question relayed to admin as plain text", async () => {
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
   await configureAi(base.asUser);
@@ -798,6 +799,13 @@ test("V3-B: unknown info → holding reply to customer + question relayed to adm
   await t.action(internal.aiReply.dispatchInbound, {
     accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
   });
+  // The reply now lands via a scheduled `deliverReply` (length-proportional
+  // delay) instead of sending inline. Fire ONLY that one pending timer —
+  // NOT `vi.runAllTimers()`/`t.finishAllScheduledFunctions()`, which would
+  // also execute the `relayQuestionToAdmin` call `deliverReply` itself
+  // schedules at delay 0, defeating the "run it directly" check below.
+  vi.runOnlyPendingTimers();
+  await t.finishInProgressScheduledFunctions();
   // customer got the holding reply
   const customerMsgs = await messagesFor(t, base.conversationId);
   const bot = customerMsgs.filter((m) => m.senderType === "bot");
@@ -834,6 +842,7 @@ test("V3-B: unknown info → holding reply to customer + question relayed to adm
   expect(adminMsgs).toHaveLength(1);
   expect(adminMsgs[0].contentType).toBe("text");
   expect(adminMsgs[0].contentText).toContain("Georgia visa");
+  vi.useRealTimers();
 });
 
 test("V3-B: admin reply answers the latest pending inquiry and is relayed to the customer", async () => {

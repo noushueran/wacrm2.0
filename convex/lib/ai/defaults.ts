@@ -17,9 +17,14 @@ import { AD_LANDING_PROMPT_CONTENT_MAX, type AdContext } from "./adContext";
  */
 export const HANDOFF_SENTINEL = "[[HANDOFF]]";
 
-/** Cap on generated reply length — keeps WhatsApp replies short and
- *  bounds token spend on the caller's own key. */
-export const MAX_OUTPUT_TOKENS = 1024;
+/** Cap on generated reply length — keeps WhatsApp replies short, bounds
+ *  token spend on the caller's own key, and bounds worst-case generation
+ *  time (which now sits inside a customer-visible typing window).
+ *  WhatsApp replies run 60-120 tokens; 320 leaves real headroom.
+ *
+ *  Deliberately NOT changed in `src/lib/ai/defaults.ts` — that constant
+ *  serves the human-reviewed draft-reply route, which may run longer. */
+export const MAX_OUTPUT_TOKENS = 320;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20;
@@ -35,20 +40,6 @@ export function aiRequestTimeoutMs(): number {
 export function aiContextMessageLimit(): number {
   const raw = Number(process.env.AI_CONTEXT_MESSAGE_LIMIT);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONTEXT_MESSAGE_LIMIT;
-}
-
-const DEFAULT_REPLY_DEBOUNCE_MS = 12_000;
-
-/**
- * How long the auto-reply waits after an inbound before generating, so
- * a burst of quick messages ("Hi" / "I want a package" / "for August")
- * gets ONE reply to the whole thought instead of one racy reply each —
- * and the bot stops answering at inhuman speed. Override with
- * `AI_REPLY_DEBOUNCE_MS` (`0` restores immediate dispatch).
- */
-export function aiReplyDebounceMs(): number {
-  const raw = Number(process.env.AI_REPLY_DEBOUNCE_MS);
-  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_REPLY_DEBOUNCE_MS;
 }
 
 /**
