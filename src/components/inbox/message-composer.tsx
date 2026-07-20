@@ -48,6 +48,7 @@ import {
   deleteAccountMedia,
   MEDIA_MAX_BYTES_BY_KIND,
 } from "@/lib/storage/upload-media";
+import { mediaUrlFromKey } from "@/lib/storage/media-url";
 import { ReplyQuote } from "./reply-quote";
 import { useTranslations } from "next-intl";
 import {
@@ -73,10 +74,10 @@ const MAX_RECORDING_SECONDS = 5 * 60;
 
 export interface SendMediaPayload {
   kind: ComposerMediaKind;
-  /** Fetchable URL Meta fetches at send time. */
-  mediaUrl: string;
-  /** Convex storage id — lets the caller GC the object if the send fails. */
-  storageId: Id<"_storage">;
+  /** R2 object key — `convex/send.ts` resolves this to a fetchable URL
+   *  for Meta at send time; also lets the caller GC the object if the
+   *  send fails. */
+  mediaKey: string;
   /** Optional caption (image/video/document only). */
   caption?: string;
   /** Original file name — surfaced to the recipient for documents. */
@@ -104,9 +105,9 @@ const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
 
 interface MediaDraft {
   kind: ComposerMediaKind;
-  mediaUrl: string;
-  /** Convex storage id — used to GC the object if the draft is discarded. */
-  storageId: Id<"_storage">;
+  /** R2 object key — used both to GC the object if the draft is
+   *  discarded and to build the preview `src` (`mediaUrlFromKey`). */
+  mediaKey: string;
   filename: string;
   caption: string;
 }
@@ -152,7 +153,7 @@ export function MessageComposer({
   const draftReply = useAction(api.aiReply.draft);
   const createQuickReply = useMutation(api.quickReplies.create);
   const convex = useConvex();
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const startUpload = useMutation(api.files.startUpload);
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -183,9 +184,9 @@ export function MessageComposer({
 
   // Best-effort GC of a staged object the user never sent. Fire-and-forget.
   const removeStaged = useCallback(
-    (storageId: Id<"_storage"> | undefined) => {
-      if (!storageId) return;
-      void deleteAccountMedia(convex, storageId).catch(() => {});
+    (mediaKey: string | undefined) => {
+      if (!mediaKey) return;
+      void deleteAccountMedia(convex, mediaKey).catch(() => {});
     },
     [convex],
   );
@@ -222,7 +223,7 @@ export function MessageComposer({
       cancelledRef.current = true;
       // stop() releases the mic stream + audio context inside opus-recorder.
       void recorderRef.current?.stop().catch(() => {});
-      removeStaged(draftRef.current?.storageId);
+      removeStaged(draftRef.current?.mediaKey);
     };
   }, [clearTimer, removeStaged]);
 
@@ -401,21 +402,32 @@ export function MessageComposer({
       }
       setBusy(true);
       try {
-        const { url, storageId } = await uploadAccountMedia(
+        // R2 "kind" (the bucket-prefix taxonomy — inbound/outbound/
+        // template/flow/avatar/ad) is a DIFFERENT axis from `kind` here
+        // (`ComposerMediaKind`: image/video/document/audio, WhatsApp's
+        // own content-type taxonomy). Every composer attachment is an
+        // agent-authored message headed OUT to the customer, so the R2
+        // kind is unconditionally "outbound" regardless of which
+        // `ComposerMediaKind` this call is for — passing the local
+        // `kind` variable through would send e.g. "image", which
+        // `startUpload`'s validator rejects outright (it only accepts
+        // MEDIA_KINDS).
+        const { key } = await uploadAccountMedia(
           convex,
-          generateUploadUrl,
+          startUpload,
           file,
+          "outbound",
         );
         // Replacing an existing draft? GC the previous object first.
-        removeStaged(draftRef.current?.storageId);
-        setDraft({ kind, mediaUrl: url, storageId, filename: file.name, caption: "" });
+        removeStaged(draftRef.current?.mediaKey);
+        setDraft({ kind, mediaKey: key, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged, convex, generateUploadUrl],
+    [removeStaged, convex, startUpload],
   );
 
   const handlePicked = useCallback(
@@ -443,20 +455,21 @@ export function MessageComposer({
       }
       setBusy(true);
       try {
-        const { url, storageId } = await uploadAccountMedia(
+        const { key } = await uploadAccountMedia(
           convex,
-          generateUploadUrl,
+          startUpload,
           file,
+          "outbound",
         );
-        removeStaged(draftRef.current?.storageId);
-        setDraft({ kind: "audio", mediaUrl: url, storageId, filename: file.name, caption: "" });
+        removeStaged(draftRef.current?.mediaKey);
+        setDraft({ kind: "audio", mediaKey: key, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged, convex, generateUploadUrl],
+    [removeStaged, convex, startUpload],
   );
 
   const startRecording = useCallback(async () => {
@@ -520,8 +533,7 @@ export function MessageComposer({
     if (!draft || busy) return;
     onSendMedia({
       kind: draft.kind,
-      mediaUrl: draft.mediaUrl,
-      storageId: draft.storageId,
+      mediaKey: draft.mediaKey,
       // Audio takes no caption (Meta rejects it). Everything else: the
       // trimmed caption, or undefined when blank.
       caption:
@@ -536,9 +548,9 @@ export function MessageComposer({
 
   // Discard GCs the staged object — it was uploaded but never sent.
   const discardDraft = useCallback(() => {
-    removeStaged(draft?.storageId);
+    removeStaged(draft?.mediaKey);
     setDraft(null);
-  }, [draft?.storageId, removeStaged]);
+  }, [draft?.mediaKey, removeStaged]);
 
   const setCaption = useCallback((caption: string) => {
     setDraft((d) => (d ? { ...d, caption } : d));
@@ -921,16 +933,24 @@ function MediaDraftPreview({
           {draft.kind === "image" && (
             // eslint-disable-next-line @next/next/no-img-element
             <img
-              src={draft.mediaUrl}
+              src={mediaUrlFromKey(draft.mediaKey) ?? undefined}
               alt={draft.filename}
               className="max-h-40 rounded-lg object-cover"
             />
           )}
           {draft.kind === "video" && (
-            <video src={draft.mediaUrl} controls className="max-h-40 rounded-lg" />
+            <video
+              src={mediaUrlFromKey(draft.mediaKey) ?? undefined}
+              controls
+              className="max-h-40 rounded-lg"
+            />
           )}
           {draft.kind === "audio" && (
-            <audio src={draft.mediaUrl} controls className="w-full" />
+            <audio
+              src={mediaUrlFromKey(draft.mediaKey) ?? undefined}
+              controls
+              className="w-full"
+            />
           )}
           {draft.kind === "document" && (
             <div className="flex items-center gap-2 text-sm text-foreground">

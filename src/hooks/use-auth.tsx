@@ -13,6 +13,7 @@ import { useConvexAuth, useMutation, useQuery } from "convex/react";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "../../convex/_generated/api";
 import { DEFAULT_CURRENCY } from "@/lib/currency";
+import { resolveMediaUrl } from "@/lib/storage/media-url";
 import {
   canEditCriticalSettings as canEditCriticalSettingsFor,
   canEditOperationalSettings as canEditOperationalSettingsFor,
@@ -194,7 +195,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         id: me.userId,
         full_name: me.name,
         email: me.email ?? "",
-        avatar_url: me.avatarUrl,
+        // `avatarKey` over the legacy `avatarUrl` (Task 5 of the R2
+        // migration: dual-read) — resolved client-side since `me` (a
+        // Convex query) intentionally returns both fields raw; see that
+        // query's own comment on why.
+        avatar_url: resolveMediaUrl({ key: me.avatarKey, url: me.avatarUrl }),
         role: null,
         beta_features: [],
         account_id: me.accountId,

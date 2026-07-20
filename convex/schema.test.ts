@@ -590,3 +590,119 @@ test("tagSuggestions row inserts and is queryable by_account_status", async () =
   expect(pending[0]._id).toBe(sugId);
   expect(pending[0].suggestedTagIds).toHaveLength(1);
 });
+
+// ============================================================
+// R2 media storage write-path, Task 4 (see
+// .superpowers/sdd/task-4-brief.md and
+// docs/superpowers/plans/2026-07-19-r2-media-write-path.md). Dormant
+// fields only — nothing reads or writes them outside these tests yet.
+// Every insert below sets BOTH the legacy `*Url` field and the new
+// `*Key` field to prove they coexist, which is the whole point: reads
+// stay on `*Url` until a later task's cutover, so a key must never
+// appear where some reader can't already resolve it.
+// ============================================================
+
+test("messages.mediaKey and referral.storedImageKey round-trip alongside their legacy URL fields", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+
+  const contactId = await t.run(async (ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "+971500000000",
+      phoneNormalized: "971500000000",
+    }),
+  );
+
+  const conversationId = await t.run(async (ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open",
+      unreadCount: 0,
+    }),
+  );
+
+  const messageId = await t.run(async (ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer",
+      contentType: "audio",
+      status: "delivered",
+      mediaUrl: "https://legacy.example.com/abc.ogg",
+      mediaKey: "acc1/inbound/abc.ogg",
+      referral: {
+        sourceType: "ad",
+        storedImageUrl: "https://legacy.example.com/def.jpg",
+        storedImageKey: "acc1/ad/def.jpg",
+      },
+    }),
+  );
+
+  const message = await t.run((ctx) => ctx.db.get(messageId));
+  expect(message?.mediaUrl).toBe("https://legacy.example.com/abc.ogg");
+  expect(message?.mediaKey).toBe("acc1/inbound/abc.ogg");
+  expect(message?.referral?.storedImageUrl).toBe(
+    "https://legacy.example.com/def.jpg",
+  );
+  expect(message?.referral?.storedImageKey).toBe("acc1/ad/def.jpg");
+});
+
+test("messageTemplates.headerMediaKey and memberships.avatarKey round-trip alongside their legacy URL fields", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId } = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: "Priya",
+      email: "priya@example.com",
+    });
+    const accountId = await ctx.db.insert("accounts", {
+      name: "Priya's account",
+      defaultCurrency: "USD",
+      ownerUserId: userId,
+    });
+    return { accountId, userId };
+  });
+
+  const templateId = await t.run(async (ctx) =>
+    ctx.db.insert("messageTemplates", {
+      accountId,
+      name: "welcome",
+      category: "Utility",
+      bodyText: "Hello {{1}}, welcome to {{2}}!",
+      headerMediaUrl: "https://legacy.example.com/header.png",
+      headerMediaKey: "acc1/template/header.png",
+    }),
+  );
+
+  // `avatarKey` is added to `memberships`, not to the real Convex `users`
+  // table. The plan/spec both write "users.avatarKey", but the legacy
+  // `avatarUrl` field this replaces lives on `memberships` — see
+  // `convex/accounts.ts`'s `me` query and `updateProfile` mutation
+  // (patches `membership.avatarUrl`; verified live in
+  // `convex/accounts.test.ts`'s "updateProfile updates the caller's own
+  // fullName and avatarUrl"). The real `users` table is spread verbatim
+  // from `@convex-dev/auth`'s `authTables` and carries no avatar field
+  // at all — only `image`, written by the auth provider, never by this
+  // app. `avatarKey` sits immediately after `memberships.avatarUrl`,
+  // the field it is actually the durable replacement for.
+  const membershipId = await t.run(async (ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: "agent",
+      avatarUrl: "https://legacy.example.com/priya.png",
+      avatarKey: "acc1/avatar/priya.png",
+    }),
+  );
+
+  const template = await t.run((ctx) => ctx.db.get(templateId));
+  expect(template?.headerMediaUrl).toBe(
+    "https://legacy.example.com/header.png",
+  );
+  expect(template?.headerMediaKey).toBe("acc1/template/header.png");
+
+  const membership = await t.run((ctx) => ctx.db.get(membershipId));
+  expect(membership?.avatarUrl).toBe("https://legacy.example.com/priya.png");
+  expect(membership?.avatarKey).toBe("acc1/avatar/priya.png");
+});

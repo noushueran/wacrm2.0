@@ -4,6 +4,9 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { ConvexError, v } from "convex/values";
 import { canAccessConversation, hasMinRole } from "./lib/roles";
 import type { Id } from "./_generated/dataModel";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
+import { parseMediaKey } from "./lib/r2/keys";
 
 // ============================================================
 // `send` — the authed, PUBLIC entrypoint the Inbox + contact-detail
@@ -50,6 +53,11 @@ export const send = action({
     ),
     contentText: v.optional(v.string()),
     mediaUrl: v.optional(v.string()),
+    // R2 object key for a staged outbound upload — the durable
+    // replacement for `mediaUrl` (Task 5 of the R2 migration: dual-read).
+    // `resolveMediaUrlLazy` below prefers this over `mediaUrl` when both
+    // are present.
+    mediaKey: v.optional(v.string()),
     filename: v.optional(v.string()),
     templateName: v.optional(v.string()),
     templateLanguage: v.optional(v.string()),
@@ -140,15 +148,71 @@ export const send = action({
       case "video":
       case "document":
       case "audio": {
-        if (!args.mediaUrl) {
-          throw new Error(`mediaUrl is required for ${args.messageType} messages`);
+        // A client-supplied `mediaKey` must be verified to belong to the
+        // CALLING account before it is ever resolved to a URL — this
+        // action's args validator has no `accountId` field (see the
+        // handler's own opening comment), so nothing upstream stops an
+        // agent of account A from passing a key that belongs to account
+        // B. Without this check, `resolveMediaUrlLazy` below would
+        // happily resolve B's key to a real, fetchable R2 URL on A's
+        // behalf, and THAT resolved URL is what would then be persisted
+        // via the `mediaKey` path (`convex/metaSend.ts`'s `sendMedia`
+        // persists `mediaUrl: args.link` unconditionally — see that
+        // module's own doc comment). A foreign key and a malformed one
+        // (`parseMediaKey` returns `null`) are BOTH `NOT_FOUND` — never
+        // `FORBIDDEN`, and never distinguishable from each other — the
+        // same non-leaky tenant-isolation contract `convex/files.ts`'s
+        // `remove` mutation already uses for the identical class of
+        // check.
+        //
+        // What this check does NOT cover: the sibling `mediaUrl`
+        // argument (this file's own args validator, above) is a
+        // free-form string with no validation at all — a caller can
+        // already pass any URL, including one pointing at someone
+        // else's object, and it lands in the message row exactly like a
+        // legitimate one would. That was true before this migration and
+        // remains true after it; this check only closes the NEW surface
+        // the `mediaKey` argument itself introduces (a key this account
+        // doesn't own getting silently resolved to a fetchable URL on
+        // its behalf) — it is not a general guarantee that every
+        // persisted `mediaUrl` points at this account's own media.
+        if (
+          args.mediaKey &&
+          parseMediaKey(args.mediaKey)?.accountId !== accountId
+        ) {
+          throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+        }
+        // `resolveMediaUrlLazy` only builds the R2 config (which throws
+        // when R2 env vars are unset — `lib/r2/config.ts`) when
+        // `args.mediaKey` is actually present, so a plain `mediaUrl` send
+        // on a deployment where R2 isn't configured yet behaves exactly
+        // as before — see `convex/lib/r2/url.ts`'s doc comment on
+        // `resolveMediaUrlLazy` for why an eager
+        // `resolveMediaUrl(r2ConfigFromEnv(), ...)` here would be unsafe.
+        const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+          key: args.mediaKey,
+          url: args.mediaUrl,
+        });
+        if (!link) {
+          throw new Error(
+            `mediaKey or mediaUrl is required for ${args.messageType} messages`,
+          );
         }
         return await ctx.runAction(internal.metaSend.sendMedia, {
           accountId,
           conversationId,
           to,
           kind: args.messageType,
-          link: args.mediaUrl,
+          link,
+          // Threaded through (not just resolved into `link` above) so
+          // the message row durably keeps the key, not only the
+          // resolved URL — final-review fix: previously `mediaKey` was
+          // resolved to `link` here and then discarded, so the composer
+          // attachment / voice-note write path never persisted a key.
+          // Safe to pass unconditionally: when present, it already
+          // passed the ownership check above; when absent, this is a
+          // no-op legacy `mediaUrl` send.
+          mediaKey: args.mediaKey,
           caption: args.contentText,
           filename: args.filename,
           contextMessageId,

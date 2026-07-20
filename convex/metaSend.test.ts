@@ -400,6 +400,10 @@ test("sendMedia in DRY-RUN persists a media message with the right contentType",
   expect(messages).toHaveLength(1);
   expect(messages[0]!.contentType).toBe("image");
   expect(messages[0]!.mediaUrl).toBe("https://example.com/photo.jpg");
+  // Legacy caller (no `mediaKey` arg) — only the resolved URL is
+  // persisted, exactly as before this field existed (final-review
+  // fix: "outbound media never persists a key").
+  expect(messages[0]!.mediaKey).toBeUndefined();
   expect(messages[0]!.contentText).toBe("Here's the photo");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
 
@@ -408,6 +412,69 @@ test("sendMedia in DRY-RUN persists a media message with the right contentType",
     paginationOpts: onePage,
   });
   expect(onePageResult.page).toHaveLength(1);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+// ============================================================
+// sendMedia — mediaKey persistence (final-review fix). Before this
+// fix, `sendMedia`'s handler persisted `mediaUrl: args.link`
+// unconditionally and had no `mediaKey` argument at all — the R2
+// object key a caller minted was resolved to a URL one call earlier
+// (`send.ts`/`flowsEngine.ts`) and then discarded, so THREE of the
+// seven media write paths (composer attachment, agent voice note,
+// flow send) never durably stored a key, unlike inbound/ad/template/
+// avatar media. That made the row carry only a resolved absolute URL
+// — the exact "core coupling problem" the design spec says this
+// migration deliberately does not repeat — and would have made the
+// Plan 2 legacy-column drop unsound (new URL-only rows would keep
+// being created forever).
+// ============================================================
+
+test("sendMedia in DRY-RUN persists BOTH mediaKey and mediaUrl when a mediaKey is supplied", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  // `link` is what a caller (`send.ts`/`flowsEngine.ts`) would already
+  // have resolved the key to (via `resolveMediaUrlLazy`) BEFORE calling
+  // this action — `sendMedia` itself never resolves a key, it only
+  // persists the one it's handed alongside the link Meta was actually
+  // POSTed to.
+  const result = await t.action(internal.metaSend.sendMedia, {
+    accountId,
+    conversationId,
+    to: "15551234567",
+    kind: "image" as const,
+    link: "https://objs.holidayys.co/acc1/outbound/photo.png",
+    mediaKey: `${accountId}/outbound/photo.png`,
+    caption: "Here's the photo",
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+  expect(messages[0]!.mediaKey).toBe(`${accountId}/outbound/photo.png`);
+  // `mediaUrl` is STILL written — it's what Meta was actually handed,
+  // and the read resolver (`convex/lib/r2/url.ts`'s `resolveMediaUrl`)
+  // prefers the key anyway, so keeping both is safe and matches every
+  // other row in this migration (`messages.mediaKey` dual-write).
+  expect(messages[0]!.mediaUrl).toBe(
+    "https://objs.holidayys.co/acc1/outbound/photo.png",
+  );
+  expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

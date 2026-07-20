@@ -955,7 +955,7 @@ export const verifyRegistration = action({
 // `internal.accounts.accountContextForUser`), but gates at "agent"
 // rather than "admin" — viewing an already-received inbox attachment
 // is a routine agent action (the same floor `convex/files.ts`'s
-// `generateUploadUrl` uses for attaching OUTBOUND media), not an
+// `startUpload` uses for attaching OUTBOUND media), not an
 // admin-only diagnostic like `verifyRegistration`.
 //
 // No DRY-RUN branch (unlike `verifyRegistration`/`metaSend.ts`): this
@@ -1031,21 +1031,33 @@ export const fetchMedia = action({
 // design `fetchMedia` documents): it decrypts, resolves the Meta media
 // id to its short-lived CDN URL (`getMediaUrl`), then hands that URL plus
 // a `Bearer` header to `files.storeFromUrl`, which downloads the bytes
-// into Convex storage. Only the resulting DURABLE storage URL comes back
-// out — so the inbox `<audio>`/`<video>`/`<img>` can fetch it directly,
-// forever, exactly like agent-sent (outbound) media, with no auth proxy
-// and no dependence on Meta's media-retention window.
+// and PUTs them to Cloudflare R2 under a key scoped to this account.
+//
+// Returns `{ key }`, NOT a resolved URL (R2-migration cutover, Task 7):
+// `convex/ingest.ts`'s caller persists this key directly onto the
+// message row (`messages.setMediaKey`) instead of eagerly resolving it
+// to R2's public URL here — the inbox `<audio>`/`<video>`/`<img>`
+// resolves `mediaKey ?? mediaUrl` lazily, at render time, instead
+// (`src/lib/convex/adapters.ts`'s `toUiMessage`, Task 5). Task 6 already
+// moved the underlying primitive (`storeFromUrl`) from a Convex-storage
+// upload returning `{ storageId }` to an R2 PUT returning `{ key }`; this
+// action briefly kept resolving that key to a URL itself (`publicUrl`)
+// as a behavior-preserving shim while `ingest.ts`'s caller still expected
+// one — Task 7 retires that shim now that the caller has been cut over
+// too.
 //
 // Best-effort by contract: returns `null` (never throws) for a missing
-// config, an undecryptable token, or any failing Meta/storage step, so
-// one media that can't be fetched degrades to an "unavailable" bubble
-// rather than derailing `ingest.processInbound`'s whole fan-out. The
-// caller reads `null` as "leave this message without a mediaUrl".
+// config, an undecryptable token, or any failing Meta/R2 step —
+// including R2 being unconfigured (`r2ConfigFromEnv()` throwing inside
+// `storeFromUrl`) — so one media that can't be fetched degrades to an
+// "unavailable" bubble rather than derailing `ingest.processInbound`'s
+// whole fan-out. The caller reads `null` as "leave this message without
+// a mediaKey".
 // ============================================================
 
 export const resolveInboundMedia = internalAction({
   args: { accountId: v.id("accounts"), mediaId: v.string() },
-  handler: async (ctx, args): Promise<{ url: string } | null> => {
+  handler: async (ctx, args): Promise<{ key: string } | null> => {
     const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
       accountId: args.accountId,
     });
@@ -1057,12 +1069,13 @@ export const resolveInboundMedia = internalAction({
         mediaId: args.mediaId,
         accessToken,
       });
-      const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+      const { key } = await ctx.runAction(internal.files.storeFromUrl, {
         url: mediaInfo.url,
         headers: { Authorization: `Bearer ${accessToken}` },
+        accountId: args.accountId,
+        kind: "inbound",
       });
-      const url = await ctx.storage.getUrl(storageId);
-      return url ? { url } : null;
+      return { key };
     } catch (err) {
       console.error(
         "[resolveInboundMedia] failed to resolve media",
