@@ -6,14 +6,38 @@
 
 ## Problem
 
-Every inbound voice note is transcribed by Whisper and every inbound image is
-described by gpt-4o-mini. Both land in `messages.aiTranscription`
-(`convex/schema.ts:323`), written by `convex/aiReply.ts:437`.
+Inbound voice notes are transcribed by Whisper and inbound images described by
+gpt-4o-mini. Both land in `messages.aiTranscription` (`convex/schema.ts:323`),
+written by `convex/aiReply.ts:437`.
 
 **No human ever sees any of it.** `aiTranscription` has zero readers under
 `src/` — verified against `origin/main`. It is read only by
 `convex/lib/ai/context.ts` when assembling the assistant's prompt. The account
-pays for transcription on every voice note, and the only consumer is the bot.
+pays for transcription, and the only consumer is the bot.
+
+> **Correction (final whole-branch review).** The original draft of this
+> document said "**every** inbound voice note is transcribed". That is **false**,
+> and the error matters because it overstates what this feature delivers.
+>
+> Transcription runs only inside `aiReply.dispatchInbound`, *after* these gates
+> return early:
+> - `!config.isActive || !config.autoReplyEnabled` (`aiReply.ts:554`)
+> - **`conversation.assignedToUserId` — "a human owns this thread"** (`:565`)
+> - `conversation.aiAutoreplyDisabled` (`:566`)
+> - no OpenAI key available (`:608`)
+>
+> plus `untranscribedMediaRows` limits: customer-sent only, a newest-50 window,
+> a **24-hour age cutoff**, and a per-dispatch cap.
+>
+> **So the moment a conversation is assigned to a salesperson, its inbound voice
+> notes stop being transcribed** — which is precisely the state in which a human
+> is reading the thread rather than the bot answering it. This feature renders
+> whatever exists; it cannot create what was never written. "An agent can read
+> the thread instead of listening to it" therefore holds **pre-handoff only**.
+>
+> The fix is not in this branch: hoist the media-transcription block above the
+> assignment and autoreply gates, since transcribing is useful independently of
+> whether the bot replies. Tracked as a follow-up.
 
 The cost falls on agents: to learn what a customer said, an agent must play the
 clip. A thread with several voice notes cannot be skimmed, caught up on at a
@@ -130,6 +154,23 @@ evidenced with a screenshot.
   assistant's pipeline, not a document the agent owns.
 - **No backfill concern.** Messages predating the transcription feature simply
   have no value in the column and render exactly as they do today.
+- **The conversation list still shows `[audio]`.** `lastMessageText` falls back
+  to `"[${contentType}]"` (`convex/messages.ts:170`); skimming the list is
+  arguably the higher-value surface and is unchanged here. A deliberate scope
+  line, recorded because it otherwise reads as an oversight.
+- **Whisper's silence hallucination is not mitigated.** `whisper-1` runs with no
+  language hint and no confidence floor (`convex/lib/ai/media.ts:36-65`), and
+  `text.trim() || null` catches only the empty case — so a near-silent or noisy
+  clip yields confident filler ("Thank you.") that renders as a plausible
+  sentence. A backend property, not something this branch can fix, but it is the
+  concrete path by which a transcript appears *misleadingly* rather than merely
+  absently. It is why the accuracy caveat is in the visible label rather than
+  only on hover.
+- **No `dir="auto"` on the transcript.** Arabic and Urdu transcripts are near
+  certain for this business and will render LTR-aligned. All eight sibling
+  paragraphs in `message-bubble.tsx` share this, so the branch is consistent
+  rather than regressive — but a transcript is the first surface where agents
+  read customer words at length, so it is the natural place to fix it next.
 
 ## Risk
 
