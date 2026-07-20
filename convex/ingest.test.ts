@@ -2221,6 +2221,19 @@ test("checkAgentReplySla anchors on the OLDEST unanswered message — rapid ping
 test("a bot reply before takeover satisfies the SLA — no false alarm after assignment", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
+  // The reply now lands via TWO nested scheduled hops instead of one —
+  // the debounced `dispatchInbound`, which itself schedules `deliverReply`
+  // after a length-proportional delay once it runs. Pin both hops' delays
+  // to a few ms so a small BOUNDED timer advance below can reliably drain
+  // both without reaching anywhere near the 10-min SLA check further down:
+  // `vi.runAllTimers()`/`t.finishAllScheduledFunctions(vi.runAllTimers)`
+  // would also fire (and consume) that far-future SLA timer prematurely,
+  // silently degrading the "no false alarm after assignment" check below
+  // into a vacuous one (nothing left to fire once assignment happens).
+  process.env.AI_REPLY_DEBOUNCE_FAST_MS = "50";
+  process.env.AI_TYPING_MIN_MS = "50";
+  process.env.AI_TYPING_MAX_MS = "100";
+  process.env.AI_TYPING_JITTER = "0";
   vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
@@ -2232,9 +2245,17 @@ test("a bot reply before takeover satisfies the SLA — no false alarm after ass
     from: "15551234567",
     message: { type: "text", text: "hello!", wamid: "wamid.SLA3" },
   });
-  // Let ONLY the debounced bot reply land (not the 10-min SLA check yet).
-  vi.advanceTimersByTime(15_000);
-  await t.finishInProgressScheduledFunctions();
+  // Bounded drain: several small steps comfortably cover both ~50-100ms
+  // hops (debounce, then delivery) while staying orders of magnitude
+  // under the 10-minute SLA window.
+  for (let i = 0; i < 5; i++) {
+    vi.advanceTimersByTime(500);
+    await t.finishInProgressScheduledFunctions();
+  }
+  delete process.env.AI_REPLY_DEBOUNCE_FAST_MS;
+  delete process.env.AI_TYPING_MIN_MS;
+  delete process.env.AI_TYPING_MAX_MS;
+  delete process.env.AI_TYPING_JITTER;
   const contact = await t.run((ctx) =>
     ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
   );
@@ -2254,3 +2275,63 @@ test("a bot reply before takeover satisfies the SLA — no false alarm after ass
   // message. No supervisor alarm may fire.
   expect(await notificationsFor(t, accountId)).toHaveLength(0);
 }, 30_000);
+
+// ============================================================
+// Instant acknowledgement wiring (whole-branch review Fix F5) — the
+// headline behaviour of this branch (blue tick + "typing…" the moment
+// an inbound lands, not after the debounce) was previously asserted
+// ONLY at the `aiReply.ackInbound` action's own gates
+// (`aiReply.test.ts`), never at the wiring layer: nothing proved
+// `processInbound` actually SCHEDULES it, let alone at delay 0. Deleting
+// the scheduling block in `ingest.ts` left the full 1938-test suite
+// green — silently restoring the pre-branch bug (customer sees nothing
+// until the debounce elapses). This test closes that gap by inspecting
+// the `_scheduled_functions` system table directly, the same pattern
+// `campaignAds.test.ts`/`conversionEvents.test.ts` already use for
+// asserting on scheduled fan-out.
+// ============================================================
+
+test("processing a normal text inbound schedules aiReply.ackInbound at delay 0, separately from the debounced aiReply.dispatchInbound", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  const beforeCall = Date.now();
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello there, need some info please", wamid: "wamid.ACKSCHED" },
+  });
+
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  const ackRows = scheduled.filter((s) => s.name === "aiReply:ackInbound");
+  expect(ackRows).toHaveLength(1);
+  const ackRow = ackRows[0]!;
+
+  // "Delay 0" means `runAfter(0, ...)` — scheduledTime lands essentially
+  // at "now", not after any debounce wait. A generous 1s tolerance
+  // absorbs the real (unmocked-timer) DB work `processInbound` awaits
+  // before reaching the scheduling call, while staying far below the
+  // fastest debounce tier (`AI_REPLY_DEBOUNCE_FAST_MS`, default 2000ms)
+  // — so this can't accidentally pass by matching the DEBOUNCED call
+  // instead of the instant one.
+  expect(ackRow.scheduledTime - beforeCall).toBeLessThan(1000);
+
+  // The ack carries the SAME triggering wamid the inbound arrived with
+  // (what F1 elsewhere makes a retry able to reuse for a re-ack).
+  expect(ackRow.args[0]).toMatchObject({
+    accountId,
+    triggerWamid: "wamid.ACKSCHED",
+  });
+
+  // The debounced dispatch is a SEPARATE scheduled call, firing
+  // meaningfully later than the ack — proving the two are independent
+  // schedules, not the same call.
+  const dispatchRows = scheduled.filter((s) => s.name === "aiReply:dispatchInbound");
+  expect(dispatchRows).toHaveLength(1);
+  expect(dispatchRows[0]!.scheduledTime - ackRow.scheduledTime).toBeGreaterThan(1000);
+});

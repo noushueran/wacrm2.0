@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
-import { aiReplyDebounceMs } from "./lib/ai/defaults";
+import { debounceMsForText } from "./lib/ai/pacing";
 import { hasMinRole } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import { allocateContactCode } from "./contacts";
@@ -788,6 +788,28 @@ export const processInbound = internalAction({
         ) {
           return;
         }
+        // Acknowledge instantly — blue tick + "typing…" within a second,
+        // rather than after the debounce. Separate from the dispatch
+        // because the whole point is that it does NOT wait.
+        //
+        // Isolated in its own try/catch (whole-branch review Fix F7):
+        // this whole callback already runs inside `runBestEffort`, whose
+        // try/catch wraps the ENTIRE callback — without this inner
+        // guard, a failure scheduling the ack would throw PAST the
+        // dispatch scheduling below it and cost the customer their reply
+        // entirely, not just the read receipt. The inline `markRead`
+        // this replaced had its own try/catch for exactly this reason
+        // (an ack failure must never be able to cost a reply).
+        try {
+          await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
+            accountId,
+            conversationId: res.conversationId,
+            contactId: res.contactId,
+            triggerWamid: message.wamid,
+          });
+        } catch (ackErr) {
+          console.error("[ingest] ackInbound scheduling failed:", ackErr);
+        }
         // Debounced, not inline: WhatsApp users fragment one thought
         // across quick messages, and one racy dispatch per fragment
         // used to produce multiple partial replies. Each inbound
@@ -796,15 +818,20 @@ export const processInbound = internalAction({
         // NEWEST customer message replies (see `dispatchInbound`'s
         // debounce gate) — one reply per burst, at human pace.
         await ctx.scheduler.runAfter(
-          aiReplyDebounceMs(),
+          debounceMsForText(inboundText),
           internal.aiReply.dispatchInbound,
           {
             accountId,
             conversationId: res.conversationId,
             contactId: res.contactId,
             triggerMessageId: res.messageId,
-            // Lets the bot blue-tick the customer's message + show
-            // "typing…" while the reply generates.
+            // Wall-clock time of THIS inbound — `deliverReply` subtracts
+            // time-already-spent from its typing-pace target so model
+            // think time is absorbed rather than stacked on top.
+            inboundAt: Date.now(),
+            // Carried through only so a scheduled retry can resend it —
+            // the initial blue-tick + "typing…" already fired above via
+            // `ackInbound`.
             triggerWamid: message.wamid,
           },
         );
