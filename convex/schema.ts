@@ -1314,6 +1314,107 @@ export default defineSchema({
       filterFields: ["accountId"],
     }),
 
+  // ============ Knowledge Engine v2 (Phase 1) ============
+  // Entity-first KB: registry + typed entries + structured ops blocks
+  // compiled into kbChunks. Legacy aiKnowledgeDocuments/-Chunks stay
+  // untouched; retrieval merges both pools (aiKnowledge.retrieve).
+  kbServices: defineTable({
+    accountId: v.id("accounts"),
+    key: v.string(),
+    name: v.string(),
+    aliases: v.array(v.string()),
+    routingTagName: v.optional(v.string()),
+    relatedServiceKeys: v.optional(v.array(v.string())),
+    status: v.union(v.literal("active"), v.literal("paused")),
+    sortOrder: v.number(),
+    updatedAt: v.number(),
+    createdByUserId: v.optional(v.id("users")),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_key", ["accountId", "key"]),
+
+  kbEntries: defineTable({
+    accountId: v.id("accounts"),
+    scope: v.union(v.literal("company"), v.literal("service"), v.literal("package")),
+    serviceKey: v.optional(v.string()),
+    packageKey: v.optional(v.string()),
+    type: v.union(
+      v.literal("overview"),
+      v.literal("faq"),
+      v.literal("itinerary"),
+      v.literal("requirements"),
+      v.literal("policy"),
+      v.literal("process"),
+      v.literal("note"),
+    ),
+    title: v.string(),
+    body: v.string(),
+    audience: v.union(v.literal("customer"), v.literal("internal")),
+    status: v.union(v.literal("draft"), v.literal("published")),
+    version: v.number(),
+    updatedAt: v.number(),
+    updatedByUserId: v.optional(v.id("users")),
+    publishedAt: v.optional(v.number()),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_service", ["accountId", "serviceKey"])
+    .index("by_account_status", ["accountId", "status"]),
+
+  kbOpsBlocks: defineTable({
+    accountId: v.id("accounts"),
+    serviceKey: v.string(),
+    kind: v.union(v.literal("qualification"), v.literal("sales"), v.literal("purchase")),
+    criteria: v.optional(v.array(v.object({
+      key: v.string(),
+      label: v.string(),
+      question: v.optional(v.string()),
+      marks: v.optional(v.number()),
+    }))),
+    steps: v.optional(v.array(v.object({
+      key: v.string(),
+      label: v.string(),
+      description: v.optional(v.string()),
+    }))),
+    conditions: v.optional(v.array(v.object({
+      key: v.string(),
+      label: v.string(),
+    }))),
+    reportValue: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    status: v.union(v.literal("draft"), v.literal("published")),
+    version: v.number(),
+    updatedAt: v.number(),
+    updatedByUserId: v.optional(v.id("users")),
+    publishedAt: v.optional(v.number()),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_service_kind", ["accountId", "serviceKey", "kind"]),
+
+  kbChunks: defineTable({
+    accountId: v.id("accounts"),
+    sourceKind: v.union(v.literal("entry"), v.literal("ops")),
+    entryId: v.optional(v.id("kbEntries")),
+    opsBlockId: v.optional(v.id("kbOpsBlocks")),
+    serviceKey: v.optional(v.string()),
+    entryType: v.optional(v.string()),
+    audience: v.union(v.literal("customer"), v.literal("internal")),
+    chunkIndex: v.number(),
+    content: v.string(),
+    embedding: v.optional(v.array(v.float64())),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_entry", ["entryId"])
+    .index("by_ops_block", ["opsBlockId"])
+    .searchIndex("search_content", {
+      searchField: "content",
+      filterFields: ["accountId", "serviceKey", "audience"],
+    })
+    .vectorIndex("by_embedding", {
+      vectorField: "embedding",
+      dimensions: 1536,
+      filterFields: ["accountId", "serviceKey", "audience"],
+    }),
+
   // One AI classification of a conversation into the account's tag
   // catalogue. `suggestedTagIds` is group-generic (a flat validated list
   // across all tag groups — respects each group's single/multi mode);

@@ -341,15 +341,30 @@ export const untranscribedMediaRows = internalQuery({
  * config load + potential embedding call) entirely when there's nothing
  * to retrieve. Purely a perf fast-path: skipping it would still behave
  * correctly, since `retrieve` already returns `[]` for an empty KB.
+ *
+ * Probes BOTH pools `retrieve` serves — the legacy `aiKnowledgeChunks`
+ * and the compiled `kbChunks` — because every caller of `retrieve` is
+ * gated on this query. Checking only the legacy pool would mean an
+ * account that migrated to Knowledge Engine v2 and then deleted its
+ * pasted documents (reachable today via `aiKnowledge.remove` in the
+ * settings UI) gated itself OFF: auto-reply and all three engines would
+ * silently ground on nothing despite a fully populated `kbChunks`.
+ * `.first()` on each, never a `.collect()` — this runs on every inbound
+ * message and only ever needs "is there at least one row".
  */
 export const hasKnowledgeChunks = internalQuery({
   args: { accountId: v.id("accounts") },
   handler: async (ctx, args): Promise<boolean> => {
-    const chunk = await ctx.db
+    const legacyChunk = await ctx.db
       .query("aiKnowledgeChunks")
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .first();
-    return chunk !== null;
+    if (legacyChunk !== null) return true;
+    const compiledChunk = await ctx.db
+      .query("kbChunks")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .first();
+    return compiledChunk !== null;
   },
 });
 
