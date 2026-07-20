@@ -115,12 +115,27 @@ export function KnowledgeStudio() {
 
   // Keeping the URL in sync with that correction (clearing a stale
   // `?service=` so a refresh doesn't reintroduce it) touches
-  // `window.history` — a real side effect, unlike the setState above,
-  // so unlike that correction it does belong in an effect. No setState
-  // call here, so `react-hooks/set-state-in-effect` has nothing to flag.
+  // `window.history` — a real side effect, unlike the setState above, so
+  // unlike that correction it does belong in an effect. No setState call
+  // here, so `react-hooks/set-state-in-effect` has nothing to flag.
+  //
+  // It deliberately does NOT key off `serviceIsStale`: that flag is
+  // computed and then corrected within the very same render (the
+  // setState above), so by the time any render actually commits,
+  // `selectedService` has already been reset to `null` and
+  // `serviceIsStale` reads `false` again — an effect watching it would
+  // never observe `true` and this cleanup would never run. Instead this
+  // reads the `?service=` param and the known service keys straight off
+  // `overview`, both values that are still what they were post-commit,
+  // and only once `overview` has actually loaded — while it's still
+  // `undefined` the known-keys list is empty, and clearing the param
+  // then would strip a valid deep link that simply hasn't resolved yet.
   useEffect(() => {
-    if (!serviceIsStale) return;
+    if (overview === undefined) return;
     const params = new URLSearchParams(window.location.search);
+    const serviceParam = params.get('service');
+    if (serviceParam === null) return;
+    if (overview.services.some((s) => s.key === serviceParam)) return;
     params.delete('service');
     const qs = params.toString();
     window.history.replaceState(
@@ -128,7 +143,7 @@ export function KnowledgeStudio() {
       '',
       qs ? `${window.location.pathname}?${qs}` : window.location.pathname,
     );
-  }, [serviceIsStale]);
+  }, [overview]);
 
   if (!isAdmin) return null;
 
