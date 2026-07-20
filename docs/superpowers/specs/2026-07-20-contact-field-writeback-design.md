@@ -153,7 +153,13 @@ values have settled, avoids that entirely.
 - **Engine integration** (convex-test): a session that qualifies lands the
   values on the contact, and a contact with a pre-filled column keeps its own
   value.
-- **Sidebar**: the three new fields render and round-trip through the edit form.
+- **Sidebar**: the mutation round-trip is covered by a convex-test against
+  `contacts.update`. The *component* itself is *not* unit-tested — the sidebar
+  is a client component wired to `useTranslations` and Convex hooks, and this
+  repo has no jsdom or Testing Library to render it with. Stated rather than
+  implied: the three `<Field>`s are copies of an established pattern in the same
+  section, so the risk is a visible typo rather than broken behaviour, and the
+  browser check in the deploy runbook is what actually covers it.
 
 ## Risk and rollout
 
