@@ -277,7 +277,29 @@ export default defineSchema({
     // reasoning as `deals.by_account_status`: the open set tracks current
     // workload, the closed set grows forever, and a `status` `.filter()`
     // after a `by_account` scan read both.
-    .index("by_account_status", ["accountId", "status"]),
+    .index("by_account_status", ["accountId", "status"])
+    // `conversations.list` (the Inbox) narrows by assignment two ways: the
+    // caller's role scope, and the Mine/Unassigned tab. Both were expressed
+    // as a `.filter()` on top of `by_account_last_message` — and a Convex
+    // `.filter()` inside `.paginate()` is the same trap as `.filter().take()`:
+    // it does not narrow the index traversal, so the runtime keeps reading
+    // until `numItems` MATCHES accumulate, and every document scanned counts
+    // against the 4096 read limit.
+    //
+    // The pathological cases are ordinary, not exotic: an agent opening
+    // "Mine" before anything is assigned to them, or "Unassigned" once the
+    // pool has been worked down — a *well-run* inbox. Both match nothing
+    // near the front of the index and scan to the end.
+    //
+    // `assignedToUserId` before `lastMessageAt` so an equality on the
+    // assignee still leaves recency as the range/order key. Optional field:
+    // Convex sorts missing before every present value, so `q.eq(field,
+    // undefined)` is a real, single range over exactly the unassigned pool.
+    .index("by_account_assigned_last_message", [
+      "accountId",
+      "assignedToUserId",
+      "lastMessageAt",
+    ]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -380,6 +402,38 @@ export default defineSchema({
     // force a scan past Convex's read limit the way a post-scan
     // `.filter(senderType===...)` on `by_account` did.
     .index("by_account_sender", ["accountId", "senderType"]),
+
+  // Hourly message counts per account — the read-bounded source for the
+  // dashboard's messages-per-day chart.
+  //
+  // `dashboard.conversationsSeries` used to `.collect()` every message in
+  // the requested window: bounded by the window, but NOT by traffic, so
+  // against the 4096-read ceiling it broke at ~137 msg/day on the default
+  // 30-day view and ~45 msg/day on the 90-day one. A chart cannot be
+  // rescued with a `.take()` — that returns a partial, silently wrong
+  // chart, which is worse than a slow one — so the counts are accumulated
+  // on write instead, at the single `insert("messages")` choke point in
+  // `messages.ts`.
+  //
+  // Hourly and UTC, deliberately: the chart's day boundaries depend on the
+  // viewer's `tzOffsetMinutes`, so a DAY-keyed rollup would have to pick a
+  // timezone at write time. Hourly UTC buckets are timezone-neutral to
+  // write and re-bucket into correct local days on read for any whole-hour
+  // offset, while making the read cost a function of the window (24 rows
+  // per day, ~2160 for 90 days) rather than of volume. See
+  // `lib/messageStats.ts` for the half-hour-offset caveat.
+  messageHourlyStats: defineTable({
+    accountId: v.id("accounts"),
+    // Start of the UTC hour — `lib/messageStats.ts`'s `hourStartMs`.
+    hourStartMs: v.number(),
+    // `senderType === "customer"`; everything else (agent + bot) is
+    // outgoing, matching what the chart previously counted per message.
+    incoming: v.number(),
+    outgoing: v.number(),
+  })
+    // Range on the hour so a window read is a genuine index range rather
+    // than an account scan with a post-filter.
+    .index("by_account_hour", ["accountId", "hourStartMs"]),
 
   // One row per (message, actor) reaction. `conversationId` is denormalized
   // here exactly like Postgres denormalized it (migration 009: "so Supabase
@@ -1253,6 +1307,32 @@ export default defineSchema({
     promptTokens: v.number(),
     completionTokens: v.number(),
     totalTokens: v.number(),
+  }).index("by_account", ["accountId"]),
+
+  // Fixed-window burst counter for AI auto-replies, one row per account.
+  //
+  // `RATE_LIMITS.aiAutoReplyAccount` (src/lib/rate-limit.ts) declared a
+  // 30/min account budget that was never enforced anywhere — `rate-limit.ts`
+  // is an in-process Map that only the Next.js `/api/v1` path ever calls,
+  // so nothing bounded auto-reply spend on the BYO provider key. This table
+  // moves that budget into Convex, where the auto-reply actually runs and
+  // where the count is durable and shared across function instances.
+  //
+  // It PACES, it never drops. The owner's 2026-07-18 decision (see
+  // `aiConfigs.autoReplyMaxPerConversation` above) is that the bot answers
+  // every message, so exceeding the window re-schedules `dispatchInbound`
+  // past the window edge rather than skipping the reply. That is also
+  // strictly better for delivery: tripping the provider's own 429 fails the
+  // reply outright, whereas pacing just moves it a few seconds.
+  //
+  // Fixed window, not sliding: one row and two fields, no per-call history
+  // to accumulate or sweep. The tradeoff — up to 2x the limit across a
+  // window boundary — is irrelevant here, where the point is to stay under
+  // a provider's rate limit rather than to bill precisely.
+  aiAutoReplyRate: defineTable({
+    accountId: v.id("accounts"),
+    windowStartMs: v.number(),
+    count: v.number(),
   }).index("by_account", ["accountId"]),
 
   // One knowledge-base entry (title + body text) an account pastes in
