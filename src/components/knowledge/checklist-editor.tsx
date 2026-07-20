@@ -6,14 +6,17 @@ import { ConvexError } from 'convex/values';
 import { ArrowDown, ArrowUp, Loader2, Plus, Trash2 } from 'lucide-react';
 
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
 import { marksTotal } from '@/lib/knowledge/verdict';
+import { softBadge } from '@/lib/ui/soft-badge';
 
 import { hasLintErrors, lintOpsBlock } from '../../../convex/lib/kb/lint';
 import type { LintIssue, OpsBlockInput } from '../../../convex/lib/kb/types';
+import { EntryStatusBadge } from './service-detail';
 
 // ============================================================
 // ChecklistEditor — inline editor for one kbOpsBlocks row: a
@@ -134,6 +137,17 @@ function parseOptionalNumber(raw: string): number | undefined {
   return Number.isNaN(n) ? undefined : n;
 }
 
+/** De-dupes a list of lint issues by `code`, keeping the first
+ *  occurrence of each. `lintOpsBlock` can emit the same code more than
+ *  once (e.g. `label_required` once per blank row), and the server's
+ *  rejection payload can carry the same shape — either way, React needs
+ *  a unique `key` per rendered `<li>`, so every issue list this
+ *  component renders (the live lint issues below and whatever a
+ *  rejected save/publish call returns) goes through this first. */
+function dedupeIssuesByCode(issues: LintIssue[]): LintIssue[] {
+  return Array.from(new Map(issues.map((i) => [i.code, i])).values());
+}
+
 /** What a rejected onSave/onPublish/onUnpublish told us. Mirrors
  *  entry-editor.tsx's own `SubmitError`. */
 type SubmitError = { kind: 'issues'; issues: LintIssue[] } | { kind: 'other' };
@@ -202,7 +216,7 @@ export function ChecklistEditor({
   // De-duping by code is enough to avoid showing the same message
   // multiple times.
   const errorIssues = issues.filter((i) => i.level === 'error' && i.code !== 'marks_sum');
-  const uniqueErrorIssues = Array.from(new Map(errorIssues.map((i) => [i.code, i])).values());
+  const uniqueErrorIssues = dedupeIssuesByCode(errorIssues);
 
   const total = kind === 'qualification' ? marksTotal(rows) : null;
 
@@ -280,7 +294,22 @@ export function ChecklistEditor({
   return (
     <div className="space-y-3">
       <div>
-        <h5 className="text-sm font-medium text-foreground">{t(`checklist.${kind}`)}</h5>
+        <div className="flex flex-wrap items-center gap-2">
+          <h5 className="text-sm font-medium text-foreground">{t(`checklist.${kind}`)}</h5>
+          {status === 'absent' ? (
+            // EntryStatusBadge's status type (EntrySummary['status']) has no
+            // "absent" member — entries always exist once listed, so that
+            // component never needs it. Hand-rolled here to match its exact
+            // markup (Badge variant="outline" + softBadge) rather than
+            // widening a shared component's contract for a state it will
+            // never see.
+            <Badge variant="outline" className={cn('text-[10px]', softBadge('neutral'))}>
+              {t('checklist.notCreatedBadge')}
+            </Badge>
+          ) : (
+            <EntryStatusBadge status={status} t={t} />
+          )}
+        </div>
         <p className="text-xs text-muted-foreground">{t(`checklist.${kind}Hint`)}</p>
       </div>
 
@@ -288,12 +317,18 @@ export function ChecklistEditor({
         <p className="text-xs text-muted-foreground">{t('checklist.notCreated')}</p>
       ) : null}
 
+      {status === 'published' ? (
+        <Alert>
+          <AlertDescription>{t('checklist.editWarning')}</AlertDescription>
+        </Alert>
+      ) : null}
+
       {submitError ? (
         <Alert variant="destructive">
           <AlertDescription>
             {submitError.kind === 'issues' ? (
               <ul className="list-disc space-y-0.5 pl-4">
-                {submitError.issues.map((issue) => (
+                {dedupeIssuesByCode(submitError.issues).map((issue) => (
                   <li key={issue.code}>{issue.message}</li>
                 ))}
               </ul>

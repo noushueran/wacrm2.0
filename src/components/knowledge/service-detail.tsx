@@ -96,7 +96,13 @@ function VerdictBadge({
   );
 }
 
-function EntryStatusBadge({
+/** Small "draft"/"published" pill. Exported so checklist-editor.tsx's
+ *  ops-block status indicator can reuse the exact same visual
+ *  treatment (and `detail.draftBadge`/`detail.publishedBadge` copy) —
+ *  kbOps.save demotes a published block to draft on every save, just
+ *  like kbEntries.save does for entries, so the two halves of the
+ *  detail view read consistently. */
+export function EntryStatusBadge({
   status,
   t,
 }: {

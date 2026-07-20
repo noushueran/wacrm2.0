@@ -2331,7 +2331,9 @@
       "publish": "Publish",
       "unpublish": "Unpublish",
       "publishBlocked": "Fix the issues above before publishing.",
+      "editWarning": "Saving changes moves this checklist back to draft. It stops being used until you publish it again.",
       "notCreated": "Not set up yet.",
+      "notCreatedBadge": "Not created",
       "saveFailed": "Something went wrong. Please try again."
     }
   }

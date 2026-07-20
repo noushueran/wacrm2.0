@@ -175,6 +175,17 @@ export function KnowledgeStudio() {
               <div className="mt-6 h-24 animate-pulse rounded-md bg-muted" />
             ) : (
               <ServiceDetail
+                // Forces a clean remount on every service change. Today
+                // every path to a different service unmounts this whole
+                // branch first (entries === undefined during the fetch, or
+                // the empty-matrix branch below), so this is defensive
+                // insurance rather than a fix for an observed bug: without
+                // it, a future change that let selectedService move
+                // directly between two services would let ChecklistEditor's
+                // useState(initial…) seed (never resynced — see that
+                // component's own doc comment) go stale and save service
+                // A's rows under service B's key.
+                key={selectedService}
                 service={selectedServiceRow}
                 entries={entries}
                 onBack={() => selectService(null)}
