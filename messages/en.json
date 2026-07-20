@@ -2307,6 +2307,32 @@
       "publishFailed": "Couldn't publish this entry. Please try again.",
       "unpublishFailed": "Couldn't unpublish this entry. Please try again.",
       "deleteFailed": "Couldn't delete this entry. Please try again."
+    },
+    "checklist": {
+      "qualification": "Qualification checklist",
+      "sales": "Sales checklist",
+      "purchase": "Purchase criteria",
+      "qualificationHint": "What the AI must learn before a lead counts as qualified. Marks must total exactly 100.",
+      "salesHint": "The steps a salesperson works through after a lead qualifies.",
+      "purchaseHint": "When a qualified lead is strong enough to report as a Purchase to Meta.",
+      "addRow": "Add item",
+      "removeRow": "Remove",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "label": "Item",
+      "question": "Question to ask",
+      "description": "Detail",
+      "marks": "Marks",
+      "marksTotal": "Total {total} / 100",
+      "marksIncomplete": "Fill in marks for every item to see the total.",
+      "reportValue": "Reported value",
+      "currency": "Currency",
+      "saveDraft": "Save draft",
+      "publish": "Publish",
+      "unpublish": "Unpublish",
+      "publishBlocked": "Fix the issues above before publishing.",
+      "notCreated": "Not set up yet.",
+      "saveFailed": "Something went wrong. Please try again."
     }
   }
 }

@@ -7,10 +7,12 @@ import { useTranslations } from 'next-intl';
 import { useQuery } from '@/lib/convex/cached';
 import { useAuth } from '@/hooks/use-auth';
 import { canEditSettings } from '@/lib/auth/roles';
+import { ChecklistEditor } from './checklist-editor';
 import { LegacyDocuments } from './legacy-documents';
 import { ServiceDetail, type EntryType } from './service-detail';
 import { ServiceForm } from './service-form';
 import { ServiceMatrix } from './service-matrix';
+import { useOpsBlocks } from './use-ops-blocks';
 import { api } from '../../../convex/_generated/api';
 import type { Id } from '../../../convex/_generated/dataModel';
 
@@ -67,6 +69,12 @@ export function KnowledgeStudio() {
     api.kbEntries.list,
     isAdmin && selectedService ? { serviceKey: selectedService } : 'skip',
   );
+  // Task 7's three ops blocks (qualification/sales/purchase). Runs its
+  // three underlying `useQuery(api.kbOps.get, …)` calls unconditionally
+  // here — same rule as `entries` above — rather than inside `opsSlot`
+  // below, which React invokes once per kind during render; hooks can't
+  // be called conditionally or in a loop. See use-ops-blocks.ts.
+  const opsBlocks = useOpsBlocks(isAdmin, selectedService);
 
   const upsertService = useMutation(api.kbServices.upsert);
   const removeService = useMutation(api.kbServices.remove);
@@ -196,14 +204,29 @@ export function KnowledgeStudio() {
                 onRemoveEntry={async (id) => {
                   await removeEntry({ entryId: id as Id<'kbEntries'> });
                 }}
-                // Task 7 fills this in with the real checklist editors,
-                // driven by queries it runs unconditionally at this
-                // component's top level (hooks can't be called from
-                // inside a render-prop callback) — this placeholder just
-                // keeps the boundary exercised until then.
-                opsSlot={() => (
-                  <p className="text-sm text-muted-foreground">Checklist editor coming soon.</p>
-                )}
+                // `opsBlocks` (useOpsBlocks) already ran its three
+                // queries unconditionally above this component's early
+                // `!isAdmin` return; this callback only ever selects
+                // from their already-fetched results, never calls a
+                // hook itself — see that hook's own doc comment.
+                opsSlot={(kind) => {
+                  const data = opsBlocks.blockFor(kind);
+                  if (data === undefined) {
+                    return <div className="h-16 animate-pulse rounded-md bg-muted" />;
+                  }
+                  return (
+                    <ChecklistEditor
+                      kind={kind}
+                      rows={data.rows}
+                      reportValue={data.reportValue}
+                      currency={data.currency}
+                      status={data.status}
+                      onSave={opsBlocks.onSave(kind)}
+                      onPublish={opsBlocks.onPublish(kind)}
+                      onUnpublish={opsBlocks.onUnpublish(kind)}
+                    />
+                  );
+                }}
               />
             )
           ) : (
