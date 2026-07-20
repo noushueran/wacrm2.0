@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildContactsPayload, buildMarkReadPayload } from "./metaApi";
+import { buildContactsPayload, buildMarkReadPayload, MetaApiError, META_ERROR_OUTSIDE_WINDOW } from "./metaApi";
 
 // The senders in metaApi.ts are network functions exercised through
 // `convex/metaSend.test.ts`'s DRY-RUN action tests; the mark-read
@@ -87,5 +87,22 @@ describe("buildContactsPayload", () => {
     expect(built.phones).toEqual([
       { phone: "+971 55 111 2233", type: "CELL", wa_id: "971551112233" },
     ]);
+  });
+});
+
+describe("MetaApiError", () => {
+  it("carries Meta's numeric code alongside the message", () => {
+    const err = new MetaApiError("Message failed to send", 131047);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.code).toBe(131047);
+    expect(err.message).toBe("Message failed to send");
+  });
+
+  it("tolerates a missing code", () => {
+    expect(new MetaApiError("boom", undefined).code).toBeUndefined();
+  });
+
+  it("exports the outside-window constant Meta uses", () => {
+    expect(META_ERROR_OUTSIDE_WINDOW).toBe(131047);
   });
 });
