@@ -21,6 +21,7 @@ import {
   type HistoryMessage,
 } from "./lib/ai/context";
 import { generateReply, parseGeneration } from "./lib/ai/generate";
+import { claimSlot, AUTO_REPLY_LIMIT } from "./lib/aiRateLimit";
 import {
   transcribeAudioFromUrl,
   describeImageFromUrl,
@@ -105,6 +106,15 @@ const FALLBACK_REPLY_TEXT =
 // config (bad key) mustn't loop either — attempt 2 is the last.
 const DISPATCH_MAX_ATTEMPTS = 2;
 const DISPATCH_RETRY_DELAY_MS = 30_000;
+
+// How many times one dispatch may be pushed back by the account's
+// auto-reply burst budget before it goes through regardless. Each deferral
+// waits out the remainder of a 60s window, so this is ~5 minutes of
+// smoothing — comfortably past any organic burst. Unlike
+// DISPATCH_MAX_ATTEMPTS, exhausting this does NOT abandon the reply: it
+// bounds scheduler churn under sustained overload, and the reply still
+// sends (see the pacing block in `dispatchInbound`).
+const PACING_MAX_DEFERRALS = 5;
 
 // One scheduled retry for a SEND-boundary failure only (Fix F4 — see
 // `deliverReply`'s own doc comment for the full reasoning: the plan this
@@ -435,6 +445,44 @@ export const hasKnowledgeChunks = internalQuery({
  * the dashboard (owner decision 2026-07-18; the old `claimReplySlot`
  * cap-gate lived here before that).
  */
+/**
+ * Take one slot from the account's auto-reply burst budget.
+ *
+ * A mutation rather than a helper so the read-decide-write is atomic:
+ * `dispatchInbound` is an action, and two inbounds landing together would
+ * otherwise both read the same count and both claim the same slot.
+ *
+ * Returns `{ allowed: false, retryAfterMs }` when the window is full —
+ * which means "come back then", NOT "skip this reply". The caller
+ * re-schedules itself; see the pacing block in `dispatchInbound`.
+ */
+export const claimAutoReplySlot = internalMutation({
+  args: { accountId: v.id("accounts") },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ allowed: boolean; retryAfterMs: number }> => {
+    const row = await ctx.db
+      .query("aiAutoReplyRate")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .unique();
+
+    const decision = claimSlot(
+      row ? { windowStartMs: row.windowStartMs, count: row.count } : null,
+      Date.now(),
+    );
+
+    if (!decision.allowed) {
+      return { allowed: false, retryAfterMs: decision.retryAfterMs };
+    }
+
+    if (row) await ctx.db.patch(row._id, decision.next);
+    else await ctx.db.insert("aiAutoReplyRate", { accountId: args.accountId, ...decision.next });
+
+    return { allowed: true, retryAfterMs: 0 };
+  },
+});
+
 export const bumpReplyCount = internalMutation({
   args: {
     accountId: v.id("accounts"),
@@ -688,6 +736,13 @@ export const dispatchInbound = internalAction({
     // subtract time already spent. Optional: dispatches scheduled before
     // this shipped carry no value and simply skip the subtraction.
     inboundAt: v.optional(v.number()),
+    // How many times this dispatch has been deferred by the account's
+    // auto-reply burst budget (absent = never). Deliberately SEPARATE from
+    // `attempt`: that one bounds error retries and gives up at its ceiling,
+    // whereas exhausting this one must never drop the reply — it proceeds
+    // anyway. Sharing a counter would let a long burst silently consume the
+    // error budget and lose the message.
+    pacingDeferrals: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
     // Flipped right after delivery is successfully scheduled (before any
@@ -870,6 +925,40 @@ export const dispatchInbound = internalAction({
         qualification: qualification ?? undefined,
         adContext,
       });
+
+      // ── Burst pacing (RATE_LIMITS.aiAutoReplyAccount) ──────────────
+      // Placed here on purpose: AFTER every eligibility gate, so a reply
+      // that would have been skipped anyway never burns a slot, and BEFORE
+      // generation, because the LLM call is the thing that costs money and
+      // trips the provider's own rate limit.
+      //
+      // Over budget = defer, never drop. Re-scheduling `dispatchInbound`
+      // re-runs all the gates above, so a human taking the thread during
+      // the wait turns the deferred dispatch into a no-op — the same
+      // property the error-retry path below relies on.
+      //
+      // The ceiling exists only to bound scheduler churn if inbound stays
+      // above budget indefinitely; hitting it PROCEEDS rather than giving
+      // up, because dropping the reply is the one outcome the owner's
+      // always-reply decision rules out. That trades the budget for the
+      // guarantee, so it is logged loudly.
+      const deferrals = args.pacingDeferrals ?? 0;
+      const slot = await ctx.runMutation(internal.aiReply.claimAutoReplySlot, {
+        accountId: args.accountId,
+      });
+      if (!slot.allowed) {
+        if (deferrals < PACING_MAX_DEFERRALS) {
+          await ctx.scheduler.runAfter(
+            slot.retryAfterMs,
+            internal.aiReply.dispatchInbound,
+            { ...args, pacingDeferrals: deferrals + 1 },
+          );
+          return;
+        }
+        console.warn(
+          `[ai auto-reply] account ${args.accountId} still over the ${AUTO_REPLY_LIMIT}/min budget after ${deferrals} deferrals — replying anyway (always-reply wins over the budget)`,
+        );
+      }
 
       const generation: GenerateResult = isDryRun()
         ? syntheticGeneration(queryText)

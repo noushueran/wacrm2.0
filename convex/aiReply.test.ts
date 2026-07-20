@@ -6,6 +6,7 @@ import schema from "./schema";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 import { HANDOFF_SENTINEL } from "./lib/ai/defaults";
+import { AUTO_REPLY_LIMIT } from "./lib/aiRateLimit";
 
 // Convex function modules for convex-test to resolve `api.*`/`internal.*`
 // references against. Absolute, from-project-root pattern (matches every
@@ -1897,3 +1898,156 @@ test("a post-send failure does NOT retry — the customer already has the messag
   // the count at zero, which is not what happened here.
   expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
 }, 20_000);
+
+// ============================================================
+// Auto-reply burst pacing (RATE_LIMITS.aiAutoReplyAccount)
+//
+// The budget was declared in src/lib/rate-limit.ts but never enforced —
+// that module is an in-process Map only the Next.js /api/v1 path calls, so
+// nothing bounded auto-reply spend on the BYO provider key. These pin the
+// Convex-side enforcement.
+//
+// The invariant that matters: this PACES, it never drops. Every refusal
+// carries a positive `retryAfterMs`; there is no "skip the reply" outcome,
+// because the owner's 2026-07-18 decision is that the bot answers every
+// message until a human takes over.
+// ============================================================
+
+test("claimAutoReplySlot allows up to the limit, then defers with a positive delay", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+
+  for (let i = 0; i < AUTO_REPLY_LIMIT; i++) {
+    const d = await t.mutation(internal.aiReply.claimAutoReplySlot, { accountId });
+    expect(d.allowed, `claim ${i + 1} of ${AUTO_REPLY_LIMIT}`).toBe(true);
+  }
+
+  const over = await t.mutation(internal.aiReply.claimAutoReplySlot, { accountId });
+  expect(over.allowed).toBe(false);
+  expect(over.retryAfterMs).toBeGreaterThan(0);
+});
+
+test("claimAutoReplySlot keeps one account's burst from starving another", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: aliceId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const { accountId: bobId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+  });
+
+  for (let i = 0; i < AUTO_REPLY_LIMIT; i++) {
+    await t.mutation(internal.aiReply.claimAutoReplySlot, { accountId: aliceId });
+  }
+  await expect(
+    t.mutation(internal.aiReply.claimAutoReplySlot, { accountId: aliceId }),
+  ).resolves.toMatchObject({ allowed: false });
+
+  // Bob's budget is his own — one row per account, keyed by `by_account`.
+  await expect(
+    t.mutation(internal.aiReply.claimAutoReplySlot, { accountId: bobId }),
+  ).resolves.toMatchObject({ allowed: true });
+});
+
+test("claimAutoReplySlot writes exactly one counter row per account", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+
+  for (let i = 0; i < 5; i++) {
+    await t.mutation(internal.aiReply.claimAutoReplySlot, { accountId });
+  }
+
+  const rows = await t.run((ctx) => ctx.db.query("aiAutoReplyRate").collect());
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.count).toBe(5);
+  expect(rows[0]!.accountId).toBe(accountId);
+});
+
+test("dispatchInbound DEFERS instead of replying when the account is over its burst budget", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi!",
+  });
+
+  // Open a full window for this account.
+  await t.run((ctx) =>
+    ctx.db.insert("aiAutoReplyRate", {
+      accountId,
+      windowStartMs: Date.now(),
+      count: AUTO_REPLY_LIMIT,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  // Nothing sent yet...
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+
+  // ...but the dispatch re-scheduled ITSELF rather than giving up. This is
+  // the whole point: a full window must never turn into a lost reply.
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect(),
+  );
+  const deferred = scheduled.filter((s) => s.name === "aiReply:dispatchInbound");
+  expect(deferred).toHaveLength(1);
+});
+
+test("a deferred reply still lands — sustained overload paces, it never drops", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551234567",
+    messageText: "Hi!",
+  });
+
+  await t.run((ctx) =>
+    ctx.db.insert("aiAutoReplyRate", {
+      accountId,
+      windowStartMs: Date.now(),
+      count: AUTO_REPLY_LIMIT,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+  // Under fake timers the clock never advances, so the window stays full
+  // through every deferral — the worst case, standing in for indefinite
+  // overload. Draining must still produce the reply, via the ceiling in
+  // `PACING_MAX_DEFERRALS` that proceeds rather than abandoning.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const messages = await messagesFor(t, conversationId);
+  const bot = messages.filter((m) => m.senderType === "bot");
+  expect(bot).toHaveLength(1); // exactly one — deferral must not duplicate
+  expect(bot[0]!.contentText).toBeTruthy();
+});
