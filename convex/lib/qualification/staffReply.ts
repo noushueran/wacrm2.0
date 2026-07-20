@@ -14,7 +14,10 @@ const DECLINE = new Set([
 ]);
 
 export function parseStaffReply(text: string): "accept" | "decline" | "other" {
-  const t = text.trim().toLowerCase();
+  // WhatsApp may echo a button label with a typographic apostrophe where
+  // the ACCEPT set holds a straight one — normalize so "I'll take it"
+  // matches "i'll take it".
+  const t = text.trim().toLowerCase().replace(/'/g, "'");
   if (!t || t.length > 40) return "other"; // long messages are conversation, not consent
   if (ACCEPT.has(t)) return "accept";
   if (DECLINE.has(t)) return "decline";

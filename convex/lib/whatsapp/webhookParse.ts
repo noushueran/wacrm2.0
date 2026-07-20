@@ -77,6 +77,7 @@ export interface MetaWebhookMessage {
     button_reply?: { id: string; title?: string };
     list_reply?: { id: string; title?: string; description?: string };
   };
+  button?: { payload?: string; text?: string };
   // Present when the customer shares contact card(s) (`type: "contacts"`)
   // — vCard data flattened to Meta's JSON shape. Only the fields the
   // readable summary needs are typed here.
@@ -397,6 +398,16 @@ function flattenByType(
         .filter(Boolean)
         .join(" - ");
       return { type: "location", text, wamid };
+    }
+
+    case "button": {
+      // A quick-reply tap on a TEMPLATE arrives as `type: "button"` (not
+      // `interactive`, which is for interactive-message replies). Mapping
+      // it to plain text means the inbox renders the label normally and
+      // `parseStaffReply` can read it as offer consent — previously these
+      // became "[Unsupported message type: button]".
+      const label = message.button?.text || message.button?.payload;
+      return { type: "text", text: label || undefined, wamid };
     }
 
     case "interactive": {
