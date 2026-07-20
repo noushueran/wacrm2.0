@@ -1446,6 +1446,9 @@ test("hasKnowledgeChunks is true for EITHER pool alone and false with neither", 
   expect(
     await t.query(internal.aiReply.hasKnowledgeChunks, { accountId: empty }),
   ).toBe(false);
+});
+
+// ============================================================
 // Instant acknowledgement (ackInbound) — blue tick + "typing…" the
 // moment the inbound lands, independent of the debounced dispatch.
 // ============================================================
