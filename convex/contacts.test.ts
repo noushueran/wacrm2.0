@@ -1768,3 +1768,33 @@ test("assignTag keeps both tags for a multi-select group", async () => {
   );
   expect(links.map((l) => l.tagId).sort()).toEqual([th, ba].sort());
 });
+
+// ============================================================
+// travel-profile fields (Task 1: contact write-back columns) —
+// travelDates/travelers/budget round-trip through contacts.update
+// the same way nationality/preferredDestination already do.
+// ============================================================
+
+test("update round-trips the travel-profile fields", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag", email: "ag@x.com", role: "agent",
+  });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId, phone: "+15551230199", phoneNormalized: "15551230199", name: "X",
+    }),
+  );
+  await asUser.mutation(api.contacts.update, {
+    contactId,
+    travelDates: "mid December",
+    travelers: "2 adults + 1 child aged 9",
+    budget: "around AED 3,000 per person",
+  });
+  const row = await t.run((ctx) => ctx.db.get(contactId));
+  expect(row).toMatchObject({
+    travelDates: "mid December",
+    travelers: "2 adults + 1 child aged 9",
+    budget: "around AED 3,000 per person",
+  });
+});

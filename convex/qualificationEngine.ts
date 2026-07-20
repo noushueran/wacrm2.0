@@ -37,6 +37,7 @@ import {
   withinServiceWindow,
   pickFollowUpText,
 } from "./lib/qualification/schedule";
+import { mapFieldsToContact } from "./lib/qualification/contactFields";
 import { insertNotification } from "./notifications";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
 import { recipientsForInbound } from "./lib/pushRecipients";
@@ -689,6 +690,29 @@ export const completeQualification = internalMutation({
       nextFollowUpAt: undefined,
       pendingQuestion: undefined,
     });
+
+    // Fill blank contact fields from what the assistant already
+    // extracted, so a rep never re-types it. Blanks only — a value
+    // already on the contact was either typed by a human or written by
+    // an earlier qualification, and either way it outranks a fresh
+    // guess. Runs once, here, rather than on every analysis pass: with
+    // blanks-only semantics whatever lands FIRST wins permanently, so
+    // writing early would let a shaky mid-conversation guess lock out
+    // the settled answer.
+    //
+    // Scoped to the write on purpose: `conversations.contactId` can
+    // dangle after a contact delete (see `contacts.ts`'s own note on
+    // its delete mutation), and a missing contact must NOT abort
+    // qualification — the session status, funnel transition, Meta
+    // conversion event and notifications above/below all still have to
+    // happen regardless.
+    const contact = await ctx.db.get(session.contactId);
+    if (contact) {
+      const contactPatch = mapFieldsToContact(session.fields, contact);
+      if (Object.keys(contactPatch).length > 0) {
+        await ctx.db.patch(session.contactId, contactPatch);
+      }
+    }
 
     // Funnel → qualified (auto). Seeds the deduped conversionEvents row
     // + schedules the live dispatcher — THE Meta signal (ad lane

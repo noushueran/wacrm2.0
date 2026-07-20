@@ -470,6 +470,54 @@ test("completion never downgrades a human-advanced funnel stage and is idempoten
   expect(transitions.filter((tr) => tr.stage === "qualified")).toHaveLength(0);
 });
 
+test("qualification writes extracted fields onto the contact, without overwriting", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // a value a rep already typed — must survive
+  await t.run((ctx) => ctx.db.patch(base.contactId, { preferredDestination: "Georgia" }));
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:85 field:destination=Dubai;field:travel_dates=mid December;" +
+    "field:budget=AED 3000 per person;field:nationality=Indian");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+
+  const [session] = (await sessionsFor(t, base.conversationId)).filter((s) => s.status === "qualified");
+  expect(session).toBeDefined();
+
+  const contact = await t.run((ctx) => ctx.db.get(base.contactId));
+  // blanks filled from what the assistant extracted
+  expect(contact).toMatchObject({
+    travelDates: "mid December",
+    budget: "AED 3000 per person",
+    nationality: "Indian",
+  });
+  // …and the rep's pre-existing value is untouched
+  expect(contact?.preferredDestination).toBe("Georgia");
+});
+
+test("a deleted contact does not abort qualification — session still completes, conversation still goes pending", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // The session's contact is gone before completion runs — the same
+  // dangling `conversations.contactId` state `contacts.ts`'s own delete
+  // mutation leaves behind on purpose (its comment: the read layer
+  // already tolerates this). Only the contact write-back may no-op;
+  // nothing else in the completion pipeline may abort because of it.
+  await t.run((ctx) => ctx.db.delete(base.contactId));
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:80 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+
+  const [session] = await sessionsFor(t, base.conversationId);
+  expect(session.status).toBe("qualified");
+
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.status).toBe("pending");
+});
+
 test("sendClosingMessage sends the configured text as a bot message on a qualified session only", async () => {
   const t = convexTest(schema, modules);
   const { accountId, contactId, conversationId } = await seedAttributed(t);
