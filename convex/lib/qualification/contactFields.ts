@@ -13,6 +13,16 @@ type ExtractedField = {
 /**
  * Normalised alias -> contact column.
  *
+ * Deliberately a conservative allowlist, not a best-effort guess list:
+ * the caller only ever fills blanks, so an alias that fires wrongly
+ * writes a permanent wrong value into a field nothing will later
+ * correct. An unmapped key just stays in the session, visible to the
+ * rep — strictly better than a mis-mapped one. Entries are added only
+ * when grounded in the observed checklist/config vocabulary, not merely
+ * because they seem plausible (a bare `when` could just as easily mean
+ * a visa-approval deadline as a travel date; a bare `mail` could mean a
+ * physical mailing address as easily as an email).
+ *
  * `country` is deliberately absent: in a travel CRM "country" reads as
  * the DESTINATION at least as often as the customer's residence, and a
  * wrong guess here is permanent — the caller only ever fills blanks, so
@@ -20,14 +30,14 @@ type ExtractedField = {
  * the service, which already lands on `session.serviceName`.
  */
 const ALIASES: Record<string, Target> = {
-  email: "email", emailaddress: "email", mail: "email",
+  email: "email", emailaddress: "email",
   nationality: "nationality", citizenship: "nationality",
   destination: "preferredDestination",
   destinationcountry: "preferredDestination",
   preferreddestination: "preferredDestination",
   travellingto: "preferredDestination",
   traveldates: "travelDates", dates: "travelDates",
-  travelmonth: "travelDates", when: "travelDates",
+  travelmonth: "travelDates",
   travelers: "travelers", travellers: "travelers",
   pax: "travelers", passengers: "travelers", numberoftravelers: "travelers",
   budget: "budget", budgetperperson: "budget",

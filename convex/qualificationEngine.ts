@@ -682,8 +682,6 @@ export const completeQualification = internalMutation({
     if (session.status !== "collecting" || !session.checklistSatisfiedAt) return;
     const conversation = await ctx.db.get(args.conversationId);
     if (!conversation || conversation.accountId !== args.accountId) return;
-    const contact = await ctx.db.get(session.contactId);
-    if (!contact) return;
     const now = Date.now();
 
     await ctx.db.patch(session._id, {
@@ -693,16 +691,27 @@ export const completeQualification = internalMutation({
       pendingQuestion: undefined,
     });
 
-    // Write back what the assistant already extracted, so a rep never
-    // re-types it. Blanks only — a value already on the contact was
-    // either typed by a human or written by an earlier qualification,
-    // and either way it outranks a fresh guess. Runs once, here, rather
-    // than on every analysis pass: with blanks-only semantics whatever
-    // lands FIRST wins permanently, so writing early would let a shaky
-    // mid-conversation guess lock out the settled answer.
-    const contactPatch = mapFieldsToContact(session.fields, contact);
-    if (Object.keys(contactPatch).length > 0) {
-      await ctx.db.patch(session.contactId, contactPatch);
+    // Fill blank contact fields from what the assistant already
+    // extracted, so a rep never re-types it. Blanks only — a value
+    // already on the contact was either typed by a human or written by
+    // an earlier qualification, and either way it outranks a fresh
+    // guess. Runs once, here, rather than on every analysis pass: with
+    // blanks-only semantics whatever lands FIRST wins permanently, so
+    // writing early would let a shaky mid-conversation guess lock out
+    // the settled answer.
+    //
+    // Scoped to the write on purpose: `conversations.contactId` can
+    // dangle after a contact delete (see `contacts.ts`'s own note on
+    // its delete mutation), and a missing contact must NOT abort
+    // qualification — the session status, funnel transition, Meta
+    // conversion event and notifications above/below all still have to
+    // happen regardless.
+    const contact = await ctx.db.get(session.contactId);
+    if (contact) {
+      const contactPatch = mapFieldsToContact(session.fields, contact);
+      if (Object.keys(contactPatch).length > 0) {
+        await ctx.db.patch(session.contactId, contactPatch);
+      }
     }
 
     // Funnel → qualified (auto). Seeds the deduped conversionEvents row
