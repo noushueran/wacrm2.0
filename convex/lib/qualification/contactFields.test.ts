@@ -101,4 +101,22 @@ describe("mapFieldsToContact", () => {
       ),
     ).toEqual({});
   });
+
+  it("maps the Ladies-Only Group Tours checklist keys (destination_or_interest, group_size)", () => {
+    expect(
+      mapFieldsToContact(
+        [
+          field({ key: "destination_or_interest", value: "Bali" }),
+          field({ key: "group_size", value: "4 friends" }),
+        ],
+        contact(),
+      ),
+    ).toEqual({ preferredDestination: "Bali", travelers: "4 friends" });
+  });
+
+  it("skips an email value that doesn't look like an email", () => {
+    expect(
+      mapFieldsToContact([field({ key: "email", value: "I don't have one" })], contact()),
+    ).toEqual({});
+  });
 });

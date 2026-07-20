@@ -36,10 +36,12 @@ const ALIASES: Record<string, Target> = {
   destinationcountry: "preferredDestination",
   preferreddestination: "preferredDestination",
   travellingto: "preferredDestination",
+  destinationorinterest: "preferredDestination", // Ladies-Only Group Tours checklist key
   traveldates: "travelDates", dates: "travelDates",
   travelmonth: "travelDates",
   travelers: "travelers", travellers: "travelers",
   pax: "travelers", passengers: "travelers", numberoftravelers: "travelers",
+  groupsize: "travelers", // Ladies-Only Group Tours checklist key
   budget: "budget", budgetperperson: "budget",
   perpersonbudget: "budget", tripbudget: "budget",
 };
@@ -67,6 +69,12 @@ export function mapFieldsToContact(
     // a label is human prose that may mention another field in passing.
     const target = ALIASES[normalize(f.key)] ?? (f.label ? ALIASES[normalize(f.label)] : undefined);
     if (!target) continue;
+    // `email` is the one mapped column with downstream semantics —
+    // contactSearch.ts matches on it and the /contacts table displays it —
+    // and a wrong write here is permanent under blanks-only. Reject obvious
+    // prose ("I don't have one") with the cheapest structural check; this
+    // is not meant to enforce full RFC-compliant email syntax.
+    if (target === "email" && !value.includes("@")) continue;
     if (patch[target] !== undefined) continue; // first field wins
     if (contact[target]) continue; // blanks only — a human's value stands
     patch[target] = value;
