@@ -79,6 +79,52 @@ test("overview is admin-gated", async () => {
   await expect(asAgent.query(api.campaigns.overview, {})).rejects.toThrow();
 });
 
+// Whole-branch review Fix 1: the owner granted supervisors `/campaigns`
+// in `SUPERVISOR_NAV` (src/lib/auth/roles.ts), but the query behind that
+// nav entry still required admin — a supervisor who clicked Campaigns
+// hit a server-side FORBIDDEN that `useQuery` re-throws synchronously
+// during render, crashing the page (no Error Boundary on this route).
+// The floor is now "supervisor", one step below the old "admin" — this
+// pins BOTH ends of that contract: a supervisor succeeds, and the next
+// role down (agent) still gets FORBIDDEN, not just "some error".
+test("overview allows a supervisor (owner-granted /campaigns access) and rejects an agent with FORBIDDEN", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAdmin(t);
+
+  const supervisorId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Sam", email: "sam@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: supervisorId,
+      accountId,
+      role: "supervisor",
+      fullName: "Sam",
+      email: "sam@example.com",
+    }),
+  );
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|s-Sam` });
+  const result = await asSupervisor.query(api.campaigns.overview, {});
+  expect(result.windowDays).toBe(365);
+
+  const agentId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Ag2", email: "ag2@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: agentId,
+      accountId,
+      role: "agent",
+      fullName: "Ag2",
+      email: "ag2@example.com",
+    }),
+  );
+  const asAgent = t.withIdentity({ subject: `${agentId}|s-Ag2` });
+  await expect(asAgent.query(api.campaigns.overview, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "supervisor" },
+  });
+});
+
 test("overview counts DISTINCT conversations per stage (repeat transitions dedupe)", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asAdmin } = await seedAdmin(t);

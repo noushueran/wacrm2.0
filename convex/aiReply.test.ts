@@ -836,7 +836,14 @@ test("playground returns an error (never throws) when every message is blank", a
   expect(result).toEqual({ error: "Send a message to test the agent." });
 });
 
-test("playground throws FORBIDDEN for a viewer (below the agent role floor)", async () => {
+// Whole-branch review Fix 3: `playground` loads the DECRYPTED account
+// config (including `systemPrompt`) and spends the account's own BYO
+// provider budget, so its floor was raised from agent+ to admin+ — its
+// only UI (`/agents`'s Playground tab) is already admin/owner-only. This
+// pins the new floor at BOTH ends: a supervisor (who now sees Campaigns
+// and much of the dashboard on this branch, but must NOT reach the AI
+// config) is rejected, same as a plain viewer.
+test("playground throws FORBIDDEN for a viewer (below the admin role floor)", async () => {
   const t = convexTest(schema, modules);
   const { accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -854,7 +861,28 @@ test("playground throws FORBIDDEN for a viewer (below the agent role floor)", as
     asVic.action(api.aiReply.playground, {
       messages: [{ role: "user", content: "Hello?" }],
     }),
-  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("playground throws FORBIDDEN for a supervisor (raised from agent+ to admin+ by Fix 3 — supervisors must not reach the decrypted config or spend the account's AI budget)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  const supUserId = await seedTeammate(t, {
+    accountId,
+    name: "Sam",
+    email: "sam@example.com",
+    role: "supervisor",
+  });
+  const asSam = t.withIdentity({ subject: `${supUserId}|session-Sam` });
+
+  await expect(
+    asSam.action(api.aiReply.playground, {
+      messages: [{ role: "user", content: "Hello?" }],
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
 
 test("playground throws UNAUTHENTICATED when there is no identity", async () => {

@@ -894,7 +894,7 @@ const playgroundMessageValidator = v.object({
 type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; code?: string };
 
 /**
- * Agent+ "test-chat with the agent" action — Convex port of `POST
+ * Admin+ "test-chat with the agent" action — Convex port of `POST
  * /api/ai/playground`. Runs the EXACT path the auto-reply bot uses
  * (knowledge retrieval + `auto_reply` system prompt + the account's
  * configured provider) against a client-supplied transcript, so what's
@@ -907,6 +907,17 @@ type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; c
  * The route accepts no config/system-prompt overrides beyond `messages`
  * (checked against the actual route, not just the task brief's
  * paraphrase) — so neither does this action.
+ *
+ * Raised from Agent+ to Admin+ (whole-branch review Fix 3): this loads
+ * the account's DECRYPTED config — including `systemPrompt`, which Task
+ * 3 of this branch deliberately stopped exposing to the member-facing
+ * config query — and spends the account's own BYO provider budget on
+ * every call. Its only UI is the Playground tab on `/agents`, which is
+ * already admin/owner-only (`/agents` is absent from `SUPERVISOR_NAV`/
+ * `AGENT_NAV`/`VIEWER_NAV` in `src/lib/auth/roles.ts`); this closes the
+ * matching backend gap. Contrast with `draft` below, which stays
+ * Agent+ — the inbox "suggest a reply" action every agent uses daily —
+ * see ITS doc comment for why raising that one would be wrong.
  */
 export const playground = action({
   args: { messages: v.array(playgroundMessageValidator) },
@@ -917,8 +928,8 @@ export const playground = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "agent")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
     }
     const { accountId } = context;
 
@@ -1003,6 +1014,18 @@ type DraftResult = { draft: string } | { error: string; code?: string };
  * lifecycle ends when its handler returns, same reasoning as
  * `dispatchInbound`'s own usage-log comment) but best-effort, matching
  * the route's own resilience around `logAiUsage`.
+ *
+ * Deliberately KEPT at Agent+ (whole-branch review Fix 3 — verified, not
+ * changed): this backs the inbox message composer's "suggest a reply"
+ * button (`src/components/inbox/message-composer.tsx`), which every
+ * agent uses on every conversation they're allowed to see. It never
+ * returns the raw config or `systemPrompt` to the caller (only the
+ * generated `draft` text) and per-conversation RBAC below already keeps
+ * an agent to their own/pool conversations. Raising this floor would
+ * break the inbox for agents, which is out of scope for this branch —
+ * contrast with `playground` above (raised to Admin+), which is a
+ * different surface (the admin-only `/agents` page) with a different
+ * blast radius (the decrypted config + the account's AI spend).
  */
 export const draft = action({
   args: { conversationId: v.id("conversations") },

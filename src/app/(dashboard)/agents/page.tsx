@@ -34,12 +34,20 @@ const AiUsageCard = dynamic(
 type Tab = 'playground' | 'setup' | 'usage';
 
 export default function AgentsPage() {
-  const { accountRole } = useAuth();
+  const { accountRole, profileLoading } = useAuth();
   const canViewUsage = accountRole ? canEditSettings(accountRole) : false;
   const [tab, setTab] = useState<Tab>('playground');
   const [decided, setDecided] = useState(false);
 
-  const configDoc = useQuery(api.aiConfig.get);
+  // Skip until the role is BOTH known and sufficient. `api.aiConfig
+  // .getFull` is admin-gated server-side; firing it as a non-admin
+  // throws FORBIDDEN synchronously inside `useQuery` (no Error Boundary
+  // in this app), which would crash the page before `RequireSection`
+  // can redirect a non-admin away from this admin/owner-only route.
+  const configDoc = useQuery(
+    api.aiConfig.getFull,
+    !profileLoading && canViewUsage ? {} : 'skip',
+  );
   // Land first-time users on Setup, returning users on the Playground —
   // decided exactly once. Render-time "adjust state" (React's own
   // recommended fix for an effect that only mirrors external data into

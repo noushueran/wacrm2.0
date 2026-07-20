@@ -657,3 +657,88 @@ test("cross-account isolation: testConnection never falls back to a different ac
   expect(result).toEqual({ error: "Enter an API key to test." });
   vi.unstubAllGlobals();
 });
+
+// ============================================================
+// get / getFull split (RBAC lockdown) — `get` stays open to every
+// member for the inbox banner's isActive/autoReplyEnabled probe, but
+// never exposes `systemPrompt`; only the new admin-only `getFull`
+// carries it.
+// ============================================================
+
+test("get never exposes the system prompt to any member", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.aiConfig.upsert, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    apiKey: "sk-test-key",
+    systemPrompt: "SECRET BUSINESS PROMPT",
+    isActive: true,
+    autoReplyEnabled: true,
+  });
+
+  // This file's local `seedTeammate` returns the bare `userId` (see its
+  // own doc comment above) — not `{ userId, asUser }` like
+  // `apiKeys.test.ts`'s copy — so build the identity the same way
+  // `asViewer` does above.
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  const config = await asSupervisor.query(api.aiConfig.get, {});
+  expect(config).not.toBeNull();
+  // The inbox banner's needs are still met...
+  expect(config?.isActive).toBe(true);
+  expect(config?.autoReplyEnabled).toBe(true);
+  expect(config?.hasKey).toBe(true);
+  // ...but the prompt is not part of the payload at all.
+  expect(config).not.toHaveProperty("systemPrompt");
+});
+
+test("getFull returns the system prompt to an admin", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.aiConfig.upsert, {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    apiKey: "sk-test-key",
+    systemPrompt: "SECRET BUSINESS PROMPT",
+    isActive: true,
+    autoReplyEnabled: true,
+  });
+
+  const config = await asOwner.query(api.aiConfig.getFull, {});
+  expect(config?.systemPrompt).toBe("SECRET BUSINESS PROMPT");
+});
+
+test("getFull throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  await expect(
+    asSupervisor.query(api.aiConfig.getFull, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});

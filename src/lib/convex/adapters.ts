@@ -660,7 +660,18 @@ export function toUiQuickReply(doc: Doc<"quickReplies">): QuickReply {
  *  verbatim by reading the raw `useQuery` result directly, not through
  *  this adapter. A fixed placeholder satisfies the (required,
  *  non-optional) UI field without ever surfacing whatever the row
- *  actually holds. */
+ *  actually holds.
+ *
+ *  As of Task 5 (supervisor-lockdown series), `whatsappConfig.get` is
+ *  admin-only (`ctx.requireRole("admin")`) — this adapter is therefore
+ *  only ever fed a doc an admin+ caller was allowed to fetch in the
+ *  first place, and `whatsapp-config.tsx` (the only caller, the
+ *  admin-only WhatsApp settings tab) is the only place this runs.
+ *  Non-admin surfaces that used to read `get` (the inbox header,
+ *  `settings-overview.tsx`'s WhatsApp tile) now read the member-safe
+ *  `whatsappConfig.connectionState` query instead — a `{ status,
+ *  isConfigured }` projection with no adapter of its own, since it's
+ *  already UI-shaped. */
 export function toUiWhatsappConfig(doc: Doc<"whatsappConfig">): WhatsAppConfig {
   return {
     id: doc._id,
@@ -722,7 +733,7 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
 // (`aiKnowledgeDocuments`).
 // ============================================================
 
-/** `aiConfig.get`'s return shape, mapped almost unchanged — it is
+/** `aiConfig.getFull`'s return shape, mapped almost unchanged — it is
  *  already a flat camelCase POJO, NOT a raw `Doc<"aiConfigs">`: that
  *  query deliberately never selects `apiKey`/`embeddingsApiKey` into
  *  its return value at all (see its own doc comment), only the derived
@@ -733,7 +744,14 @@ export function toUiApiKey(doc: Omit<Doc<"apiKeys">, "keyHash">): ApiKeyView {
  *  `ApiKeyView` above, this UI-facing type is declared here instead.
  *  `autoReplyMaxPerConversation`/`handoffAgentId` are NOT part of this
  *  view (Task B7 removed the deprecated reply-cap/handoff plumbing —
- *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`). */
+ *  nothing enforces/reads either anymore; see `aiConfig.ts`'s `get`).
+ *
+ *  This mapper is `getFull`-shaped, not `get`-shaped (RBAC lockdown
+ *  split — `aiConfig.ts`'s own doc comments on both exports): `get`'s
+ *  narrower, member-safe payload has no `systemPrompt` field at all, so
+ *  a `configDoc` from `get` is not a valid input here. The only caller
+ *  (`ai-config.tsx`, the admin settings form that edits the prompt)
+ *  already reads `getFull`. */
 export interface AiConfigView {
   provider: "openai" | "anthropic";
   model: string;
@@ -747,7 +765,7 @@ export interface AiConfigView {
 export function toUiAiConfig(config: {
   provider: "openai" | "anthropic";
   model: string;
-  systemPrompt: string | undefined;
+  systemPrompt: string | null;
   isActive: boolean;
   autoReplyEnabled: boolean;
   hasKey: boolean;
