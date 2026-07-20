@@ -42,7 +42,14 @@ Append to `convex/contacts.test.ts` (reuse that file's existing seed helpers —
 ```ts
 test("update round-trips the travel-profile fields", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, contactId } = await seedContact(t); // use this file's own helper
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag", email: "ag@x.com", role: "agent",
+  });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId, phone: "+15551230199", phoneNormalized: "15551230199", name: "X",
+    }),
+  );
   await asUser.mutation(api.contacts.update, {
     contactId,
     travelDates: "mid December",
@@ -58,7 +65,9 @@ test("update round-trips the travel-profile fields", async () => {
 });
 ```
 
-If `convex/contacts.test.ts` has no seed helper that yields both an authed client and a contact id, build the fixture the way the neighbouring tests in that file do — do not import helpers across test files.
+There is no `seedContact` helper in that file — contacts are inserted inline,
+exactly as above (see the tests around `convex/contacts.test.ts:1296` and
+`:1313`). `seedAccountMember` returns `{ userId, accountId, asUser }`.
 
 - [ ] **Step 2: Run to verify it fails**
 
