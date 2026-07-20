@@ -2267,6 +2267,46 @@
       "delete": "Delete service",
       "deleteConfirm": "Delete this service? Its key can be reused afterwards.",
       "deleteBlocked": "This service still has entries or checklists. Delete its content first, then delete the service."
+    },
+    "detail": {
+      "back": "All services",
+      "editService": "Edit service",
+      "addEntry": "Add {type}",
+      "noEntries": "Nothing here yet.",
+      "draftBadge": "Draft",
+      "publishedBadge": "Published",
+      "version": "v{n}",
+      "types": {
+        "overview": "Overview",
+        "faq": "FAQ",
+        "requirements": "Requirements",
+        "itinerary": "Itinerary",
+        "policy": "Policy",
+        "process": "Process",
+        "note": "Note"
+      }
+    },
+    "entryEditor": {
+      "createTitle": "Add entry",
+      "editTitle": "Edit entry",
+      "title": "Title",
+      "body": "Content",
+      "type": "Type",
+      "audience": "Audience",
+      "audienceCustomer": "Customer-facing",
+      "audienceInternal": "Internal only",
+      "audienceHint": "Internal content is used to steer the AI but is never quoted to a customer.",
+      "saveDraft": "Save draft",
+      "publish": "Publish",
+      "unpublish": "Unpublish",
+      "delete": "Delete",
+      "deleteConfirm": "Delete this entry and its compiled search content? This cannot be undone.",
+      "editWarning": "Saving changes moves this entry back to draft. It stays out of the AI's answers until you publish again.",
+      "cancel": "Cancel",
+      "saveFailed": "Something went wrong. Please try again.",
+      "publishFailed": "Couldn't publish this entry. Please try again.",
+      "unpublishFailed": "Couldn't unpublish this entry. Please try again.",
+      "deleteFailed": "Couldn't delete this entry. Please try again."
     }
   }
 }
