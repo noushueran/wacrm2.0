@@ -48,6 +48,7 @@ type ServiceFormValues = {
   name: string;
   aliases: string[];
   routingTagName?: string;
+  relatedServiceKeys?: string[];
   status: 'active' | 'paused';
   sortOrder: number;
 };
@@ -125,6 +126,15 @@ export function ServiceForm({
   const [keyTouched, setKeyTouched] = useState(false);
   const [aliasesRaw, setAliasesRaw] = useState('');
   const [routingTagName, setRoutingTagName] = useState('');
+  // No input binds to this — nothing in the UI manages related services
+  // yet. It's carried in state purely so it round-trips through this
+  // form unchanged (seeded below, resubmitted verbatim in handleSave):
+  // `kbServices.upsert` PATCHes whatever `relatedServiceKeys` it's
+  // given, and an `undefined` field in a Convex `patch()` call deletes
+  // that field. Without this, ServiceForm — the only writer of
+  // `kbServices.upsert` — would silently wipe it on every edit, the same
+  // class of bug `routingTagName` above was already fixed for.
+  const [relatedServiceKeys, setRelatedServiceKeys] = useState<string[] | undefined>(undefined);
   const [status, setStatus] = useState<'active' | 'paused'>('active');
   const [sortOrder, setSortOrder] = useState(0);
 
@@ -162,6 +172,7 @@ export function ServiceForm({
     setKeyTouched(false);
     setAliasesRaw((seed?.aliases ?? []).join(', '));
     setRoutingTagName(seed?.routingTagName ?? '');
+    setRelatedServiceKeys(seed?.relatedServiceKeys);
     setStatus(seed?.status ?? 'active');
     setSortOrder(seed?.sortOrder ?? 0);
     setSubmitError(null);
@@ -201,6 +212,7 @@ export function ServiceForm({
         name: name.trim(),
         aliases,
         routingTagName: routingTagName.trim() || undefined,
+        relatedServiceKeys,
         status,
         sortOrder,
       });

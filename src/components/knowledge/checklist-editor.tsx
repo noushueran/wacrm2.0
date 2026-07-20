@@ -36,7 +36,9 @@ import { EntryStatusBadge } from './service-detail';
 // blocks only on SHAPE errors (`label_required`, `key_duplicate`) so a
 // half-finished checklist can be parked as a draft; Publish blocks on
 // EVERY error-level issue via `hasLintErrors`, most visibly a
-// qualification's marks not summing to 100.
+// qualification's marks not summing to 100. Save additionally refuses
+// zero rows outright (see `computeSaveBlocked`) — a client-only UX
+// guard layered on top of the lint split, not part of it.
 //
 // Row `key` is assigned once, at add-time, via `nextRowKey` — never
 // rewritten when its label is edited afterwards, since downstream data
@@ -77,10 +79,39 @@ export function nextRowKey(label: string, existing: string[]): string {
   return `${base}-${n}`;
 }
 
-// Shape problems block Save; every other error-level issue
-// (items_required, marks_sum, report_value_positive, currency_format)
-// only blocks Publish. Mirrors kbOps.ts's own SHAPE_ERROR_CODES.
+// Shape problems block Save via SHAPE_ISSUE_CODES below; every other
+// error-level issue (marks_sum, report_value_positive, currency_format)
+// only blocks Publish. `items_required` is the one exception: it's a
+// completeness issue, not a shape one, so it's deliberately left out of
+// this set (which otherwise stays byte-for-byte mirrored to kbOps.ts's
+// own SHAPE_ERROR_CODES) — `computeSaveBlocked` below blocks Save on
+// zero rows separately instead. See that function's own comment.
 const SHAPE_ISSUE_CODES = new Set(['label_required', 'key_duplicate']);
+
+/** Whether the current rows/issues combination should block Save.
+ *  Exported so it's directly unit-testable (checklist-editor.test.ts) —
+ *  this repo has no React Testing Library to drive the component itself.
+ *
+ *  Blocks on zero rows, in addition to any SHAPE_ISSUE_CODES error.
+ *  Zero rows only trips `items_required` (a completeness issue — see
+ *  SHAPE_ISSUE_CODES above), so without this extra check Save stayed
+ *  enabled on an empty, untouched block. That mattered because Save is
+ *  the only mutation that can create a `kbOpsBlocks` row in the first
+ *  place (`status === 'absent'` means none exists yet): once created,
+ *  `kbServices.remove` treats the service as permanently "in use", and
+ *  Phase 1 ships no `kbOps.remove` mutation to undo it (Convex
+ *  dashboard only).
+ *
+ *  This also blocks re-saving an *existing* block down to zero rows —
+ *  intentionally, not as a side effect. An empty checklist is never a
+ *  meaningful thing to persist (Publish has always refused one, via the
+ *  same `items_required` issue), and nothing is stranded by refusing
+ *  it: the last real save stays intact server-side until rows are added
+ *  back. */
+export function computeSaveBlocked(rows: ChecklistRow[], issues: LintIssue[]): boolean {
+  if (rows.length === 0) return true;
+  return issues.some((i) => i.level === 'error' && SHAPE_ISSUE_CODES.has(i.code));
+}
 
 type Kind = 'qualification' | 'sales' | 'purchase';
 
@@ -206,7 +237,7 @@ export function ChecklistEditor({
   const submitting = pending !== null;
 
   const issues = lintOpsBlock(toOpsBlockInput(kind, rows, reportValue, currency));
-  const saveBlocked = issues.some((i) => i.level === 'error' && SHAPE_ISSUE_CODES.has(i.code));
+  const saveBlocked = computeSaveBlocked(rows, issues);
   const publishBlocked = hasLintErrors(issues);
   // marks_sum is surfaced instead by the dedicated live total below
   // (which shows the exact running total, not just "off by some

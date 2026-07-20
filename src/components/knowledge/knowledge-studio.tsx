@@ -59,11 +59,13 @@ export function KnowledgeStudio() {
   // Raw kbServices rows, for the edit-service dialog's `initial` only.
   // `studioOverview`'s rows are deliberately status/stats-only (see that
   // query's own doc comment) and don't carry every raw field — notably
-  // not `routingTagName`. Without this, editing a service would silently
-  // blanket-clear its routing tag on every save, since ServiceForm always
-  // submits whatever `routingTagName` it was seeded with (trimmed to
-  // `undefined` when empty) and `kbServices.upsert` patches that field
-  // verbatim.
+  // not `routingTagName` or `relatedServiceKeys`. Without this, editing a
+  // service would silently blanket-clear whichever of those two fields it
+  // holds on every save: ServiceForm always submits both verbatim
+  // (routingTagName trimmed to `undefined` when empty; relatedServiceKeys
+  // is a pure pass-through with no UI control at all — see that form's
+  // own comment) and `kbServices.upsert` PATCHes both fields exactly as
+  // given, where an `undefined` field deletes it.
   const kbServicesList = useQuery(api.kbServices.list, isAdmin ? {} : 'skip');
   const entries = useQuery(
     api.kbEntries.list,
@@ -257,6 +259,7 @@ export function KnowledgeStudio() {
                     name: editServiceRow.name,
                     aliases: editServiceRow.aliases,
                     routingTagName: editServiceRow.routingTagName,
+                    relatedServiceKeys: editServiceRow.relatedServiceKeys,
                     status: editServiceRow.status,
                     sortOrder: editServiceRow.sortOrder,
                   }
