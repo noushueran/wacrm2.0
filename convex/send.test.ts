@@ -510,8 +510,239 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
   expect(messages).toHaveLength(1);
   expect(messages[0]!.contentType).toBe("image");
   expect(messages[0]!.mediaUrl).toBe("https://example.com/photo.jpg");
+  // A legacy `mediaUrl`-only send persists just the URL — no key exists
+  // to carry (final-review fix: "outbound media never persists a key").
+  expect(messages[0]!.mediaKey).toBeUndefined();
   expect(messages[0]!.contentText).toBe("Here's the photo");
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+});
+
+test("send resolves a message's mediaKey to a public R2 URL for Meta, and persists BOTH the key and the resolved URL", async () => {
+  // Arrange an outbound media send whose staged object is identified by
+  // key, not by legacy URL, and assert the `link` handed to Meta is the
+  // objs.holidayys.co URL rather than a Convex storage URL.
+  //
+  // Same arrangement as "send routes a media messageType (image) to
+  // metaSend.sendMedia" above (DRY-RUN + account/conversation seeding).
+  // There is no `metaSend.sendMedia` argument-interception pattern
+  // anywhere in this file or in `metaSend.test.ts` — every existing test
+  // in both files goes through DRY-RUN and asserts on the PERSISTED row
+  // instead. That's a faithful proxy here too:
+  // `metaSend.sendMedia`'s handler (`convex/metaSend.ts:358`) persists
+  // `mediaUrl: args.link` unconditionally, even in DRY-RUN (only
+  // `whatsappMessageId` is synthetic) — so the persisted row's
+  // `mediaUrl` IS the exact `link` value that would have been handed to
+  // Meta's Graph API on a real send.
+  //
+  // Also the regression test for the final-review fix "outbound media
+  // never persists a key": `send` threads its already-ownership-checked
+  // `args.mediaKey` through to `metaSend.sendMedia` (not just the
+  // resolved `link`), so the persisted row carries BOTH — proving the
+  // composer-attachment / voice-note write path durably stores a key
+  // instead of discarding it after resolution.
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  // The key's own account segment MUST be the caller's real seeded
+  // `accountId`, not a fixture literal like "acc1" — `send` verifies the
+  // key's prefix against the caller's own account (cross-tenant
+  // ownership check, see the tests below) before ever resolving it to a
+  // URL, so a key minted for a DIFFERENT account here would be rejected
+  // rather than resolved. This is also, therefore, the regression test
+  // for "an agent's OWN key still succeeds."
+  await asUser.action(api.send.send, {
+    conversationId,
+    messageType: "image",
+    mediaKey: `${accountId}/outbound/photo.png`,
+  });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(1);
+  const capturedLink = messages[0]!.mediaUrl;
+  expect(capturedLink).toBe(
+    `https://objs.holidayys.co/${accountId}/outbound/photo.png`,
+  );
+  expect(messages[0]!.mediaKey).toBe(`${accountId}/outbound/photo.png`);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+// ============================================================
+// send — mediaKey cross-tenant ownership (Important review finding):
+// `send`'s args validator has no `accountId` field, so nothing upstream
+// stops a client from passing a `mediaKey` that belongs to a DIFFERENT
+// account. Without a server-side check, `resolveMediaUrlLazy` would
+// happily resolve a foreign key to a real, fetchable R2 URL, Meta would
+// fetch and deliver that object, and the foreign URL would land in the
+// caller's own account's message row
+// (`convex/metaSend.ts`'s `sendMedia` persists `mediaUrl: args.link`
+// unconditionally). A foreign key and a malformed key must be
+// indistinguishable — both `NOT_FOUND`, never `FORBIDDEN` — matching
+// `convex/files.ts`'s `remove` mutation, which enforces the identical
+// contract for the same key shape.
+// ============================================================
+
+test("send rejects a mediaKey belonging to a different account (cross-tenant), and nothing is persisted", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  // R2 is deliberately left CONFIGURED (not omitted) for this test: with
+  // no ownership check, `resolveMediaUrlLazy` would successfully resolve
+  // Bob's key to a real `objs.holidayys.co` URL and the send would
+  // SUCCEED (persisting Bob's URL into Alice's message) — that failure
+  // mode is the actual vulnerability, and it only surfaces when R2 is
+  // configured. Leaving R2 unconfigured would instead make an unfixed
+  // `send` throw a generic "R2_BUCKET is not set" error, which also
+  // rejects but for the wrong reason and would mask a regression where
+  // the ownership check silently moved to run AFTER key resolution.
+  const { asUser: asAlice, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { accountId: bobAccountId } = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const contactId = await asAlice.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await expect(
+    asAlice.action(api.send.send, {
+      conversationId,
+      messageType: "image",
+      mediaKey: `${bobAccountId}/outbound/photo.png`,
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
+
+  // Nothing was persisted into Alice's conversation — proof the send
+  // pipeline (which would have called Meta) was never reached.
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("send rejects a malformed mediaKey with the SAME NOT_FOUND shape as a foreign key", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await expect(
+    asUser.action(api.send.send, {
+      conversationId,
+      messageType: "image",
+      // `parseMediaKey` requires exactly 3 `/`-separated segments with a
+      // known `kind` — this has neither, so it must be rejected without
+      // ever attempting to resolve it, identically to a foreign key.
+      mediaKey: "not-a-real-key",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("send still requires a mediaUrl or mediaKey for media messages (both absent throws)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await expect(
+    asUser.action(api.send.send, { conversationId, messageType: "image" }),
+  ).rejects.toThrow(/mediaKey or mediaUrl is required/);
 
   delete process.env.CONVEX_META_DRY_RUN;
 });

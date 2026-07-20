@@ -456,6 +456,62 @@ describe("validateFlowForActivation — send_media", () => {
     ).toBe(true);
   });
 
+  it("passes with only media_key set (no media_url)", () => {
+    const issues = validateFlowForActivation(
+      baseFlow,
+      nodesWith({
+        media_type: "document",
+        media_key: "flow-media/abc123-invoice.pdf",
+        caption: "Your invoice",
+        filename: "invoice.pdf",
+        next_node_key: "h",
+      }),
+    );
+    expect(issues).toEqual([]);
+  });
+
+  it("passes with only media_url set (regression guard)", () => {
+    const issues = validateFlowForActivation(
+      baseFlow,
+      nodesWith({
+        media_type: "document",
+        media_url: "https://cdn.example/invoice.pdf",
+        caption: "Your invoice",
+        filename: "invoice.pdf",
+        next_node_key: "h",
+      }),
+    );
+    expect(issues).toEqual([]);
+  });
+
+  it("passes with both media_key and media_url set", () => {
+    const issues = validateFlowForActivation(
+      baseFlow,
+      nodesWith({
+        media_type: "document",
+        media_key: "flow-media/abc123-invoice.pdf",
+        media_url: "https://cdn.example/invoice.pdf",
+        caption: "Your invoice",
+        filename: "invoice.pdf",
+        next_node_key: "h",
+      }),
+    );
+    expect(issues).toEqual([]);
+  });
+
+  it("flags neither media_key nor media_url, reported under field media_url", () => {
+    const issues = validateFlowForActivation(
+      baseFlow,
+      nodesWith({
+        media_type: "image",
+        next_node_key: "h",
+      }),
+    );
+    expect(
+      issues.some((i) => i.node_key === "m" && i.field === "media_url"),
+    ).toBe(true);
+  });
+
   it("flags missing media_type", () => {
     const issues = validateFlowForActivation(
       baseFlow,

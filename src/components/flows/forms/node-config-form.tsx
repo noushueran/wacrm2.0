@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { uploadAccountMedia, MEDIA_MAX_BYTES } from "@/lib/storage/upload-media";
+import { mediaUrlFromKey, resolveMediaUrl } from "@/lib/storage/media-url";
 import { slugify, type BuilderNode } from "../shared";
 import { NextNodeRow, NodeKeySelect, TextRow } from "./fields";
 import { api } from "../../../../convex/_generated/api";
@@ -859,6 +860,13 @@ function useUserTags(): UserTag[] {
 interface SendMediaCfg {
   media_type?: "image" | "video" | "document";
   media_url?: string;
+  /** R2 object key (R2 migration: write path) — the durable replacement
+   *  for `media_url`, written ALONGSIDE it (never in place of it) so a
+   *  pre-cutover node with only `media_url` keeps working untouched and
+   *  `src/lib/flows/validate.ts`'s existing "needs a file" check (which
+   *  only inspects `media_url`) is unaffected. Read at display/send time
+   *  via `resolveMediaUrl({ key: media_key, url: media_url })`. */
+  media_key?: string;
   caption?: string;
   filename?: string;
   next_node_key?: string;
@@ -891,13 +899,17 @@ function SendMediaForm({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const convex = useConvex();
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const startUpload = useMutation(api.files.startUpload);
 
   const mediaType = cfg.media_type ?? "image";
   const isDocument = mediaType === "document";
+  const resolvedMediaUrl = resolveMediaUrl({
+    key: cfg.media_key,
+    url: cfg.media_url,
+  });
   const displayName =
     cfg.filename ||
-    (cfg.media_url ? cfg.media_url.split("/").pop() ?? "" : "");
+    (resolvedMediaUrl ? resolvedMediaUrl.split("/").pop() ?? "" : "");
 
   const handleFile = useCallback(
     async (file: File) => {
@@ -909,10 +921,23 @@ function SendMediaForm({
       }
       setUploading(true);
       try {
-        const { url } = await uploadAccountMedia(convex, generateUploadUrl, file);
+        const { key } = await uploadAccountMedia(convex, startUpload, file, "flow");
+        // `media_url` is ALSO populated (resolved from the freshly
+        // minted key) rather than left blank: `validate.ts`'s send_media
+        // check only inspects `media_url`, and this node's own Meta send
+        // path (`flowsEngine.ts`) already resolves `media_key ??
+        // media_url` — writing both means this activates correctly
+        // either way and stays consistent with every pre-cutover node.
+        const url = mediaUrlFromKey(key);
+        if (!url) {
+          throw new Error(
+            "Uploaded, but the public media host isn't configured yet.",
+          );
+        }
         // Patch all fields in one call so the form doesn't re-render
         // with a half-uploaded state.
         onUpdateConfig({
+          media_key: key,
           media_url: url,
           filename: file.name,
         });
@@ -924,11 +949,11 @@ function SendMediaForm({
         setUploading(false);
       }
     },
-    [onUpdateConfig, convex, generateUploadUrl],
+    [onUpdateConfig, convex, startUpload],
   );
 
   const handleClear = () => {
-    onUpdateConfig({ media_url: "", filename: "" });
+    onUpdateConfig({ media_key: "", media_url: "", filename: "" });
   };
 
   return (
@@ -963,17 +988,17 @@ function SendMediaForm({
 
       <div>
         <label className="mb-1 block text-xs text-muted-foreground">{t("fileLabel")}</label>
-        {cfg.media_url ? (
+        {resolvedMediaUrl ? (
           <div className="flex items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-xs">
             <Paperclip className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
             <a
-              href={cfg.media_url}
+              href={resolvedMediaUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="min-w-0 flex-1 truncate text-foreground hover:text-cyan-300"
-              title={displayName || cfg.media_url}
+              title={displayName || resolvedMediaUrl}
             >
-              {displayName || cfg.media_url}
+              {displayName || resolvedMediaUrl}
             </a>
             <button
               type="button"

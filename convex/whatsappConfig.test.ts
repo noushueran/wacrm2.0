@@ -383,7 +383,7 @@ test("cross-account denial: B's get never sees A's config", async () => {
   expect(alicesConfig!.phoneNumberId).toBe("1000000000");
 });
 
-test("get is visible to a non-admin member of the same account", async () => {
+test("get is visible to any admin-or-above teammate of the same account", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -395,15 +395,21 @@ test("get is visible to a non-admin member of the same account", async () => {
     accessToken: "alice-token",
     status: "connected",
   });
-  const viewerId = await seedTeammate(t, {
+  // `get` is now admin+ only (Task 5, supervisor-lockdown series) — this
+  // used to seed a "viewer" teammate to prove non-admin visibility, which
+  // is no longer true (see "get throws FORBIDDEN for a caller below the
+  // admin role" below); a second SAME-role teammate on the same account
+  // (not just the row's original creator) is the still-valid case this
+  // test now covers.
+  const teammateId = await seedTeammate(t, {
     accountId,
-    name: "Vic",
-    email: "vic@example.com",
-    role: "viewer",
+    name: "Tia",
+    email: "tia@example.com",
+    role: "admin",
   });
-  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
+  const asTeammate = t.withIdentity({ subject: `${teammateId}|session-Tia` });
 
-  const config = await asViewer.query(api.whatsappConfig.get, {});
+  const config = await asTeammate.query(api.whatsappConfig.get, {});
   expect(config!.phoneNumberId).toBe("1000000000");
 });
 
@@ -1805,8 +1811,7 @@ test("connectionStatus in DRY-RUN reports a synthetic success without ever calli
   delete process.env.CONVEX_META_DRY_RUN;
 });
 
-test("connectionStatus is reachable by a non-admin viewer (role floor)", async () => {
-  process.env.CONVEX_META_DRY_RUN = "1";
+test("connectionStatus throws FORBIDDEN for a caller below the admin role", async () => {
   const t = convexTest(schema, modules);
   const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
     name: "Alice",
@@ -1818,6 +1823,12 @@ test("connectionStatus is reachable by a non-admin viewer (role floor)", async (
     accessToken: "alice-token",
     status: "connected",
   });
+  // `connectionStatus` used to float at "viewer" (any authenticated
+  // member) — this test asserted exactly that "role floor" until Task 5
+  // of the supervisor-lockdown series raised it to admin+, matching
+  // `get`'s own new gate. Non-admin members now read `connectionState`
+  // instead (member-safe, no live Meta call — see that query's doc
+  // comment).
   const viewerId = await seedTeammate(t, {
     accountId,
     name: "Vic",
@@ -1826,10 +1837,9 @@ test("connectionStatus is reachable by a non-admin viewer (role floor)", async (
   });
   const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vic` });
 
-  const result = await asViewer.action(api.whatsappConfig.connectionStatus, {});
-  expect(result).toMatchObject({ connected: true });
-
-  delete process.env.CONVEX_META_DRY_RUN;
+  await expect(
+    asViewer.action(api.whatsappConfig.connectionStatus, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
 });
 
 test("connectionStatus throws UNAUTHENTICATED when there is no identity", async () => {
@@ -1881,4 +1891,172 @@ test("resolveInboundMedia returns null when the account has no WhatsApp config",
     mediaId: "meta-audio-1",
   });
   expect(result).toBeNull();
+});
+
+test("resolveInboundMedia downloads Meta media into R2 and returns its key (not a URL)", async () => {
+  // R2-migration cutover (Task 7): `resolveInboundMedia` used to resolve
+  // the R2 key it got from `files.storeFromUrl` (Task 6) straight into a
+  // public URL (`publicUrl(r2ConfigFromEnv(), key)`) as a behavior-
+  // preserving shim. That shim is retired — this test locks in the new
+  // `{ key }` contract directly, independent of `ingest.test.ts`'s own
+  // full `processInbound` coverage of the same path.
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  const t = convexTest(schema, modules);
+  const { asUser: asAdmin, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "admin",
+  });
+  await asAdmin.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "1000000000",
+    wabaId: "waba-1",
+    accessToken: "plaintext-token",
+    status: "connected",
+  });
+
+  // Same three-leg mock `ingest.test.ts`'s voice-note test uses: Meta's
+  // getMediaUrl (id -> CDN url + mime), the authenticated CDN download,
+  // then the R2 PUT `files.storeFromUrl` now makes — that PUT goes
+  // through `aws4fetch`, which signs a `Request` and invokes the global
+  // `fetch` with that single `Request` object as its only argument, so
+  // this mock must handle both calling conventions.
+  const bytes = new TextEncoder().encode("png-bytes");
+  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    if (input instanceof Request) {
+      return new Response(null, { status: 200 });
+    }
+    const url = String(input);
+    if (url.includes("graph.facebook.com")) {
+      return new Response(
+        JSON.stringify({ url: "https://cdn.example.com/media/abc", mime_type: "image/png" }),
+        { status: 200 },
+      );
+    }
+    return new Response(bytes, {
+      status: 200,
+      headers: { "content-type": "image/png" },
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await t.action(internal.whatsappConfig.resolveInboundMedia, {
+    accountId,
+    mediaId: "media-123",
+  });
+
+  // The fix (Task 7): a raw R2 object key, shaped
+  // `<accountId>/inbound/<random><ext>` (`convex/lib/r2/keys.ts`'s
+  // `buildMediaKey`) — NOT a resolved `{ url }`. The caller
+  // (`convex/ingest.ts`) persists this key directly; resolving it to a
+  // public URL is left entirely to the read path
+  // (`convex/lib/r2/url.ts`'s `resolveMediaUrl`, Task 5).
+  expect(result).not.toBeNull();
+  expect(result!.key).toMatch(/^[^/]+\/inbound\//);
+  expect(Object.keys(result!)).toEqual(["key"]);
+
+  vi.unstubAllGlobals();
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+// ============================================================
+// connectionState — member-safe connection state query
+// ============================================================
+
+test("connectionState exposes only status and configured-ness", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.whatsappConfig.upsert, {
+    phoneNumberId: "123456789",
+    wabaId: "987654321",
+    accessToken: "EAA-secret-token",
+    status: "connected",
+  });
+
+  const viewerId = await seedTeammate(t, {
+    accountId,
+    name: "Vee",
+    email: "vee@example.com",
+    role: "viewer",
+  });
+  const asViewer = t.withIdentity({ subject: `${viewerId}|session-Vee` });
+
+  const state = await asViewer.query(api.whatsappConfig.connectionState, {});
+  expect(state).toEqual({ status: "connected", isConfigured: true });
+  // The identifiers the raw row carries must not ride along.
+  expect(state).not.toHaveProperty("phoneNumberId");
+  expect(state).not.toHaveProperty("wabaId");
+  expect(state).not.toHaveProperty("accessToken");
+});
+
+test("connectionState reports an unconfigured account without throwing", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+
+  const state = await asOwner.query(api.whatsappConfig.connectionState, {});
+  expect(state).toEqual({ status: null, isConfigured: false });
+});
+
+// ============================================================
+// Task 5 (supervisor-lockdown series): `get` gated to admin+, now that
+// both non-admin consumers (the inbox and settings-overview.tsx) read
+// `connectionState` instead.
+// ============================================================
+
+test("get throws FORBIDDEN for a caller below the admin role", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  // `seedTeammate` returns a raw userId (see its own definition above) —
+  // an authenticated client is derived the same way every other test in
+  // this file does, via `t.withIdentity`.
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  await expect(
+    asSupervisor.query(api.whatsappConfig.get, {}),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+});
+
+test("connectionState remains readable by a supervisor after get is gated", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner@example.com",
+    role: "owner",
+  });
+  const supervisorId = await seedTeammate(t, {
+    accountId,
+    name: "Sup",
+    email: "sup@example.com",
+    role: "supervisor",
+  });
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|session-Sup` });
+
+  await expect(
+    asSupervisor.query(api.whatsappConfig.connectionState, {}),
+  ).resolves.toEqual({ status: null, isConfigured: false });
 });

@@ -12,6 +12,8 @@
 // output this endpoint has always returned.
 // ============================================================
 
+import { resolveMediaUrl } from '@/lib/storage/media-url';
+
 export interface ApiConversation {
   id: string;
   contact_id: string;
@@ -83,6 +85,13 @@ export interface ConvexApiMessage {
   contentType: string;
   contentText?: string;
   mediaUrl?: string;
+  /** R2 object key for this message's media — the durable replacement
+   *  for `mediaUrl` (Task 5 of the R2 migration: dual-read). `apiV1.ts`'s
+   *  `listMessages` already returns full raw docs, so this field is
+   *  present at runtime whether or not it's declared here — declaring it
+   *  is what makes `serializeMessage` actually resolve it instead of
+   *  silently dropping it. */
+  mediaKey?: string;
   templateName?: string;
   messageId?: string;
   status: string;
@@ -132,7 +141,11 @@ export function serializeMessage(doc: ConvexApiMessage): ApiMessage {
     sender_type: doc.senderType,
     content_type: doc.contentType,
     content_text: doc.contentText ?? null,
-    media_url: doc.mediaUrl ?? null,
+    // `mediaKey` over the legacy `mediaUrl` (Task 5 of the R2 migration:
+    // dual-read) — this is the PUBLIC wire response for external API
+    // partners, so it must not silently keep handing out stale/VPS URLs
+    // once a message's media is written under a key.
+    media_url: resolveMediaUrl({ key: doc.mediaKey, url: doc.mediaUrl }),
     template_name: doc.templateName ?? null,
     whatsapp_message_id: doc.messageId ?? null,
     status: doc.status,

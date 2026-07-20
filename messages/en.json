@@ -2211,5 +2211,134 @@
       "qualifyLabel": "Qualification",
       "checklistLabel": "Checklists"
     }
+  },
+  "Knowledge": {
+    "tab": "Knowledge",
+    "title": "Knowledge base",
+    "subtitle": "The structured knowledge your AI agent uses to describe services, qualify leads, and report purchases.",
+    "legacy": {
+      "sectionTitle": "Legacy documents",
+      "sectionHint": "Free-text documents from the old knowledge base. Still searched by the assistant. These will be retired once their content is migrated."
+    },
+    "empty": {
+      "title": "No services yet",
+      "body": "Add a service to start building structured knowledge your AI agent can use.",
+      "action": "Add your first service"
+    },
+    "verdict": {
+      "ready": "Ready",
+      "blocked": "Blocked",
+      "draft": "Draft",
+      "empty": "Empty"
+    },
+    "columns": {
+      "service": "Service",
+      "overview": "Overview",
+      "faq": "FAQ",
+      "requirements": "Requirements",
+      "qualification": "Qualification",
+      "sales": "Sales",
+      "purchase": "Purchase"
+    },
+    "matrix": {
+      "otherCount": "+{count} more",
+      "newService": "Add service",
+      "marksOff": "Marks total {total}, needs 100",
+      "entryStatus": "{published} published, {draft} draft",
+      "opsState": {
+        "published": "Published",
+        "draft": "Draft",
+        "absent": "Not started"
+      }
+    },
+    "serviceForm": {
+      "createTitle": "Add service",
+      "editTitle": "Edit service",
+      "name": "Display name",
+      "namePlaceholder": "UAE Visa Services",
+      "key": "Key",
+      "keyHint": "Used internally to link content, routing, and reports. Cannot be changed once created.",
+      "aliases": "Aliases",
+      "aliasesHint": "Comma-separated. Other ways customers name this service, e.g. \"tourist visa, visit visa\".",
+      "routingTag": "Routing tag",
+      "routingTagHint": "Optional. The member tag used to decide which salespeople are offered leads for this service.",
+      "status": "Status",
+      "statusActive": "Active",
+      "statusPaused": "Paused",
+      "sortOrder": "Display order",
+      "save": "Save",
+      "cancel": "Cancel",
+      "delete": "Delete service",
+      "deleteConfirm": "Delete this service? Its key can be reused afterwards.",
+      "deleteBlocked": "This service still has entries or checklists. Delete its content first, then delete the service."
+    },
+    "detail": {
+      "back": "All services",
+      "editService": "Edit service",
+      "addEntry": "Add {type}",
+      "noEntries": "Nothing here yet.",
+      "draftBadge": "Draft",
+      "publishedBadge": "Published",
+      "version": "v{n}",
+      "types": {
+        "overview": "Overview",
+        "faq": "FAQ",
+        "requirements": "Requirements",
+        "itinerary": "Itinerary",
+        "policy": "Policy",
+        "process": "Process",
+        "note": "Note"
+      }
+    },
+    "entryEditor": {
+      "createTitle": "Add entry",
+      "editTitle": "Edit entry",
+      "title": "Title",
+      "body": "Content",
+      "type": "Type",
+      "audience": "Audience",
+      "audienceCustomer": "Customer-facing",
+      "audienceInternal": "Internal only",
+      "audienceHint": "Internal content is used to steer the AI but is never quoted to a customer.",
+      "saveDraft": "Save draft",
+      "publish": "Publish",
+      "unpublish": "Unpublish",
+      "delete": "Delete",
+      "deleteConfirm": "Delete this entry and its compiled search content? This cannot be undone.",
+      "editWarning": "Saving changes moves this entry back to draft. It stays out of the AI's answers until you publish again.",
+      "cancel": "Cancel",
+      "saveFailed": "Something went wrong. Please try again.",
+      "publishFailed": "Couldn't publish this entry. Please try again.",
+      "unpublishFailed": "Couldn't unpublish this entry. Please try again.",
+      "deleteFailed": "Couldn't delete this entry. Please try again."
+    },
+    "checklist": {
+      "qualification": "Qualification checklist",
+      "sales": "Sales checklist",
+      "purchase": "Purchase criteria",
+      "qualificationHint": "What the AI must learn before a lead counts as qualified. Marks must total exactly 100.",
+      "salesHint": "The steps a salesperson works through after a lead qualifies.",
+      "purchaseHint": "When a qualified lead is strong enough to report as a Purchase to Meta.",
+      "addRow": "Add item",
+      "removeRow": "Remove",
+      "moveUp": "Move up",
+      "moveDown": "Move down",
+      "label": "Item",
+      "question": "Question to ask",
+      "description": "Detail",
+      "marks": "Marks",
+      "marksTotal": "Total {total} / 100",
+      "marksIncomplete": "Fill in marks for every item to see the total.",
+      "reportValue": "Reported value",
+      "currency": "Currency",
+      "saveDraft": "Save draft",
+      "publish": "Publish",
+      "unpublish": "Unpublish",
+      "publishBlocked": "Fix the issues above before publishing.",
+      "editWarning": "Saving changes moves this checklist back to draft. It stops being used until you publish it again.",
+      "notCreated": "Not set up yet.",
+      "notCreatedBadge": "Not created",
+      "saveFailed": "Something went wrong. Please try again."
+    }
   }
 }

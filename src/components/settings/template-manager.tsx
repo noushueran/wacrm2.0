@@ -18,6 +18,7 @@ import {
   uploadAccountMedia,
   MEDIA_MAX_BYTES_BY_KIND,
 } from '@/lib/storage/upload-media';
+import { mediaUrlFromKey } from '@/lib/storage/media-url';
 import { useAuth } from '@/hooks/use-auth';
 import { toUiTemplate } from '@/lib/convex/adapters';
 import { Button } from '@/components/ui/button';
@@ -163,7 +164,7 @@ export function TemplateManager() {
   // per-template lifecycle route caller below.
   const editTemplate = useAction(api.templates.editSubmit);
   const convex = useConvex();
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const startUpload = useMutation(api.files.startUpload);
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -477,7 +478,29 @@ export function TemplateManager() {
     }
     setUploadingHeader(true);
     try {
-      const { url } = await uploadAccountMedia(convex, generateUploadUrl, file);
+      // Uploads straight to R2 (`convex/files.ts`'s `startUpload`), but
+      // resolves the returned key to a public URL immediately and keeps
+      // writing ONLY `header_media_url` — the same field this form has
+      // always populated. `messageTemplates.headerMediaKey` (R2
+      // migration: dormant field, Task 4) is deliberately left
+      // unwritten by this form: Meta's template-submission API
+      // (`convex/metaTemplates.ts`) needs a fetchable URL regardless of
+      // storage backend, and persisting the key too would require
+      // threading a new optional field through `convex/templates.ts`'s
+      // `submit`/`editSubmit`/`upsert`/`upsertInternal` AND exposing it
+      // from `src/lib/convex/adapters.ts`'s `toUiTemplate` so `openEdit`
+      // can reload it — without that adapter change, `header_media_key`
+      // would silently go missing (get patched back to blank) on every
+      // template edit that doesn't re-upload a header image, since this
+      // form never round-trips an existing key back into itself. That
+      // is a real data-loss hazard, not just an omission, so it's left
+      // for a follow-up rather than guessed at here — see this task's
+      // report.
+      const { key } = await uploadAccountMedia(convex, startUpload, file, 'template');
+      const url = mediaUrlFromKey(key);
+      if (!url) {
+        throw new Error("Uploaded, but the public media host isn't configured yet.");
+      }
       setForm((f) => ({ ...f, header_media_url: url }));
       toast.success(t('toastUploadSuccess'));
     } catch (err) {

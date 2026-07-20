@@ -12,6 +12,7 @@ import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
+import { deliveryDelayMs } from "./lib/ai/pacing";
 import { landingUrlKey, type AdContext } from "./lib/ai/adContext";
 import { latestUserMessage } from "./lib/ai/query";
 import {
@@ -27,6 +28,8 @@ import {
 } from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
 import type { GenerateResult } from "./lib/ai/types";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
 // AI auto-reply dispatch (Phase 7, Task 3 — the final Convex-backend
@@ -103,10 +106,52 @@ const FALLBACK_REPLY_TEXT =
 const DISPATCH_MAX_ATTEMPTS = 2;
 const DISPATCH_RETRY_DELAY_MS = 30_000;
 
+// One scheduled retry for a SEND-boundary failure only (Fix F4 — see
+// `deliverReply`'s own doc comment for the full reasoning: the plan this
+// branch originally shipped with assumed Meta send rejections were
+// "near-always non-retryable," which is factually wrong — the WhatsApp
+// Cloud API returns retryable 429/500/503 responses same as any other
+// HTTP API). Deliberately its OWN budget, separate from
+// `DISPATCH_MAX_ATTEMPTS`/`DISPATCH_RETRY_DELAY_MS` above: by the time
+// `deliverReply` even runs, the typing indicator has already been ticking
+// for up to `deliveryDelayMs`'s ~15-20s range, so this retry cannot afford
+// the full 30s dispatch-level delay without risking the exact dead-air
+// failure Fix F1 exists to close. In the worst case (target up to 20s +
+// failed attempt + 3s wait + successful attempt), the total reaches ~25-27s
+// — at or slightly past Meta's ~25s typing-indicator ceiling. When the
+// margin is exceeded, the failure is graceful: the indicator disappears a
+// few seconds early and the retried message still arrives — unlike the
+// silent-forever failure the retry exists to prevent. One retry (never a
+// loop) keeps this worst case bounded.
+const DELIVER_MAX_ATTEMPTS = 2;
+const DELIVER_RETRY_DELAY_MS = 3_000;
+
 /** `[[FAIL]]` in the triggering message steers the provider-failure
  *  branch in DRY-RUN tests — thrown from `syntheticGeneration`, exactly
  *  where a real `generateReply` network failure would surface. */
 const FAILURE_SENTINEL = "[[FAIL]]";
+
+/** DRY-RUN send-boundary failure sentinels for `deliverReply`'s own
+ *  retry tests (Fix F4) — same convention as `FAILURE_SENTINEL` above,
+ *  but `metaSend.ts` itself is a file this phase leaves untouched and has
+ *  no failure hook of its own, so the synthetic throw lives here instead,
+ *  positioned at the exact boundary each sentinel is meant to probe:
+ *    - `[[SENDFAIL]]` in `replyText` throws BEFORE the send call
+ *      resolves, and ONLY on the first attempt — so the retry (which
+ *      carries the same `replyText` forward unchanged) succeeds, same as
+ *      a real transient failure that clears by the next try. This is
+ *      exactly where a real Meta 429/500 rejection would surface.
+ *    - `[[SENDFAIL_ALWAYS]]` is the same, but on EVERY attempt — for
+ *      proving `DELIVER_MAX_ATTEMPTS` actually bounds the retry (a
+ *      config-shaped failure that never clears must not loop), the same
+ *      role `[[FAIL]]` plays for `dispatchInbound`'s own "persistent
+ *      failure stops" test.
+ *    - `[[POSTSENDFAIL]]` throws AFTER the send has already gone out,
+ *      simulating a downstream bookkeeping failure — must NOT retry.
+ */
+const SEND_FAILURE_SENTINEL = "[[SENDFAIL]]";
+const ALWAYS_SEND_FAILURE_SENTINEL = "[[SENDFAIL_ALWAYS]]";
+const POST_SEND_FAILURE_SENTINEL = "[[POSTSENDFAIL]]";
 
 /** DRY-RUN stand-in for a voice-note transcript / image description. */
 const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
@@ -114,6 +159,19 @@ const DRY_RUN_TRANSCRIPT = "[dry-run transcript]";
 /** Upper bound on media rows transcribed per dispatch — a burst of
  *  voice notes costs at most this many transcription calls per reply. */
 const MAX_TRANSCRIPTIONS_PER_DISPATCH = 3;
+
+/**
+ * Outcome of `ackInbound`: which gate (if any) fired, or success.
+ * Returned instead of void so tests can verify the action's eligibility
+ * gates without relying on side effects (which are skipped in DRY-RUN).
+ */
+export type AckOutcome =
+  | "acked" // successful blue-tick + typing indicator
+  | "skipped_inactive" // no config, or isActive/autoReplyEnabled off
+  | "skipped_no_context" // loadDispatchContext returned null
+  | "skipped_assigned" // a human owns the thread
+  | "skipped_paused" // aiAutoreplyDisabled on this conversation
+  | "failed"; // the try/catch caught something
 
 /**
  * DRY-RUN stand-in for `generate.ts`'s `generateReply` — skips the
@@ -267,8 +325,17 @@ export const latestInboundMessageId = internalQuery({
 /**
  * Customer media rows (voice notes / images) still awaiting an AI
  * transcription/description — newest first, bounded by `limit`. Only
- * rows whose media already resolved into storage (`mediaUrl` set)
- * qualify; the rest keep their placeholder until a later dispatch.
+ * rows whose media already resolved into storage (`mediaKey` OR
+ * `mediaUrl` set) qualify; the rest keep their placeholder until a later
+ * dispatch.
+ *
+ * Returns the RAW `mediaKey`/`mediaUrl` pair rather than a resolved URL:
+ * this is a `query`, and resolving requires `r2ConfigFromEnv()` — Convex
+ * codebase convention here (see `conversionEvents.ts`/`campaignAds.ts`'s
+ * own "only an action can read process.env" comments) is that only an
+ * action reads deployment env, so resolution happens in the caller
+ * (`dispatchInbound`, an `internalAction`) instead, inside its own
+ * per-row try/catch — see that call site's comment for why.
  */
 export const untranscribedMediaRows = internalQuery({
   args: {
@@ -280,7 +347,13 @@ export const untranscribedMediaRows = internalQuery({
     ctx,
     args,
   ): Promise<
-    { messageId: Id<"messages">; contentType: "audio" | "image"; mediaUrl: string; caption: string | null }[]
+    {
+      messageId: Id<"messages">;
+      contentType: "audio" | "image";
+      mediaKey: string | null;
+      mediaUrl: string | null;
+      caption: string | null;
+    }[]
   > => {
     // BOUNDED raw window, filtered in JS: a DB-level contentType filter
     // would stream the index until it found `limit` media matches —
@@ -304,14 +377,15 @@ export const untranscribedMediaRows = internalQuery({
           m.senderType === "customer" &&
           (m.contentType === "audio" || m.contentType === "image") &&
           m._creationTime > cutoff &&
-          m.mediaUrl &&
+          (m.mediaKey || m.mediaUrl) &&
           !m.aiTranscription,
       )
       .slice(0, args.limit)
       .map((m) => ({
         messageId: m._id,
         contentType: m.contentType as "audio" | "image",
-        mediaUrl: m.mediaUrl!,
+        mediaKey: m.mediaKey ?? null,
+        mediaUrl: m.mediaUrl ?? null,
         caption: m.contentText?.trim() || null,
       }));
   },
@@ -507,6 +581,73 @@ async function loadAdContext(
 // ------------------------------------------------------------
 
 /**
+ * Blue-tick the inbound and show "typing…" as soon as it lands, rather
+ * than after the debounce elapses. Scheduled at `runAfter(0)` from
+ * `ingest.ts` in parallel with the (delayed) dispatch.
+ *
+ * This exists because the customer used to sit in total silence for the
+ * whole debounce window, which reads as being ignored. Acknowledging
+ * first makes the wait legible, so the wait itself no longer has to be
+ * short to feel human.
+ *
+ * Gates mirror `dispatchInbound`'s first four (config live, auto-reply
+ * on, account owns the thread, no human in charge) but deliberately
+ * NOT its debounce-token check: re-acking on every message of a burst
+ * is correct — a human reading along would keep the receipt current.
+ *
+ * Best-effort throughout. A failure here costs a read receipt, never a
+ * reply, so it must never throw into the scheduler. Returns an `AckOutcome`
+ * so tests can verify the eligibility gates without relying on side effects
+ * (which are skipped in DRY-RUN).
+ */
+export const ackInbound = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    triggerWamid: v.string(),
+  },
+  handler: async (ctx, args): Promise<AckOutcome> => {
+    try {
+      const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!config || !config.isActive || !config.autoReplyEnabled) {
+        return "skipped_inactive";
+      }
+
+      const dispatchContext: { conversation: Doc<"conversations">; to: string } | null =
+        await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+          contactId: args.contactId,
+        });
+      if (!dispatchContext) {
+        return "skipped_no_context";
+      }
+
+      const { conversation } = dispatchContext;
+      if (conversation.assignedToUserId) {
+        return "skipped_assigned"; // a human owns this thread
+      }
+      if (conversation.aiAutoreplyDisabled) {
+        return "skipped_paused"; // handed off / turned off here
+      }
+
+      await ctx.runAction(internal.metaSend.markRead, {
+        accountId: args.accountId,
+        whatsappMessageId: args.triggerWamid,
+        typingIndicator: true,
+      });
+      return "acked";
+    } catch (err) {
+      console.warn("[ai auto-reply] ack failed:", err);
+      return "failed";
+    }
+  },
+});
+
+/**
  * AI auto-reply for a freshly-arrived inbound message. Never throws
  * into the caller (own top-level try/catch, mirrors the source and
  * every other engine's dispatch entry point in this codebase) — a
@@ -530,22 +671,30 @@ export const dispatchInbound = internalAction({
     // 1-based retry counter (absent = first attempt). Only the retry
     // scheduled from the catch below ever passes it.
     attempt: v.optional(v.number()),
-    // Meta wamid of the inbound message that triggered this dispatch —
-    // lets the bot mark it read (blue ticks) + show "typing…" while the
-    // reply generates. Optional: older callers simply skip the receipt.
+    // Meta wamid of the inbound message that triggered this dispatch.
+    // The initial blue-tick + "typing…" now fires immediately via
+    // `ackInbound` (scheduled separately from `ingest.ts`); this is kept
+    // only so a scheduled retry can carry it forward unchanged. Optional:
+    // older callers simply skip it.
     triggerWamid: v.optional(v.string()),
     // Row id of that same inbound message — the debounce token. The
-    // ingest layer schedules dispatch `aiReplyDebounceMs()` after each
+    // ingest layer schedules dispatch `debounceMsForText()` after each
     // inbound; at fire time only the dispatch whose trigger is still
     // the newest customer message replies, so a burst of quick
     // fragments gets ONE reply. Optional: direct callers (tests, a
     // future manual trigger) skip the staleness check.
     triggerMessageId: v.optional(v.id("messages")),
+    // Wall-clock ms when the triggering inbound arrived, so delivery can
+    // subtract time already spent. Optional: dispatches scheduled before
+    // this shipped carry no value and simply skip the subtraction.
+    inboundAt: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<void> => {
-    // Flipped right after the Meta send succeeds: a failure AFTER this
-    // point must never retry (the customer already has the reply —
-    // re-dispatching would double-text them).
+    // Flipped right after delivery is successfully scheduled (before any
+    // real Meta send happens): a failure AFTER this point must not retry
+    // (delivery has been handed off, so this dispatch must not retry).
+    // The actual send may still fail inside deliverReply, which logs
+    // rather than retries, deliberately avoiding double-texts.
     let sent = false;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
@@ -583,22 +732,6 @@ export const dispatchInbound = internalAction({
       // stops. `aiReplyCount` is still counted after each send, purely
       // as a metric.
 
-      // Every gate passed — we intend to reply. Blue-tick the triggering
-      // message and show "typing…" for the LLM's think time (Meta
-      // auto-dismisses it on our send). Polish, never load-bearing: a
-      // failure here must not cost the customer their reply.
-      if (args.triggerWamid) {
-        try {
-          await ctx.runAction(internal.metaSend.markRead, {
-            accountId: args.accountId,
-            whatsappMessageId: args.triggerWamid,
-            typingIndicator: true,
-          });
-        } catch (err) {
-          console.warn("[ai auto-reply] mark-read failed:", err);
-        }
-      }
-
       // Voice notes & images: transcribe / describe BEFORE building the
       // transcript, so the reply addresses the actual content (owner
       // requirement — the bot "listens" and "reads", then answers in
@@ -616,15 +749,31 @@ export const dispatchInbound = internalAction({
         let transcribedAny = false;
         for (const row of pendingMedia) {
           try {
+            // Resolved HERE, inside the per-row try — not in the query
+            // above, and not hoisted above this `try` — so that
+            // `r2ConfigFromEnv()`'s throw (only reachable when
+            // `row.mediaKey` is actually present; see
+            // `resolveMediaUrlLazy`'s doc comment) is caught by the same
+            // best-effort per-row handling as any other transcription
+            // failure, rather than aborting the whole dispatch. The
+            // query's widened filter (`mediaKey || mediaUrl`) guarantees
+            // at least one is truthy for every row reaching this loop,
+            // so `link` is only ever null if that invariant is somehow
+            // violated — the `continue` guard below is belt-and-braces.
+            const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+              key: row.mediaKey,
+              url: row.mediaUrl,
+            });
+            if (!link) continue;
             const text = isDryRun()
               ? DRY_RUN_TRANSCRIPT
               : row.contentType === "audio"
-                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: row.mediaUrl })
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: link })
                 : await describeImageFromUrl({
                     apiKey: openAiKey,
                     model:
                       config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
-                    mediaUrl: row.mediaUrl,
+                    mediaUrl: link,
                     caption: row.caption ?? undefined,
                   });
             if (text) {
@@ -661,28 +810,40 @@ export const dispatchInbound = internalAction({
 
       const queryText = latestUserMessage(messages);
 
-      // Ground the reply in the account's knowledge base (best-effort;
-      // skipped entirely when there's nothing to retrieve — see
-      // `hasKnowledgeChunks`'s own doc comment).
-      let knowledge: string[] = [];
-      const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
-        accountId: args.accountId,
-      });
-      if (hasKb) {
-        knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, {
+      // Independent of each other — the knowledge lookup makes a network
+      // call for embeddings, so overlapping them saves real wall-clock
+      // inside a window the customer is now watching.
+      const knowledgePromise = (async (): Promise<string[]> => {
+        const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, {
+          accountId: args.accountId,
+        });
+        if (!hasKb) return [];
+        return await ctx.runAction(internal.aiKnowledge.retrieve, {
           accountId: args.accountId,
           queryText,
         });
-      }
-
-      // Lead-qualification steering (spec §7): tell the assistant which
-      // answers exist (never re-ask) and the ONE question to weave in.
-      // Null when the feature is dormant / session terminal — prompt is
-      // then byte-identical to pre-qualification behaviour.
-      const qualification = await ctx.runQuery(
-        internal.qualificationEngine.getObjectives,
-        { accountId: args.accountId, conversationId: args.conversationId },
-      );
+      })();
+      // Unhandled-rejection guard (whole-branch review Fix F8): if
+      // `qualification` below rejects FIRST, `Promise.all` settles on ITS
+      // reason and stops awaiting `knowledgePromise` — but that promise
+      // is still running, and if it later ALSO rejects, nothing is left
+      // listening to it, so Node flags it as an unhandled rejection (a
+      // runtime warning) even though the outer try/catch already has the
+      // failure covered via `Promise.all`'s own rejection. This no-op
+      // `.catch` just registers a handler so that warning never fires;
+      // `Promise.all` below still listens to this SAME promise directly,
+      // so it still rejects (and the outer catch still fires) exactly as
+      // before if `knowledgePromise` itself fails — behaviour is
+      // unchanged, only the spurious warning is gone.
+      knowledgePromise.catch(() => {});
+      const [knowledgeResult, qualification] = await Promise.all([
+        knowledgePromise,
+        ctx.runQuery(internal.qualificationEngine.getObjectives, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+        }),
+      ]);
+      let knowledge: string[] = knowledgeResult;
       // v4: on the turn a lead just qualified, the closing message IS
       // the reply — a second assistant message here double-texted and
       // could re-ask already-given details.
@@ -754,54 +915,30 @@ export const dispatchInbound = internalAction({
         replyText = FALLBACK_REPLY_TEXT;
       }
 
-      // Re-check the debounce token at the last moment: transcription +
-      // generation can take many seconds, and a message that arrived
-      // meanwhile owns the reply (its own dispatch fires shortly). One
-      // wasted generation beats a reply that ignores the newest message.
-      if (args.triggerMessageId) {
-        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+      // Hand off to a delayed delivery instead of sending now, so the
+      // reply lands at a pace proportional to its own length. `elapsed`
+      // is measured from the INBOUND, not from here — that absorbs the
+      // model's think time into the typing window rather than stacking
+      // on top of it.
+      const elapsedMs = args.inboundAt ? Date.now() - args.inboundAt : 0;
+      await ctx.scheduler.runAfter(
+        deliveryDelayMs({ replyLength: replyText.length, elapsedMs }),
+        internal.aiReply.deliverReply,
+        {
           accountId: args.accountId,
           conversationId: args.conversationId,
-        });
-        if (latestNow && latestNow !== args.triggerMessageId) return;
-      }
-
-      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-        to,
-        text: replyText,
-      });
-      sent = true;
-      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
-        accountId: args.accountId,
-        whatsappMessageId: sendResult.whatsappMessageId,
-      });
-      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
-        accountId: args.accountId,
-        conversationId: args.conversationId,
-      });
-
-      // Ask-admin relay (v3): fan the question out to the admin numbers
-      // AFTER the holding reply went out; and retire any team answers
-      // this reply just delivered.
-      if (generation.askAdmin) {
-        await ctx.scheduler.runAfter(
-          0,
-          internal.qualificationEngine.relayQuestionToAdmin,
-          {
-            accountId: args.accountId,
-            conversationId: args.conversationId,
-            contactId: args.contactId,
-            question: generation.askAdmin,
-          },
-        );
-      }
-      if (teamAnswers.inquiryIds.length > 0) {
-        await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+          contactId: args.contactId,
+          to,
+          replyText,
+          triggerMessageId: args.triggerMessageId,
+          askAdmin: generation.askAdmin ?? undefined,
           inquiryIds: teamAnswers.inquiryIds,
-        });
-      }
+        },
+      );
+      // Delivery is scheduled and owns the send from here. Any failure
+      // past this point must not re-dispatch — see this flag's own
+      // declaration comment.
+      sent = true;
     } catch (err) {
       console.error("[ai auto-reply] dispatch failed:", err);
       // Transient failures (provider 429/timeout, an infra hiccup) must
@@ -823,11 +960,288 @@ export const dispatchInbound = internalAction({
               // Keeps the debounce gate honest on the retry too: if a
               // newer inbound arrived meanwhile, its dispatch replies.
               triggerMessageId: args.triggerMessageId,
+              // Carry inboundAt forward so pacing still measures from the
+              // customer's original message, not from the retry. Without
+              // this, a delayed retry adds the full target delay on top of
+              // the already-elapsed time, blowing past Meta's 25s ceiling.
+              inboundAt: args.inboundAt,
             },
           );
+          // Re-ack on retry (whole-branch review Fix F1 — CORRECTED: the
+          // first attempt at this fix scheduled the re-ack at
+          // `runAfter(0)`, which is wrong and this comment exists so
+          // nobody repeats it). Both `runAfter` calls in this catch block
+          // are issued at the SAME instant — the moment attempt N's
+          // failure lands here — so their delays are directly comparable:
+          // an ack scheduled at `+0ms` starts its "typing…" indicator
+          // right now, and Meta auto-dismisses that indicator ~25s later
+          // with no documented way to refresh it. The retry above isn't
+          // scheduled to actually RUN until `+DISPATCH_RETRY_DELAY_MS`
+          // (30s) later. 30s > 25s: a `+0ms` ack is therefore GUARANTEED
+          // to expire roughly 5s before the retry even begins executing —
+          // and the retry then still needs its own generation time on top
+          // of that. The customer watches "typing…" die, then sits in
+          // silence; re-acking at +0 shrinks that silent gap, it does not
+          // eliminate it.
+          //
+          // The fix: schedule the re-ack at the SAME delay as the retry
+          // itself (`DISPATCH_RETRY_DELAY_MS`), so its indicator becomes
+          // live at the moment the retry actually STARTS running, not at
+          // the moment it was merely scheduled. The two land together by
+          // design — see `aiReply.test.ts`'s own timing assertion on this
+          // exact relationship. This is what makes `triggerWamid` a live
+          // argument (see its own declaration comment above) rather than
+          // dead weight only ever forwarded, never read.
+          //
+          // Scheduled in its own try/catch: a failure acking must never
+          // cost the customer the retry itself — same reasoning as Fix
+          // F7's `ingest.ts` guard around the very same call.
+          if (args.triggerWamid) {
+            try {
+              await ctx.scheduler.runAfter(
+                DISPATCH_RETRY_DELAY_MS,
+                internal.aiReply.ackInbound,
+                {
+                  accountId: args.accountId,
+                  conversationId: args.conversationId,
+                  contactId: args.contactId,
+                  triggerWamid: args.triggerWamid,
+                },
+              );
+            } catch (ackErr) {
+              console.warn("[ai auto-reply] retry re-ack scheduling failed:", ackErr);
+            }
+          }
         } catch (schedErr) {
           // Preserve this action's never-throws contract even here.
           console.error("[ai auto-reply] retry scheduling failed:", schedErr);
+        }
+      }
+    }
+  },
+});
+
+/**
+ * Send a reply that has already been generated, then do the post-send
+ * bookkeeping. Scheduled by `dispatchInbound` after a delay derived from
+ * the reply's own length, so the message lands at a human typing pace
+ * instead of the instant the model finishes.
+ *
+ * Split out rather than sleeping inside `dispatchInbound`: an in-action
+ * sleep would hold an action slot and bill up to ~15s of idle compute on
+ * every single reply (`DEFAULT_TYPING_MAX_MS` in `lib/ai/pacing.ts` —
+ * the 12s flat debounce this replaced is gone).
+ *
+ * The debounce token, the account-wide AI kill switch, and per-
+ * conversation human takeover are ALL re-checked HERE, at the last
+ * possible moment — more time has passed than at any earlier gate, so
+ * this is where any of the three is most likely to have changed under us
+ * (whole-branch review Fixes F2 (conversation-level, then completed to
+ * also cover the account-level switch) and the debounce/takeover checks
+ * alongside it).
+ *
+ * Retry semantics deliberately differ from `dispatchInbound`'s own, and
+ * are scoped to the SEND itself (Fix F4 — overriding this branch's
+ * original plan, which retried nothing here on the theory that "Meta
+ * send rejections were near-always non-retryable." That theory is
+ * factually wrong: the WhatsApp Cloud API returns retryable 429 (rate
+ * limit) and 500/503 (transient) responses same as any other HTTP API,
+ * so an un-retried 429 during a busy hour left the customer with a blue
+ * tick, "typing…", and then nothing, ever). `metaSend.sendText` is the
+ * first thing this action's try block actually DOES — everything before
+ * it is a re-check, not an effect — so `sent` flips true the instant that
+ * call resolves, and the catch below reschedules this action ONLY when
+ * `sent` is still false, i.e. only when the send itself never went out.
+ * A failure AFTER that point (a downstream mutation, the admin relay) is
+ * logged, never retried: the customer already has the message, and
+ * retrying would mean re-running this action's own body again, double-
+ * texting them.
+ *
+ * The retry's safety from double-texting relies on the distinction between
+ * a clean send rejection (definitive HTTP error from Meta, a pre-send check
+ * throwing) vs. an ambiguous network failure where the response is lost in
+ * transit after Meta has already received and processed the message. For
+ * clean rejections, `sent` stays false and a retry is safe. But the Cloud
+ * API's text-send endpoint takes no client-supplied idempotency key, and
+ * our `fetch()` call has no `AbortController`, timeout, or timeout detection
+ * — so a network-level response loss can go undetected, leaving `sent`
+ * false while the customer already received the message. A retry in this
+ * case sends a duplicate. This tradeoff was accepted deliberately: a rare
+ * duplicate is preferred over the silent-forever failure (a typing indicator
+ * that disappears without a reply) the retry exists to prevent.
+ *
+ * Bounded like `dispatchInbound`'s own retry (one retry, never a loop, its
+ * own `sendAttempt` counter so the two schemes can't be confused) but with
+ * its own much shorter delay — see `DELIVER_RETRY_DELAY_MS`'s own comment
+ * for why it must stay short.
+ */
+export const deliverReply = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    to: v.string(),
+    replyText: v.string(),
+    triggerMessageId: v.optional(v.id("messages")),
+    askAdmin: v.optional(v.string()),
+    // Table name verified against `qualificationEngine.markAnswersDelivered`
+    // (`convex/qualificationEngine.ts:1332`) — it is `adminInquiries`.
+    inquiryIds: v.array(v.id("adminInquiries")),
+    // 1-based retry counter for a SEND-boundary failure only (Fix F4;
+    // absent = first attempt). Only ever set by this action's OWN catch
+    // block below when it reschedules itself — deliberately a separate
+    // field from `dispatchInbound`'s `attempt`, since the two are
+    // different retry scopes (generation vs. send) with different
+    // budgets and must never be conflated.
+    sendAttempt: v.optional(v.number()),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    // Flipped the instant `metaSend.sendText` resolves (Fix F4): nothing
+    // before this point is an externally-visible effect (they're re-
+    // checks), so a failure while `sent` is still false means the
+    // customer has NOT received anything yet and a retry is safe. Once
+    // `sent` is true, the catch below must never retry — see this
+    // action's own doc comment for the full reasoning.
+    let sent = false;
+    try {
+      if (args.triggerMessageId) {
+        const latestNow = await ctx.runQuery(internal.aiReply.latestInboundMessageId, {
+          accountId: args.accountId,
+          conversationId: args.conversationId,
+        });
+        if (latestNow && latestNow !== args.triggerMessageId) return;
+      }
+
+      // Re-check the account-wide AI kill switch (whole-branch review Fix
+      // F2, completing the re-check below — this half was missing from
+      // the first attempt at this fix): `dispatchInbound` already gated
+      // on `config.isActive`/`config.autoReplyEnabled` — the very FIRST
+      // gate it applies — before ever scheduling this delivery, but that
+      // read is now stale by up to `deliveryDelayMs`'s max (~15s): long
+      // enough for the owner to flip the account-wide emergency AI-off
+      // switch in Settings (e.g. right after watching the bot say
+      // something wrong) and reasonably expect it to take effect
+      // immediately, not up to 15s later. Re-loading and re-checking it
+      // here, exactly like `ackInbound` does at its own execution time
+      // (see that action's handler), is what makes the switch actually
+      // immediate.
+      const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!config || !config.isActive || !config.autoReplyEnabled) return;
+
+      // Re-check human takeover (whole-branch review Fix F2): delivery
+      // can be scheduled up to `deliveryDelayMs`'s max (~15s) after
+      // `dispatchInbound` already checked `assignedToUserId`/
+      // `aiAutoreplyDisabled` — long enough for an agent to claim or
+      // pause the conversation from the dashboard in between. Before this
+      // branch the send happened right after generation (~2-6s of
+      // exposure); the scheduled delay widened that window, and manual
+      // takeover is the ONLY stop the bot recognizes (see this file's
+      // header) — re-checking here, at the last possible moment before
+      // sending, is what keeps that guarantee true.
+      const dispatchContext = await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+      });
+      if (!dispatchContext) return;
+      if (dispatchContext.conversation.assignedToUserId) return;
+      if (dispatchContext.conversation.aiAutoreplyDisabled) return;
+
+      // DRY-RUN send-boundary failure sentinels (Fix F4 tests) — see
+      // `SEND_FAILURE_SENTINEL`'s own comment. Positioned exactly where a
+      // real Meta send rejection would surface, i.e. BEFORE `sent` is
+      // ever set.
+      if (
+        isDryRun() &&
+        ((args.replyText.includes(SEND_FAILURE_SENTINEL) && (args.sendAttempt ?? 1) === 1) ||
+          args.replyText.includes(ALWAYS_SEND_FAILURE_SENTINEL))
+      ) {
+        throw new Error("DRY-RUN synthetic send failure");
+      }
+
+      const sendResult = await ctx.runAction(internal.metaSend.sendText, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        to: args.to,
+        text: args.replyText,
+      });
+      // The customer now has the message — nothing past this point may
+      // ever cause a retry (see this handler's own `sent` declaration).
+      sent = true;
+
+      // DRY-RUN post-send failure sentinel (Fix F4 tests): proves a
+      // failure AFTER the send does NOT retry (retrying would double-text
+      // a customer who already has the message).
+      if (isDryRun() && args.replyText.includes(POST_SEND_FAILURE_SENTINEL)) {
+        throw new Error("DRY-RUN synthetic post-send failure");
+      }
+
+      await ctx.runMutation(internal.aiReply.markMessageAiGenerated, {
+        accountId: args.accountId,
+        whatsappMessageId: sendResult.whatsappMessageId,
+      });
+      await ctx.runMutation(internal.aiReply.bumpReplyCount, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+      });
+
+      if (args.askAdmin) {
+        await ctx.scheduler.runAfter(
+          0,
+          internal.qualificationEngine.relayQuestionToAdmin,
+          {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+            question: args.askAdmin,
+          },
+        );
+      }
+      if (args.inquiryIds.length > 0) {
+        await ctx.runMutation(internal.qualificationEngine.markAnswersDelivered, {
+          inquiryIds: args.inquiryIds,
+        });
+      }
+    } catch (err) {
+      console.error("[ai auto-reply] delivery failed:", err);
+      // Retry ONLY a send-boundary failure (Fix F4 — see this action's
+      // own doc comment for why "Meta rejections are non-retryable" was
+      // the wrong call): the WhatsApp Cloud API's 429/500/503 responses
+      // ARE retryable, so a failure reaching this catch while `sent` is
+      // still false must not leave the customer with a dead "typing…"
+      // indicator and permanent silence. A failure once `sent` is true
+      // (a downstream mutation, the admin relay) is logged only —
+      // `dispatchInbound` already considers this reply handed off, and
+      // re-running this action's OWN body again would double-text a
+      // customer who may already have received the message.
+      //
+      // Bounded exactly like `dispatchInbound`'s own retry (one retry,
+      // never a loop) but with a SHORT delay of its own
+      // (`DELIVER_RETRY_DELAY_MS`, its own comment explains why): the
+      // customer already has a live typing indicator running from
+      // `ackInbound`/the dispatch retry's re-ack by the time delivery
+      // even starts, so this cannot afford anywhere near
+      // `DISPATCH_RETRY_DELAY_MS` without risking the exact dead-air
+      // failure Fix F1 exists to close.
+      const attempt = args.sendAttempt ?? 1;
+      if (!sent && attempt < DELIVER_MAX_ATTEMPTS) {
+        try {
+          await ctx.scheduler.runAfter(DELIVER_RETRY_DELAY_MS, internal.aiReply.deliverReply, {
+            accountId: args.accountId,
+            conversationId: args.conversationId,
+            contactId: args.contactId,
+            to: args.to,
+            replyText: args.replyText,
+            triggerMessageId: args.triggerMessageId,
+            askAdmin: args.askAdmin,
+            inquiryIds: args.inquiryIds,
+            sendAttempt: attempt + 1,
+          });
+        } catch (schedErr) {
+          // Preserve this action's never-throws contract even here.
+          console.error("[ai auto-reply] delivery retry scheduling failed:", schedErr);
         }
       }
     }
@@ -860,7 +1274,7 @@ const playgroundMessageValidator = v.object({
 type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; code?: string };
 
 /**
- * Agent+ "test-chat with the agent" action — Convex port of `POST
+ * Admin+ "test-chat with the agent" action — Convex port of `POST
  * /api/ai/playground`. Runs the EXACT path the auto-reply bot uses
  * (knowledge retrieval + `auto_reply` system prompt + the account's
  * configured provider) against a client-supplied transcript, so what's
@@ -873,6 +1287,17 @@ type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; c
  * The route accepts no config/system-prompt overrides beyond `messages`
  * (checked against the actual route, not just the task brief's
  * paraphrase) — so neither does this action.
+ *
+ * Raised from Agent+ to Admin+ (whole-branch review Fix 3): this loads
+ * the account's DECRYPTED config — including `systemPrompt`, which Task
+ * 3 of this branch deliberately stopped exposing to the member-facing
+ * config query — and spends the account's own BYO provider budget on
+ * every call. Its only UI is the Playground tab on `/agents`, which is
+ * already admin/owner-only (`/agents` is absent from `SUPERVISOR_NAV`/
+ * `AGENT_NAV`/`VIEWER_NAV` in `src/lib/auth/roles.ts`); this closes the
+ * matching backend gap. Contrast with `draft` below, which stays
+ * Agent+ — the inbox "suggest a reply" action every agent uses daily —
+ * see ITS doc comment for why raising that one would be wrong.
  */
 export const playground = action({
   args: { messages: v.array(playgroundMessageValidator) },
@@ -883,8 +1308,8 @@ export const playground = action({
       userId,
     });
     if (!context) throw new ConvexError({ code: "NO_ACCOUNT" });
-    if (!hasMinRole(context.role, "agent")) {
-      throw new ConvexError({ code: "FORBIDDEN", min: "agent" });
+    if (!hasMinRole(context.role, "admin")) {
+      throw new ConvexError({ code: "FORBIDDEN", min: "admin" });
     }
     const { accountId } = context;
 
@@ -969,6 +1394,18 @@ type DraftResult = { draft: string } | { error: string; code?: string };
  * lifecycle ends when its handler returns, same reasoning as
  * `dispatchInbound`'s own usage-log comment) but best-effort, matching
  * the route's own resilience around `logAiUsage`.
+ *
+ * Deliberately KEPT at Agent+ (whole-branch review Fix 3 — verified, not
+ * changed): this backs the inbox message composer's "suggest a reply"
+ * button (`src/components/inbox/message-composer.tsx`), which every
+ * agent uses on every conversation they're allowed to see. It never
+ * returns the raw config or `systemPrompt` to the caller (only the
+ * generated `draft` text) and per-conversation RBAC below already keeps
+ * an agent to their own/pool conversations. Raising this floor would
+ * break the inbox for agents, which is out of scope for this branch —
+ * contrast with `playground` above (raised to Admin+), which is a
+ * different surface (the admin-only `/agents` page) with a different
+ * blast radius (the decrypted config + the account's AI spend).
  */
 export const draft = action({
   args: { conversationId: v.id("conversations") },

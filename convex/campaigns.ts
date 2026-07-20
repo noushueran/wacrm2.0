@@ -14,9 +14,19 @@ export const WINDOW_DAYS = 365;
 const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
 /**
- * Funnel performance overview for the admin dashboard. Admin+ only (exposes
- * account-wide conversion/revenue aggregates — same gate as
- * `conversionEvents.listRecent`). Read-only. Two account-scoped, window-
+ * Funnel performance overview for the /campaigns dashboard. Supervisor+
+ * — deliberately looser than `conversionEvents.listRecent`'s admin-only
+ * gate: the account owner explicitly asked for supervisors to reach
+ * Campaigns (`SUPERVISOR_NAV` in `src/lib/auth/roles.ts`), and this is
+ * safe to grant because the query returns only AGGREGATE funnel counts
+ * and purchase totals — no raw phone numbers or per-contact detail.
+ * Supervisors already see strictly more elsewhere
+ * (`conversationScope("supervisor") === "all"`,
+ * `canSeeContactPhone(...) === true`), so this isn't a new exposure, just
+ * closing the gap between the nav allowlist and the query it points at
+ * (whole-branch review Fix 1 — the query used to stay admin-only after
+ * the nav was opened, which crashed every supervisor who clicked
+ * Campaigns). Read-only. Two account-scoped, window-
  * bounded index scans (was 2×7 per-stage scans) bucketed in memory:
  *  - per-stage funnel counts (distinct conversations reaching each stage)
  *    from `funnelTransitions.by_account`,
@@ -37,7 +47,7 @@ const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 export const overview = accountQuery({
   args: {},
   handler: async (ctx) => {
-    ctx.requireRole("admin");
+    ctx.requireRole("supervisor");
     const account = await ctx.db.get(ctx.accountId);
     const currency = account?.defaultCurrency ?? "USD";
     const cutoff = Date.now() - WINDOW_MS;

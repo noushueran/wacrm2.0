@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { normalizePhone } from "./lib/phone";
 import { AI_VISIBLE_MEDIA_TYPES } from "./lib/ai/context";
-import { aiReplyDebounceMs } from "./lib/ai/defaults";
+import { debounceMsForText } from "./lib/ai/pacing";
 import { hasMinRole } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import { allocateContactCode } from "./contacts";
@@ -588,47 +588,64 @@ export const processInbound = internalAction({
     // a bare Meta `mediaId`: `flattenInboundMessage` can't resolve it (a
     // signed Graph fetch is real network I/O), and neither can the
     // `ingestInbound` mutation, so the row was just persisted with no
-    // `mediaUrl` — which the inbox renders as an "unavailable" bubble.
-    // Now — AFTER the dedup check, so a Meta retry can't re-download and
-    // orphan a second copy in storage — pull the bytes into Convex
-    // storage and attach the durable URL to the already-persisted
-    // message. Best-effort: `resolveInboundMedia` returns null on any
-    // failure, leaving the "unavailable" bubble rather than derailing the
-    // fan-out below (a media that won't fetch must not cost the customer
-    // their flow/automation/AI reply).
+    // `mediaKey`/`mediaUrl` — which the inbox renders as an "unavailable"
+    // bubble. Now — AFTER the dedup check, so a Meta retry can't
+    // re-download and orphan a second copy in R2 — pull the bytes into
+    // Cloudflare R2 and attach the resulting object KEY (not a resolved
+    // URL — R2-migration Task 7, completing the cutover `resolveInboundMedia`
+    // started in Task 6) to the already-persisted message. Readers
+    // resolve `mediaKey ?? mediaUrl` lazily wherever the media is
+    // actually rendered/fetched (`convex/lib/r2/url.ts`'s
+    // `resolveMediaUrl`, Task 5), so nothing downstream needs an
+    // eagerly-resolved URL. Best-effort: `resolveInboundMedia` returns
+    // null on any failure, leaving the "unavailable" bubble rather than
+    // derailing the fan-out below (a media that won't fetch must not
+    // cost the customer their flow/automation/AI reply).
     if (message.mediaId && !message.mediaUrl) {
       const resolved = await ctx.runAction(
         internal.whatsappConfig.resolveInboundMedia,
         { accountId, mediaId: message.mediaId },
       );
       if (resolved) {
-        await ctx.runMutation(internal.messages.setMediaUrl, {
+        await ctx.runMutation(internal.messages.setMediaKey, {
           messageId: res.messageId,
-          mediaUrl: resolved.url,
+          mediaKey: resolved.key,
         });
       }
     }
 
     // ---- Ad-referral image → storage ----
     // The referral gives a DIRECT public CDN url (not a Meta mediaId), so a
-    // plain `storeFromUrl` (no auth headers) re-hosts it into Convex storage
+    // plain `storeFromUrl` (no auth headers) re-hosts it into Cloudflare R2
     // — same durability the inbound-media block gives voice notes/photos,
     // so the ad card never breaks when Meta's CDN url expires. After the
     // dedup guard above, so a Meta retry can't orphan a second copy.
+    //
+    // R2-migration write path (Task 7, completing what Task 6 staged):
+    // `storeFromUrl` returns `{ key }`, and that key is now handed
+    // straight to `messages.setAdReferralImage` as `storedImageKey` — NO
+    // `publicUrl`/`r2ConfigFromEnv` resolution happens here anymore (it
+    // used to, as a behavior-preserving shim while the mutation still
+    // expected a URL). The inbox reads
+    // `referral.storedImageKey ?? referral.storedImageUrl` lazily
+    // (`src/lib/convex/adapters.ts`'s `toUiMessage`, Task 5), so eagerly
+    // resolving a URL at ingest time bought nothing but an extra way for
+    // this best-effort step to fail. `setAdReferralImage` no longer
+    // denormalizes onto `conversation.adReferral` either — see that
+    // mutation's own doc comment for why (no `storedImageKey` field on
+    // that denorm, and nothing ever rendered its image).
     const adImageSrc = message.referral?.imageUrl ?? message.referral?.thumbnailUrl;
     if (adImageSrc) {
       await runBestEffort("ingest.storeAdReferralImage", async () => {
-        const { storageId } = await ctx.runAction(internal.files.storeFromUrl, {
+        const { key } = await ctx.runAction(internal.files.storeFromUrl, {
           url: adImageSrc,
+          accountId,
+          kind: "ad",
         });
-        const url = await ctx.storage.getUrl(storageId);
-        if (url) {
-          await ctx.runMutation(internal.messages.setAdReferralImage, {
-            messageId: res.messageId,
-            conversationId: res.conversationId,
-            storedImageUrl: url,
-          });
-        }
+        await ctx.runMutation(internal.messages.setAdReferralImage, {
+          messageId: res.messageId,
+          storedImageKey: key,
+        });
       });
     }
 
@@ -771,6 +788,28 @@ export const processInbound = internalAction({
         ) {
           return;
         }
+        // Acknowledge instantly — blue tick + "typing…" within a second,
+        // rather than after the debounce. Separate from the dispatch
+        // because the whole point is that it does NOT wait.
+        //
+        // Isolated in its own try/catch (whole-branch review Fix F7):
+        // this whole callback already runs inside `runBestEffort`, whose
+        // try/catch wraps the ENTIRE callback — without this inner
+        // guard, a failure scheduling the ack would throw PAST the
+        // dispatch scheduling below it and cost the customer their reply
+        // entirely, not just the read receipt. The inline `markRead`
+        // this replaced had its own try/catch for exactly this reason
+        // (an ack failure must never be able to cost a reply).
+        try {
+          await ctx.scheduler.runAfter(0, internal.aiReply.ackInbound, {
+            accountId,
+            conversationId: res.conversationId,
+            contactId: res.contactId,
+            triggerWamid: message.wamid,
+          });
+        } catch (ackErr) {
+          console.error("[ingest] ackInbound scheduling failed:", ackErr);
+        }
         // Debounced, not inline: WhatsApp users fragment one thought
         // across quick messages, and one racy dispatch per fragment
         // used to produce multiple partial replies. Each inbound
@@ -779,15 +818,20 @@ export const processInbound = internalAction({
         // NEWEST customer message replies (see `dispatchInbound`'s
         // debounce gate) — one reply per burst, at human pace.
         await ctx.scheduler.runAfter(
-          aiReplyDebounceMs(),
+          debounceMsForText(inboundText),
           internal.aiReply.dispatchInbound,
           {
             accountId,
             conversationId: res.conversationId,
             contactId: res.contactId,
             triggerMessageId: res.messageId,
-            // Lets the bot blue-tick the customer's message + show
-            // "typing…" while the reply generates.
+            // Wall-clock time of THIS inbound — `deliverReply` subtracts
+            // time-already-spent from its typing-pace target so model
+            // think time is absorbed rather than stacked on top.
+            inboundAt: Date.now(),
+            // Carried through only so a scheduled retry can resend it —
+            // the initial blue-tick + "typing…" already fired above via
+            // `ackInbound`.
             triggerWamid: message.wamid,
           },
         );

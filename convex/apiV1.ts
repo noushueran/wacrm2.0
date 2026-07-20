@@ -8,6 +8,8 @@ import { loadActiveApiKey } from "./apiKeys";
 import { clampLimit } from "./lib/cronSummary";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx, MutationCtx, ActionCtx } from "./_generated/server";
+import { r2ConfigFromEnv } from "./lib/r2/config";
+import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
 // Public REST API (`/api/v1/*`) data functions — Phase 8, Task 5, the
@@ -508,7 +510,20 @@ export const sendMessage = action({
       badRequest("content_text is required for text messages");
     }
     const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(args.type);
-    if (isMediaKind && !args.mediaUrl) {
+    // This public endpoint has no `mediaKey` argument — an external API
+    // caller has no way to name an internal R2 object key, only a URL —
+    // so `key` here is always absent and `resolvedMediaLink` always
+    // reduces to `args.mediaUrl || null`. Routed through the shared
+    // resolver anyway for the same "empty string treated as absent"
+    // precedence every other read site gets, and so this endpoint is
+    // already wired the day a key-bearing input is ever added to it.
+    // `resolveMediaUrlLazy` (not an eager `resolveMediaUrl(r2ConfigFromEnv(), ...)`)
+    // means this never depends on R2 being configured while `key` stays
+    // unused — see `convex/lib/r2/url.ts`'s doc comment.
+    const resolvedMediaLink = resolveMediaUrlLazy(r2ConfigFromEnv, {
+      url: args.mediaUrl,
+    });
+    if (isMediaKind && !resolvedMediaLink) {
       badRequest("media_url is required for media messages");
     }
     if (args.type === "template" && !args.template?.name) {
@@ -574,7 +589,7 @@ export const sendMessage = action({
         conversationId,
         to: target.to,
         kind: args.type as "image" | "video" | "document" | "audio",
-        link: args.mediaUrl!,
+        link: resolvedMediaLink!,
         caption: args.text,
         filename: args.filename,
         contextMessageId: target.contextMessageId,

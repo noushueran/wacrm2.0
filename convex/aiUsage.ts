@@ -12,9 +12,17 @@ import { v } from "convex/values";
 // `ctx.runMutation(internal.aiUsage.log, { accountId, ... })` after a
 // provider call completes), so `accountId` is a caller-supplied arg
 // here instead of derived from `ctx.accountId` — same shape as
-// `automationsEngine.ts`'s `createLog`. `summary` IS `accountQuery`:
-// the usage dashboard is a normal authenticated read of the caller's
-// own account, same trust level as `apiKeys.list`.
+// `automationsEngine.ts`'s `createLog`. `summary` IS `accountQuery`,
+// gated `ctx.requireRole("admin")`: raw per-call provider/model/token
+// rows are billing-class detail, the same trust level `apiKeys.list`
+// was RAISED TO earlier in this branch (`convex/apiKeys.ts`). This
+// comment used to claim parity with `apiKeys.list` back when THAT query
+// was still open to viewer+ — it was never updated when `apiKeys.list`
+// was tightened, so it went stale (whole-branch review Fix 2). `summary`
+// now actually enforces the same admin floor server-side instead of
+// relying on the client (`ai-usage.tsx`) to skip the query, which was
+// UI-only and trivially bypassable by any authenticated member calling
+// the query directly.
 // ============================================================
 
 /**
@@ -70,8 +78,9 @@ export const log = internalMutation({
 });
 
 /**
- * The caller's own account's usage rows created at/after `sinceMs` —
- * the same "genuine index range scan" idiom `dashboard.ts`'s
+ * Admin+ only (billing-class per-call provider/model/token detail — see
+ * the module header above). The caller's own account's usage rows
+ * created at/after `sinceMs` — the same "genuine index range scan" idiom `dashboard.ts`'s
  * `conversationsSeries`/`responseTime` use
  * (`.withIndex("by_account", (q) => q.eq("accountId",
  * ctx.accountId).gte("_creationTime", sinceMs))`), relying on
@@ -87,6 +96,7 @@ export const log = internalMutation({
 export const summary = accountQuery({
   args: { sinceMs: v.number() },
   handler: async (ctx, args) => {
+    ctx.requireRole("admin");
     return await ctx.db
       .query("aiUsageLog")
       .withIndex("by_account", (q) =>

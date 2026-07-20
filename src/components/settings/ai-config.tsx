@@ -25,7 +25,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { SettingsPanelHead } from './settings-panel-head';
-import { AiKnowledgeCard } from './ai-knowledge';
 import { AI_PROVIDER_DEFAULT_MODEL } from '@/lib/ai/defaults';
 import type { AiProvider } from '@/lib/ai/types';
 import { toUiAiConfig, isConvexErrorCode } from '@/lib/convex/adapters';
@@ -47,11 +46,14 @@ const KEY_PLACEHOLDER: Record<AiProvider, string> = {
 
 /**
  * AI auto-reply config (Phase 8, Task 3 / P8-T3) — `aiConfigs`, one row
- * per account. `api.aiConfig.get` never returns the encrypted
- * `apiKey`/`embeddingsApiKey` columns, only derived `hasKey`/
- * `hasEmbeddingsKey` booleans (see that query's own doc comment), so
- * the masked placeholder below is always a fixed string, never
- * anything read back from the server. Saving goes through
+ * per account. This form reads `api.aiConfig.getFull` (admin-only,
+ * RBAC lockdown split) rather than the member-safe `api.aiConfig.get`,
+ * because it is the one place that edits `systemPrompt` — see
+ * `getFull`'s own doc comment. Like `get`, it never returns the
+ * encrypted `apiKey`/`embeddingsApiKey` columns, only derived `hasKey`/
+ * `hasEmbeddingsKey` booleans, so the masked placeholder below is
+ * always a fixed string, never anything read back from the server.
+ * Saving goes through
  * `api.aiConfig.upsert`, which encrypts a freshly-typed key
  * server-side and REUSES the stored ciphertext whenever a key field is
  * omitted (untouched) — see that mutation's doc comment — so the form
@@ -70,7 +72,15 @@ export function AiConfig() {
   const { canEditSettings: canEdit, profileLoading } = useAuth();
   const t = useTranslations('Settings.aiConfig');
 
-  const configDoc = useQuery(api.aiConfig.get);
+  // Skip until the role is BOTH known and sufficient — same reasoning as
+  // `agents/page.tsx`'s own `configDoc`: `api.aiConfig.getFull` is
+  // admin-gated server-side, and a synchronous FORBIDDEN throw here
+  // would crash the page (no Error Boundary) instead of letting the
+  // route guard redirect a non-admin away.
+  const configDoc = useQuery(
+    api.aiConfig.getFull,
+    !profileLoading && canEdit ? {} : 'skip',
+  );
   const loading = configDoc === undefined;
   const configured = configDoc != null;
   const config = useMemo(
@@ -410,17 +420,6 @@ export function AiConfig() {
 
           </CardContent>
         </Card>
-
-        {canEdit && (
-          <AiKnowledgeCard
-            canEdit={canEdit}
-            hasEmbeddingsKey={
-              embeddingsKeyEdited
-                ? embeddingsKey.trim().length > 0
-                : hasStoredEmbeddingsKey
-            }
-          />
-        )}
 
         <div className="flex justify-end">
           <Button onClick={handleSave} disabled={disabled}>

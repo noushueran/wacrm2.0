@@ -112,8 +112,8 @@ export default function InboxPage() {
     }
   }, [deepLinkConvId, conversations, activeConversationId, markRead]);
 
-  const wa = useQuery(api.whatsappConfig.get);
-  const whatsappConnected = wa === undefined ? null : wa?.status === "connected";
+  const wa = useQuery(api.whatsappConfig.connectionState);
+  const whatsappConnected = wa === undefined ? null : wa.status === "connected";
 
   const handleSelectConversation = useCallback(
     (conversation: Conversation) => {

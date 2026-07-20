@@ -45,6 +45,7 @@ import type * as kbEntries from "../kbEntries.js";
 import type * as kbImport from "../kbImport.js";
 import type * as kbOps from "../kbOps.js";
 import type * as kbServices from "../kbServices.js";
+import type * as knowledge from "../knowledge.js";
 import type * as leadCharges from "../leadCharges.js";
 import type * as lib_ai_adContext from "../lib/ai/adContext.js";
 import type * as lib_ai_chunk from "../lib/ai/chunk.js";
@@ -161,6 +162,7 @@ declare const fullApi: ApiFromModules<{
   kbImport: typeof kbImport;
   kbOps: typeof kbOps;
   kbServices: typeof kbServices;
+  knowledge: typeof knowledge;
   leadCharges: typeof leadCharges;
   "lib/ai/adContext": typeof lib_ai_adContext;
   "lib/ai/chunk": typeof lib_ai_chunk;
