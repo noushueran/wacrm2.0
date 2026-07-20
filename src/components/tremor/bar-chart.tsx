@@ -661,7 +661,30 @@ const BarChart = React.forwardRef<HTMLDivElement, BarChartProps>(
         tremor-id="tremor-raw"
         {...other}
       >
-        <ResponsiveContainer>
+        {/*
+          `initialDimension` seeds ResponsiveContainer's internal size
+          state for the first render, before its ResizeObserver effect
+          measures this wrapper. recharts defaults it to `{-1, -1}`,
+          which trips its own "The width(-1) and height(-1) of chart
+          should be greater than 0" console warning on EVERY mount —
+          even though the wrapper is correctly sized (`h-80 w-full`)
+          and the chart draws fine one frame later. The warning is a
+          false positive, and it reaches production because recharts
+          hardcodes `isDev = true` in its LogUtils rather than gating
+          on NODE_ENV (still true as of 3.9.2, so upgrading is not a
+          fix).
+
+          Seeding height (not width) is deliberate, and the asymmetry
+          matters:
+            - The warning is skipped when width > 0 OR height > 0, so
+              a positive height alone silences it.
+            - The chart body only renders when width > 0 AND height > 0
+              (recharts' `isAcceptableSize`), so leaving width at -1
+              preserves the existing render-nothing-until-measured
+              behaviour. Seeding BOTH would paint a 1px chart for one
+              frame before the observer corrects it.
+        */}
+        <ResponsiveContainer initialDimension={{ width: -1, height: 1 }}>
           <RechartsBarChart
             data={data}
             onClick={
