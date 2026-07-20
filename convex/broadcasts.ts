@@ -250,6 +250,10 @@ async function requireOwnContact(
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
+    // Supervisor+, matching `SUPERVISOR_NAV`'s `/broadcasts`. Campaign
+    // history is not agent-facing; `get`/`listRecipients` below share the
+    // floor so the detail view can't be reached around the list.
+    ctx.requireRole("supervisor");
     // `by_account` binds only `accountId`, so the sole remaining sort
     // key is the implicit `_creationTime` — `.order("desc")` gives
     // newest-first, matching `contacts.list`'s identical treatment of
@@ -265,6 +269,7 @@ export const list = accountQuery({
 export const get = accountQuery({
   args: { broadcastId: v.id("broadcasts") },
   handler: async (ctx, args) => {
+    ctx.requireRole("supervisor"); // same floor as `list`
     return await requireOwnBroadcast(ctx, args.broadcastId);
   },
 });
@@ -275,6 +280,7 @@ export const listRecipients = accountQuery({
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
+    ctx.requireRole("supervisor"); // same floor as `list`
     await requireOwnBroadcast(ctx, args.broadcastId);
     return await ctx.db
       .query("broadcastRecipients")

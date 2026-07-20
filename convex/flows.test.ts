@@ -131,7 +131,7 @@ const VALID_GRAPH_NODES = [
 
 test("list returns the caller's own flows, newest-first, with nodeCount/isActive summary", async () => {
   const t = convexTest(schema, modules);
-  const { asUser } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
+  const { asUser } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "admin" });
 
   await asUser.mutation(api.flows.create, { name: "First" });
   const secondId = await asUser.mutation(api.flows.create, { template: "welcome_menu" });
@@ -146,8 +146,8 @@ test("list returns the caller's own flows, newest-first, with nodeCount/isActive
 
 test("list never returns another account's flows", async () => {
   const t = convexTest(schema, modules);
-  const { asUser: asAlice } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
-  const { asUser: asBob } = await seedAccountMember(t, { name: "Bob", email: "bob@example.com", role: "agent" });
+  const { asUser: asAlice } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "admin" });
+  const { asUser: asBob } = await seedAccountMember(t, { name: "Bob", email: "bob@example.com", role: "admin" });
 
   await asAlice.mutation(api.flows.create, { name: "Alice's" });
 
@@ -240,8 +240,8 @@ test("create throws INVALID_INPUT for an unknown template slug", async () => {
 
 test("get round-trips a template-created flow's full graph, and is ownership-checked", async () => {
   const t = convexTest(schema, modules);
-  const { asUser: asAlice } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
-  const { asUser: asBob } = await seedAccountMember(t, { name: "Bob", email: "bob@example.com", role: "agent" });
+  const { asUser: asAlice } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "admin" });
+  const { asUser: asBob } = await seedAccountMember(t, { name: "Bob", email: "bob@example.com", role: "admin" });
 
   const flowId = await asAlice.mutation(api.flows.create, { template: "lead_capture" });
 
@@ -540,7 +540,9 @@ test("runs returns the flow's runs newest-first with embedded contact + flattene
   expect(result.runs).toHaveLength(2);
   expect(result.runs[0]!._id).toBe(run2); // newest first
   expect(result.runs[1]!._id).toBe(run1);
-  expect(result.runs[1]!.contact).toMatchObject({ name: "Jonas", phone: "+15550000000" });
+  // Masked because the caller is an agent — see the dedicated masking
+  // tests below for both ends of that rule.
+  expect(result.runs[1]!.contact).toMatchObject({ name: "Jonas", phone: "•••••••••00" });
   expect(result.runs[0]!.contact).toBeNull();
   expect(result.events).toHaveLength(2);
 });
@@ -579,13 +581,61 @@ test("runs throws NOT_FOUND for another account's flow", async () => {
   await expect(asBob.query(api.flows.runs, { flowId })).rejects.toMatchObject({ data: { code: "NOT_FOUND" } });
 });
 
+// `runs` embeds a contact snapshot, and it was the ONE read path in the
+// codebase that shipped `contact.phone` raw. `lib/roles.ts`'s
+// `canSeeContactPhone` states the policy — a viewer never sees a real
+// number, an agent only on a conversation assigned to them — and
+// `contacts.ts`/`conversations.ts` both enforce it via `maskPhone`. A
+// flow run has no "assigned to caller" notion, so the floor here is
+// supervisor: the same line `canSeeContactPhone` draws for everyone who
+// isn't the assignee. Without this, `flows.list` (ungated) → `flows.runs`
+// is a two-call walk to every contact's E.164 number, no guessing needed.
+test("runs masks the embedded contact phone for a caller below supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
+  const flowId = await asUser.mutation(api.flows.create, { name: "F" });
+  const contactId = await seedContact(t, accountId, "+15550000000", "Jonas");
+  await seedFlowRun(t, { accountId, flowId, contactId });
+
+  const result = await asUser.query(api.flows.runs, { flowId });
+  // maskPhone keeps the last 2 digits so two leads stay distinguishable.
+  expect(result.runs[0]!.contact!.phone).toBe("•••••••••00");
+  // The name is deliberately NOT masked — it is what makes the row usable.
+  expect(result.runs[0]!.contact!.name).toBe("Jonas");
+});
+
+test("runs returns the real contact phone for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "admin" });
+  const flowId = await asUser.mutation(api.flows.create, { name: "F" });
+  const contactId = await seedContact(t, accountId, "+15550000000", "Jonas");
+  await seedFlowRun(t, { accountId, flowId, contactId });
+
+  const supervisorId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Sam", email: "sam@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: supervisorId,
+      accountId,
+      role: "supervisor",
+      fullName: "Sam",
+      email: "sam@example.com",
+    }),
+  );
+  const asSupervisor = t.withIdentity({ subject: `${supervisorId}|s-Sam` });
+
+  const result = await asSupervisor.query(api.flows.runs, { flowId });
+  expect(result.runs[0]!.contact!.phone).toBe("+15550000000");
+});
+
 // ============================================================
 // templates
 // ============================================================
 
 test("templates returns the static catalog with slug/name/description/icon/triggerType/nodeCount", async () => {
   const t = convexTest(schema, modules);
-  const { asUser } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "agent" });
+  const { asUser } = await seedAccountMember(t, { name: "Alice", email: "alice@example.com", role: "admin" });
 
   const list = await asUser.query(api.flows.templates, {});
   expect(list.map((tpl) => tpl.slug).sort()).toEqual(["faq_bot", "lead_capture", "welcome_menu"]);
@@ -601,4 +651,59 @@ test("templates returns the static catalog with slug/name/description/icon/trigg
   const lead = list.find((tpl) => tpl.slug === "lead_capture")!;
   expect(lead.nodeCount).toBe(6);
   expect(lead.triggerType).toBe("first_inbound_message");
+});
+
+// ============================================================
+// Read-side role floor
+//
+// `/automations` and `/flows` are absent from `SUPERVISOR_NAV` in
+// src/lib/auth/roles.ts, so `canAccessNav` admits only admin/owner — but
+// these reads carried no role check, leaving automation and flow
+// definitions (plus their execution logs) readable by a viewer. Floor set
+// to admin to match the nav. Every frontend caller already lives on those
+// admin-only pages.
+// ============================================================
+
+async function seedFloorRole(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  role: "viewer" | "agent" | "supervisor" | "admin",
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@floor.test` }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role,
+      fullName: role,
+      email: `${role}@floor.test`,
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-${role}` });
+}
+
+test("flows list/get/templates throw FORBIDDEN below admin and succeed for an admin", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const flowId = await asOwner.mutation(api.flows.create, { name: "F" });
+
+  const asSupervisor = await seedFloorRole(t, accountId, "supervisor");
+  await expect(asSupervisor.query(api.flows.list, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "admin" },
+  });
+  await expect(
+    asSupervisor.query(api.flows.get, { flowId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  await expect(asSupervisor.query(api.flows.templates, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "admin" },
+  });
+
+  const asAdmin = await seedFloorRole(t, accountId, "admin");
+  await expect(asAdmin.query(api.flows.list, {})).resolves.toBeDefined();
 });

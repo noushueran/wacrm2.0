@@ -87,6 +87,29 @@ interface MetaErrorResponse {
 }
 
 /**
+ * Meta's re-engagement error: the recipient's 24h customer-service window
+ * has closed, so free-form sends are rejected and only an approved
+ * template will be delivered. `notifyStaff` treats this as authoritative
+ * proof the window is shut — more reliable than our own tracking, which
+ * can go stale (e.g. after a block/unblock).
+ */
+export const META_ERROR_OUTSIDE_WINDOW = 131047;
+
+/**
+ * Error carrying Meta's numeric code. Previously the code was parsed and
+ * dropped, leaving callers to string-match Meta's English prose — which
+ * made 131047 undetectable and out-of-window staff sends silently lost.
+ */
+export class MetaApiError extends Error {
+  readonly code: number | undefined;
+  constructor(message: string, code: number | undefined) {
+    super(message);
+    this.name = "MetaApiError";
+    this.code = code;
+  }
+}
+
+/**
  * Meta's error #100 ("Invalid parameter" / unsupported operation) is
  * notoriously opaque: it fires when an object ID doesn't exist, is the
  * WRONG TYPE for the endpoint (e.g. a Phone Number ID passed where a
@@ -123,7 +146,7 @@ async function throwMetaError(
   } catch {
     // response body wasn't JSON — keep the fallback
   }
-  throw new Error(humanizeMetaError(message, code));
+  throw new MetaApiError(humanizeMetaError(message, code), code);
 }
 
 // ============================================================

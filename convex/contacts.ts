@@ -197,6 +197,16 @@ export const list = accountQuery({
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
+    // Browsing the contact directory is supervisor+, matching
+    // `SUPERVISOR_NAV` in src/lib/auth/roles.ts (which is what already
+    // restricts `/contacts`). See the read-side role-floor block in
+    // contacts.test.ts for why this is a security fix and not just
+    // nav tidiness: below supervisor, the `search` branch below matched
+    // on the RAW phone and then masked the results, turning this query
+    // into an oracle that recovered full numbers a digit at a time.
+    // Writes (`create`/`update`) stay at agent — the inbox edits
+    // contacts inline; it is enumerating them that is privileged.
+    ctx.requireRole("supervisor");
     const { search, paginationOpts } = args;
     const term = search?.trim();
 
@@ -253,6 +263,12 @@ export const list = accountQuery({
 export const get = accountQuery({
   args: { contactId: v.id("contacts") },
   handler: async (ctx, args) => {
+    // Supervisor+, same floor as `list` — every frontend caller of this
+    // query (`/contacts`, `/broadcasts/[id]`, `/automations/[id]/logs`)
+    // already sits behind that floor in the nav. The mask below is now
+    // unreachable, but is kept rather than deleted so the policy stays
+    // stated at the point of return if the floor is ever revisited.
+    ctx.requireRole("supervisor");
     const contact = await requireOwnContact(ctx, args.contactId);
     const withTags = await embedTags(ctx, contact);
     return hasMinRole(ctx.role, "supervisor")
@@ -269,6 +285,11 @@ export const filterByTags = accountQuery({
     offset: v.number(),
   },
   handler: async (ctx, args) => {
+    // Supervisor+, same floor as `list`. This is the other half of the
+    // phone-search oracle — it runs the same `matchesContactSearch`
+    // against raw docs before masking — so both must be gated together
+    // or closing one just moves the bypass to the other.
+    ctx.requireRole("supervisor");
     const { tagIds, search, limit, offset } = args;
 
     // OR across tags: union every matching contactId (Set dedupes a
@@ -358,6 +379,9 @@ export const byCustomFieldValue = accountQuery({
     value: v.string(),
   },
   handler: async (ctx, args) => {
+    // Supervisor+, same floor as `list`. Its only caller is the
+    // broadcast audience builder, which is already supervisor+.
+    ctx.requireRole("supervisor");
     // Ranged on `by_account_field`, not a `by_account` scan with a
     // `customFieldId` `.filter()` — a Convex `.filter()` runs after the
     // index scan, so the old form read every custom value in the account

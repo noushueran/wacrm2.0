@@ -1794,3 +1794,118 @@ test("viewer cannot assign", async () => {
     v.asUser.mutation(api.conversations.assign, { conversationId, userId: v.userId }),
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "agent" } });
 });
+
+// ============================================================
+// list: assignment is served by an index, not a post-scan filter
+//
+// `by_account_assigned_last_message` (schema.ts) replaced a `.filter()`
+// stacked on the recency index. A Convex `.filter()` does not narrow the
+// traversal, so `.paginate()` read until `numItems` MATCHES accumulated —
+// a tab matching nothing near the front scanned the whole account.
+//
+// NOTE ON COVERAGE: convex-test does not model the 4096-document read
+// limit (verified — a 5,000-row unmatched scan completes cleanly here),
+// so no test in this suite can fail on the performance property itself.
+// That is exactly why this bug class keeps reaching production with a
+// green suite. What these tests CAN pin is that switching indexes did not
+// change what the inbox shows or the order it shows it in.
+// ============================================================
+
+test("list: the Mine tab is ordered newest-first by lastMessageAt", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "1", phoneNormalized: "1", name: "C" }),
+  );
+  // Insert oldest-first so insertion order can't accidentally satisfy the
+  // assertion — only a real lastMessageAt-desc ordering can.
+  for (const at of [100, 300, 200]) {
+    await t.run((ctx) =>
+      ctx.db.insert("conversations", {
+        accountId, contactId, status: "open" as const, unreadCount: 0,
+        assignedToUserId: a.userId, lastMessageAt: at,
+      }),
+    );
+  }
+
+  const mine = await a.asUser.query(api.conversations.list, { assignment: "mine", ...onePage });
+  expect(mine.page.map((c) => c.lastMessageAt)).toEqual([300, 200, 100]);
+});
+
+test("list: the Unassigned tab is ordered newest-first and excludes assigned threads", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "1", phoneNormalized: "1", name: "C" }),
+  );
+  for (const at of [100, 300, 200]) {
+    await t.run((ctx) =>
+      ctx.db.insert("conversations", {
+        accountId, contactId, status: "open" as const, unreadCount: 0, lastMessageAt: at,
+      }),
+    );
+  }
+  // An assigned thread NEWER than every pooled one — it must not lead the
+  // page just because it sorts first on the recency index.
+  await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId, contactId, status: "open" as const, unreadCount: 0,
+      assignedToUserId: a.userId, lastMessageAt: 999,
+    }),
+  );
+
+  const pool = await a.asUser.query(api.conversations.list, { assignment: "unassigned", ...onePage });
+  expect(pool.page.map((c) => c.lastMessageAt)).toEqual([300, 200, 100]);
+});
+
+test("list: the indexed tab agrees with filtering the unscoped list by hand", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const s = await seedUserInAccount(t, accountId, { name: "Sup", email: "s@x.com", role: "supervisor" });
+  const b = await seedUserInAccount(t, accountId, { name: "AgentB", email: "b@x.com", role: "agent" });
+
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "1", phoneNormalized: "1", name: "C" }),
+  );
+  for (let i = 0; i < 8; i++) {
+    await t.run((ctx) =>
+      ctx.db.insert("conversations", {
+        accountId, contactId, status: "open" as const, unreadCount: 0,
+        lastMessageAt: i * 10,
+        ...(i % 3 === 0 ? { assignedToUserId: b.userId } : {}),
+      }),
+    );
+  }
+
+  // Supervisor sees everything, so the unscoped list is ground truth for
+  // what the pool tab (a different index) must return.
+  const all = await s.asUser.query(api.conversations.list, onePage);
+  const expected = all.page.filter((c) => c.assignedToUserId === undefined).map((c) => c._id);
+  const pool = await s.asUser.query(api.conversations.list, { assignment: "unassigned", ...onePage });
+  expect(pool.page.map((c) => c._id)).toEqual(expected);
+});
+
+test("list: a viewer clicking Mine gets an empty page (the predicate is unsatisfiable)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountWithOwner(t);
+  const v = await seedUserInAccount(t, accountId, { name: "Vic", email: "v@x.com", role: "viewer" });
+  const a = await seedUserInAccount(t, accountId, { name: "AgentA", email: "a@x.com", role: "agent" });
+
+  await seedConv(t, accountId, { phone: "111", name: "Pool" });
+  await seedConv(t, accountId, { phone: "222", name: "Theirs", assignedToUserId: a.userId });
+
+  // A viewer's scope is the pool only, so "assigned to me" can never hold.
+  // Previously this scanned every conversation in the account to return
+  // nothing; now it short-circuits before any read.
+  const mine = await v.asUser.query(api.conversations.list, { assignment: "mine", ...onePage });
+  expect(mine.page).toEqual([]);
+  expect(mine.isDone).toBe(true);
+
+  // ...and the viewer's normal view is unaffected.
+  const pool = await v.asUser.query(api.conversations.list, onePage);
+  expect(pool.page.map((c) => c.contact?.name)).toEqual(["Pool"]);
+});

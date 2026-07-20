@@ -495,3 +495,30 @@ test("flattenInboundMessage: a payload-less contacts message still renders a gen
     text: "📇 Shared contact",
   });
 });
+
+test("parses a template quick-reply button tap as text", () => {
+  const result = flattenInboundMessage({
+    id: "wamid.BTN",
+    type: "button",
+    button: { payload: "I'll take it", text: "I'll take it" },
+  } as never);
+  expect(result).toEqual({ type: "text", text: "I'll take it", wamid: "wamid.BTN" });
+});
+
+test("falls back to the button payload when no display text is present", () => {
+  const result = flattenInboundMessage({
+    id: "wamid.BTN2",
+    type: "button",
+    button: { payload: "Not now" },
+  } as never);
+  expect(result?.text).toBe("Not now");
+});
+
+test("does not emit the unsupported-type placeholder for buttons", () => {
+  const result = flattenInboundMessage({
+    id: "wamid.BTN3",
+    type: "button",
+    button: { text: "Show me" },
+  } as never);
+  expect(result?.text).not.toContain("Unsupported message type");
+});

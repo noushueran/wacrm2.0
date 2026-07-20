@@ -223,7 +223,7 @@ test("create's out_of_office template nests its send_message step under the cond
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
 
   const automationId = await asUser.mutation(api.automations.create, {
@@ -318,7 +318,7 @@ test("list returns the caller's own automations, newest-first, each with a stepC
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
 
   await asUser.mutation(api.automations.create, {
@@ -344,12 +344,12 @@ test("list never returns another account's automations", async () => {
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "admin",
   });
 
   await asAlice.mutation(api.automations.create, {
@@ -370,7 +370,7 @@ test("get round-trips a nested step tree built by create, and is ownership-check
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
 
   const automationId = await asUser.mutation(api.automations.create, {
@@ -397,12 +397,12 @@ test("get throws NOT_FOUND when the automation belongs to a different account", 
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "admin",
   });
 
   const automationId = await asAlice.mutation(api.automations.create, {
@@ -988,7 +988,7 @@ test("duplicate deep-copies the automation and its step tree with fresh ids", as
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const originalId = await asUser.mutation(api.automations.create, {
     name: "Original",
@@ -1080,12 +1080,12 @@ test("logs returns only the caller's own account's logs, newest-first", async ()
   const { asUser: asAlice, accountId: aliceAccountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const { asUser: asBob, accountId: bobAccountId } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "admin",
   });
   const aliceAutomationId = await asAlice.mutation(api.automations.create, {
     name: "Alice's",
@@ -1113,7 +1113,7 @@ test("logs filters by automationId when given, and a foreign automationId yields
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const automationA = await asUser.mutation(api.automations.create, {
     name: "A",
@@ -1133,7 +1133,7 @@ test("logs filters by automationId when given, and a foreign automationId yields
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "admin",
   });
   const forForeign = await asBob.query(api.automations.logs, { automationId: automationA });
   expect(forForeign).toEqual([]);
@@ -1144,7 +1144,7 @@ test("logs respects the limit argument", async () => {
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const automationId = await asUser.mutation(api.automations.create, {
     name: "A",
@@ -1170,7 +1170,7 @@ async function seedFilteredLogFixture(t: ReturnType<typeof convexTest>) {
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const automationA = await asUser.mutation(api.automations.create, {
     name: "A",
@@ -1226,7 +1226,7 @@ test("logs clamps a huge limit to 200 so one request can't take the whole log ta
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const automationId = await asUser.mutation(api.automations.create, {
     name: "A",
@@ -1253,7 +1253,7 @@ test("logs clamps a non-positive limit up to 1 rather than returning nothing", a
   const { asUser, accountId } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "admin",
   });
   const automationId = await asUser.mutation(api.automations.create, {
     name: "A",
@@ -1265,4 +1265,64 @@ test("logs clamps a non-positive limit up to 1 rather than returning nothing", a
   // Unclamped, `.take(0)` returned []; the clamp floors the limit at 1.
   const rows = await asUser.query(api.automations.logs, { limit: 0 });
   expect(rows).toHaveLength(1);
+});
+
+// ============================================================
+// Read-side role floor
+//
+// `/automations` and `/flows` are absent from `SUPERVISOR_NAV` in
+// src/lib/auth/roles.ts, so `canAccessNav` admits only admin/owner — but
+// these reads carried no role check, leaving automation and flow
+// definitions (plus their execution logs) readable by a viewer. Floor set
+// to admin to match the nav. Every frontend caller already lives on those
+// admin-only pages.
+// ============================================================
+
+async function seedFloorRole(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  role: "viewer" | "agent" | "supervisor" | "admin",
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: role, email: `${role}@floor.test` }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role,
+      fullName: role,
+      email: `${role}@floor.test`,
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-${role}` });
+}
+
+test("automations list/get/logs throw FORBIDDEN below admin and succeed for an admin", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const automationId = await asOwner.mutation(api.automations.create, {
+    name: "A",
+    triggerType: "keyword_match",
+    triggerConfig: { keywords: ["hi"] },
+    steps: [],
+  });
+
+  const asSupervisor = await seedFloorRole(t, accountId, "supervisor");
+  await expect(asSupervisor.query(api.automations.list, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "admin" },
+  });
+  await expect(
+    asSupervisor.query(api.automations.get, { automationId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "admin" } });
+  await expect(asSupervisor.query(api.automations.logs, {})).rejects.toMatchObject({
+    data: { code: "FORBIDDEN", min: "admin" },
+  });
+
+  const asAdmin = await seedFloorRole(t, accountId, "admin");
+  await expect(asAdmin.query(api.automations.list, {})).resolves.toBeDefined();
 });

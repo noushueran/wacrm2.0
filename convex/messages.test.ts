@@ -1,10 +1,12 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
+import { insertMessageAndUpdateConversation } from "./messages";
+import { hourStartMs } from "./lib/messageStats";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches
@@ -824,4 +826,199 @@ test("appendInternal persists replyToMessageId (reply linkage)", async () => {
 
   const stored = await t.run((ctx) => ctx.db.get(replyId));
   expect(stored!.replyToMessageId).toBe(parentId);
+});
+
+// ============================================================
+// Hourly rollup is maintained at the message-insert choke point
+//
+// `insertMessageAndUpdateConversation` is the ONLY `insert("messages")` in
+// the backend — every path (inbound ingest, agent send, broadcast
+// fan-out) funnels through it — so incrementing here is what makes the
+// dashboard chart's rollup complete. A second insert site added later
+// without a matching increment would silently undercount the chart, which
+// is why these tests assert through the choke point rather than through
+// any one caller.
+// ============================================================
+
+async function statsRows(t: ReturnType<typeof convexTest>) {
+  return await t.run((ctx) => ctx.db.query("messageHourlyStats").collect());
+}
+
+async function appendVia(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  conversationId: Id<"conversations">,
+  senderType: "customer" | "agent" | "bot",
+) {
+  await t.run(async (ctx) => {
+    const conversation = await ctx.db.get(conversationId);
+    await insertMessageAndUpdateConversation(
+      ctx,
+      { accountId, conversationId, senderType, contentType: "text", contentText: "hi" },
+      conversation!,
+    );
+  });
+}
+
+test("appending a message opens an hourly bucket and counts it by direction", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+1", phoneNormalized: "1" }),
+  );
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  await appendVia(t, accountId, conversationId, "customer");
+  await appendVia(t, accountId, conversationId, "agent");
+  await appendVia(t, accountId, conversationId, "bot");
+
+  const rows = await statsRows(t);
+  // All three land in the same hour, so one row — the rollup must PATCH an
+  // open bucket, not insert a row per message (that would reproduce the
+  // unbounded read it exists to avoid).
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.accountId).toBe(accountId);
+  // Only "customer" is inbound; agent and bot are both outgoing, matching
+  // what the chart counted when it read raw messages.
+  expect(rows[0]!.incoming).toBe(1);
+  expect(rows[0]!.outgoing).toBe(2);
+});
+
+test("the hourly bucket is keyed to the containing UTC hour", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+1", phoneNormalized: "1" }),
+  );
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  await appendVia(t, accountId, conversationId, "customer");
+
+  const rows = await statsRows(t);
+  expect(rows[0]!.hourStartMs).toBe(hourStartMs(rows[0]!.hourStartMs));
+  expect(rows[0]!.hourStartMs % 3_600_000).toBe(0);
+});
+
+test("each account accumulates its own buckets", async () => {
+  const t = convexTest(schema, modules);
+  const a = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const b = await seedAccountMember(t, { name: "B", email: "b@x.com", role: "admin" });
+  const mk = async (accountId: Id<"accounts">) => {
+    const contactId = await t.run((ctx) =>
+      ctx.db.insert("contacts", { accountId, phone: "+1", phoneNormalized: "1" }),
+    );
+    return await seedConversation(t, { accountId, contactId });
+  };
+  const convA = await mk(a.accountId);
+  const convB = await mk(b.accountId);
+
+  await appendVia(t, a.accountId, convA, "customer");
+  await appendVia(t, a.accountId, convA, "customer");
+  await appendVia(t, b.accountId, convB, "customer");
+
+  const rows = await statsRows(t);
+  expect(rows).toHaveLength(2);
+  const byAccount = Object.fromEntries(rows.map((r) => [r.accountId, r.incoming]));
+  expect(byAccount[a.accountId]).toBe(2);
+  expect(byAccount[b.accountId]).toBe(1);
+});
+
+// ============================================================
+// Backfill
+//
+// The rollup only starts accumulating at deploy, so without this the
+// dashboard chart is empty for everything that happened before. The
+// important property beyond "it works" is IDEMPOTENCE: it rebuilds whole
+// hours with SET semantics rather than incrementing, so a re-run (or a
+// resumed run that overlaps) converges instead of doubling.
+// ============================================================
+
+/** Inserts a message the way pre-rollup history exists: raw, with no
+ *  hourly bucket behind it. */
+async function seedRawMessage(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  conversationId: Id<"conversations">,
+  senderType: "customer" | "agent" | "bot",
+) {
+  await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType,
+      contentType: "text",
+      contentText: "old",
+      status: "sent",
+    }),
+  );
+}
+
+test("backfill rebuilds hourly buckets from pre-existing messages", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+1", phoneNormalized: "1" }),
+  );
+  const conversationId = await seedConversation(t, { accountId, contactId });
+
+  await seedRawMessage(t, accountId, conversationId, "customer");
+  await seedRawMessage(t, accountId, conversationId, "customer");
+  await seedRawMessage(t, accountId, conversationId, "agent");
+  expect(await statsRows(t)).toHaveLength(0); // nothing rolled up yet
+
+  await t.mutation(internal.messages.backfillMessageHourlyStats, {});
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const rows = await statsRows(t);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.incoming).toBe(2);
+  expect(rows[0]!.outgoing).toBe(1);
+});
+
+test("backfill is idempotent — a second run does not double the counts", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone: "+1", phoneNormalized: "1" }),
+  );
+  const conversationId = await seedConversation(t, { accountId, contactId });
+  await seedRawMessage(t, accountId, conversationId, "customer");
+  await seedRawMessage(t, accountId, conversationId, "agent");
+
+  await t.mutation(internal.messages.backfillMessageHourlyStats, {});
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  const first = await statsRows(t);
+
+  await t.mutation(internal.messages.backfillMessageHourlyStats, {});
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  const second = await statsRows(t);
+
+  expect(second).toHaveLength(first.length);
+  expect(second[0]!.incoming).toBe(first[0]!.incoming);
+  expect(second[0]!.outgoing).toBe(first[0]!.outgoing);
+  expect(second[0]!.incoming).toBe(1);
+  expect(second[0]!.outgoing).toBe(1);
+});
+
+test("backfill covers every account, not just the first", async () => {
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const a = await seedAccountMember(t, { name: "A", email: "a@x.com", role: "admin" });
+  const b = await seedAccountMember(t, { name: "B", email: "b@x.com", role: "admin" });
+  for (const acc of [a, b]) {
+    const contactId = await t.run((ctx) =>
+      ctx.db.insert("contacts", { accountId: acc.accountId, phone: "+1", phoneNormalized: "1" }),
+    );
+    const conversationId = await seedConversation(t, { accountId: acc.accountId, contactId });
+    await seedRawMessage(t, acc.accountId, conversationId, "customer");
+  }
+
+  await t.mutation(internal.messages.backfillMessageHourlyStats, {});
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const rows = await statsRows(t);
+  expect(rows).toHaveLength(2);
+  expect(rows.every((r) => r.incoming === 1)).toBe(true);
 });

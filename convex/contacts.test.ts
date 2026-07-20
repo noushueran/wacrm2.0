@@ -235,12 +235,12 @@ test("list never returns another account's contacts", async () => {
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
 
   await asAlice.mutation(api.contacts.create, {
@@ -265,7 +265,7 @@ test("filterByTags never returns another account's contacts, even when the calle
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
 
   const aliceContactId = await asAlice.mutation(api.contacts.create, {
@@ -647,7 +647,7 @@ test("list search_name matches by name prefix and stays scoped to the caller's a
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
 
   await asUser.mutation(api.contacts.create, {
@@ -1261,12 +1261,12 @@ test("get throws NOT_FOUND when the contact belongs to a different account", asy
   const { asUser: asAlice } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
   const { asUser: asBob } = await seedAccountMember(t, {
     name: "Bob",
     email: "bob@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
 
   const aliceContactId = await asAlice.mutation(api.contacts.create, {
@@ -1291,106 +1291,95 @@ test("get throws NOT_FOUND when the contact belongs to a different account", asy
 // `conversations.ts`'s `embedContact` does.
 // ============================================================
 
-test("contacts.get masks the phone for agent and viewer", async () => {
+// These four tests previously asserted that an agent/viewer calling these
+// reads directly received a MASKED contact. That capability is gone: the
+// reads are supervisor+ now (see the read-side role-floor block above), so
+// a sub-supervisor caller never reaches the masking branch at all. They are
+// rewritten to pin the floor instead — the stronger guarantee, since it
+// denies the whole row rather than one field of it.
+//
+// The masking policy itself is NOT dead and is still covered: agents see
+// contacts through `conversations.ts`, which applies `conversationScope`
+// plus `canSeeContactPhone` and has its own mask tests. The mask branches
+// left in this file are unreachable defence-in-depth, kept so that lowering
+// the floor cannot silently start leaking real numbers.
+
+test("contacts.get denies an agent outright rather than masking", async () => {
   const t = convexTest(schema, modules);
   const { asUser, accountId } = await seedAccountMember(t, { name: "Ag", email: "ag@x.com", role: "agent" });
   const contactId = await t.run((ctx) =>
     ctx.db.insert("contacts", { accountId, phone: "+15551230148", phoneNormalized: "15551230148", name: "X" }),
   );
-  const got = await asUser.query(api.contacts.get, { contactId });
-  expect(got.phone).toMatch(/^•+48$/);
-  expect(got.phoneNormalized).toBe("");
+  await expect(
+    asUser.query(api.contacts.get, { contactId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
-test("filterByTags masks phone for agent/viewer", async () => {
+test("contacts.get denies a viewer outright rather than masking", async () => {
   const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
-    name: "Ag",
-    email: "ag@x.com",
-    role: "agent",
-  });
-  const { tagId } = await t.run(async (ctx) => {
-    const contactId = await ctx.db.insert("contacts", {
-      accountId,
-      phone: "+15551230148",
-      phoneNormalized: "15551230148",
-      name: "X",
-    });
-    const tagId = await ctx.db.insert("tags", {
-      accountId,
-      name: "VIP",
-      color: "#f00",
-    });
-    await ctx.db.insert("contactTags", { accountId, contactId, tagId });
-    return { contactId, tagId };
-  });
-
-  const result = await asUser.query(api.contacts.filterByTags, {
-    tagIds: [tagId],
-    limit: 10,
-    offset: 0,
-  });
-
-  expect(result.items).toHaveLength(1);
-  expect(result.items[0]!.phone).toMatch(/^•+48$/);
-  expect(result.items[0]!.phoneNormalized).toBe("");
-});
-
-test("byCustomFieldValue masks phone for agent/viewer", async () => {
-  const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, {
-    name: "Ag",
-    email: "ag@x.com",
-    role: "agent",
-  });
-  const { fieldId } = await t.run(async (ctx) => {
-    const contactId = await ctx.db.insert("contacts", {
-      accountId,
-      phone: "+15551230148",
-      phoneNormalized: "15551230148",
-      name: "X",
-    });
-    const fieldId = await ctx.db.insert("customFields", {
-      accountId,
-      fieldName: "Plan",
-      fieldType: "text",
-    });
-    await ctx.db.insert("contactCustomValues", {
-      accountId,
-      contactId,
-      customFieldId: fieldId,
-      value: "Pro",
-    });
-    return { contactId, fieldId };
-  });
-
-  const result = await asUser.query(api.contacts.byCustomFieldValue, {
-    customFieldId: fieldId,
-    operator: "is",
-    value: "Pro",
-  });
-
-  expect(result).toHaveLength(1);
-  expect(result[0]!.phone).toMatch(/^•+48$/);
-  expect(result[0]!.phoneNormalized).toBe("");
-});
-
-test("contacts.get masks both phone and altPhone for agent", async () => {
-  const t = convexTest(schema, modules);
-  const { asUser, accountId } = await seedAccountMember(t, { name: "Ag", email: "ag@x.com", role: "agent" });
+  const { accountId } = await seedAccountMember(t, { name: "Ow", email: "ow@x.com", role: "owner" });
   const contactId = await t.run((ctx) =>
-    ctx.db.insert("contacts", {
-      accountId,
-      phone: "+15551230148",
-      phoneNormalized: "15551230148",
-      altPhone: "+15551234567",
-      name: "X",
+    ctx.db.insert("contacts", { accountId, phone: "+15551230148", phoneNormalized: "15551230148", name: "X" }),
+  );
+  const viewerId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Vic", email: "vic@x.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: viewerId, accountId, role: "viewer", fullName: "Vic", email: "vic@x.com",
     }),
   );
-  const got = await asUser.query(api.contacts.get, { contactId });
-  expect(got.phone).toMatch(/^•+48$/);
-  expect(got.altPhone).toMatch(/^•+67$/);
-  expect(got.phoneNormalized).toBe("");
+  await expect(
+    t.withIdentity({ subject: `${viewerId}|s-Vic` }).query(api.contacts.get, { contactId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("filterByTags denies an agent outright rather than masking", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  const tagId = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId, phone: "+15551230148", phoneNormalized: "15551230148", name: "X",
+    });
+    const tagId = await ctx.db.insert("tags", { accountId, name: "VIP", color: "#f00" });
+    await ctx.db.insert("contactTags", { accountId, contactId, tagId });
+    return tagId;
+  });
+
+  await expect(
+    asUser.query(api.contacts.filterByTags, { tagIds: [tagId], limit: 10, offset: 0 }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("byCustomFieldValue denies an agent outright rather than masking", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Ag",
+    email: "ag@x.com",
+    role: "agent",
+  });
+  const fieldId = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId, phone: "+15551230148", phoneNormalized: "15551230148", name: "X",
+    });
+    const fieldId = await ctx.db.insert("customFields", {
+      accountId, fieldName: "Plan", fieldType: "text",
+    });
+    await ctx.db.insert("contactCustomValues", {
+      accountId, contactId, customFieldId: fieldId, value: "Pro",
+    });
+    return fieldId;
+  });
+
+  await expect(
+    asUser.query(api.contacts.byCustomFieldValue, {
+      customFieldId: fieldId, operator: "is", value: "Pro",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 test("filterByTags returns nothing for an empty tagIds list", async () => {
@@ -1398,7 +1387,7 @@ test("filterByTags returns nothing for an empty tagIds list", async () => {
   const { asUser } = await seedAccountMember(t, {
     name: "Alice",
     email: "alice@example.com",
-    role: "agent",
+    role: "supervisor", // reads are supervisor+; this test is about scoping, not policy,
   });
   await asUser.mutation(api.contacts.create, { phone: "111" });
 
@@ -1767,6 +1756,167 @@ test("assignTag keeps both tags for a multi-select group", async () => {
     ctx.db.query("contactTags").withIndex("by_contact", (q) => q.eq("contactId", contactId)).collect(),
   );
   expect(links.map((l) => l.tagId).sort()).toEqual([th, ba].sort());
+});
+
+// ============================================================
+// Read-side role floor
+//
+// `/contacts` is supervisor+ in the nav (`SUPERVISOR_NAV`, and it is
+// absent from `AGENT_NAV`/`VIEWER_NAV` in src/lib/auth/roles.ts), and
+// `require-section.tsx` states in comment that "server queries already
+// reject; this is UX." That was not true for this file: every read below
+// was reachable by a viewer, whose `conversationScope` is "unassigned
+// only", yielding the entire contact directory.
+//
+// Masking made it worse rather than better. `maskPhone` preserves digit
+// length and the last two digits, `_id` is stable, and
+// `matchesContactSearch` substring-matches the caller's term against the
+// RAW `phoneNormalized` before masking is applied — so a viewer could
+// extend a known suffix a digit at a time and read set membership as an
+// oracle, recovering a full E.164 number in ~120 queries. Gating the
+// reads closes the oracle at its source: the only callers who can still
+// search by digits are supervisors, who are permitted the real number
+// anyway.
+//
+// Writes are deliberately NOT gated. `contacts.create`/`update` stay at
+// agent because the inbox creates and edits contacts inline; it is
+// browsing the directory that is supervisor+. Every frontend caller of
+// the four reads below lives on `/contacts`, `/pipelines`, `/broadcasts`
+// or `/automations/[id]/logs` — all already supervisor+ or admin+, so
+// this changes no reachable UI.
+// ============================================================
+
+async function seedSupervisor(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+) {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Sam", email: "sam@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: "supervisor",
+      fullName: "Sam",
+      email: "sam@example.com",
+    }),
+  );
+  return t.withIdentity({ subject: `${userId}|s-Sam` });
+}
+
+const onePageArgs = {
+  paginationOpts: { numItems: 10, cursor: null },
+};
+
+test("list throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAgent, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  await asAgent.mutation(api.contacts.create, { phone: "+15550000000" });
+
+  await expect(
+    asAgent.query(api.contacts.list, onePageArgs),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+
+  const asSupervisor = await seedSupervisor(t, accountId);
+  const result = await asSupervisor.query(api.contacts.list, onePageArgs);
+  expect(result.page).toHaveLength(1);
+});
+
+test("list denies a viewer — the role the phone-search oracle was reachable from", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  await asOwner.mutation(api.contacts.create, { phone: "+15550000000" });
+
+  const viewerId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Vic", email: "vic@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: viewerId,
+      accountId,
+      role: "viewer",
+      fullName: "Vic",
+      email: "vic@example.com",
+    }),
+  );
+  const asViewer = t.withIdentity({ subject: `${viewerId}|s-Vic` });
+
+  // The oracle probed with a digit term; that path must be unreachable.
+  await expect(
+    asViewer.query(api.contacts.list, { ...onePageArgs, search: "5550" }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+test("get throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAgent, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asAgent.mutation(api.contacts.create, {
+    phone: "+15550000001",
+  });
+
+  await expect(
+    asAgent.query(api.contacts.get, { contactId }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+
+  const asSupervisor = await seedSupervisor(t, accountId);
+  await expect(
+    asSupervisor.query(api.contacts.get, { contactId }),
+  ).resolves.toMatchObject({ _id: contactId });
+});
+
+test("filterByTags throws FORBIDDEN below supervisor and succeeds for a supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAgent, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  await expect(
+    asAgent.query(api.contacts.filterByTags, { tagIds: [], limit: 10, offset: 0 }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+
+  const asSupervisor = await seedSupervisor(t, accountId);
+  await expect(
+    asSupervisor.query(api.contacts.filterByTags, { tagIds: [], limit: 10, offset: 0 }),
+  ).resolves.toBeDefined();
+});
+
+test("byCustomFieldValue throws FORBIDDEN below supervisor", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asAgent, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const customFieldId = await t.run((ctx) =>
+    ctx.db.insert("customFields", {
+      accountId,
+      fieldName: "Passport",
+      fieldType: "text",
+    }),
+  );
+
+  await expect(
+    asAgent.query(api.contacts.byCustomFieldValue, {
+      customFieldId,
+      operator: "is",
+      value: "x",
+    }),
+  ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
 });
 
 // ============================================================

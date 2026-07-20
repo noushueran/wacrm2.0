@@ -101,43 +101,104 @@ export const list = accountQuery({
     const { status, assignment, paginationOpts } = args;
     const scope = conversationScope(ctx.role);
 
-    const base = ctx.db
-      .query("conversations")
-      .withIndex("by_account_last_message", (q) =>
-        q.eq("accountId", ctx.accountId),
-      )
-      .order("desc");
+    // Collapse the role scope and the Mine/Unassigned tab into ONE
+    // assignment predicate before touching the database. Both used to be
+    // `.filter()`s stacked on a `by_account_last_message` scan, which does
+    // not narrow the traversal — `.paginate()` then reads until `numItems`
+    // MATCHES accumulate, so a tab matching nothing near the front scanned
+    // to the end of the account. See the index comment in schema.ts.
+    //
+    // The tab AND-composes with the scope and so can never widen what a
+    // role may see; collapsing them here keeps that property explicit
+    // rather than emergent from filter order.
+    type AssignmentPlan =
+      // No assignment predicate at all — supervisor+ with no tab.
+      | { kind: "any" }
+      // Exactly one assignee (a user id, or `undefined` for the pool).
+      | { kind: "eq"; assignee: Id<"users"> | undefined }
+      // An agent's default view: assigned to me OR unassigned.
+      | { kind: "meOrPool" }
+      // Unsatisfiable — e.g. a viewer (pool-only scope) clicking "Mine".
+      | { kind: "empty" };
 
-    // Compose the optional status filter with the role visibility scope,
-    // plus the optional assignment tab. `own_and_pool` = assigned to me OR
-    // unassigned; `unassigned` = the pool only; `all` = no scope predicate.
-    // The assignment tab (`mine`/`unassigned`) narrows *within* that scope
-    // and is AND-composed, so it can never widen a role's visibility.
-    const query =
-      status || assignment || scope !== "all"
-        ? base.filter((q) => {
-            const parts = [];
-            if (status) parts.push(q.eq(q.field("status"), status));
-            if (scope === "own_and_pool") {
-              parts.push(
-                q.or(
-                  q.eq(q.field("assignedToUserId"), ctx.userId),
-                  q.eq(q.field("assignedToUserId"), undefined),
-                ),
-              );
-            } else if (scope === "unassigned") {
-              parts.push(q.eq(q.field("assignedToUserId"), undefined));
-            }
-            if (assignment === "mine") {
-              parts.push(q.eq(q.field("assignedToUserId"), ctx.userId));
-            } else if (assignment === "unassigned") {
-              parts.push(q.eq(q.field("assignedToUserId"), undefined));
-            }
-            return parts.reduce((a, b) => q.and(a, b));
-          })
-        : base;
+    const plan: AssignmentPlan = (() => {
+      if (scope === "unassigned") {
+        // Viewer: the pool is all they may see, so "Mine" is a
+        // contradiction. This is the worst case of the old code — an
+        // impossible predicate scanned every conversation in the account
+        // to return nothing.
+        return assignment === "mine"
+          ? { kind: "empty" }
+          : { kind: "eq", assignee: undefined };
+      }
+      if (assignment === "mine") return { kind: "eq", assignee: ctx.userId };
+      if (assignment === "unassigned") return { kind: "eq", assignee: undefined };
+      return scope === "own_and_pool" ? { kind: "meOrPool" } : { kind: "any" };
+    })();
 
-    const result = await query.paginate(paginationOpts);
+    // Nothing can match — answer without a single read.
+    if (plan.kind === "empty") {
+      return { page: [], isDone: true, continueCursor: "" };
+    }
+
+    // `status` stays a filter in every branch. That is safe alongside an
+    // indexed assignment: it is a coarse predicate (almost everything is
+    // "open", since nothing auto-closes — see `dashboard.metrics`), so it
+    // matches early and often rather than starving the scan.
+    const result = await (async () => {
+      if (plan.kind === "eq") {
+        // Single assignee → a genuine index range. This is the fix: the
+        // Mine and Unassigned tabs, for every role, now read only their own
+        // slice instead of scanning the whole account.
+        const q = ctx.db
+          .query("conversations")
+          .withIndex("by_account_assigned_last_message", (ix) =>
+            ix
+              .eq("accountId", ctx.accountId)
+              .eq("assignedToUserId", plan.assignee),
+          )
+          .order("desc");
+        return status
+          ? await q
+              .filter((f) => f.eq(f.field("status"), status))
+              .paginate(paginationOpts)
+          : await q.paginate(paginationOpts);
+      }
+
+      // `any` and `meOrPool` keep the recency index. `any` needs no
+      // assignment predicate at all. `meOrPool` is an OR across two
+      // disjoint index ranges, which a single `.paginate()` cursor cannot
+      // express; it stays a filter deliberately, and is the benign case —
+      // for an agent, "mine or unassigned" matches a large share of the
+      // rows near the front, so it terminates quickly. Splitting it into
+      // two paginated streams merged under a composite cursor is a
+      // separate change, worth doing only if an account ever accumulates
+      // enough OTHER agents' threads to starve it.
+      const q = ctx.db
+        .query("conversations")
+        .withIndex("by_account_last_message", (ix) =>
+          ix.eq("accountId", ctx.accountId),
+        )
+        .order("desc");
+
+      if (!status && plan.kind === "any") return await q.paginate(paginationOpts);
+
+      return await q
+        .filter((f) => {
+          const parts = [];
+          if (status) parts.push(f.eq(f.field("status"), status));
+          if (plan.kind === "meOrPool") {
+            parts.push(
+              f.or(
+                f.eq(f.field("assignedToUserId"), ctx.userId),
+                f.eq(f.field("assignedToUserId"), undefined),
+              ),
+            );
+          }
+          return parts.reduce((a, b) => f.and(a, b));
+        })
+        .paginate(paginationOpts);
+    })();
 
     const page = await Promise.all(
       result.page.map((conversation) => embedContact(ctx, conversation)),
