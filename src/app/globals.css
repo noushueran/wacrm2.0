@@ -2,7 +2,19 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
-@custom-variant dark (&:is(.dark *));
+/* Tailwind's `dark:` variant, wired to how THIS app actually switches
+ * mode: `document.documentElement.dataset.mode` (see `use-theme.tsx` and
+ * the boot script in `layout.tsx`). It must stay in sync with the
+ * `html[data-mode="dark"]` block below — `src/lib/themes.test.ts` fails
+ * if it drifts.
+ *
+ * The shadcn default here is `&:is(.dark *)`, which keys off a `.dark`
+ * class that nothing in this app ever sets. Under that selector every
+ * `dark:` utility in the codebase silently no-ops: `dark:` overrides
+ * never applied, so dark mode rendered the light-mode stop on a dark
+ * surface (soft badges measured 2.36–3.59:1, under the WCAG AA 4.5:1
+ * floor). Do not "simplify" this back to `.dark`. */
+@custom-variant dark (&:is(html[data-mode="dark"] *));
 
 @theme inline {
   --color-background: var(--background);
