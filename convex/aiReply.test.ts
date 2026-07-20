@@ -454,6 +454,7 @@ test("a customer media row with mediaKey and R2 unconfigured is skipped (best-ef
   // be caught per-row (matching the existing "best-effort per row"
   // design already documented on `untranscribedMediaRows`) and must not
   // take down the rest of the dispatch (the reply still sends).
+  vi.useFakeTimers();
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -481,6 +482,12 @@ test("a customer media row with mediaKey and R2 unconfigured is skipped (best-ef
   );
 
   await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+  // `dispatchInbound` no longer sends inline — it schedules `deliverReply`
+  // after the pacing delay — so the reply only exists once the scheduler is
+  // drained. The assertion below is unchanged: the point is still that a
+  // throwing `resolveMediaUrlLazy` is caught per-row and does NOT cost the
+  // customer their reply.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
 
   const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
   expect(audioRow!.aiTranscription).toBeUndefined();
