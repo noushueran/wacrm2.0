@@ -51,4 +51,20 @@ describe("VoiceTranscript", () => {
     expect(render({ text: LONG })).toContain("Show more");
     expect(render({ text: "Yes please." })).not.toContain("Show more");
   });
+
+  it("can break an unbroken run rather than overflowing the bubble", () => {
+    // `line-clamp` carries no word-breaking of its own, so without
+    // `break-words` a single long token — a URL, a spelled-out email, a
+    // PNR — runs off the side of the bubble instead of wrapping. That
+    // is issue #165's failure class, and it bites hardest in the
+    // UNCLAMPED state, i.e. every transcript under the threshold.
+    // Asserting the class is the only handle available here: real
+    // overflow needs layout, and this repo has no jsdom.
+    expect(render({ text: "https://holidayys.co/packages/dubai-family-7n-6d-winter-2026" }))
+      .toContain("break-words");
+  });
+
+  it("reports its collapsed state to assistive tech", () => {
+    expect(render({ text: LONG })).toContain('aria-expanded="false"');
+  });
 });

@@ -58,9 +58,16 @@ export function VoiceTranscript({
         <Sparkles className="h-2.5 w-2.5" />
         {label}
       </span>
+      {/* `break-words` is load-bearing, not decoration: `line-clamp`
+          brings no word-breaking of its own, and a transcript can carry
+          one unbroken run — a URL, a spelled-out email, a PNR or a long
+          phone number are all ordinary in a travel voice note. Without
+          it that run overflows the bubble sideways, the same failure
+          class as issue #165. Every other `whitespace-pre-wrap` in
+          `message-bubble.tsx` pairs the two for exactly this reason. */}
       <p
         className={cn(
-          "mt-1 whitespace-pre-wrap text-xs opacity-80",
+          "mt-1 whitespace-pre-wrap break-words text-xs opacity-80",
           canOverflow && !expanded && "line-clamp-3",
         )}
       >
@@ -70,6 +77,7 @@ export function VoiceTranscript({
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
           className="mt-0.5 text-[10px] underline opacity-70 hover:opacity-100"
         >
           {expanded ? lessLabel : moreLabel}
