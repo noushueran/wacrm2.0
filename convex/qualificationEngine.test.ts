@@ -470,6 +470,39 @@ test("completion never downgrades a human-advanced funnel stage and is idempoten
   expect(transitions.filter((tr) => tr.stage === "qualified")).toHaveLength(0);
 });
 
+test("qualification writes extracted fields onto the contact, without overwriting", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  // a value a rep already typed — must survive
+  await t.run((ctx) => ctx.db.patch(base.contactId, { preferredDestination: "Georgia" }));
+  await t.run(async (ctx) => {
+    const s = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .first();
+    if (s) await ctx.db.delete(s._id);
+  });
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:85 field:destination=Dubai;field:travel_dates=mid December;" +
+    "field:budget=AED 3000 per person;field:nationality=Indian");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+
+  const [session] = (await sessionsFor(t, base.conversationId)).filter((s) => s.status === "qualified");
+  expect(session).toBeDefined();
+
+  const contact = await t.run((ctx) => ctx.db.get(base.contactId));
+  // blanks filled from what the assistant extracted
+  expect(contact).toMatchObject({
+    travelDates: "mid December",
+    budget: "AED 3000 per person",
+    nationality: "Indian",
+  });
+  // …and the rep's pre-existing value is untouched
+  expect(contact?.preferredDestination).toBe("Georgia");
+});
+
 test("sendClosingMessage sends the configured text as a bot message on a qualified session only", async () => {
   const t = convexTest(schema, modules);
   const { accountId, contactId, conversationId } = await seedAttributed(t);
