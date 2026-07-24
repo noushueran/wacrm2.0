@@ -1,5 +1,6 @@
 import { AiError, type ProviderResult } from "../types";
 import { MAX_OUTPUT_TOKENS } from "../defaults";
+import { reasoningEffortFor } from "../media";
 import {
   mergeConsecutive,
   normalizeUsage,
@@ -36,6 +37,14 @@ interface OpenAiResponse {
 export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult> {
   const { apiKey, model, systemPrompt, messages, timeoutMs } = args;
 
+  // `MAX_OUTPUT_TOKENS` is shared between reasoning tokens and the
+  // reply itself. Left unpinned, a reasoning-by-default model (the
+  // GPT-5.6 family defaults to "medium") can consume the entire budget
+  // thinking and return a 200 with empty `content` — which surfaces
+  // below as an `empty_response` AiError and reaches the customer as
+  // silence. `null` ⇒ the model would 400 on the argument, so omit it.
+  const effort = reasoningEffortFor(model);
+
   let res: Response;
   try {
     res = await fetch(OPENAI_URL, {
@@ -48,6 +57,7 @@ export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult
         model,
         messages: [{ role: "system", content: systemPrompt }, ...mergeConsecutive(messages)],
         max_completion_tokens: MAX_OUTPUT_TOKENS,
+        ...(effort ? { reasoning_effort: effort } : {}),
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
