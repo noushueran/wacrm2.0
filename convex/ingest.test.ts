@@ -1671,6 +1671,71 @@ test("integration seam: a RAW Meta message with an HY- code in the text flattens
   expect(events[0]!.status).toBe("pending");
 });
 
+test("integration seam: a RAW Meta CTWA message whose referral carries an UNRECOGNIZED source_type/media_type still ingests (regression: it used to be dropped outright)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+
+  // Meta is free to introduce ad surfaces/formats outside the closed
+  // unions this codebase stores. Before the narrowing in
+  // `flattenInboundMessage`, these two fields reached
+  // `ingestInbound`'s validator verbatim and threw an
+  // ArgumentValidationError — and since `http.ts` schedules
+  // `processInbound` AFTER acking Meta 200, the throw was invisible:
+  // Meta never retried and the lead vanished. The message must land.
+  const raw: MetaWebhookMessage = {
+    id: "wamid.INT-CTWA-UNKNOWN-ENUM",
+    from: "15551230009",
+    timestamp: "1700000000",
+    type: "text",
+    text: { body: "I saw your ad, send me details" },
+    referral: {
+      ctwa_clid: "clid-unknown-enum",
+      source_id: "120237861630560444",
+      source_type: "story_mention",
+      media_type: "carousel",
+      headline: "Georgia Holiday from AED 2699",
+      body: "Tap Send Message",
+    } as MetaWebhookMessage["referral"],
+  };
+
+  const flattened = flattenInboundMessage(raw);
+  if (!flattened) throw new Error("expected a flattened message, got null");
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: raw.from,
+    message: flattened,
+  });
+
+  const message = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  // The customer's actual message survived — the whole point.
+  expect(message).not.toBeNull();
+  expect(message!.contentText).toBe("I saw your ad, send me details");
+  // The creative still renders; only the unrecognized enums are absent.
+  expect(message!.referral?.headline).toBe("Georgia Holiday from AED 2699");
+  expect(message!.referral?.sourceType).toBeUndefined();
+  expect(message!.referral?.mediaType).toBeUndefined();
+  // Attribution still captured: the adReferrals row (the durable ad-lane
+  // source) is written despite the unrecognized enums.
+  const referralRow = await t.run((ctx) =>
+    ctx.db
+      .query("adReferrals")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  expect(referralRow).not.toBeNull();
+  expect(referralRow!.ctwaClid).toBe("clid-unknown-enum");
+  expect(referralRow!.headline).toBe("Georgia Holiday from AED 2699");
+});
+
 test("integration seam: a RAW Meta message with neither a code nor a referral flattens via flattenInboundMessage and ingests via processInbound with NO attribution signal", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
   process.env.CONVEX_AI_DRY_RUN = "1";
