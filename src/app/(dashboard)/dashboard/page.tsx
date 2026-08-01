@@ -25,6 +25,7 @@ import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
 import { ResponsePerformance } from '@/components/dashboard/response-performance'
 import { NeedsAttentionCard } from '@/components/dashboard/needs-attention-panel'
 import { ActivityFeed } from '@/components/dashboard/activity-feed'
+import { WidgetBoundary } from '@/components/dashboard/widget-boundary'
 
 import { useTranslations } from 'next-intl'
 
@@ -32,6 +33,11 @@ type RangeDays = 7 | 30 | 90
 
 export default function DashboardPage() {
   const t = useTranslations('Dashboard.page')
+  // Widget titles for the error fallbacks are reused from each widget's
+  // own namespace rather than duplicated — `Dashboard` is the common
+  // parent, so `tw('leadsPipeline.title')` is the same string the healthy
+  // card renders in its header.
+  const tw = useTranslations('Dashboard')
   // `accountId` is the account-readiness signal: `accountQuery` (which
   // backs every `api.dashboard.*` below) derives the account server-side
   // and THROWS `NO_ACCOUNT`/`UNAUTHENTICATED` if a query runs before the
@@ -102,10 +108,14 @@ export default function DashboardPage() {
   // Skip until the role is BOTH known and sufficient. `api.dashboard
   // .activity` is supervisor-gated server-side (it returns per-row
   // detail, unlike the aggregates beside it); firing it below that floor
-  // throws FORBIDDEN synchronously inside `useQuery` (no Error Boundary
-  // in this app), which would crash the page before `RequireSection` can
-  // redirect. Same `canAccessNav` + 'skip' idiom as `campaigns/page.tsx`,
-  // which keeps the nav floor and the query floor coupled.
+  // throws FORBIDDEN synchronously inside `useQuery`. Every widget now
+  // sits in a `WidgetBoundary`, so that no longer white-screens the
+  // route — but the skip stays: an under-privileged visit is an EXPECTED
+  // state that `RequireSection` handles by redirecting, and it should
+  // never flash an error card on the way there. Boundaries are for
+  // unexpected failures. Same `canAccessNav` + 'skip' idiom as
+  // `campaigns/page.tsx`, which keeps the nav floor and the query floor
+  // coupled.
   const canReadActivity = !!accountId && !!accountRole && canAccessNav(accountRole, '/dashboard')
   const activityData = useQuery(api.dashboard.activity, canReadActivity ? { limit: 50 } : 'skip')
   // Exact, role-scoped count of conversations awaiting a reply — powers the
@@ -136,92 +146,111 @@ export default function DashboardPage() {
     <div className="space-y-5">
       {/* No in-page title — the header now carries "Dashboard". */}
 
-      {/* Metric cards */}
+      {/* Metric cards.
+
+          Each `WidgetBoundary` is DOM-transparent while healthy, so
+          these stay direct grid children and the 4-column layout is
+          unchanged. Only a fallback card takes up a slot — which is why
+          the metrics bundle's boundary carries `lg:col-span-3`: the
+          three cards behind it share ONE query, so they fail together
+          and one wide error card is more honest (and less noisy) than
+          three identical ones. */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {/* Waiting on reply — the act-now number; loads independently of
             the metrics bundle so it can render as soon as it resolves. */}
-        {waitingLoading ? (
-          <SkeletonCard />
-        ) : (
-          <MetricCard
-            title={t('waitingOnReply')}
-            value={waiting.toLocaleString()}
-            icon={Clock}
-            subtitle={t('awaitingReply')}
-          />
-        )}
-        {metricsLoading || !metrics ? (
-          <>
+        <WidgetBoundary title={t('waitingOnReply')}>
+          {waitingLoading ? (
             <SkeletonCard />
-            <SkeletonCard />
-            <SkeletonCard />
-          </>
-        ) : (
-          <>
+          ) : (
             <MetricCard
-              title={t('activeConversations')}
-              // `capped` means the backend stopped counting at its ceiling
-              // rather than reading the whole table (see
-              // ACTIVE_CONVERSATIONS_CAP in convex/dashboard.ts), so the
-              // real figure is higher than `current`. Render "500+" — a
-              // bare "500" would read as exact and be wrong.
-              value={`${metrics.activeConversations.current.toLocaleString()}${
-                metrics.activeConversations.capped ? '+' : ''
-              }`}
-              icon={MessageSquare}
-              delta={{
-                sign: metrics.activeConversations.previous,
-                label: deltaLabel(
-                  metrics.activeConversations.previous,
-                  t('newTodayVsYesterday'),
-                  t('noChange', { suffix: t('newTodayVsYesterday') })
-                ),
-              }}
+              title={t('waitingOnReply')}
+              value={waiting.toLocaleString()}
+              icon={Clock}
+              subtitle={t('awaitingReply')}
             />
-            <MetricCard
-              title={t('newContactsToday')}
-              value={metrics.newContactsToday.current.toLocaleString()}
-              icon={UserPlus}
-              {...(metrics.newLeadsBySource
-                ? {
-                    subtitle: t('leadsSplit', {
-                      ad: metrics.newLeadsBySource.adToday,
-                      direct: metrics.newLeadsBySource.directToday,
-                    }),
-                  }
-                : {
-                    delta: {
-                      sign:
-                        metrics.newContactsToday.current -
-                        metrics.newContactsToday.previous,
-                      label: deltaLabel(
-                        metrics.newContactsToday.current -
+          )}
+        </WidgetBoundary>
+        <WidgetBoundary title={t('keyMetrics')} className="lg:col-span-3">
+          {metricsLoading || !metrics ? (
+            <>
+              <SkeletonCard />
+              <SkeletonCard />
+              <SkeletonCard />
+            </>
+          ) : (
+            <>
+              <MetricCard
+                title={t('activeConversations')}
+                // `capped` means the backend stopped counting at its ceiling
+                // rather than reading the whole table (see
+                // ACTIVE_CONVERSATIONS_CAP in convex/dashboard.ts), so the
+                // real figure is higher than `current`. Render "500+" — a
+                // bare "500" would read as exact and be wrong.
+                value={`${metrics.activeConversations.current.toLocaleString()}${
+                  metrics.activeConversations.capped ? '+' : ''
+                }`}
+                icon={MessageSquare}
+                delta={{
+                  sign: metrics.activeConversations.previous,
+                  label: deltaLabel(
+                    metrics.activeConversations.previous,
+                    t('newTodayVsYesterday'),
+                    t('noChange', { suffix: t('newTodayVsYesterday') })
+                  ),
+                }}
+              />
+              <MetricCard
+                title={t('newContactsToday')}
+                value={metrics.newContactsToday.current.toLocaleString()}
+                icon={UserPlus}
+                {...(metrics.newLeadsBySource
+                  ? {
+                      subtitle: t('leadsSplit', {
+                        ad: metrics.newLeadsBySource.adToday,
+                        direct: metrics.newLeadsBySource.directToday,
+                      }),
+                    }
+                  : {
+                      delta: {
+                        sign:
+                          metrics.newContactsToday.current -
                           metrics.newContactsToday.previous,
-                        t('vsYesterday'),
-                        t('noChange', { suffix: t('vsYesterday') })
-                      ),
-                    },
-                  })}
-            />
-            <MetricCard
-              title={t('openDealsValue')}
-              value={formatCurrency(metrics.openDealsValue, defaultCurrency)}
-              icon={DollarSign}
-              subtitle={t('openDeals', { count: metrics.openDealsCount })}
-            />
-          </>
-        )}
+                        label: deltaLabel(
+                          metrics.newContactsToday.current -
+                            metrics.newContactsToday.previous,
+                          t('vsYesterday'),
+                          t('noChange', { suffix: t('vsYesterday') })
+                        ),
+                      },
+                    })}
+              />
+              <MetricCard
+                title={t('openDealsValue')}
+                value={formatCurrency(metrics.openDealsValue, defaultCurrency)}
+                icon={DollarSign}
+                subtitle={t('openDeals', { count: metrics.openDealsCount })}
+              />
+            </>
+          )}
+        </WidgetBoundary>
       </div>
 
       {/* Needs attention — the operational queue (open conversations
           awaiting a reply), role-scoped with Unassigned/Mine/All tabs. */}
-      <NeedsAttentionCard />
+      <WidgetBoundary title={tw('needsAttention.title')}>
+        <NeedsAttentionCard />
+      </WidgetBoundary>
 
       {/* Lead spend — self-hides (renders null) until an admin sets a
-          positive lead value, so no conditional needed here. */}
-      <LeadSpendCard />
+          positive lead value, so no conditional needed here. A boundary
+          around a card that normally renders nothing is not wasted: the
+          self-hide branch is only reached once `leadCharges.report`
+          RESOLVES, and it's the throw on the way there we're catching. */}
+      <WidgetBoundary title={tw('leadSpend.title')}>
+        <LeadSpendCard />
+      </WidgetBoundary>
 
-      {/* Quick actions */}
+      {/* Quick actions — pure links, no query, so nothing to contain. */}
       <QuickActions />
 
       {/* Charts row */}
@@ -233,25 +262,37 @@ export default function DashboardPage() {
           height while the line chart drove the row height. */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
         <div className={showLeadsPipeline ? 'h-full lg:col-span-3' : 'h-full lg:col-span-5'}>
-          <ConversationsChart
-            series={series}
-            loading={seriesLoading}
-            range={range}
-            onRangeChange={setRange}
-          />
+          {/* The column wrapper keeps the grid span; `h-full` on the
+              fallback makes a failed chart match the pipeline card's
+              stretched height instead of collapsing the row. */}
+          <WidgetBoundary title={tw('conversationsChart.title')} className="h-full">
+            <ConversationsChart
+              series={series}
+              loading={seriesLoading}
+              range={range}
+              onRangeChange={setRange}
+            />
+          </WidgetBoundary>
         </div>
         {showLeadsPipeline ? (
           <div className="h-full lg:col-span-2">
-            <LeadsPipelineCard />
+            <WidgetBoundary title={tw('leadsPipeline.title')} className="h-full">
+              <LeadsPipelineCard />
+            </WidgetBoundary>
           </div>
         ) : null}
       </div>
 
-      {/* Response performance — week-over-week averages vs SLA target. */}
-      <ResponsePerformance data={responseTime} loading={responseTimeLoading} />
+      {/* Response performance — week-over-week averages vs SLA target.
+          This is the widget whose query took the whole page down. */}
+      <WidgetBoundary title={tw('responsePerformance.title')}>
+        <ResponsePerformance data={responseTime} loading={responseTimeLoading} />
+      </WidgetBoundary>
 
       {/* Activity feed */}
-      <ActivityFeed items={activity} loading={activityLoading} />
+      <WidgetBoundary title={tw('activityFeed.title')}>
+        <ActivityFeed items={activity} loading={activityLoading} />
+      </WidgetBoundary>
     </div>
   )
 }

@@ -18,11 +18,14 @@ export default function CampaignsPage() {
   // Skip until the role is BOTH known and sufficient: `api.campaigns
   // .overview` is supervisor-gated server-side, and firing it below that
   // floor returns FORBIDDEN, which `useQuery` re-throws synchronously
-  // during render — this app has no Error Boundary, so a sub-supervisor
-  // caller reaching this page would crash instead of just seeing nothing
-  // (defense in depth: `canAccessNav` is also what keeps the nav link +
-  // route guard from ever sending anyone here in the first place). Same
-  // 'skip' idiom as `whatsapp-config.tsx`'s `whatsappConfig.get` query.
+  // during render. `(dashboard)/error.tsx` now catches that instead of
+  // white-screening the app, but the skip still earns its keep: a
+  // sub-supervisor reaching this page is an EXPECTED state the route
+  // guard resolves by redirecting, and it should see nothing rather than
+  // an error page on the way out (defense in depth: `canAccessNav` is
+  // also what keeps the nav link + route guard from ever sending anyone
+  // here in the first place). Same 'skip' idiom as
+  // `whatsapp-config.tsx`'s `whatsappConfig.get` query.
   const canRead = !!accountRole && !!accountId && canAccessNav(accountRole, '/campaigns')
   const data = useQuery(api.campaigns.overview, canRead ? {} : 'skip')
   const loading = data === undefined

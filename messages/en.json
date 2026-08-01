@@ -90,6 +90,7 @@
       "noChange": "No change {suffix}",
       "waitingOnReply": "Waiting on Reply",
       "awaitingReply": "awaiting a reply",
+      "keyMetrics": "Key metrics",
       "leadsSplit": "{ad} ads · {direct} direct"
     },
     "quickActions": {
@@ -151,6 +152,11 @@
     },
     "emptyState": {
       "title": "Not enough data yet"
+    },
+    "widgetError": {
+      "message": "This card couldn't load. The rest of the dashboard is unaffected.",
+      "retry": "Retry",
+      "details": "Error details"
     },
     "leadSpend": {
       "title": "Lead spend",
@@ -2343,5 +2349,12 @@
       "notCreatedBadge": "Not created",
       "saveFailed": "Something went wrong. Please try again."
     }
+  },
+  "RouteError": {
+    "title": "This page couldn't load",
+    "message": "Something went wrong while rendering this section. Your data is safe — try again, or pick another section from the sidebar.",
+    "retry": "Try again",
+    "details": "Error details",
+    "digest": "Reference: {digest}"
   }
 }
