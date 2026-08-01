@@ -26,6 +26,24 @@ export const HANDOFF_SENTINEL = "[[HANDOFF]]";
  *  serves the human-reviewed draft-reply route, which may run longer. */
 export const MAX_OUTPUT_TOKENS = 320;
 
+/** Output cap for the lead-qualification ANALYSIS call
+ *  (`qualificationEngine.analyzeInbound`), which is structured output,
+ *  not a WhatsApp reply: a JSON object carrying `fields[]`,
+ *  `scoreBreakdown[]` (one entry per checklist criterion) and a
+ *  `nextQuestion` with two alternate phrasings.
+ *
+ *  `MAX_OUTPUT_TOKENS` (320) is far too small for that. Measured against
+ *  the live API on `gpt-5.4-mini` with a real 7-turn conversation and a
+ *  two-service checklist, the complete object took 404 completion
+ *  tokens; at 320 the call returned `finish_reason: "length"` with the
+ *  JSON cut mid-object, which `parseAnalysis` then discards entirely
+ *  (it can only return null when no complete JSON object is present) —
+ *  so the analysis silently extracted nothing at all.
+ *
+ *  1024 leaves real headroom for a longer conversation or a checklist
+ *  with more criteria, while still bounding spend on the caller's key. */
+export const ANALYSIS_MAX_OUTPUT_TOKENS = 1024;
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20;
 

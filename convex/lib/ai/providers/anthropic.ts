@@ -47,7 +47,7 @@ function normalizeForAnthropic(messages: ChatMessage[]): ChatMessage[] {
  * in `generate.ts`'s `generateReply`).
  */
 export async function generateAnthropic(args: ProviderArgs): Promise<ProviderResult> {
-  const { apiKey, model, systemPrompt, messages, timeoutMs } = args;
+  const { apiKey, model, systemPrompt, messages, timeoutMs, maxTokens } = args;
 
   let res: Response;
   try {
@@ -61,7 +61,10 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
       body: JSON.stringify({
         model,
         system: systemPrompt,
-        max_tokens: MAX_OUTPUT_TOKENS,
+        // Same per-call override as the OpenAI adapter — a structured
+        // caller (the qualification analysis) needs more than the
+        // WhatsApp-reply default. See `ProviderArgs.maxTokens`.
+        max_tokens: maxTokens ?? MAX_OUTPUT_TOKENS,
         messages: normalizeForAnthropic(messages),
       }),
       signal: AbortSignal.timeout(timeoutMs),
