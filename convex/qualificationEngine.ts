@@ -17,7 +17,11 @@ import {
   carryoverFields,
   type AnalysisResult,
 } from "./lib/qualification/analyze";
-import { aiContextMessageLimit, buildSystemPrompt } from "./lib/ai/defaults";
+import {
+  ANALYSIS_MAX_OUTPUT_TOKENS,
+  aiContextMessageLimit,
+  buildSystemPrompt,
+} from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
 import { toChatMessages } from "./lib/ai/context";
 import { generateReply } from "./lib/ai/generate";
@@ -525,6 +529,11 @@ export const analyzeInbound = internalAction({
           apiKey: aiCfg.apiKey,
           systemPrompt,
           messages,
+          // Structured output, not a WhatsApp reply. At the default 320
+          // the JSON came back cut mid-object (`finish_reason: "length"`)
+          // and `parseAnalysis` discarded the entire analysis — measured
+          // at 404 completion tokens for a real 7-turn conversation.
+          maxTokens: ANALYSIS_MAX_OUTPUT_TOKENS,
         });
         raw = gen.text;
         try {

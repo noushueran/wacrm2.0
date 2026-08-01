@@ -27,6 +27,10 @@ export interface GenerateArgs {
   systemPrompt: string;
   /** Recent conversation turns, oldest first. */
   messages: ChatMessage[];
+  /** Per-call output cap. Omit for the WhatsApp-reply default
+   *  (`MAX_OUTPUT_TOKENS`); structured callers must raise it — see
+   *  `ANALYSIS_MAX_OUTPUT_TOKENS` and `ProviderArgs.maxTokens`. */
+  maxTokens?: number;
 }
 
 /**
@@ -37,9 +41,9 @@ export interface GenerateArgs {
  * what makes the auto-reply dispatch as a whole never throw.
  */
 export async function generateReply(args: GenerateArgs): Promise<GenerateResult> {
-  const { provider, model, apiKey, systemPrompt, messages } = args;
+  const { provider, model, apiKey, systemPrompt, messages, maxTokens } = args;
   const timeoutMs = aiRequestTimeoutMs();
-  const providerArgs = { apiKey, model, systemPrompt, messages, timeoutMs };
+  const providerArgs = { apiKey, model, systemPrompt, messages, timeoutMs, maxTokens };
 
   let result: { text: string; usage: AiUsage | null };
   switch (provider) {

@@ -13,6 +13,14 @@ export interface ProviderArgs {
   systemPrompt: string;
   messages: ChatMessage[];
   timeoutMs: number;
+  /** Output-token cap for THIS call. Defaults to `MAX_OUTPUT_TOKENS`,
+   *  which is tuned for a short WhatsApp reply (see `defaults.ts`). A
+   *  caller whose expected output is structured rather than
+   *  conversational — the qualification analysis emits a JSON object
+   *  with `fields[]`, `scoreBreakdown[]` and a `nextQuestion` carrying
+   *  two alternates — must raise it, or the response is truncated
+   *  mid-object (`finish_reason: "length"`) and fails to parse. */
+  maxTokens?: number;
 }
 
 /**
