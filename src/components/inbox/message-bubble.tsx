@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
+import { downloadHrefFor, filenameFor } from "@/lib/media/download";
 import type { ContactsPayloadEntry, Message, MessageReaction } from "@/types";
 import {
   Clock,
@@ -17,12 +18,15 @@ import {
   Phone,
   Mail,
   Globe,
+  Download,
+  Maximize2,
 } from "lucide-react";
 import { format } from "date-fns";
 import { ReplyQuote } from "./reply-quote";
 import { MessageReactions } from "./message-reactions";
 import { AdReferralCard } from "./ad-referral-card";
 import { VoiceTranscript } from "./voice-transcript";
+import { MediaLightbox } from "./media-lightbox";
 import { InteractivePreview } from "@/components/interactive/interactive-preview";
 import { useTranslations } from "next-intl";
 
@@ -65,42 +69,105 @@ function MediaUnavailable({ label, t }: { label: string, t: ReturnType<typeof us
   );
 }
 
-function MediaImage({ url, alt }: { url: string; alt: string }) {
+/**
+ * Save control for a media bubble.
+ *
+ * `href` comes from `downloadHrefFor`, which routes cross-origin media
+ * through `/api/media/download` — the `download` attribute below is
+ * IGNORED by browsers on a cross-origin url, so without that indirection
+ * this button would just navigate to the file.
+ */
+function MediaDownloadButton({
+  href,
+  filename,
+  label,
+  className,
+}: {
+  href: string;
+  filename: string;
+  label: string;
+  className?: string;
+}) {
+  return (
+    <a
+      href={href}
+      download={filename}
+      title={label}
+      aria-label={label}
+      className={cn(
+        "inline-flex items-center justify-center rounded-md bg-black/55 p-1.5 text-white backdrop-blur-sm transition-colors hover:bg-black/75 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none",
+        className,
+      )}
+    >
+      <Download className="h-3.5 w-3.5" />
+    </a>
+  );
+}
+
+/** Corner overlay controls, revealed when the media is hovered or focused. */
+const OVERLAY_CONTROL =
+  "opacity-0 transition-opacity group-hover/media:opacity-100 group-focus-within/media:opacity-100";
+
+function MediaImage({
+  url,
+  alt,
+  message,
+  t,
+}: {
+  url: string;
+  alt: string;
+  message: Message;
+  t: ReturnType<typeof useTranslations>;
+}) {
   const [src, setSrc] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(true);
-
-  const loadImage = useCallback(async () => {
-    if (!url) return;
-
-    // Proxy URLs need auth fetch to create blob URL
-    if (url.startsWith("/api/whatsapp/media/")) {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error("Failed to load media");
-        const blob = await res.blob();
-        const blobUrl = URL.createObjectURL(blob);
-        setSrc(blobUrl);
-      } catch {
-        setError(true);
-      } finally {
-        setLoading(false);
-      }
-    } else {
-      setSrc(url);
-      setLoading(false);
-    }
-  }, [url]);
+  const [zoomed, setZoomed] = useState(false);
+  // The blob url must be revoked through a ref, not through `src`. The old
+  // cleanup closed over the render in which the effect ran, where `src` was
+  // still null — so it never revoked anything and every proxied image leaked
+  // for the life of the page.
+  const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
-    loadImage();
+    let cancelled = false;
+    setSrc(null);
+    setError(false);
+    setLoading(true);
+
+    async function load() {
+      if (!url) return;
+
+      // Proxy URLs need auth fetch to create blob URL
+      if (url.startsWith("/api/whatsapp/media/")) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error("Failed to load media");
+          const blob = await res.blob();
+          if (cancelled) return;
+          const blobUrl = URL.createObjectURL(blob);
+          blobUrlRef.current = blobUrl;
+          setSrc(blobUrl);
+        } catch {
+          if (!cancelled) setError(true);
+        } finally {
+          if (!cancelled) setLoading(false);
+        }
+      } else {
+        setSrc(url);
+        setLoading(false);
+      }
+    }
+
+    load();
     return () => {
-      if (src?.startsWith("blob:")) {
-        URL.revokeObjectURL(src);
+      cancelled = true;
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadImage]);
+  }, [url]);
 
   if (error) {
     return (
@@ -118,13 +185,135 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
     );
   }
 
+  const filename = filenameFor(message);
+  const downloadHref = message.media_url
+    ? downloadHrefFor(message.media_url, filename)
+    : null;
+
   return (
-    <img
-      src={src ?? ""}
-      alt={alt}
-      className="max-h-64 max-w-60 rounded-lg object-cover"
-      onError={() => setError(true)}
-    />
+    <>
+      <div className="group/media relative w-fit">
+        <button
+          type="button"
+          onClick={() => setZoomed(true)}
+          aria-label={t("viewImage")}
+          className="block cursor-zoom-in rounded-lg focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        >
+          {/* `object-contain` is a safeguard, not the fix. With only
+              `max-*` constraints and no fixed dimensions the box already
+              takes the image's own aspect ratio, so `cover` and `contain`
+              render identically today (measured: both 76.8×256 for a
+              600×2000 banner). `contain` states the intent and stays
+              correct if this ever gains explicit width/height, where
+              `cover` WOULD start cropping. What actually made a tall
+              banner unreadable is the thumbnail size itself — 77px wide
+              here — which is what the lightbox below exists to solve. */}
+          <img
+            src={src ?? ""}
+            alt={alt}
+            className="max-h-64 max-w-60 rounded-lg object-contain"
+            onError={() => setError(true)}
+          />
+        </button>
+        {downloadHref && (
+          <MediaDownloadButton
+            href={downloadHref}
+            filename={filename}
+            label={t("download")}
+            className={cn("absolute top-1.5 right-1.5", OVERLAY_CONTROL)}
+          />
+        )}
+      </div>
+      {src && (
+        <MediaLightbox
+          open={zoomed}
+          onOpenChange={setZoomed}
+          kind="image"
+          src={src}
+          alt={alt}
+          title={alt}
+          // Falls back to the displayed source (a blob url for proxied
+          // media) when the message carries no resolvable media url.
+          downloadHref={downloadHref ?? src}
+          filename={filename}
+          downloadLabel={t("download")}
+          closeLabel={t("closeViewer")}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * Video bubble. The inline player keeps its native controls, so enlarging
+ * is an explicit corner button rather than a click on the video itself —
+ * clicking the frame belongs to play/pause.
+ */
+function MediaVideo({
+  url,
+  message,
+  t,
+}: {
+  url: string;
+  message: Message;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  const [zoomed, setZoomed] = useState(false);
+  const inlineRef = useRef<HTMLVideoElement>(null);
+  const filename = filenameFor(message);
+  const downloadHref = downloadHrefFor(url, filename);
+
+  // The lightbox mounts a SECOND player on the same source. Without this the
+  // inline one keeps playing behind the backdrop and the agent hears both.
+  function openZoomed() {
+    inlineRef.current?.pause();
+    setZoomed(true);
+  }
+
+  return (
+    <>
+      <div className="group/media relative w-fit">
+        <video
+          ref={inlineRef}
+          src={url}
+          controls
+          className="max-h-64 max-w-60 rounded-lg"
+        />
+        <div
+          className={cn(
+            "absolute top-1.5 right-1.5 flex items-center gap-1",
+            OVERLAY_CONTROL,
+          )}
+        >
+          <button
+            type="button"
+            onClick={openZoomed}
+            title={t("viewVideo")}
+            aria-label={t("viewVideo")}
+            className="inline-flex items-center justify-center rounded-md bg-black/55 p-1.5 text-white backdrop-blur-sm transition-colors hover:bg-black/75 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
+          >
+            <Maximize2 className="h-3.5 w-3.5" />
+          </button>
+          <MediaDownloadButton
+            href={downloadHref}
+            filename={filename}
+            label={t("download")}
+          />
+        </div>
+      </div>
+      <MediaLightbox
+        open={zoomed}
+        onOpenChange={setZoomed}
+        kind="video"
+        src={url}
+        alt={t("video")}
+        title={t("video")}
+        downloadHref={downloadHref}
+        filename={filename}
+        downloadLabel={t("download")}
+        closeLabel={t("closeViewer")}
+      />
+    </>
   );
 }
 
@@ -152,7 +341,12 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       return (
         <div>
           {message.media_url ? (
-            <MediaImage url={message.media_url} alt="Shared image" />
+            <MediaImage
+              url={message.media_url}
+              alt="Shared image"
+              message={message}
+              t={t}
+            />
           ) : (
             <MediaUnavailable label={t("photo")} t={t} />
           )}
@@ -168,11 +362,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       return (
         <div>
           {message.media_url ? (
-            <video
-              src={message.media_url}
-              controls
-              className="max-h-64 max-w-60 rounded-lg"
-            />
+            <MediaVideo url={message.media_url} message={message} t={t} />
           ) : (
             <MediaUnavailable label={t("video")} t={t} />
           )}
@@ -188,7 +378,15 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       return (
         <div>
           {message.media_url ? (
-            <audio src={message.media_url} controls className="max-w-60" />
+            <div className="flex items-center gap-1.5">
+              <audio src={message.media_url} controls className="max-w-60" />
+              <MediaDownloadButton
+                href={downloadHrefFor(message.media_url, filenameFor(message))}
+                filename={filenameFor(message)}
+                label={t("download")}
+                className="shrink-0 bg-foreground/10 text-foreground hover:bg-foreground/20"
+              />
+            </div>
           ) : (
             <MediaUnavailable label={t("audio")} t={t} />
           )}
@@ -208,23 +406,28 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
         </div>
       );
 
-    case "document":
+    case "document": {
       if (!message.media_url) {
         return <MediaUnavailable label={message.content_text || t("document")} t={t} />;
       }
+      // The row is the download. It used to `target="_blank"` straight at
+      // the media url, which — being cross-origin — opened the file in a
+      // tab instead of saving it, leaving no way to get the file at all.
+      const filename = filenameFor(message);
       return (
         <a
-          href={message.media_url}
-          target="_blank"
-          rel="noopener noreferrer"
+          href={downloadHrefFor(message.media_url, filename)}
+          download={filename}
           className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm hover:bg-muted"
         >
           <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
           <span className="truncate">
             {message.content_text || t("document")}
           </span>
+          <Download className="h-4 w-4 shrink-0 text-muted-foreground" />
         </a>
       );
+    }
 
     case "template":
       return (

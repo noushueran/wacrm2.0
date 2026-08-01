@@ -8,12 +8,21 @@
 An agent received a tall marketing banner as an inbound WhatsApp image. In the
 inbox thread they cannot read it, cannot enlarge it, and cannot save it:
 
-1. **Cropped.** `MediaImage` renders at `max-h-64 max-w-60 object-cover`
-   (`src/components/inbox/message-bubble.tsx`). `object-cover` fills the
-   240×256 box by cutting the overflow away, so the middle of a tall banner is
-   simply not on screen.
+1. **Far too small to read.** `MediaImage` renders at `max-h-64 max-w-60`
+   (`src/components/inbox/message-bubble.tsx`). A tall banner is
+   height-limited, so a 600×2000 image lands at **76.8×240** — measured in the
+   browser against the app's own compiled CSS. The text on it is unreadable at
+   that size.
+
+   The `object-cover` on that same element was *suspected* of cropping the
+   banner as well. Measurement disproved it: with only `max-*` constraints and
+   no fixed width/height, the box already adopts the image's aspect ratio, so
+   `cover` and `contain` produce byte-identical layout (both 76.8×256).
+   Cropping needs a box whose aspect ratio is forced to differ. The switch to
+   `object-contain` is kept as an intent-revealing safeguard for any future
+   fixed-dimension styling — **it is not the fix**.
 2. **Not openable.** The `<img>` has no click handler. There is no enlarged
-   view anywhere in the inbox.
+   view anywhere in the inbox. This is the real fix for (1).
 3. **Not downloadable.** There is no download control, and the obvious fix
    does not work — see below.
 
@@ -94,8 +103,8 @@ images, `<video controls>` for video.
 
 ### 4. `src/components/inbox/message-bubble.tsx`
 
-- `object-cover` → **`object-contain`**, which un-crops the banner in the
-  thread itself.
+- `object-cover` → `object-contain` as a safeguard only — see the Problem
+  section for why this changes nothing at today's sizing.
 - Image and video become clickable (`cursor-zoom-in`) and open the lightbox.
 - A download control on image, video, audio and document bubbles.
 - Documents keep their existing row but point at the download href, so they
