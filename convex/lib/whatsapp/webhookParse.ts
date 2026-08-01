@@ -93,11 +93,20 @@ export interface MetaWebhookMessage {
   referral?: {
     ctwa_clid?: string;
     source_id?: string;
-    source_type?: "ad" | "post";
+    // `source_type`/`media_type` are typed as the OPEN `string`, not the
+    // closed `"ad" | "post"` / `"image" | "video"` unions the domain
+    // `AdReferral` below uses, because this interface describes UNTRUSTED
+    // JSON Meta sent us — a TS literal union here is a compile-time
+    // fiction that the runtime payload is free to violate, and Meta has
+    // shipped new ad surfaces/formats before without warning. Narrowing
+    // happens once, in `normalizeSourceType`/`normalizeMediaType` below.
+    // See those functions for why an unrecognized value must not reach
+    // `ingest.ingestInbound`'s validator.
+    source_type?: string;
     source_url?: string;
     headline?: string;
     body?: string;
-    media_type?: "image" | "video";
+    media_type?: string;
     image_url?: string;
     video_url?: string;
     thumbnail_url?: string;
@@ -295,6 +304,47 @@ export interface FlattenedInboundMessage {
 }
 
 /**
+ * Narrow Meta's raw `referral.source_type` to the closed union the data
+ * model stores, or DROP it (`undefined`) when it's anything else.
+ *
+ * Why dropping — rather than passing the raw string through — is the only
+ * safe option: `sourceType` is validated as
+ * `v.optional(v.union(v.literal("ad"), v.literal("post")))` in FOUR places
+ * (`ingest.ts`'s `inboundMessageValidator`, `adReferrals.ts`'s record
+ * validator, and `schema.ts`'s `messages.referral` + the
+ * `conversations.adReferral` denorm). A value outside that union makes
+ * `ingest.ingestInbound` throw an ArgumentValidationError — and because
+ * `http.ts` dispatches `processInbound` through
+ * `ctx.scheduler.runAfter(0, ...)` AFTER the httpAction has already
+ * returned its 200, that throw is invisible to Meta: no retry, no error
+ * surfaced to the operator, and the customer's message is lost outright.
+ * A cosmetic ad-card field must never cost us the actual message.
+ *
+ * The field is `v.optional` everywhere, so omitting it is always valid.
+ * The one behavioural consumer is `adReferrals.ts`'s
+ * `sourceType === "ad"` gate on campaign-ad resolution, which correctly
+ * declines to resolve a source it cannot classify. The ad card still
+ * renders — it reads `headline`/`body`/`imageUrl`, not `sourceType`.
+ *
+ * Case is folded because Meta's own casing has not been contractually
+ * stable across surfaces; `"AD"` is unambiguously the documented `"ad"`.
+ */
+function normalizeSourceType(raw: string | undefined): "ad" | "post" | undefined {
+  const v = raw?.trim().toLowerCase();
+  return v === "ad" || v === "post" ? v : undefined;
+}
+
+/** Same contract as `normalizeSourceType`, for `referral.media_type` —
+ *  which is likewise a closed `"image" | "video"` union at rest, and
+ *  likewise fatal to the whole message when Meta sends a format outside
+ *  it (a carousel/product ad, say). Dropping it costs only the media-kind
+ *  hint on the ad card; keeping it costs the message. */
+function normalizeMediaType(raw: string | undefined): "image" | "video" | undefined {
+  const v = raw?.trim().toLowerCase();
+  return v === "image" || v === "video" ? v : undefined;
+}
+
+/**
  * Public entry point: flattens by type, then merges the click-to-WhatsApp
  * ad click id (if any) AND the full ad referral creative (`AdReferral`,
  * when previewable content is present) onto the result. Kept separate from
@@ -324,12 +374,12 @@ export function flattenInboundMessage(
     );
   const referral: AdReferral | undefined = hasCreative
     ? {
-        sourceType: r!.source_type,
+        sourceType: normalizeSourceType(r!.source_type),
         sourceId: r!.source_id,
         sourceUrl: r!.source_url,
         headline: r!.headline,
         body: r!.body,
-        mediaType: r!.media_type,
+        mediaType: normalizeMediaType(r!.media_type),
         imageUrl: r!.image_url,
         videoUrl: r!.video_url,
         thumbnailUrl: r!.thumbnail_url,

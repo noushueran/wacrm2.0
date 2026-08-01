@@ -449,6 +449,80 @@ test("flattenInboundMessage: lifts the full referral creative alongside ctwaClid
   });
 });
 
+// ------------------------------------------------------------
+// flattenInboundMessage: referral enum narrowing
+//
+// `sourceType`/`mediaType` are stored as CLOSED unions
+// (`v.union(v.literal("ad"), v.literal("post"))` /
+// `v.literal("image"), v.literal("video")`) in `ingest.ts`'s
+// `inboundMessageValidator`, `adReferrals.ts` and `schema.ts`. Meta is
+// free to send a source/format outside those sets, and when it did the
+// whole `ingestInbound` mutation threw an ArgumentValidationError —
+// which, because `http.ts` schedules `processInbound` AFTER acking Meta
+// 200, silently discarded the customer's message with no retry. These
+// pin the narrowing that keeps an unrecognized enum cosmetic.
+// ------------------------------------------------------------
+
+test("flattenInboundMessage: an unrecognized referral source_type is dropped, NOT passed through (it would break ingest)", () => {
+  const result = flattenInboundMessage(
+    msg({
+      type: "text",
+      text: { body: "Saw your story" },
+      id: "wamid.AD_STORY",
+      referral: {
+        ctwa_clid: "clid-story",
+        source_id: "120299",
+        source_type: "story_mention",
+        headline: "Georgia Holiday",
+      } as MetaWebhookMessage["referral"],
+    }),
+  );
+  // The message and its creative survive; only the unknown enum is gone.
+  expect(result?.ctwaClid).toBe("clid-story");
+  expect(result?.referral?.sourceType).toBeUndefined();
+  expect(result?.referral?.headline).toBe("Georgia Holiday");
+  expect(result?.referral?.sourceId).toBe("120299");
+});
+
+test("flattenInboundMessage: an unrecognized referral media_type is dropped but the ad card survives", () => {
+  const result = flattenInboundMessage(
+    msg({
+      type: "text",
+      text: { body: "Tell me more" },
+      id: "wamid.AD_CAROUSEL",
+      referral: {
+        ctwa_clid: "clid-carousel",
+        source_type: "ad",
+        media_type: "carousel",
+        headline: "Multi-city Europe",
+        image_url: "https://scontent.example/c.jpg",
+      } as MetaWebhookMessage["referral"],
+    }),
+  );
+  expect(result?.referral?.mediaType).toBeUndefined();
+  // `sourceType: "ad"` must still survive — `adReferrals` gates campaign
+  // resolution on exactly that value.
+  expect(result?.referral?.sourceType).toBe("ad");
+  expect(result?.referral?.headline).toBe("Multi-city Europe");
+});
+
+test("flattenInboundMessage: referral enum casing is folded to the stored literal", () => {
+  const result = flattenInboundMessage(
+    msg({
+      type: "text",
+      text: { body: "hi" },
+      id: "wamid.AD_CASE",
+      referral: {
+        source_type: "AD",
+        media_type: "VIDEO",
+        headline: "Cased",
+      } as MetaWebhookMessage["referral"],
+    }),
+  );
+  expect(result?.referral?.sourceType).toBe("ad");
+  expect(result?.referral?.mediaType).toBe("video");
+});
+
 test("flattenInboundMessage: a referral with only ctwa_clid/source_id attaches NO referral object (nothing to preview)", () => {
   const result = flattenInboundMessage(
     msg({ type: "text", text: { body: "hi" }, referral: { ctwa_clid: "abc", source_id: "AD1" } }),
