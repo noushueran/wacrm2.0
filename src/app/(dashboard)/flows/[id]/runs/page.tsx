@@ -280,12 +280,12 @@ function RunCard({
               )}
             </Badge>
             {run.status === "active" && run.current_node_key && (
-              <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              <code className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                 {t("atNode", { node: run.current_node_key })}
               </code>
             )}
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+          <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
             <span>{t("started", { time: format(new Date(run.started_at), "PP p") })}</span>
             {run.reprompt_count > 0 && (
               <span>· {t("reprompts", { count: run.reprompt_count })}</span>
@@ -301,7 +301,7 @@ function RunCard({
               <summary className="cursor-pointer text-xs text-muted-foreground">
                 {t("capturedVars", { count: Object.keys(run.vars).length })}
               </summary>
-              <pre className="mt-2 overflow-x-auto rounded-md bg-background p-2 text-[11px] text-muted-foreground">
+              <pre className="mt-2 overflow-x-auto rounded-md bg-background p-2 text-[12px] text-muted-foreground">
                 {JSON.stringify(run.vars, null, 2)}
               </pre>
             </details>
@@ -337,19 +337,19 @@ function EventLine({ ev }: { ev: EventRow }) {
   const cls = EVENT_COLOR[ev.event_type] ?? "text-muted-foreground";
   return (
     <div className="flex items-start gap-2 rounded-md px-2 py-1 text-xs">
-      <span className="w-32 shrink-0 text-[10px] text-muted-foreground">
+      <span className="w-32 shrink-0 text-[11px] text-muted-foreground">
         {format(new Date(ev.created_at), "HH:mm:ss")}
       </span>
-      <span className={cn("w-32 shrink-0 font-mono text-[10px]", cls)}>
+      <span className={cn("w-32 shrink-0 font-mono text-[11px]", cls)}>
         {ev.event_type}
       </span>
       {ev.node_key && (
-        <code className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+        <code className="shrink-0 rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
           {ev.node_key}
         </code>
       )}
       {Object.keys(ev.payload).length > 0 && (
-        <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground">
           {summarizePayload(ev.payload)}
         </span>
       )}

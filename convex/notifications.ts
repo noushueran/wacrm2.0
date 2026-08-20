@@ -27,22 +27,32 @@ const LIST_RECENT_CAP = 50;
 // side; `create` is the account-scoped, agent+ write side for the one
 // type it accepts (below).
 //
-// `notifications.type` (`convex/schema.ts`) is a 3-literal union, not a
+// `notifications.type` (`convex/schema.ts`) is a SIX-literal union, not a
 // bare string — `"conversation_assigned"` (migration 027's own
-// `notify_conversation_assigned` trigger, now `conversations.assign` and
-// the lead-offer-accept path in `qualificationEngine.ts`),
-// `"lead_qualified"` (a lead crosses the qualification threshold, or a
-// lead offer needs supervisor escalation — both in
-// `qualificationEngine.ts`), and `"sla_alert"` (an assigned chat's
-// reply-SLA breaches, targeting supervisors+ — `ingest.ts` and
-// `aiReply.ts`). Every insert goes through `insertNotification` below —
-// never a caller's own `ctx.db.insert` — so all four call sites (`create`
-// here, plus those three) can never drift out of shape with the schema
-// or each other; a fourth type would still be a visible, typed change in
-// both places at once, not a silent widening. `create` itself stays
-// scoped to `v.literal("conversation_assigned")` only — the other two
-// types are system/engine-triggered (qualification, SLA breach), not
-// something an agent explicitly creates via this generic mutation.
+// `notify_conversation_assigned` trigger, now `conversations.assign`, the
+// lead-offer-accept path in `qualificationEngine.ts`, and the
+// auto-assign sweep in `inboxChaseAssign.ts`), `"lead_qualified"` (a lead
+// crosses the qualification threshold, or a lead offer needs supervisor
+// escalation — both in `qualificationEngine.ts`), `"sla_alert"` (an
+// assigned chat's reply-SLA breaches, targeting supervisors+ —
+// `ingest.ts` and `aiReply.ts`), `"purchase_signal"` (a proxy Meta
+// Purchase fired for a highly-qualified lead), `"lead_returned"` (an
+// archived conversation came back on inbound), and `"chase_unassigned"`
+// (no eligible agent existed when the auto-assign sweep reached an
+// unowned Chasing thread). Every insert goes through `insertNotification`
+// below — never a caller's own `ctx.db.insert` — so no call site can
+// drift out of shape with the schema or with the others; a seventh type
+// is still a visible, typed change in both places at once, not a silent
+// widening. `create` itself stays scoped to
+// `v.literal("conversation_assigned")` only — every other type is
+// system/engine-triggered, not something an agent explicitly creates via
+// this generic mutation.
+//
+// FIVE hand-copied declarations mirror this union and must move
+// together: `schema.ts`'s `notifications.type`, `insertNotification`'s
+// own arg union below, `src/types/index.ts`'s `NotificationType`, and
+// `src/lib/notifications/shared.ts`'s exhaustive `TYPE_ICON` record
+// (plus `convex/_generated/api.d.ts`'s module list for a new module).
 // ============================================================
 
 /**
@@ -59,7 +69,13 @@ export async function insertNotification(
   args: {
     accountId: Id<"accounts">;
     userId: Id<"users">;
-    type: "conversation_assigned" | "lead_qualified" | "sla_alert" | "purchase_signal";
+    type:
+      | "conversation_assigned"
+      | "lead_qualified"
+      | "sla_alert"
+      | "purchase_signal"
+      | "lead_returned"
+      | "chase_unassigned";
     conversationId?: Id<"conversations">;
     contactId?: Id<"contacts">;
     actorUserId?: Id<"users">;

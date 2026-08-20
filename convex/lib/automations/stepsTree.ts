@@ -87,6 +87,30 @@ export function seedsToTree(seeds: BuilderStepInput[]): BuilderStepInput[] {
 
 export interface BuilderStepNode extends BuilderStepInput {
   id: string;
+  // Passed through from `StepRow.stepKey` (see its comment below) so
+  // `automations.get`'s caller — the builder UI's `fromServerSteps` — can
+  // round-trip it on the next save via `toApiSteps`'s `id`. Deliberately
+  // left RAW (possibly absent) — see `effectiveStepKey` immediately below
+  // for why this must not gain a `?? id` fallback of its own.
+  stepKey: string | null | undefined;
+  // schema.ts's own comment on `automationSteps.stepKey`: "Readers derive
+  // an effective key as `stepKey ?? _id`, so old rows keep working." This
+  // is that fallback, computed once here so every reader (the canvas's
+  // per-step stats chips, the Waiting tab's step lookup) joins against
+  // `automationStepStats`/`automationRuns.currentStepKey` the same way
+  // `automationsEngine.ts` wrote them (`step.stepKey ?? step._id`) —
+  // without a computed field like this, a step saved before Task 10's
+  // stepKey migration has no key its own accumulated stats can be found
+  // by.
+  //
+  // A SEPARATE field from `stepKey` on purpose, not a change to it:
+  // `stepKey` also feeds `toApiSteps`'s "should this save mint a fresh
+  // key" decision (automation-builder.tsx), and folding the fallback in
+  // there would make a fabricated identity look like a real stored one,
+  // silently defeating Task 10's intentional mint-on-first-save. Readers
+  // that need identity for JOINING should use this field; `stepKey`
+  // itself stays reserved for round-tripping into a save.
+  effectiveStepKey: string;
   branches: { yes: BuilderStepNode[]; no: BuilderStepNode[] };
 }
 
@@ -103,6 +127,18 @@ export interface StepRow {
   branch: "yes" | "no" | null | undefined;
   stepType: string;
   stepConfig: Record<string, unknown> | null | undefined;
+  // The stable identity from `automationSteps.stepKey` (see that field's
+  // comment in convex/schema.ts). `id` above stays the row's real `_id` —
+  // needed as-is to resolve `parentStepId` references while rebuilding the
+  // tree — so this is a second, separate field, not a replacement for it.
+  //
+  // Whoever builds a `StepRow` owns resolving that field's documented
+  // `stepKey ?? _id` fallback for a row that predates key-minting;
+  // `convex/automations.ts`'s `toStepRow` is the real caller and does
+  // exactly that. This module deliberately passes whatever it is given
+  // through verbatim (see `buildStepsTree`) and never substitutes `id`
+  // itself — it has no way to know the two are related.
+  stepKey: string | null | undefined;
 }
 
 /**
@@ -122,6 +158,8 @@ export function buildStepsTree(rows: StepRow[]): BuilderStepNode[] {
   for (const row of rows) {
     byId.set(row.id, {
       id: row.id,
+      stepKey: row.stepKey,
+      effectiveStepKey: row.stepKey ?? row.id,
       step_type: row.stepType,
       step_config: row.stepConfig ?? {},
       branches: { yes: [], no: [] },
@@ -142,4 +180,84 @@ export function buildStepsTree(rows: StepRow[]): BuilderStepNode[] {
     }
   }
   return roots;
+}
+
+// ============================================================
+// stepsTreeEqual — fix wave (2026-08), finding 3. `automations.update`
+// scoped its "cancel queued runs" side effect to `steps !== undefined`,
+// with an explicit comment that a name-only or `stopOnReply`-only save
+// must cancel nothing — but the ONLY caller, `automation-builder.tsx`'s
+// `save()`, sends the full (unedited) steps array on EVERY save, so
+// that guard never actually fires on the real UI's rename-only path.
+// The fix moves the real distinction from "was `steps` present" to "did
+// the tree ACTUALLY change" — this function is that comparison.
+//
+// Deliberately ignores `id`/`stepKey`/`effectiveStepKey`: a genuinely
+// unedited resave round-trips each step's stable key as `id` (mirrors
+// `automation-builder.tsx`'s `toApiSteps`), but comparing on identity
+// would make ANY resave (even a byte-for-byte one) register as
+// "changed" the moment a single step's incoming `id` happens to differ
+// from how `buildStepsTree` represents the stored side — which is
+// exactly the false positive this function exists to avoid. Order
+// still matters (position drives `automationRuns.nextPosition`
+// resolution), so a plain reorder DOES register as a change: array
+// order is compared alongside content, not sorted away.
+// ============================================================
+
+/** Structural (not reference) equality for JSON-shaped values — used
+ *  only to compare `step_config` objects. Treats a key whose value is
+ *  `undefined` as absent on both sides, since a step round-tripped
+ *  through a save can pick up/drop `undefined` fields that carry no
+ *  actual meaning (Convex strips `undefined` values on write; the
+ *  builder's own local state may or may not include them). Being
+ *  lenient here only widens what counts as "unchanged" — it can never
+ *  cause a REAL difference to be missed, since any two values that
+ *  differ in a defined key still compare unequal. */
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return a === b;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepEqualJson(v, b[i]));
+  }
+
+  const aObj = a as Record<string, unknown>;
+  const bObj = b as Record<string, unknown>;
+  const aKeys = Object.keys(aObj).filter((k) => aObj[k] !== undefined);
+  const bKeys = Object.keys(bObj).filter((k) => bObj[k] !== undefined);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((k) => bKeys.includes(k) && deepEqualJson(aObj[k], bObj[k]));
+}
+
+/**
+ * True when two step trees are structurally identical: same length and
+ * order at every level, each pair sharing the same `step_type` and a
+ * deep-equal `step_config`, recursing into `branches.yes`/`branches.no`.
+ * Ignores `id`/`stepKey`/`branch`/`parent_index` — see this section's
+ * own header comment for why.
+ *
+ * Both sides are expected already in nested-tree form — callers pass
+ * `buildStepsTree`'s output for the stored side and
+ * `normalizeStepsInput`'s output for the incoming side (both live in
+ * `convex/automations.ts`, which imports this function; not re-imported
+ * here to keep this module dependency-free per its own header comment).
+ */
+export function stepsTreeEqual(a: BuilderStepInput[], b: BuilderStepInput[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const nodeA = a[i]!;
+    const nodeB = b[i]!;
+    if (nodeA.step_type !== nodeB.step_type) return false;
+    if (!deepEqualJson(nodeA.step_config ?? {}, nodeB.step_config ?? {})) return false;
+    const aYes = nodeA.branches?.yes ?? [];
+    const aNo = nodeA.branches?.no ?? [];
+    const bYes = nodeB.branches?.yes ?? [];
+    const bNo = nodeB.branches?.no ?? [];
+    if (!stepsTreeEqual(aYes, bYes)) return false;
+    if (!stepsTreeEqual(aNo, bNo)) return false;
+  }
+  return true;
 }

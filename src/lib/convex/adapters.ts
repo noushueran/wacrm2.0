@@ -1,5 +1,8 @@
 import { ConvexError } from "convex/values";
 import type { Doc, Id } from "../../../convex/_generated/dataModel";
+// Pure, dependency-free module (see its own header) — safe to import into
+// this client-side adapter file, unlike `_generated`/`convex/server`.
+import type { RunCounts } from "../../../convex/lib/automations/runStats";
 import { resolveMediaUrl } from "@/lib/storage/media-url";
 import type {
   AccountInvitation,
@@ -70,18 +73,32 @@ import type {
 // of it displays these legacy fields.
 // ============================================================
 
+/** `embedTags` (`convex/contacts.ts`/`convex/conversations.ts`, kept in
+ *  step with each other) rides the owning `contactTags` link's `source`
+ *  along with each embedded tag doc so the UI can mark an ad-derived
+ *  label without a second round trip. A plain `Doc<"tags">` (e.g. from
+ *  `api.tags.list`, which has no `contactTags` link to read a source
+ *  from) is assignable here too — `source` is optional. */
+type EmbeddedTag = Doc<"tags"> & { source?: "ai" | "manual" | "ad" };
+
 /** Convex has no `updatedAt` field on `contacts` yet — `Contact.updated_at`
  *  is required on the UI type, so it's backfilled from `_creationTime`
  *  until a real column exists. Every write path in this vertical updates
  *  reactively anyway, so no UI currently depends on this value changing
- *  independently of `created_at`. */
-export function toUiTag(doc: Doc<"tags">): Tag {
+ *  independently of `created_at`.
+ *
+ *  Takes the tag doc's `source` as part of `doc` itself (not a second
+ *  parameter) so a bare `.map(toUiTag)` stays correctly typed wherever
+ *  it's called — a second parameter would collide with the `index`
+ *  `Array.prototype.map` passes into that position. */
+export function toUiTag(doc: EmbeddedTag): Tag {
   return {
     id: doc._id,
     user_id: "",
     name: doc.name,
     color: doc.color,
     group_id: doc.groupId,
+    source: doc.source,
     created_at: new Date(doc._creationTime).toISOString(),
   };
 }
@@ -111,7 +128,7 @@ export function toUiTagSuggestion(doc: Doc<"tagSuggestions">): TagSuggestion {
 }
 
 export function toUiContact(
-  doc: Doc<"contacts"> & { tags?: Doc<"tags">[] },
+  doc: Doc<"contacts"> & { tags?: EmbeddedTag[] },
 ): Contact {
   const createdAt = new Date(doc._creationTime).toISOString();
   return {
@@ -134,7 +151,11 @@ export function toUiContact(
     travelers: doc.travelers,
     budget: doc.budget,
     notes: doc.notes,
-    avatar_url: doc.avatarUrl,
+    // Same dual-read as `toUiMember` — R2 key preferred, legacy absolute
+    // url as the fallback. `?? undefined` rather than passing the `null`
+    // straight through: `Contact.avatar_url` is an optional `string`,
+    // unlike `AccountMember.avatar_url`, which is `string | null`.
+    avatar_url: resolveMediaUrl({ key: doc.avatarKey, url: doc.avatarUrl }) ?? undefined,
     created_at: createdAt,
     updated_at: createdAt,
     tags: doc.tags ? doc.tags.map(toUiTag) : undefined,
@@ -147,6 +168,7 @@ export function toUiContact(
           first_seen_at: new Date(doc.acquisitionAd.firstSeenAt).toISOString(),
         }
       : undefined,
+    do_not_contact: doc.doNotContact,
   };
 }
 
@@ -301,7 +323,24 @@ export function toUiNotification(doc: Doc<"notifications">): Notification {
  *  undefined`, not `Contact | null`. */
 export function toUiConversation(
   doc: Doc<"conversations"> & {
-    contact: (Doc<"contacts"> & { tags?: Doc<"tags">[] }) | null;
+    contact: (Doc<"contacts"> & { tags?: EmbeddedTag[] }) | null;
+    // Chasing-lane-only sequence detail (Task 7) — present when `doc`
+    // came from `conversations.list` with `lane: "chasing"`, absent from
+    // every other lane and from `conversations.get`. Optional here so
+    // every other caller of this adapter keeps compiling unchanged.
+    followUpsSent?: number;
+    // The same four-literal union `Conversation.sequenceStatus` and
+    // `leadAnalyses.sequenceStatus` (schema.ts) declare — a bare `string`
+    // here would not assign to the narrowed UI type.
+    sequenceStatus?: "idle" | "running" | "exhausted" | "stopped";
+    // Manual lane overrides (Task 7, spec 2026-07-28-inbox-manual-
+    // overrides) — real columns on `conversations` (`schema.ts`'s
+    // `v.optional(v.number())`, unset on every row that hasn't been
+    // snoozed/force-chased), returned by `conversations.list` on every
+    // lane (unlike `followUpsSent`/`sequenceStatus` above, which are
+    // Chasing-lane-only projections).
+    snoozedUntil?: number;
+    chasingForcedAt?: number;
   },
 ): Conversation {
   const createdAt = new Date(doc._creationTime).toISOString();
@@ -339,6 +378,41 @@ export function toUiConversation(
           started_at: new Date(doc.adReferral.startedAt).toISOString(),
         }
       : undefined,
+    archived_at: doc.archivedAt
+      ? new Date(doc.archivedAt).toISOString()
+      : undefined,
+    // Meta's two messaging windows. `lastInboundAt` anchors the 24h
+    // customer service window (message TYPE); `metaWindow` carries Meta's
+    // own authoritative record of the free-entry-point window (COST), with
+    // `firstReplyAt` anchoring the local estimate until it arrives.
+    last_inbound_at: doc.lastInboundAt
+      ? new Date(doc.lastInboundAt).toISOString()
+      : undefined,
+    first_reply_at: doc.firstReplyAt
+      ? new Date(doc.firstReplyAt).toISOString()
+      : undefined,
+    meta_window: doc.metaWindow
+      ? {
+          conversation_meta_id: doc.metaWindow.conversationMetaId,
+          origin_type: doc.metaWindow.originType,
+          expires_at: doc.metaWindow.expiresAt
+            ? new Date(doc.metaWindow.expiresAt).toISOString()
+            : undefined,
+          is_free_entry_point: doc.metaWindow.isFreeEntryPoint,
+        }
+      : undefined,
+    followUpsSent: doc.followUpsSent,
+    sequenceStatus: doc.sequenceStatus,
+    snoozed_until: doc.snoozedUntil
+      ? new Date(doc.snoozedUntil).toISOString()
+      : undefined,
+    chasing_forced_at: doc.chasingForcedAt
+      ? new Date(doc.chasingForcedAt).toISOString()
+      : undefined,
+    // Passed straight through, NOT coerced: `undefined` (pre-backfill)
+    // and `false` are different facts, and the "Chase now" gate that
+    // reads it must not treat an unbackfilled row as "we spoke last".
+    awaiting_reply: doc.awaitingReply,
   };
 }
 
@@ -841,7 +915,7 @@ export function toUiAiKnowledgeDoc(
  *  cast elsewhere in this file — Postgres never put a CHECK on
  *  `triggerType` either (see schema.ts's own comment on this column). */
 export function toUiAutomation(
-  doc: Doc<"automations"> & { stepCount?: number },
+  doc: Doc<"automations"> & { stepCount?: number; runCounts?: RunCounts },
 ): Automation {
   return {
     id: doc._id,
@@ -860,6 +934,11 @@ export function toUiAutomation(
     updated_at: doc.updatedAt
       ? new Date(doc.updatedAt).toISOString()
       : new Date(doc._creationTime).toISOString(),
+    stop_on_reply: doc.stopOnReply ?? false,
+    // Only `automations.list` computes this (see that query's own
+    // `summarizeRuns` call) — `automations.get` doesn't, so this stays
+    // `undefined` for edit/logs-page callers that source from `get`.
+    runCounts: doc.runCounts,
   };
 }
 

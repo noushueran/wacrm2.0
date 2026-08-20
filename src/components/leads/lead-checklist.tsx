@@ -91,7 +91,7 @@ export function LeadChecklist({
           <ListChecks className="h-3.5 w-3.5 text-primary" />
           {t('title')}
         </p>
-        <Badge variant="outline" className="gap-1 text-[10px] text-muted-foreground">
+        <Badge variant="outline" className="gap-1 text-[11px] text-muted-foreground">
           <BookOpenText className="h-3 w-3" />
           {checklist.source === 'kb' ? t('sourceKb') : t('sourceDefault')}
         </Badge>
@@ -174,7 +174,7 @@ export function LeadChecklist({
                     </p>
                   ) : null}
                   {item.done && (item.doneByName || item.doneAt) ? (
-                    <p className="mt-0.5 text-[11px] text-muted-foreground/70">
+                    <p className="mt-0.5 text-[12px] text-muted-foreground/70">
                       {t('doneBy', {
                         name: item.doneByName ?? '—',
                         ago: item.doneAt
@@ -241,7 +241,7 @@ export function LeadChecklist({
                     >
                       {t('cancel')}
                     </Button>
-                    <span className="text-[11px] text-muted-foreground">{t('noteHint')}</span>
+                    <span className="text-[12px] text-muted-foreground">{t('noteHint')}</span>
                   </div>
                 </div>
               ) : null}

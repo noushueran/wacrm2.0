@@ -20,6 +20,14 @@ export const CONFIG_PATCH_KEYS = [
   "followUpDelaysMinutes",
   "maxFollowUps",
   "sessionWindowHours",
+  // The Inbox's Waiting/Chasing boundary (spec 2026-07-27-inbox-lanes
+  // §Data model). Absent means "exactly where the qualification engine
+  // gives up" — `sessionWindowHours / 24` — so it only needs setting to
+  // give agents LONGER before a thread is called stale. Patchable here
+  // because the spec tells owners to set it explicitly; without this key
+  // `updateConfig` silently stripped it and a direct DB write was the
+  // only way in.
+  "chasingAfterDays",
   "reengagementTemplateName",
   "reengagementTemplateLanguage",
   "closingMessage",
@@ -136,6 +144,17 @@ export function validateConfigPatch(patch: QualificationConfigPatch): string | n
   if (p.sessionWindowHours !== undefined) {
     if (!isNumber(p.sessionWindowHours) || p.sessionWindowHours < 1 || p.sessionWindowHours > 24 * 14) {
       return "sessionWindowHours must be 1–336";
+    }
+  }
+  if (p.chasingAfterDays !== undefined) {
+    // Lower bound 1 day, matching `lib/inbox/lanes.ts`'s own MIN_DAYS
+    // clamp — a cutoff at or after `now` would render every thread an
+    // agent just answered as neglected, and would hand the auto-assign
+    // sweep the whole Waiting lane. Upper bound 90 days: beyond that the
+    // Chasing lane is empty in practice and the honest tool is P2's
+    // archive, not a boundary nobody's threads ever cross.
+    if (!isNumber(p.chasingAfterDays) || p.chasingAfterDays < 1 || p.chasingAfterDays > 90) {
+      return "chasingAfterDays must be 1–90 days";
     }
   }
   if (p.basicFields !== undefined) {

@@ -62,7 +62,7 @@ describe("VoiceTranscript", () => {
     // UNCLAMPED state, i.e. every transcript under the threshold.
     // Asserting the class is the only handle available here: real
     // overflow needs layout, and this repo has no jsdom.
-    expect(render({ text: "https://holidayys.co/packages/dubai-family-7n-6d-winter-2026" }))
+    expect(render({ text: "https://amaniworld.com/packages/dubai-family-7n-6d-winter-2026" }))
       .toContain("break-words");
   });
 

@@ -41,7 +41,7 @@ export function BottomNav({ onOpenMore }: { onOpenMore: () => void }) {
             href={item.href}
             aria-label={t(item.labelKey)}
             className={cn(
-              "relative flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[11px] font-medium",
+              "relative flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium",
               active ? "text-primary" : "text-muted-foreground",
             )}
           >
@@ -55,7 +55,7 @@ export function BottomNav({ onOpenMore }: { onOpenMore: () => void }) {
         type="button"
         onClick={onOpenMore}
         aria-label={t("openMenu")}
-        className="flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[11px] font-medium text-muted-foreground"
+        className="flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium text-muted-foreground"
       >
         <Menu className="h-5 w-5" />
         {t("more")}

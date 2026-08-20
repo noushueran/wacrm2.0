@@ -214,7 +214,7 @@ test("list throws FORBIDDEN for a caller below the admin role", async () => {
 
 test("list still returns keys for an admin", async () => {
   const t = convexTest(schema, modules);
-  const { accountId, asUser: asOwner } = await seedAccountMember(t, {
+  const { asUser: asOwner } = await seedAccountMember(t, {
     name: "Owner",
     email: "owner@example.com",
     role: "owner",

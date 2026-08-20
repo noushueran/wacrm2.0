@@ -29,7 +29,14 @@
 //
 // Response (202):
 //   { "data": { "broadcast_id", "status": "sending",
-//               "total_recipients", "accepted", "rejected" } }
+//               "total_recipients", "accepted", "rejected", "skipped" } }
+//
+// `total_recipients`/`accepted` count only recipients that will
+// ACTUALLY be messaged — same number persisted on the broadcast row.
+// `rejected` counts recipients dropped for an invalid phone number;
+// `skipped` (additive) counts recipients dropped because the resolved
+// contact has asked not to be contacted (`doNotContact`). A recipient
+// is never both.
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
@@ -90,6 +97,7 @@ export async function POST(request: Request) {
         total_recipients: result.totalRecipients,
         accepted: result.totalRecipients,
         rejected: result.rejected,
+        skipped: result.skipped,
       },
       202
     );

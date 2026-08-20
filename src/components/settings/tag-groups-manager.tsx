@@ -78,7 +78,7 @@ export function TagGroupsManager() {
                 {group ? group.name : t('ungrouped')}
               </span>
               {group && (
-                <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] uppercase text-muted-foreground">
                   {group.selection_mode === 'single' ? t('single') : t('multi')}
                 </span>
               )}

@@ -399,16 +399,137 @@ test("an inbound image is described the same way", async () => {
   expect(imageRow!.aiTranscription).toBe("[dry-run transcript]");
 }, 20_000);
 
+// ============================================================
+// Media understanding is INDEPENDENT of auto-reply (2026-07-25).
+//
+// Transcription used to live inside `dispatchInbound`, below its
+// `autoReplyEnabled` gate, and `setTranscription` had exactly one
+// caller — so an account with auto-reply off (the default; the owner
+// enables it deliberately) never produced a single transcript. Reading
+// what a customer said and letting the bot answer them were the same
+// switch. They are different decisions.
+// ============================================================
+
+async function seedAudioThread(
+  t: TestConvex<typeof schema>,
+  asUser: Awaited<ReturnType<typeof seedAccountMember>>["asUser"],
+  accountId: Id<"accounts">,
+  phone: string,
+) {
+  const contactId = await asUser.mutation(api.contacts.create, { phone });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  const audioMessageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "audio" as const,
+      mediaUrl: "https://example.com/voice.ogg",
+      status: "sent" as const,
+    }),
+  );
+  return { contactId, conversationId, audioMessageId };
+}
+
+test("a voice note is transcribed with auto-reply OFF — and no reply is sent", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser, { autoReplyEnabled: false });
+  const { contactId, conversationId, audioMessageId } = await seedAudioThread(
+    t,
+    asUser,
+    accountId,
+    "15551234567",
+  );
+
+  await t.action(internal.aiReply.understandInboundMedia, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  // The transcript reaches the inbox…
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBe("[dry-run transcript]");
+  // …and the bot stays silent. This is the whole point: an agent can
+  // read the voice note without the business auto-messaging customers.
+  const msgs = await messagesFor(t, conversationId);
+  expect(msgs.filter((m) => m.senderType !== "customer")).toHaveLength(0);
+}, 20_000);
+
+test("understanding still stands down when the account's AI is switched off entirely", async () => {
+  // `isActive` is the master switch — and what says we may spend the
+  // account's own BYO key at all. Only `autoReplyEnabled` is bypassed.
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser, { isActive: false, autoReplyEnabled: false });
+  const { contactId, conversationId, audioMessageId } = await seedAudioThread(
+    t,
+    asUser,
+    accountId,
+    "15551234568",
+  );
+
+  await t.action(internal.aiReply.understandInboundMedia, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBeUndefined();
+}, 20_000);
+
+test("re-running understanding is idempotent — an already-transcribed row is left alone", async () => {
+  // Both entry points (arrival + the reply dispatch) call the same
+  // helper, so this must not re-spend the key on the same clip.
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser, { autoReplyEnabled: false });
+  const { contactId, conversationId, audioMessageId } = await seedAudioThread(
+    t,
+    asUser,
+    accountId,
+    "15551234569",
+  );
+  await t.run((ctx) => ctx.db.patch(audioMessageId, { aiTranscription: "already heard" }));
+
+  await t.action(internal.aiReply.understandInboundMedia, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  const audioRow = await t.run((ctx) => ctx.db.get(audioMessageId));
+  expect(audioRow!.aiTranscription).toBe("already heard");
+}, 20_000);
+
 test("a customer media row with only mediaKey (no mediaUrl) is still picked up and transcribed", async () => {
   // Task 5 of the R2 migration: `untranscribedMediaRows`' filter widens
   // from `m.mediaUrl` alone to `m.mediaKey || m.mediaUrl` — without that
   // widening, a key-only row (the post-cutover shape) would be silently
   // excluded from the query and never transcribed at all.
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
     name: "Alice",
@@ -1010,6 +1131,250 @@ test("account isolation: playground never falls back to a different account's AI
   expect(result).toMatchObject({ code: "ai_not_configured" });
 });
 
+test("playground rejects a media key from another account (never leaks)", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [
+      { role: "user", content: "", media: { kind: "audio", key: "other-account/inbound/x.webm" } },
+    ],
+  });
+
+  expect(result).toEqual({
+    error: "That attachment could not be found.",
+    code: "media_not_found",
+  });
+});
+
+test("playground rejects more than one live media turn in a single call, without ever touching the network", async () => {
+  // The validator's own doc comment asserts "at most one key is present per
+  // call" (the client only ever attaches a live key to the turn it's
+  // sending now — older media turns are replayed as plain text). Two live
+  // media turns must be rejected outright, not silently transcribed up to
+  // PLAYGROUND_MAX_TURNS times while `understanding` reports only the last.
+  const fetchSpy = vi.fn(() => {
+    throw new Error("fetch should not be called");
+  });
+  vi.stubGlobal("fetch", fetchSpy);
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [
+      { role: "user", content: "", media: { kind: "audio", key: `${accountId}/inbound/a.webm` } },
+      { role: "user", content: "", media: { kind: "image", key: `${accountId}/inbound/b.jpg` } },
+    ],
+  });
+
+  expect(result).toEqual({
+    error: "Send one voice note or image at a time.",
+    code: "too_many_media",
+  });
+  expect(fetchSpy).not.toHaveBeenCalled();
+  vi.unstubAllGlobals();
+});
+
+test("playground transcribes a recorded voice note, then replies (mirrors auto-reply)", async () => {
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
+  try {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+    });
+    await configureAi(asUser);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("objs.amaniworld.com")) {
+          // R2 download inside transcribeAudioFromUrl
+          return new Response(new Blob([new Uint8Array([1, 2, 3])], { type: "audio/webm" }), {
+            status: 200,
+            headers: { "content-type": "audio/webm" },
+          });
+        }
+        if (url.includes("/audio/transcriptions")) {
+          return new Response(JSON.stringify({ text: "Dubai visa venam" }), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "Sure — happy to help with a Dubai visa!" } }],
+            usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const result = await asUser.action(api.aiReply.playground, {
+      messages: [
+        { role: "user", content: "", media: { kind: "audio", key: `${accountId}/inbound/v.webm` } },
+      ],
+    });
+
+    expect(result).toEqual({
+      reply: "Sure — happy to help with a Dubai visa!",
+      handoff: false,
+      understanding: {
+        transcription: "Dubai visa venam",
+        historyContent: "[voice note] Dubai visa venam",
+      },
+    });
+    vi.unstubAllGlobals();
+  } finally {
+    delete process.env.R2_BUCKET;
+    delete process.env.R2_ENDPOINT;
+    delete process.env.R2_ACCESS_KEY_ID;
+    delete process.env.R2_SECRET_ACCESS_KEY;
+    delete process.env.R2_PUBLIC_HOST;
+  }
+});
+
+test("playground describes an image with its caption, then replies", async () => {
+  process.env.R2_BUCKET = "test-bucket";
+  process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "test-key";
+  process.env.R2_SECRET_ACCESS_KEY = "test-secret";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
+  try {
+    const t = convexTest(schema, modules);
+    const { asUser, accountId } = await seedAccountMember(t, {
+      name: "Alice",
+      email: "alice@example.com",
+    });
+    // A chat model distinct from the pinned vision model, so the
+    // request-body assertions below can prove the two are DECOUPLED:
+    // the reply uses `config.model`, the vision-describe does not.
+    await configureAi(asUser, { model: "gpt-4o" });
+
+    let chatCalls = 0;
+    let firstChatModel: unknown;
+    let secondChatModel: unknown;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/chat/completions")) {
+          chatCalls += 1;
+          // Capture each call's `model` so the vision/reply split can be
+          // asserted below, outside this stub.
+          const body = JSON.parse((init?.body as string | undefined) ?? "{}") as {
+            model?: unknown;
+          };
+          if (chatCalls === 1) firstChatModel = body.model;
+          if (chatCalls === 2) secondChatModel = body.model;
+          // 1st chat call = vision describe; 2nd = the reply.
+          const content =
+            chatCalls === 1
+              ? "A UAE tourist visa document."
+              : "Thanks — that looks like a valid UAE visa.";
+          return new Response(
+            JSON.stringify({
+              choices: [{ message: { content } }],
+              usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+            }),
+            { status: 200 },
+          );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    const result = await asUser.action(api.aiReply.playground, {
+      messages: [
+        { role: "user", content: "is this valid?", media: { kind: "image", key: `${accountId}/inbound/p.jpg` } },
+      ],
+    });
+
+    // The vision-describe call uses the PINNED vision model, so image
+    // reading can't be broken by configuring a non-vision chat model…
+    expect(firstChatModel).toBe("gpt-5.6-luna");
+    // …while the reply itself still honours the account's own model.
+    expect(secondChatModel).toBe("gpt-4o");
+
+    expect(result).toEqual({
+      reply: "Thanks — that looks like a valid UAE visa.",
+      handoff: false,
+      understanding: {
+        transcription: "A UAE tourist visa document.",
+        historyContent: "[image] is this valid? — A UAE tourist visa document.",
+      },
+    });
+    vi.unstubAllGlobals();
+  } finally {
+    delete process.env.R2_BUCKET;
+    delete process.env.R2_ENDPOINT;
+    delete process.env.R2_ACCESS_KEY_ID;
+    delete process.env.R2_SECRET_ACCESS_KEY;
+    delete process.env.R2_PUBLIC_HOST;
+  }
+});
+
+test("playground degrades to the bare placeholder (never rejects) when R2 is unconfigured", async () => {
+  // The exact trap `dispatchInbound`'s own R2-unconfigured test calls out
+  // (see "a customer media row with mediaKey and R2 unconfigured is
+  // skipped" above): `r2ConfigFromEnv()` throws when R2 env vars are
+  // unset — deliberately NOT set anywhere in this test — and
+  // `resolveMediaUrlLazy` forwards that throw whenever `key` is present.
+  // `PlaygroundResult`'s contract is `{error, code?}` — never thrown — for
+  // domain failures, so the action must still RESOLVE, degrading to the
+  // bare `[voice note]` placeholder (`transcription: null`) exactly as
+  // production does when media can't be understood, instead of rejecting
+  // the caller's promise.
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+
+  // Only the chat completion (the reply itself) should ever be fetched —
+  // `transcribeAudioFromUrl` must never be reached because the throw
+  // happens earlier, while resolving the media URL. Enforced (not just
+  // assumed): anything other than the chat-completions call throws, so a
+  // regression that let `transcribeAudioFromUrl` run would fail this test
+  // instead of silently passing (it would otherwise still resolve to
+  // `transcription: null` and look identical).
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/chat/completions")) {
+        return okChatCompletion("Sure, happy to help!");
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }),
+  );
+
+  const result = await asUser.action(api.aiReply.playground, {
+    messages: [
+      { role: "user", content: "", media: { kind: "audio", key: `${accountId}/inbound/v.webm` } },
+    ],
+  });
+
+  expect(result).toEqual({
+    reply: "Sure, happy to help!",
+    handoff: false,
+    understanding: { transcription: null, historyContent: "[voice note]" },
+  });
+  vi.unstubAllGlobals();
+});
+
 // ------------------------------------------------------------
 // draft
 // ------------------------------------------------------------
@@ -1303,7 +1668,7 @@ test("an ad-lead conversation replies AND warms the landing cache lazily", async
       adReferral: {
         headline: "Georgia Summer Package",
         body: "5 nights from AED 1299",
-        sourceUrl: "https://holidayys.co/packages/georgia-summer?fbclid=click-1",
+        sourceUrl: "https://amaniworld.com/packages/georgia-summer?fbclid=click-1",
         sourceType: "ad" as const,
         startedAt: Date.now(),
       },
@@ -1325,7 +1690,7 @@ test("an ad-lead conversation replies AND warms the landing cache lazily", async
       .withIndex("by_account_url", (q) =>
         q
           .eq("accountId", accountId)
-          .eq("urlKey", "https://holidayys.co/packages/georgia-summer"),
+          .eq("urlKey", "https://amaniworld.com/packages/georgia-summer"),
       )
       .collect(),
   );
@@ -1513,6 +1878,47 @@ test("ackInbound returns skipped_assigned once a human owns the thread", async (
   expect(result).toBe("skipped_assigned");
 });
 
+test("ackInbound skips a do-not-contact customer — no read receipt, no typing indicator", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-ack-dnc@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000104",
+    messageText: "hi",
+  });
+
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Asked us never to contact him again",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, {
+      doNotContact: { at: Date.now(), noteId },
+    });
+  });
+
+  // Same mechanism the other ackInbound gate tests use: the returned
+  // `AckOutcome` IS the observable — `metaSend.markRead` (the read
+  // receipt + typing indicator) is only ever reached on the "acked"
+  // path below it, and under DRY-RUN it no-ops before touching Meta or
+  // the DB either way, so there is nothing else to assert against.
+  const result = await t.action(internal.aiReply.ackInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerWamid: "wamid.TEST_ACK_DNC",
+  });
+
+  expect(result).toBe("skipped_do_not_contact");
+});
+
 test("ackInbound returns acked when the conversation is eligible", async () => {
   const t = convexTest(schema, modules);
   const { accountId, asUser } = await seedAccountMember(t, {
@@ -1651,6 +2057,56 @@ test("deliverReply stands down when a human claims the conversation after dispat
     contactId,
     to: "+971500000203",
     replyText: "must not send — a human just took over",
+    inquiryIds: [],
+  });
+
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.some((m) => m.senderType === "bot")).toBe(false);
+  // No bookkeeping either — this send never happened.
+  expect((await getConversation(t, conversationId))!.aiReplyCount ?? 0).toBe(0);
+});
+
+test("deliverReply stands down when a do-not-contact flag lands after dispatch already scheduled delivery", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-deliver-dnc@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000206",
+    messageText: "how much for the August package?",
+  });
+
+  // Gate passes at dispatch: nothing has flagged this contact yet.
+  const dispatchContext = await t.run((ctx) =>
+    ctx.db.get(contactId).then((c) => ({ blockedReasonInput: c })),
+  );
+  expect(dispatchContext.blockedReasonInput?.doNotContact).toBeUndefined();
+
+  // Simulates an agent recording a do-not-contact note from the thread
+  // during the artificial typing delay `dispatchInbound` already
+  // scheduled this delivery behind — the exact race GAP 5 closes.
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Asked us never to contact him again",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, {
+      doNotContact: { at: Date.now(), noteId },
+    });
+  });
+
+  await t.action(internal.aiReply.deliverReply, {
+    accountId,
+    conversationId,
+    contactId,
+    to: "+971500000206",
+    replyText: "must not send — contact was flagged do-not-contact mid-flight",
     inquiryIds: [],
   });
 
@@ -2050,4 +2506,303 @@ test("a deferred reply still lands — sustained overload paces, it never drops"
   const bot = messages.filter((m) => m.senderType === "bot");
   expect(bot).toHaveLength(1); // exactly one — deferral must not duplicate
   expect(bot[0]!.contentText).toBeTruthy();
+});
+
+// ------------------------------------------------------------
+// Audience isolation on the customer-facing reply paths
+// ------------------------------------------------------------
+
+/**
+ * `aiKnowledge.retrieve`'s `audience: "customer"` narrowing is what keeps
+ * `audience: "internal"` chunks — agent-only Notes (pricing ranges,
+ * disqualification rules, "route to a human" playbooks) and
+ * `kbOpsBlocks`' PURCHASE CRITERIA sentinels — out of anything a customer
+ * reads. `aiKnowledge.test.ts` proves the FILTER works; this proves the
+ * reply paths actually ASK for it.
+ *
+ * That distinction matters because the argument is optional and the
+ * failure is silent: drop it and `retrieve` happily returns internal
+ * chunks, which carry only a `[Service — Notes]` header — nothing marking
+ * them internal — so the model cannot self-censor either. Every compiled
+ * chunk would then be eligible to ground a reply we send to a customer.
+ * That is exactly the state this file's `dispatchInbound`/`draft` paths
+ * shipped in before this guard existed.
+ *
+ * A behavioural assertion isn't available here: under `CONVEX_AI_DRY_RUN`
+ * `syntheticGeneration` ignores the retrieved knowledge entirely and
+ * returns a fixed string, so leaked content never reaches an observable
+ * output. This is therefore a STRUCTURAL guard over the call sites. It
+ * proves the argument is passed — not that the pool is correctly filtered
+ * (that is `aiKnowledge.test.ts`'s job).
+ *
+ * Deliberately scoped to `aiReply.ts`: `qualificationEngine.ts` and
+ * `salesChecklists.ts` call the same action WITHOUT the filter on purpose,
+ * because they exist to read the internal checklists.
+ */
+test("every customer-facing reply path requests the customer-only pool", async () => {
+  const fs = await import("node:fs");
+  const url = await import("node:url");
+  const src = fs.readFileSync(
+    url.fileURLToPath(new URL("./aiReply.ts", import.meta.url)),
+    "utf8",
+  );
+
+  const NEEDLE = "internal.aiKnowledge.retrieve";
+  const sites: string[] = [];
+  let from = 0;
+  for (;;) {
+    const at = src.indexOf(NEEDLE, from);
+    if (at === -1) break;
+    from = at + NEEDLE.length;
+    // Walk from the call's `{` to its matching `}` so the slice is the
+    // argument object itself — not a fixed character window that a
+    // longer comment could push the `audience` key out of.
+    const open = src.indexOf("{", from);
+    if (open === -1) continue;
+    let depth = 0;
+    let end = open;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === "{") depth++;
+      else if (src[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    sites.push(src.slice(open, end + 1));
+  }
+
+  // Premise guard: if a refactor renames or removes these calls this test
+  // must fail loudly rather than vacuously pass over an empty list.
+  expect(sites.length).toBe(3);
+
+  for (const site of sites) {
+    expect(site).toContain('audience: "customer"');
+  }
+});
+
+// ============================================================
+// Document + video understanding. Both were fetched into R2 at ingest
+// and then never read: `untranscribedMediaRows` only ever selected
+// audio/image, so the model saw a bare "[document]"/"[video]".
+// ============================================================
+
+async function seedMediaConversation(t: ReturnType<typeof convexTest>) {
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  await configureAi(asUser);
+  const contactId = await asUser.mutation(api.contacts.create, { phone: "15551234567" });
+  const conversationId = await t.run((ctx) =>
+    ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open" as const,
+      unreadCount: 0,
+    }),
+  );
+  return { accountId, contactId, conversationId };
+}
+
+test("an inbound PDF document is read instead of staying a placeholder", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedMediaConversation(t);
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "document" as const,
+      contentText: "visa-approval.pdf",
+      mediaUrl: "https://objs.amaniworld.com/acct/inbound/a.pdf",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const row = await t.run((ctx) => ctx.db.get(messageId));
+  expect(row!.aiTranscription).toBe("[dry-run transcript]");
+}, 20_000);
+
+test("a passport photo sent as a document is read too", async () => {
+  // WhatsApp's "send as document" preserves image quality, so this is how
+  // scans actually arrive — envelope says document, body is a JPEG.
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedMediaConversation(t);
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "document" as const,
+      contentText: "passport.jpg",
+      mediaUrl: "https://objs.amaniworld.com/acct/inbound/a.jpg",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const row = await t.run((ctx) => ctx.db.get(messageId));
+  expect(row!.aiTranscription).toBe("[dry-run transcript]");
+}, 20_000);
+
+test("an inbound video is transcribed for its audio track", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedMediaConversation(t);
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "video" as const,
+      mediaUrl: "https://objs.amaniworld.com/acct/inbound/a.mp4",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const row = await t.run((ctx) => ctx.db.get(messageId));
+  expect(row!.aiTranscription).toBe("[dry-run transcript]");
+}, 20_000);
+
+test("a format nothing can read keeps its placeholder rather than burning a call", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedMediaConversation(t);
+  const messageId = await t.run((ctx) =>
+    ctx.db.insert("messages", {
+      accountId,
+      conversationId,
+      senderType: "customer" as const,
+      contentType: "document" as const,
+      contentText: "contract.docx",
+      mediaUrl: "https://objs.amaniworld.com/acct/inbound/a.docx",
+      status: "sent" as const,
+    }),
+  );
+
+  await t.action(internal.aiReply.dispatchInbound, { accountId, conversationId, contactId });
+
+  const row = await t.run((ctx) => ctx.db.get(messageId));
+  expect(row!.aiTranscription).toBeUndefined();
+});
+
+// ============================================================
+// Gate 1 — do-not-contact (Task 4). `blockedReason` (`lib/notes/gate.ts`)
+// is the single predicate every automated outbound path consults;
+// `dispatchInbound` is the one that stops an actual reply from going
+// out. `loadDispatchContext` computes both the gate input and the
+// distilled `CustomerState` the reply prompt reads — see that query's
+// own comment for why they're derived together.
+// ============================================================
+
+test("dispatchInbound skips a do-not-contact customer and says so", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-dnc@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000300",
+    messageText: "Hello?",
+  });
+
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Asked us never to contact him again",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, {
+      doNotContact: { at: Date.now(), noteId },
+    });
+  });
+
+  const outcome = await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  expect(outcome).toBe("skipped_do_not_contact");
+
+  // Nothing was sent.
+  const messages = await messagesFor(t, conversationId);
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+});
+
+test("dispatchInbound still replies to a contact with notes but no do-not-contact flag", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-notes-only@example.com",
+  });
+  await configureAi(asUser);
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000301",
+    messageText: "Hello?",
+  });
+
+  await t.run((ctx) =>
+    ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Called, wants March",
+      kind: "call",
+      outcome: "follow_up",
+    }),
+  );
+
+  const outcome = await t.action(internal.aiReply.dispatchInbound, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+  expect(outcome).not.toBe("skipped_do_not_contact");
+});
+
+test("loadDispatchContext derives customer state without exposing note text", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Owner",
+    email: "owner-load-context@example.com",
+  });
+  const { contactId, conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "+971500000302",
+    messageText: "Hello?",
+  });
+  const SECRET = "time-waster, quote him double";
+
+  await t.run((ctx) =>
+    ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: SECRET,
+      kind: "call",
+      outcome: "follow_up",
+    }),
+  );
+
+  const context = await t.query(internal.aiReply.loadDispatchContext, {
+    accountId,
+    conversationId,
+    contactId,
+  });
+
+  expect(context).not.toBeNull();
+  expect(context!.customerState.lastOfflineContact?.kind).toBe("call");
+  expect(context!.customerState.followUpFlaggedAtMs).toBeGreaterThan(0);
+  // The whole point: the note's TEXT is nowhere in what dispatch receives.
+  expect(JSON.stringify(context)).not.toContain(SECRET);
 });

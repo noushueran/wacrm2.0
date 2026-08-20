@@ -232,7 +232,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
 
                   <div className="space-y-2">
                     {column.length === 0 ? (
-                      <p className="whitespace-normal rounded-lg border border-dashed border-border px-2 py-3 text-center text-[11px] text-muted-foreground">
+                      <p className="whitespace-normal rounded-lg border border-dashed border-border px-2 py-3 text-center text-[12px] text-muted-foreground">
                         {over && canEdit ? t('dropHere') : '—'}
                       </p>
                     ) : (
@@ -270,7 +270,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
                                   </span>
                                   <span
                                     className={cn(
-                                      'ml-auto flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full px-1 text-[10px] font-bold tabular-nums',
+                                      'ml-auto flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full px-1 text-[11px] font-bold tabular-nums',
                                       scoreDotTone(lead.score),
                                     )}
                                   >
@@ -282,7 +282,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
                                     {lead.serviceName}
                                   </p>
                                 ) : null}
-                                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+                                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-muted-foreground">
                                   {checklist ? (
                                     <span
                                       className={cn(
@@ -377,7 +377,7 @@ export function LeadsPipelineView<L extends PipelineLead>({
                 <DialogTitle className="flex flex-wrap items-center gap-2">
                   {openLead.contactName}
                   {openLead.serviceName ? (
-                    <Badge variant="outline" className="text-[10px] text-muted-foreground">
+                    <Badge variant="outline" className="text-[11px] text-muted-foreground">
                       {openLead.serviceName}
                     </Badge>
                   ) : null}

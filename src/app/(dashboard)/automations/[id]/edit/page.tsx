@@ -2,12 +2,13 @@
 
 import { Component, use, useMemo } from "react"
 import { useRouter } from "next/navigation"
-import { useQuery } from "convex/react"
+import { useQuery } from "@/lib/convex/cached"
 import { Loader2 } from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import {
   AutomationBuilder,
+  ResourcesProvider,
   fromServerSteps,
   type BuilderInitial,
   type ServerStepNode,
@@ -64,6 +65,7 @@ function EditAutomationContent({ id }: { id: string }) {
       trigger_config: automation.trigger_config as Record<string, unknown>,
       is_active: automation.is_active,
       steps: fromServerSteps(result.steps as ServerStepNode[]),
+      stop_on_reply: automation.stop_on_reply,
     }
   }, [result])
 
@@ -101,7 +103,18 @@ export default function EditAutomationPage({
         </div>
       }
     >
-      <EditAutomationContent id={id} />
+      {/* Mounted OUTSIDE `EditAutomationContent`'s loading gate on
+          purpose. The builder — and therefore the tags/templates/custom
+          fields/pipelines/members queries it needs — used to mount only
+          after `automations.get` had already resolved, making the two a
+          sequential waterfall of round trips against the self-hosted
+          backend. Out here they all start in the same tick, so by the
+          time `get` lands the resources are usually there too. The
+          builder's own inner `ResourcesProvider` sees these and becomes
+          a pass-through rather than re-querying. */}
+      <ResourcesProvider>
+        <EditAutomationContent id={id} />
+      </ResourcesProvider>
     </AutomationNotFoundBoundary>
   )
 }

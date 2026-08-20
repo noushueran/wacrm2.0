@@ -43,7 +43,7 @@ async function seedAccount(t: TestConvex<typeof schema>) {
       email: "owner@example.com",
     });
     return await ctx.db.insert("accounts", {
-      name: "Holidayys",
+      name: "Amani",
       defaultCurrency: "USD",
       ownerUserId: userId,
     });

@@ -8,9 +8,10 @@ import { useAction, useConvex, useMutation } from "convex/react";
 // chat paints instantly instead of paying another cold round-trip to the
 // self-hosted Convex backend. Mutations/actions stay on `convex/react`.
 import { useQuery, usePaginatedQuery } from "@/lib/convex/cached";
+import type { FunctionReturnType } from "convex/server";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
-import { QualificationChip } from "@/components/inbox/qualification-chip";
+import { ThreadHeader } from "@/components/inbox/thread-header";
 import {
   toUiMemberProfile,
   toUiMessage,
@@ -18,18 +19,25 @@ import {
   toUiTagGroup,
 } from "@/lib/convex/adapters";
 import { tagChipRow } from "@/lib/inbox/labels";
+import { splitEarlierNotes, mergeTimelineEntries } from "@/lib/inbox/notes";
+import { NoteCard } from "./note-card";
+import { AssignmentEvent } from "./assignment-event";
+import { OptionalFeatureBoundary } from "./optional-feature-boundary";
+import { NoteComposer } from "./note-composer";
+import { DoNotContactBanner } from "./do-not-contact-banner";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
-import { PresenceDot } from "@/components/presence/presence-dot";
-import { presenceLabel } from "@/lib/presence";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/dashboard/skeleton";
 import {
   INITIAL_MESSAGE_PAGE_SIZE,
   messageAreaState,
+  overrideControls,
 } from "@/lib/inbox/view";
-import { adFreeWindowRemainingMs } from "@/lib/inbox/adWindow";
-import { formatPhoneIntl } from "@/lib/whatsapp/phone-utils";
+import {
+  formatWindowRemaining,
+  resolveConversationWindows,
+} from "@/lib/inbox/messagingWindow";
 import type {
   Conversation,
   Message,
@@ -41,26 +49,13 @@ import type {
 } from "@/types";
 import {
   MessageSquare,
-  ChevronDown,
   UserPlus,
-  Check,
-  Clock,
-  ArrowLeft,
   Loader2,
-  ChevronRight,
-  Megaphone,
+  BadgeCheck,
 } from "lucide-react";
-import { format, isToday, isYesterday, differenceInHours } from "date-fns";
+import { format, isToday, isYesterday } from "date-fns";
 import { useTranslations } from "next-intl";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -77,10 +72,16 @@ import { TemplatePicker } from "./template-picker";
 import { AiThreadBanner } from "./ai-thread-banner";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
-import { canAssignToOthers } from "@/lib/auth/roles";
+import { canAssignToOthers, hasMinRole } from "@/lib/auth/roles";
 import { UI_FUNNEL_STAGES } from "@/lib/inbox/funnel";
 import { LossReasonDialog } from "@/components/leads/loss-reason-dialog";
 import { convexErrorData } from "@/lib/convex/adapters";
+// Pure type only — `convex/lib/inbox/overrides.ts` has no server-only
+// import of its own (no `ctx`/`db` reference), so it's safe to pull a
+// type from it into client code, same precedent as
+// `src/lib/inbox/messagingWindow.ts` importing from
+// `convex/lib/whatsapp/messagingWindow`.
+import type { SnoozePreset } from "../../../convex/lib/inbox/overrides";
 
 interface ReplyDraft {
   id: string;
@@ -114,9 +115,31 @@ interface MessageThreadProps {
    */
   contactPanelOpen?: boolean;
   onToggleContactPanel?: () => void;
+  /**
+   * Puts this thread's unread badge back — the escape hatch for opening
+   * the wrong chat, since simply rendering here already marked it read
+   * (see the `markRead` effect below). The page owns it because
+   * restoring the badge only sticks if the thread is closed in the same
+   * breath; this component just offers the control.
+   */
+  onMarkUnread?: (conversationId: string) => void;
 }
 
-function formatDateSeparator(dateStr: string, t: ReturnType<typeof useTranslations>): string {
+/**
+ * `null` for an empty `dateStr` — the shape `mergeTimelineEntries`
+ * (`src/lib/inbox/notes.ts`) hands back for a note-only group when the
+ * conversation has no messages at all: there is no meaningful date to
+ * show for it, and `new Date("")` is an Invalid Date that `date-fns`'s
+ * `format` throws `RangeError: Invalid time value` on. The caller must
+ * skip rendering the separator entirely on `null` rather than falling
+ * back to some placeholder string — that would print the same wrong
+ * label for every note-only conversation.
+ */
+function formatDateSeparator(
+  dateStr: string,
+  t: ReturnType<typeof useTranslations>,
+): string | null {
+  if (!dateStr) return null;
   const date = new Date(dateStr);
   if (isToday(date)) return t("today");
   if (isYesterday(date)) return t("yesterday");
@@ -158,16 +181,49 @@ const STATUS_OPTIONS: { label: string; value: ConversationStatus; color: string 
 const DOODLE_BG_CLASSES =
   "bg-background bg-[url('/inbox-doodle.svg')] bg-repeat";
 
+/** One conversation's ownership handovers, exactly as
+ *  `conversations.listEvents` projects them. */
+type ThreadEvents = FunctionReturnType<typeof api.conversations.listEvents>;
+
+/**
+ * Renders nothing. Its only job is running `conversations.listEvents` and
+ * lifting the result up to `MessageThread` — isolating the subscription
+ * (and its potential throw) in a component of its own so
+ * `OptionalFeatureBoundary` can catch it. That isolation is the whole
+ * point: `useQuery` rethrows a query error during the render of whatever
+ * component CALLS it, so leaving the hook in `MessageThread` and wrapping
+ * the pills in a boundary would catch nothing and a missing backend
+ * function would take the Inbox route down. Same shape (and the same
+ * reason) as `DeepLinkFallbackFetcher` in
+ * `src/app/(dashboard)/inbox/page.tsx`.
+ */
+function ThreadEventsFetcher({
+  conversationId,
+  onResolved,
+}: {
+  conversationId: Id<"conversations">;
+  onResolved: (state: { conversationId: string; docs: ThreadEvents }) => void;
+}) {
+  const events = useQuery(api.conversations.listEvents, { conversationId });
+  useEffect(() => {
+    if (events) onResolved({ conversationId, docs: events });
+  }, [events, conversationId, onResolved]);
+  return null;
+}
+
 export function MessageThread({
   conversation,
   contact,
   onBack,
   contactPanelOpen,
   onToggleContactPanel,
+  onMarkUnread,
 }: MessageThreadProps) {
   const t = useTranslations("Inbox.messageThread");
   const tTimer = useTranslations("Inbox.sessionTimer");
+  const tWindow = useTranslations("Inbox.messagingWindow");
   const tQuote = useTranslations("Inbox.replyQuote");
+  const tNotes = useTranslations("Inbox.notes");
 
   const { user, accountRole } = useAuth();
   const convex = useConvex();
@@ -180,6 +236,7 @@ export function MessageThread({
   const [claiming, setClaiming] = useState(false);
 
   const conversationId = conversation?.id;
+  const contactId = contact?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
   const tFunnel = useTranslations("Inbox.funnel");
@@ -191,6 +248,16 @@ export function MessageThread({
   const [purchaseOpen, setPurchaseOpen] = useState(false);
   const [purchaseAmount, setPurchaseAmount] = useState("");
   const [lossOpen, setLossOpen] = useState(false);
+
+  // Custom-snooze dialog state (Task 7) — the one preset that needs a
+  // form rather than a single click. `customSnoozeDateTime` holds the
+  // raw `datetime-local` input value (browser-local wall time); resolved
+  // to epoch ms only at confirm time, matching every other timestamp on
+  // this page being computed at the point of use rather than kept as a
+  // Date object in state.
+  const [snoozeCustomOpen, setSnoozeCustomOpen] = useState(false);
+  const [customSnoozeDateTime, setCustomSnoozeDateTime] = useState("");
+  const [customSnoozeReason, setCustomSnoozeReason] = useState("");
 
   const applyStage = useCallback(
     async (
@@ -253,6 +320,26 @@ export function MessageThread({
     [memberDocs],
   );
 
+  // Do-not-contact banner (Task 10, spec 2026-07-30-conversation-notes-
+  // p3): Tasks 4-8 make auto-reply, follow-ups, broadcasts and
+  // auto-assignment silently stop for a flagged contact — this is the
+  // visible half. `canClearDoNotContact` mirrors `clearDoNotContact`'s
+  // own `requireRole("supervisor")` floor (a stricter gate than the
+  // agent+ checks above, because clearing overrides something the
+  // CUSTOMER asked for), the same client-check-is-a-display-concern
+  // pattern as `canStopChasing`/`canArchive` below. `doNotContactByName`
+  // resolves against `profiles` (already loaded for the assign
+  // dropdown) instead of adding a query just for a name — `null` when
+  // the setting member isn't found (e.g. removed from the account),
+  // and the banner falls back to its date-only copy.
+  const canClearDoNotContact =
+    !!accountRole && hasMinRole(accountRole, "supervisor");
+  const doNotContactByName = useMemo(() => {
+    const byUserId = contact?.do_not_contact?.byUserId;
+    if (!byUserId) return null;
+    return profiles.find((p) => p.user_id === byUserId)?.full_name ?? null;
+  }, [contact?.do_not_contact?.byUserId, profiles]);
+
   // Messages — Convex paginated query, newest-first; reversed below for
   // chronological (oldest-first) display. "Load older messages" calls
   // `msg.loadMore`.
@@ -286,51 +373,158 @@ export function MessageThread({
   );
   const reactions = (reactionDocs ?? []).map(toUiReaction);
 
-  // 24-hour session timer
+  // Grouped by date — feeds both the date separators below and the notes
+  // merge (`timelineGroups`). Computed here rather than after the
+  // `!conversation || !contact` early return further down: the merge
+  // lives in a `useMemo`, which (like every hook) must run
+  // unconditionally on every render, so its inputs can't wait on a
+  // conditional return either.
+  const messageGroups = useMemo(() => groupMessagesByDate(messages), [messages]);
+
+  // Notes — reactive, oldest-first (Task 5's `listForConversation`).
+  const noteDocs = useQuery(
+    api.contactNotes.listForConversation,
+    conversationId
+      ? { conversationId: conversationId as Id<"conversations"> }
+      : "skip",
+  );
+  const removeNoteMutation = useMutation(api.contactNotes.remove);
+
+  // Ownership handovers — reactive, oldest-first
+  // (`conversations.listEvents`), but subscribed by `ThreadEventsFetcher`
+  // under an error boundary further down rather than here, so a thread
+  // never goes down over a backend function the deployment doesn't have
+  // yet. The conversation id is stored beside the rows and re-checked on
+  // read: without it, a thread switch would paint the PREVIOUS thread's
+  // handovers until the new subscription resolved.
+  const [eventsState, setEventsState] = useState<{
+    conversationId: string;
+    docs: ThreadEvents;
+  } | null>(null);
+  // `eventsState &&` before the comparison, not `?.`: with no state and
+  // no open conversation both sides would be `undefined` and match — the
+  // same false positive the note-ownership checks below guard against.
+  const eventDocs =
+    eventsState && eventsState.conversationId === conversationId
+      ? eventsState.docs
+      : undefined;
+
+  // Notes and ownership events render inline so the thread reads as one
+  // story. `messageGroups` keeps owning date bucketing and its
+  // separators; the merge only places entries inside groups it produced.
+  const { earlierCount, earlierEventCount, timelineGroups } = useMemo(() => {
+    const oldest = messageGroups[0]?.messages[0];
+    const oldestAt = oldest ? new Date(oldest.created_at).getTime() : null;
+    const notes = splitEarlierNotes(noteDocs ?? [], oldestAt);
+    const events = splitEarlierNotes(eventDocs ?? [], oldestAt);
+    return {
+      earlierCount: notes.earlier.length + events.earlier.length,
+      // Kept apart from the total so the pill can pick an honest
+      // sentence: "N earlier notes and updates" is a lie for a thread
+      // whose earlier rows are all notes — the common case.
+      earlierEventCount: events.earlier.length,
+      // Explicit type arguments: given one array literal that mixes
+      // "note" and "event" tagged entries, TS's inference for the union
+      // parameter `TimelineEntry<N, E>` doesn't keep N and E separate per
+      // element — it collapses both onto the same (note-shaped) candidate,
+      // so the "event" literal then fails to type-check against a
+      // `value` typed for notes. Naming N and E from each source's own
+      // `inWindow` result sidesteps that inference gap.
+      timelineGroups: mergeTimelineEntries<
+        Message,
+        (typeof notes.inWindow)[number],
+        (typeof events.inWindow)[number],
+        (typeof messageGroups)[number]
+      >(
+        messageGroups,
+        [
+          ...notes.inWindow.map((value) => ({ type: "note" as const, value })),
+          ...events.inWindow.map((value) => ({ type: "event" as const, value })),
+        ],
+        (m: Message) => new Date(m.created_at).getTime(),
+      ),
+    };
+  }, [noteDocs, eventDocs, messageGroups]);
+
+  // Delete is wired for real (author-or-admin gated server-side by
+  // `contactNotes.remove`). Edit is Phase 2 — no editor UI exists yet, so
+  // `onEdit` is simply not passed to `NoteCard` below, which omits the
+  // Edit menu item entirely rather than rendering one that no-ops.
+  const handleDeleteNote = useCallback(
+    async (noteId: string) => {
+      try {
+        await removeNoteMutation({ noteId: noteId as Id<"contactNotes"> });
+      } catch {
+        toast.error(tNotes("deleteFailed"));
+      }
+    },
+    [removeNoteMutation, tNotes],
+  );
+
+  // Both messaging windows tick down while the thread is open, so the
+  // countdowns stay honest without a reload. A minute of granularity is
+  // all the labels render, so 30s keeps them accurate at half the cost of
+  // a per-second timer.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Meta runs TWO independent clocks and this resolves both from one shared
+  // source of truth (`convex/lib/whatsapp/messagingWindow.ts`):
+  //   - the 24h customer service window decides whether a free-form message
+  //     may be sent at all;
+  //   - the 72h free-entry-point window decides whether messages are FREE.
+  // They are not nested: a conversation can be template-only AND free.
+  const windows = useMemo(
+    () =>
+      resolveConversationWindows({
+        conversation: conversation ?? {},
+        messages,
+        now: nowMs,
+      }),
+    [conversation, messages, nowMs],
+  );
+
+  // 24-hour session timer. `windows.csw` already accounts for
+  // `last_inbound_at`, falling back to the loaded thread for older rows.
   const sessionInfo = useMemo(() => {
     if (!messages.length) return { expired: false, remaining: "" };
 
-    // Find last customer message
-    const lastCustomerMsg = [...messages]
-      .reverse()
-      .find((m) => m.sender_type === "customer");
+    const hasCustomerMessage = messages.some((m) => m.sender_type === "customer");
+    if (!hasCustomerMessage) {
+      return { expired: true, remaining: tTimer("noCustomerMessages") };
+    }
 
-    if (!lastCustomerMsg) return { expired: true, remaining: "No customer messages" };
-
-    const hoursSince = differenceInHours(new Date(), new Date(lastCustomerMsg.created_at));
-    const expired = hoursSince >= 24;
-
-    if (expired) {
+    if (!windows.csw.open) {
       return { expired: true, remaining: tTimer("expired") };
     }
 
-    const hoursLeft = 24 - hoursSince;
+    const hoursLeft = windows.csw.remainingMs / (60 * 60 * 1000);
     const remaining =
       hoursLeft >= 1
         ? tTimer("xhRemaining", { hours: Math.floor(hoursLeft) })
-        : tTimer("xmRemaining", { minutes: Math.floor(hoursLeft * 60) });
+        : tTimer("xmRemaining", {
+            minutes: Math.max(1, Math.floor(hoursLeft * 60)),
+          });
 
-    return { expired, remaining };
-  }, [messages, tTimer]);
+    return { expired: false, remaining };
+  }, [messages, tTimer, windows.csw.open, windows.csw.remainingMs]);
 
-  // Ad-lead free-entry-point window (72h, cost-only). Shown in the composer
-  // once the 24h free-form window has closed, so agents know template
-  // re-engagement is free. `null` when not an ad lead or the 72h has run out.
-  const adFreeWindowLabel = useMemo(() => {
-    // `conversation` is nullable here (this memo runs before the
-    // `!conversation` render guard below), so chain past it too.
-    const startedIso = conversation?.ad_referral?.started_at;
-    if (!startedIso) return null;
-    const remainingMs = adFreeWindowRemainingMs(
-      new Date(startedIso).getTime(),
-      Date.now(),
-    );
-    if (remainingMs <= 0) return null;
-    const hoursLeft = remainingMs / (60 * 60 * 1000);
-    return hoursLeft >= 1
-      ? tTimer("adFreeXhRemaining", { hours: Math.floor(hoursLeft) })
-      : tTimer("adFreeXmRemaining", { minutes: Math.floor(hoursLeft * 60) });
-  }, [conversation?.ad_referral?.started_at, tTimer]);
+  // 72h free-entry-point countdown. Rendered whenever the window is open —
+  // deliberately NOT gated on the 24h window having expired, which is what
+  // previously hid it for every freshly-active ad lead.
+  const freeWindowRemaining = windows.fep.open
+    ? formatWindowRemaining(windows.fep.remainingMs)
+    : null;
+
+  // Time left to reply and still unlock the free window. Only set while
+  // this is an unanswered ad lead inside the 24h deadline.
+  const unlockRemaining =
+    windows.unlockRemainingMs !== null
+      ? formatWindowRemaining(windows.unlockRemainingMs)
+      : null;
 
   // Reset the server-side unread_count to 0 whenever an unread count
   // surfaces on the active conversation — covers both (a) opening a
@@ -461,6 +655,177 @@ export function MessageThread({
     },
     [conversation, setStatusMutation]
   );
+
+  // Stop chasing (Task 7, spec 2026-07-27-inbox-lanes): pull a lead out
+  // of the automated follow-up sequence by hand. Agent+ — matches
+  // `leadAnalysis.stopSequence`'s own `requireRole("agent")` (Task 5
+  // lowered this from supervisor+, same as `leadAnalysis.archive`/
+  // `restore`) — computed the same way `inbox/page.tsx`'s `canRestore`
+  // and `lead-analysis/page.tsx`'s `canArchive` are (client check is a
+  // display concern only; the server call is the real gate).
+  const canStopChasing = !!accountRole && hasMinRole(accountRole, "agent");
+  const stopSequenceMutation = useMutation(api.leadAnalysis.stopSequence);
+  const handleStopChasing = useCallback(async () => {
+    if (!conversation) return;
+    try {
+      await stopSequenceMutation({
+        conversationId: conversation.id as Id<"conversations">,
+      });
+    } catch (err) {
+      console.error("Failed to stop chasing this conversation:", err);
+      toast.error(t("stopChasingFailed"));
+    }
+  }, [conversation, stopSequenceMutation, t]);
+
+  /**
+   * Archive from the Inbox. P2 shipped `leadAnalysis.archive` and wired
+   * it to the Lead Analysis board, and shipped Restore to this app's
+   * archived banner — but never wired Archive itself into the Inbox, so
+   * the only way to shelve a thread was to leave the screen you work in
+   * and find it on the board. Reported 2026-07-28.
+   *
+   * Same agent+ gate as `handleStopChasing` above and as
+   * `inbox/page.tsx`'s `canRestore`, for the same reason: the client
+   * check is a display concern, `requireRole("agent")` on the mutation
+   * is the real gate.
+   *
+   * Deliberately available on EVERY lane, not just Chasing. The single
+   * most common reason to archive is a wrong number or a spam message,
+   * and those arrive in Active — see the spec's §Manual archive
+   * short-circuits the ladder.
+   */
+  const canArchive = !!accountRole && hasMinRole(accountRole, "agent");
+  const archiveMutation = useMutation(api.leadAnalysis.archive);
+  const handleArchive = useCallback(async () => {
+    if (!conversation) return;
+    try {
+      await archiveMutation({
+        conversationId: conversation.id as Id<"conversations">,
+      });
+      toast.success(t("archivedToast"));
+    } catch (err) {
+      console.error("Failed to archive this conversation:", err);
+      toast.error(t("archiveFailed"));
+    }
+  }, [conversation, archiveMutation, t]);
+
+  /**
+   * Manual lane overrides (Task 7, spec 2026-07-28-inbox-manual-
+   * overrides): Snooze parks a thread until a wake time; Chase now marks
+   * a lead ghosted by moving it into Chasing by hand. Same agent+ gate
+   * as `handleArchive`/`handleStopChasing` above — the client check is a
+   * display concern only, `requireRole("agent")` on each
+   * `inboxOverrides.ts` mutation is the real gate.
+   *
+   * Both actions hide the thread from wherever the agent is currently
+   * looking (a snoozed thread drops out of every lane but Snoozed; a
+   * forced-Chasing thread jumps out of Active/Waiting into Chasing), so
+   * a misclick is otherwise only recoverable by hunting through a tab —
+   * hence the Undo action on each success toast, wired to the inverse
+   * mutation (`wake`/`unforceChasing`).
+   *
+   * WHICH of the three controls to show is decided by `overrideControls`
+   * in `@/lib/inbox/view` rather than inline here — every "false" it
+   * returns mirrors a rejection in `convex/inboxOverrides.ts`, so the
+   * rules are the load-bearing part and belong somewhere testable
+   * (this component is not statically renderable; that module is).
+   */
+  const overrides = overrideControls(
+    !!accountRole && hasMinRole(accountRole, "agent"),
+    // `?? {}` for the no-conversation-selected render, matching the
+    // `conversation ?? {}` this file already uses above.
+    conversation ?? {},
+  );
+
+  const wakeMutation = useMutation(api.inboxOverrides.wake);
+  const handleWake = useCallback(async () => {
+    if (!conversation) return;
+    try {
+      await wakeMutation({
+        conversationId: conversation.id as Id<"conversations">,
+      });
+    } catch (err) {
+      // No dedicated copy for this failure (it's reached either from the
+      // "Wake now" button or as the Undo on a snooze toast, neither the
+      // primary action) — plain string, same convention
+      // `handleAssignChange`/`handleStatusChange` above already use for
+      // their own secondary-action failures.
+      console.error("Failed to wake this conversation:", err);
+      toast.error("Failed to wake this conversation");
+    }
+  }, [conversation, wakeMutation]);
+
+  const unforceChasingMutation = useMutation(api.inboxOverrides.unforceChasing);
+  const handleUnforceChasing = useCallback(async () => {
+    if (!conversation) return;
+    try {
+      await unforceChasingMutation({
+        conversationId: conversation.id as Id<"conversations">,
+      });
+    } catch (err) {
+      // Same "no dedicated copy for a secondary action" reasoning as
+      // `handleWake` above — this only ever runs as the Undo on a
+      // Chase-now toast.
+      console.error("Failed to undo Chase now:", err);
+      toast.error("Failed to undo Chase now");
+    }
+  }, [conversation, unforceChasingMutation]);
+
+  const snoozeMutation = useMutation(api.inboxOverrides.snooze);
+  const handleSnooze = useCallback(
+    async (
+      choice: { preset: SnoozePreset } | { customMs: number },
+      reason?: string,
+    ) => {
+      if (!conversation) return;
+      try {
+        const until = await snoozeMutation({
+          conversationId: conversation.id as Id<"conversations">,
+          ...("preset" in choice
+            ? { preset: choice.preset }
+            : { customMs: choice.customMs }),
+          ...(reason ? { reason } : {}),
+        });
+        toast.success(
+          t("snoozedToast", { when: format(new Date(until), "MMM d, h:mm a") }),
+          { action: { label: t("undo"), onClick: () => void handleWake() } },
+        );
+      } catch (err) {
+        console.error("Failed to snooze this conversation:", err);
+        toast.error(t("snoozeFailed"));
+      }
+    },
+    [conversation, snoozeMutation, t, handleWake],
+  );
+
+  const forceChasingMutation = useMutation(api.inboxOverrides.forceChasing);
+  const handleChaseNow = useCallback(async () => {
+    if (!conversation) return;
+    try {
+      await forceChasingMutation({
+        conversationId: conversation.id as Id<"conversations">,
+      });
+      toast.success(t("chasedToast"), {
+        action: { label: t("undo"), onClick: () => void handleUnforceChasing() },
+      });
+    } catch (err) {
+      console.error("Failed to move this conversation to Chasing:", err);
+      toast.error(t("chaseNowFailed"));
+    }
+  }, [conversation, forceChasingMutation, t, handleUnforceChasing]);
+
+  // Confirm handler for the custom-snooze dialog — the datetime-local
+  // input's value is interpreted as browser-local wall time by `Date`,
+  // same as every other client-side timestamp construction in this app.
+  const handleConfirmCustomSnooze = useCallback(() => {
+    if (!customSnoozeDateTime) return;
+    const ms = new Date(customSnoozeDateTime).getTime();
+    if (!Number.isFinite(ms)) return;
+    setSnoozeCustomOpen(false);
+    void handleSnooze({ customMs: ms }, customSnoozeReason.trim() || undefined);
+    setCustomSnoozeDateTime("");
+    setCustomSnoozeReason("");
+  }, [customSnoozeDateTime, customSnoozeReason, handleSnooze]);
 
   const handleOpenTemplates = useCallback(() => {
     setTemplateModalOpen(true);
@@ -679,7 +1044,6 @@ export function MessageThread({
 
   const displayName = contact.name || contact.phone;
   const headerChips = tagChipRow(groups, contact.tags ?? [], 6);
-  const messageGroups = groupMessagesByDate(messages);
   // Cold first-page load → skeleton (not a blank spinner); loaded-but-empty
   // → empty state; otherwise the message list. A re-visited conversation is
   // served from the query cache, so `area` is "list" immediately and the
@@ -690,9 +1054,6 @@ export function MessageThread({
   );
   const assignedAgentId = conversation.assigned_agent_id ?? null;
   const currentAssignee = profiles.find((p) => p.user_id === assignedAgentId);
-  const assignLabel = assignedAgentId
-    ? (currentAssignee?.full_name ?? t("assigned"))
-    : t("assign");
   // Claim-to-reply (Task 11): whether this conversation is the caller's
   // own vs. still sitting in the shared pool. Drives both the header
   // assign-dropdown's agent-limited actions and the composer swap below.
@@ -716,335 +1077,296 @@ export function MessageThread({
     // root shrink lets the bubbles' break-words / max-w caps apply.
     // Issue #257.
     <div className={cn("flex min-w-0 flex-1 flex-col", DOODLE_BG_CLASSES)}>
-      {/* Header — solid card surface sits on top of the doodle so the
-          name/avatar/dropdowns stay legible. */}
-      <div className="flex items-center justify-between gap-2 border-b border-border bg-card px-3 py-3 sm:px-4">
-        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
-          {/* Back-to-list button — mobile only. Hidden on lg+ where the
-              conversation list is always visible next to the thread. */}
-          {onBack && (
-            <button
-              type="button"
-              onClick={onBack}
-              aria-label={t("backToConversations")}
-              className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground lg:hidden"
-            >
-              <ArrowLeft className="h-5 w-5" />
-            </button>
-          )}
-          <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
-            {displayName.charAt(0).toUpperCase()}
-          </div>
-          {/* Clicking the name/number opens the contact-details slide-over. */}
-          <button
-            type="button"
-            onClick={() => onToggleContactPanel?.()}
-            aria-label={t("viewContactDetails")}
-            aria-expanded={!!contactPanelOpen}
-            className="group flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted"
-          >
-            <span className="min-w-0">
-              <span className="block truncate text-sm font-semibold text-foreground">
-                {displayName}
-              </span>
-              <span className="block truncate text-xs text-muted-foreground">
-                {formatPhoneIntl(contact.phone)}
-              </span>
-            </span>
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-          </button>
-          {/* Session timer badge — hidden on the narrowest phones so
-              the name + back arrow keep their room. */}
-          <Badge
-            variant="outline"
-            className={cn(
-              "ml-1 hidden gap-1 border-border text-[10px] sm:inline-flex sm:ml-2",
-              sessionInfo.expired ? "text-red-400" : "text-primary"
-            )}
-          >
-            <Clock className="h-3 w-3" />
-            {sessionInfo.remaining}
-          </Badge>
-          {conversation.ad_referral && (
-            <Badge
-              variant="outline"
-              className="ml-1 hidden gap-1 border-primary/40 text-[10px] text-primary sm:inline-flex sm:ml-2"
-            >
-              <Megaphone className="h-3 w-3" />
-              {t("adLeadBadge")}
-            </Badge>
-          )}
-          <QualificationChip
-            conversationId={
-              conversationId ? (conversationId as Id<"conversations">) : null
-            }
+      {/* Renders no DOM — the ownership-events subscription, isolated so
+          its failure costs the pills and nothing else. Keyed by
+          conversation so a caught error doesn't stick to every later
+          thread, the same reason the Inbox page keys its own boundary. */}
+      {conversationId && (
+        <OptionalFeatureBoundary
+          key={conversationId}
+          feature="conversations.listEvents"
+        >
+          <ThreadEventsFetcher
+            conversationId={conversationId as Id<"conversations">}
+            onResolved={setEventsState}
           />
-          {headerChips.visible.map((tag) => (
-            <span
-              key={tag.id}
-              className="hidden shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium sm:inline-flex"
-              style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
-            >
-              {tag.name}
-            </span>
-          ))}
-          {headerChips.overflow > 0 && (
-            <span className="hidden shrink-0 items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground sm:inline-flex">
-              +{headerChips.overflow}
-            </span>
-          )}
-        </div>
+        </OptionalFeatureBoundary>
+      )}
+      <ThreadHeader
+        displayName={displayName}
+        phone={contact.phone}
+        photoUrl={contact.avatar_url}
+        onBack={onBack}
+        onToggleContactPanel={onToggleContactPanel}
+        contactPanelOpen={contactPanelOpen}
 
-        <div className="flex items-center gap-2">
-          {accountRole !== "viewer" && (
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                className={cn(
-                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
-                  funnelState?.currentStage ? "text-primary" : "text-muted-foreground",
-                )}
-              >
-                {funnelState?.currentStage
-                  ? tFunnel(`stage.${funnelState.currentStage}`)
-                  : tFunnel("label")}
-                <ChevronDown className="h-3 w-3" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="border-border bg-popover">
-                {UI_FUNNEL_STAGES.map((s) => (
-                  <DropdownMenuItem
-                    key={s.key}
-                    onClick={() => handleStageSelect(s.key)}
-                    className="text-sm"
+        sessionRemaining={sessionInfo.remaining}
+        sessionExpired={sessionInfo.expired}
+        freeText={
+          freeWindowRemaining
+            ? tWindow("freeBadge", { remaining: freeWindowRemaining })
+            : null
+        }
+        freeTitle={
+          freeWindowRemaining
+            ? tWindow(
+                windows.fep.source === "meta"
+                  ? "freeBadgeTitle"
+                  : "freeBadgeEstimatedTitle",
+                { remaining: freeWindowRemaining },
+              )
+            : undefined
+        }
+
+        status={currentStatus ?? null}
+        statusOptions={STATUS_OPTIONS}
+        onStatusChange={(v) => handleStatusChange(v as ConversationStatus)}
+        canEditStatus={accountRole !== "viewer"}
+
+        canEditLead={accountRole !== "viewer"}
+        conversationId={conversationId ? (conversationId as Id<"conversations">) : null}
+        currentStage={funnelState?.currentStage ?? null}
+        stageLabel={
+          funnelState?.currentStage
+            ? tFunnel(`stage.${funnelState.currentStage}`)
+            : null
+        }
+        onStageSelect={handleStageSelect}
+        profiles={profiles}
+        assignedAgentId={assignedAgentId}
+        assigneeName={currentAssignee?.full_name ?? null}
+        currentUserId={user?.id ?? null}
+        canAssignToOthers={!!accountRole && canAssignToOthers(accountRole)}
+        mine={mine}
+        isPool={isPool}
+        onAssignChange={handleAssignChange}
+        getPresence={getPresence}
+        getLastSeenAt={(id) => getRow(id)?.last_seen_at ?? null}
+        now={now}
+        isAdLead={!!conversation.ad_referral}
+        tags={headerChips.visible}
+        tagOverflow={headerChips.overflow}
+
+        showSnooze={overrides.snooze}
+        showWake={overrides.wake}
+        onSnoozeThreeHours={() => void handleSnooze({ preset: "three_hours" })}
+        onSnoozeTomorrow={() => void handleSnooze({ preset: "tomorrow" })}
+        onSnoozeNextWeek={() => void handleSnooze({ preset: "next_week" })}
+        onSnoozeCustom={() => setSnoozeCustomOpen(true)}
+        onWake={() => void handleWake()}
+
+        showChaseNow={overrides.chaseNow}
+        onChaseNow={() => void handleChaseNow()}
+        showStopChasing={canStopChasing && conversation.sequenceStatus === "running"}
+        onStopChasing={() => void handleStopChasing()}
+        showArchive={canArchive && !conversation.archived_at}
+        onArchive={() => void handleArchive()}
+        showMarkUnread={accountRole !== "viewer" && !!onMarkUnread && !!conversationId}
+        onMarkUnread={() => conversationId && onMarkUnread?.(conversationId)}
+      />
+
+      {/* Messages Area. Wrapped in its own `relative flex-1 flex flex-col`
+          box (rather than putting `relative` on the scrolling div itself)
+          so `NoteComposer`'s `absolute bottom-4 right-4` trigger anchors
+          to a box that does NOT scroll. An absolutely-positioned
+          descendant of a scrolling ancestor is laid out against that
+          ancestor's padding box but travels with the scrolled content —
+          mounting the composer as a sibling of the scroll div, both
+          inside this non-scrolling wrapper, keeps the button fixed in
+          the viewport regardless of scroll position.
+          `min-h-0` is load-bearing here too: a flex child defaults to
+          min-height:auto, so without it this wrapper would grow to fit
+          its content instead of shrinking to the remaining column
+          space, and the inner scroll div would never see an overflow to
+          scroll (same failure mode `conversation-list.tsx`'s `ScrollArea`
+          comment documents for issue #229 — this only happens to work
+          without it via the min-content-size-to-overflowing-descendant
+          recursion, which is spec-compliant but not worth depending on
+          silently). */}
+      <div className="relative flex-1 flex flex-col min-h-0">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
+          {area === "loading" ? (
+            <ThreadSkeleton />
+          ) : area === "empty" && timelineGroups.length === 0 ? (
+            // `area === "empty"` only means no MESSAGES loaded
+            // (`messageAreaState`, `src/lib/inbox/view.ts`) — a
+            // message-less conversation can still carry notes
+            // (`insertConversation`/`findOrCreateForContact`/broadcasts
+            // all produce one before any message exists). Falling
+            // through to the placeholder whenever `timelineGroups` is
+            // non-empty keeps a note-only thread's notes visible
+            // instead of silently swallowing them behind "No messages
+            // yet".
+            <div className="flex flex-col items-center justify-center py-12">
+              <p className="text-sm text-muted-foreground">{t("noMessagesYet")}</p>
+              <p className="text-xs text-muted-foreground">
+                {t("sendTemplateHint")}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Load older messages — cursor-paginated via Convex;
+                  `msg.loadMore` fetches the next (older) page. */}
+              {msg.status === "CanLoadMore" && (
+                <div className="flex justify-center pb-2">
+                  <button
+                    type="button"
+                    onClick={() => msg.loadMore(30)}
+                    className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
-                    {tFunnel(`stage.${s.key}`)}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-
-          {/* Status dropdown — hidden for viewers, same as the assign
-              dropdown and AiThreadBanner below. Changing a
-              conversation's status is an agent-class write
-              (`conversations.setStatus` requires requireRole("agent")),
-              which a viewer can never perform — so hide the control
-              rather than let every click fail server-side with a
-              generic "Failed to update status" toast (Task 11). */}
-          {accountRole !== "viewer" && (
-            <DropdownMenu>
-              <DropdownMenuTrigger className={cn(
-                    "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
-                    currentStatus?.color ?? "text-muted-foreground"
-                  )}>
-                  {currentStatus ? t(`status${currentStatus.label}`) : t("status")}
-                  <ChevronDown className="h-3 w-3" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                className="border-border bg-popover"
-              >
-                {STATUS_OPTIONS.map((opt) => (
-                  <DropdownMenuItem
-                    key={opt.value}
-                    onClick={() => handleStatusChange(opt.value)}
-                    className={cn("text-sm", opt.color)}
-                  >
-                    {t(`status${opt.label}`)}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-
-          {/* Assign dropdown — supervisor+ keeps the full teammate picker.
-              An agent gets self-serve Claim/Release only: the server now
-              rejects an agent assigning to anyone but themselves (Task 11).
-              A viewer gets no assign control at all — view-only, can't
-              assign/claim/release. */}
-          {accountRole !== "viewer" && (
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                className={cn(
-                  "inline-flex items-center justify-center h-7 gap-1 px-2 text-xs rounded-md hover:bg-muted",
-                  assignedAgentId ? "text-primary" : "text-muted-foreground"
-                )}
-              >
-                <UserPlus className="h-3 w-3" />
-                <span className="hidden sm:inline">{assignLabel}</span>
-                <ChevronDown className="h-3 w-3" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                className="border-border bg-popover"
-              >
-                {accountRole && canAssignToOthers(accountRole) ? (
-                  <>
-                    {profiles.length === 0 ? (
-                      <DropdownMenuItem disabled className="text-sm text-muted-foreground">
-                        {t("noTeammates")}
-                      </DropdownMenuItem>
-                    ) : (
-                      profiles.map((p) => {
-                        const isSelected = p.user_id === assignedAgentId;
-                        const presence = getPresence(p.user_id);
-                        return (
-                          <DropdownMenuItem
-                            key={p.id}
-                            onClick={() => handleAssignChange(p.user_id)}
-                            className={cn(
-                              "text-sm",
-                              isSelected ? "text-primary" : "text-popover-foreground"
-                            )}
-                          >
-                            <PresenceDot
-                              status={presence}
-                              label={presenceLabel(
-                                presence,
-                                getRow(p.user_id)?.last_seen_at ?? null,
-                                now
-                              )}
-                              className="mr-2"
-                            />
-                            <span className="flex-1">
-                              {p.full_name}
-                              {p.user_id === user?.id ? t("me") : ""}
-                            </span>
-                            {isSelected && <Check className="ml-2 h-3 w-3" />}
-                          </DropdownMenuItem>
-                        );
-                      })
+                    Load older messages
+                  </button>
+                </div>
+              )}
+              {msg.status === "LoadingMore" && (
+                <div className="flex justify-center pb-2">
+                  <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                </div>
+              )}
+              {/* Notes and events older than the oldest loaded message have
+                  no message to sit beside — surfaced as a count instead of
+                  vanishing. See `splitEarlierNotes`. */}
+              {earlierCount > 0 && (
+                <div className="flex justify-center pb-2">
+                  <span className="rounded-full bg-amber-500/10 px-3 py-1 text-[11px] text-muted-foreground">
+                    {/* "…notes and updates" only when there ARE updates
+                        up there. Most threads have notes and no handover,
+                        and promising an ownership change that isn't there
+                        sends the agent hunting for it. */}
+                    {tNotes(
+                      earlierEventCount > 0 ? "earlierItems" : "earlierNotes",
+                      { count: earlierCount },
                     )}
-                    {assignedAgentId && (
-                      <>
-                        <DropdownMenuSeparator className="bg-border" />
-                        <DropdownMenuItem
-                          onClick={() => handleAssignChange(null)}
-                          className="text-sm text-muted-foreground"
-                        >
-                          {t("unassign")}
-                        </DropdownMenuItem>
-                      </>
-                    )}
-                  </>
-                ) : mine ? (
-                  // Agent, theirs: release back to the pool.
-                  <DropdownMenuItem
-                    onClick={() => handleAssignChange(null)}
-                    className="text-sm text-popover-foreground"
-                  >
-                    {t("release")}
-                  </DropdownMenuItem>
-                ) : (
-                  // Agent, unassigned (a colleague's conversation is never
-                  // reachable here — the inbox scope already hides it):
-                  // self-claim only.
-                  <DropdownMenuItem
-                    disabled={!isPool || !user?.id}
-                    onClick={() => user?.id && handleAssignChange(user.id)}
-                    className="text-sm text-popover-foreground"
-                  >
-                    {t("claim")}
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-        </div>
-      </div>
-
-      {/* Messages Area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
-        {area === "loading" ? (
-          <ThreadSkeleton />
-        ) : area === "empty" ? (
-          <div className="flex flex-col items-center justify-center py-12">
-            <p className="text-sm text-muted-foreground">{t("noMessagesYet")}</p>
-            <p className="text-xs text-muted-foreground">
-              {t("sendTemplateHint")}
-            </p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {/* Load older messages — cursor-paginated via Convex;
-                `msg.loadMore` fetches the next (older) page. */}
-            {msg.status === "CanLoadMore" && (
-              <div className="flex justify-center pb-2">
-                <button
-                  type="button"
-                  onClick={() => msg.loadMore(30)}
-                  className="rounded-md px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
-                >
-                  Load older messages
-                </button>
-              </div>
-            )}
-            {msg.status === "LoadingMore" && (
-              <div className="flex justify-center pb-2">
-                <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-              </div>
-            )}
-            {messageGroups.map((group) => (
-              <div key={group.date}>
-                {/* Date separator */}
-                <div className="mb-4 flex items-center justify-center">
-                  <span className="rounded-full bg-muted px-3 py-1 text-[10px] font-medium text-muted-foreground">
-                    {formatDateSeparator(group.date, t)}
                   </span>
                 </div>
-                {/* Messages */}
-                <div className="space-y-2">
-                  {group.messages.map((msg) => {
-                    const parent = msg.reply_to_message_id
-                      ? messagesById.get(msg.reply_to_message_id)
-                      : null;
-                    const reply = parent
-                      ? {
-                          authorLabel:
-                            parent.sender_type === "agent" || parent.sender_type === "bot"
-                              ? t("me")
-                              : contact?.name || contact?.phone || "Unknown",
-                          preview: buildReplyPreview(parent, tQuote),
-                        }
-                      : null;
-                    const msgReactions = reactionsByMessageId.get(msg.id);
-                    // Toggle is computed at the call site — `msgReactions`
-                    // and `user?.id` are already in scope, no extra hook.
-                    const handlePillToggle = (emoji: string) => {
-                      const own = msgReactions?.find(
-                        (r) =>
-                          r.actor_type === "agent" &&
-                          r.actor_id === user?.id,
-                      );
-                      const next = own?.emoji === emoji ? "" : emoji;
-                      void postReaction(msg.id, next);
-                    };
-                    return (
-                      <MessageActions
-                        key={msg.id}
-                        message={msg}
-                        canReact={canReact}
-                        onReply={() => handleStartReply(msg)}
-                        onReact={(emoji) => {
-                          if (emoji) void postReaction(msg.id, emoji);
-                        }}
-                      >
-                        <MessageBubble
+              )}
+              {timelineGroups.map((group, groupIndex) => {
+                const dateLabel = formatDateSeparator(group.date, t);
+                return (
+                <div key={group.date || `no-date-${groupIndex}`}>
+                  {/* Date separator — omitted for a note-only group
+                      (`group.date === ""`, see `mergeTimelineEntries`):
+                      there is no message to anchor a date to, and
+                      `formatDateSeparator` returns `null` for it rather
+                      than feeding an Invalid Date into `date-fns`. */}
+                  {dateLabel && (
+                    <div className="mb-4 flex items-center justify-center">
+                      <span className="rounded-full bg-muted px-3 py-1 text-[11px] font-medium text-muted-foreground">
+                        {dateLabel}
+                      </span>
+                    </div>
+                  )}
+                  {/* Messages + inline notes and ownership events */}
+                  <div className="space-y-2">
+                    {group.items.map((item) => {
+                      if (item.type === "event") {
+                        return (
+                          <AssignmentEvent
+                            key={item.value._id}
+                            event={item.value}
+                          />
+                        );
+                      }
+                      if (item.type === "note") {
+                        const note = item.value;
+                        // `!!note.createdByUserId` guards against a
+                        // false-positive match on `undefined === undefined`
+                        // while `user` hasn't populated yet — without it, a
+                        // system note (no author) would briefly show
+                        // Delete, which the server's `requireAuthorOrAdmin`
+                        // would then reject.
+                        const canManage =
+                          (!!note.createdByUserId && note.createdByUserId === user?.id) ||
+                          (accountRole ? hasMinRole(accountRole, "admin") : false);
+                        return (
+                          <NoteCard
+                            key={note._id}
+                            note={note}
+                            canManage={canManage}
+                            // `onEdit` intentionally omitted — Phase 2
+                            // builds the edit UI; `NoteCard` only renders
+                            // the Edit menu item when a handler is passed.
+                            onDelete={handleDeleteNote}
+                          />
+                        );
+                      }
+                      const msg = item.value;
+                      const parent = msg.reply_to_message_id
+                        ? messagesById.get(msg.reply_to_message_id)
+                        : null;
+                      const reply = parent
+                        ? {
+                            authorLabel:
+                              parent.sender_type === "agent" || parent.sender_type === "bot"
+                                ? t("me")
+                                : contact?.name || contact?.phone || "Unknown",
+                            preview: buildReplyPreview(parent, tQuote),
+                          }
+                        : null;
+                      const msgReactions = reactionsByMessageId.get(msg.id);
+                      // Toggle is computed at the call site — `msgReactions`
+                      // and `user?.id` are already in scope, no extra hook.
+                      const handlePillToggle = (emoji: string) => {
+                        const own = msgReactions?.find(
+                          (r) =>
+                            r.actor_type === "agent" &&
+                            r.actor_id === user?.id,
+                        );
+                        const next = own?.emoji === emoji ? "" : emoji;
+                        void postReaction(msg.id, next);
+                      };
+                      return (
+                        <MessageActions
+                          key={msg.id}
                           message={msg}
-                          reply={reply}
-                          reactions={msgReactions}
-                          currentUserId={user?.id}
-                          onToggleReaction={handlePillToggle}
                           canReact={canReact}
-                        />
-                      </MessageActions>
-                    );
-                  })}
+                          onReply={() => handleStartReply(msg)}
+                          onReact={(emoji) => {
+                            if (emoji) void postReaction(msg.id, emoji);
+                          }}
+                        >
+                          <MessageBubble
+                            message={msg}
+                            reply={reply}
+                            reactions={msgReactions}
+                            currentUserId={user?.id}
+                            onToggleReaction={handlePillToggle}
+                            canReact={canReact}
+                          />
+                        </MessageActions>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        {conversationId && contactId && (
+          <NoteComposer
+            contactId={contactId as Id<"contacts">}
+            conversationId={conversationId as Id<"conversations">}
+          />
         )}
       </div>
+
+      {/* Free-window unlock nudge. Meta opens the 72h free-entry-point
+          window only if we answer a Click-to-WhatsApp lead within 24h of
+          the click — miss it and every later template is billed. Shown
+          only while that is still winnable, and not to viewers, who
+          cannot reply. */}
+      {unlockRemaining && accountRole !== "viewer" && (
+        <div
+          title={tWindow("unlockNudgeTitle")}
+          className="mb-2 flex items-center gap-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-xs text-emerald-400"
+        >
+          <BadgeCheck className="h-4 w-4 shrink-0" />
+          <span>
+            {tWindow("unlockNudge", { remaining: unlockRemaining })}
+          </span>
+        </div>
+      )}
 
       {/* AI auto-reply banner — take over an active bot, or resume it
           after a handoff. Renders nothing unless the account has
@@ -1063,6 +1385,24 @@ export function MessageThread({
               void handleAssignChange(patch.assigned_agent_id ?? null);
             }
           }}
+        />
+      )}
+
+      {/* Do-not-contact banner (Task 10) — rendered as a sibling of the
+          messages-area wrapper above and the composer below, so like the
+          unlock nudge and AiThreadBanner it sits outside the `overflow-
+          y-auto` scroll div (line ~1441) and cannot scroll out of view
+          (the Phase 1 Critical this task exists to avoid repeating: a
+          floating trigger placed inside the scroll container). Directly
+          above the composer per the brief. The composer itself is never
+          disabled here — a human is not blocked from messaging, only
+          the automated paths (Tasks 4-8) are gated server-side. */}
+      {contactId && contact?.do_not_contact && (
+        <DoNotContactBanner
+          contactId={contactId as Id<"contacts">}
+          at={contact.do_not_contact.at}
+          byName={doNotContactByName}
+          canClear={canClearDoNotContact}
         />
       )}
 
@@ -1094,7 +1434,10 @@ export function MessageThread({
           onOpenTemplates={handleOpenTemplates}
           replyTo={replyTo}
           onClearReply={() => setReplyTo(null)}
-          adFreeWindowLabel={sessionInfo.expired ? adFreeWindowLabel : null}
+          // Scoped to the expired-session case on purpose: that is when an
+          // agent needs to know template re-engagement is free. The header
+          // badge carries the always-visible signal.
+          adFreeWindowLabel={sessionInfo.expired ? freeWindowRemaining : null}
         />
       )}
 
@@ -1143,6 +1486,40 @@ export function MessageThread({
           void applyStage("lost", { lossCategory: category, lossDetail: detail })
         }
       />
+
+      {/* Custom snooze (Task 7) — the one preset that needs a form. The
+          server (`inboxOverrides.snooze` / `resolveSnoozeUntilMs`) is the
+          real gate on "in the past" / "beyond 30 days"; this dialog does
+          no client-side range validation of its own, only requiring a
+          value be picked before Confirm is enabled. */}
+      <Dialog open={snoozeCustomOpen} onOpenChange={setSnoozeCustomOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("snoozeCustom")}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              type="datetime-local"
+              value={customSnoozeDateTime}
+              onChange={(e) => setCustomSnoozeDateTime(e.target.value)}
+              autoFocus
+            />
+            <Input
+              value={customSnoozeReason}
+              onChange={(e) => setCustomSnoozeReason(e.target.value)}
+              placeholder={t("snoozeReasonPlaceholder")}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={handleConfirmCustomSnooze}
+              disabled={!customSnoozeDateTime}
+            >
+              {t("snoozeConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

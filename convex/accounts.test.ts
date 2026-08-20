@@ -218,7 +218,7 @@ test("me exposes the membership's avatarKey alongside avatarUrl (Task 5 of the R
   );
   await t.run((ctx) =>
     ctx.db.patch(membership!._id, {
-      avatarUrl: "https://convex-api.holidayys.co/api/storage/old",
+      avatarUrl: "https://convex-api.amaniworld.com/api/storage/old",
       avatarKey: "acc1/avatars/sarah.png",
     }),
   );
@@ -228,7 +228,7 @@ test("me exposes the membership's avatarKey alongside avatarUrl (Task 5 of the R
   // Unresolved on purpose (see comment above) — still the raw fallback
   // chain `me` has always returned.
   expect(profile!.avatarUrl).toBe(
-    "https://convex-api.holidayys.co/api/storage/old",
+    "https://convex-api.amaniworld.com/api/storage/old",
   );
 });
 
@@ -280,7 +280,7 @@ test("updateProfile writes avatarKey (R2 migration: write path) alongside avatar
 
   const membershipId = await asSarah.mutation(api.accounts.updateProfile, {
     name: "Sarah Connor",
-    avatarUrl: `https://objs.holidayys.co/${accountId}/avatar/sarah.png`,
+    avatarUrl: `https://objs.amaniworld.com/${accountId}/avatar/sarah.png`,
     avatarKey: `${accountId}/avatar/sarah.png`,
   });
 

@@ -13,6 +13,19 @@ export default defineConfig({
       ENCRYPTION_KEY:
         "0000000000000000000000000000000000000000000000000000000000000000",
       META_APP_SECRET: "test-meta-app-secret",
+      // Brand identity — `src/lib/brand.ts` and `convex/lib/brand.ts`
+      // throw on a missing value BY DESIGN (a fallback is how one
+      // company's CRM ships wearing another's name), so the suites must
+      // supply their own. Deliberately a nonsense company: a test that
+      // passes only because the value happens to be the real brand is a
+      // test that would pass in the wrong deployment too.
+      NEXT_PUBLIC_BRAND_NAME: "Testco",
+      NEXT_PUBLIC_BRAND_LEGAL_NAME: "Testco Holdings LLC",
+      NEXT_PUBLIC_SITE_URL: "https://wa.testco.example",
+      NEXT_PUBLIC_BRAND_WEBSITE: "https://testco.example",
+      NEXT_PUBLIC_BRAND_EMAIL: "hello@testco.example",
+      BRAND_NAME: "Testco",
+      BRAND_SITE_URL: "https://wa.testco.example",
     },
     clearMocks: true,
     // Split by directory: `convex/**` runs Convex functions through
@@ -35,6 +48,14 @@ export default defineConfig({
           name: "convex",
           environment: "edge-runtime",
           include: ["convex/**/*.test.ts"],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "scripts",
+          environment: "node",
+          include: ["scripts/**/*.test.mjs"],
         },
       },
     ],

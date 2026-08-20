@@ -63,7 +63,7 @@ export function lintEntryInput(args: {
   if (!args.body.trim()) issues.push(err("body_required", "Body is required."));
   if (args.audience === "customer" && args.body && PRICE_RE.test(args.body)) {
     issues.push(warn("price_mention",
-      "Customer-safe text mentions prices/fees — Holidayys policy routes cost talk to a human."));
+      "Customer-safe text mentions prices/fees — company policy routes cost talk to a human."));
   }
   return issues;
 }

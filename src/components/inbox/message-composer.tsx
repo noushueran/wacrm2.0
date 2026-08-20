@@ -49,6 +49,10 @@ import {
   MEDIA_MAX_BYTES_BY_KIND,
 } from "@/lib/storage/upload-media";
 import { mediaUrlFromKey } from "@/lib/storage/media-url";
+import {
+  decidePasteAttachment,
+  PICKER_ACCEPT,
+} from "@/lib/inbox/pasteAttachment";
 import { ReplyQuote } from "./reply-quote";
 import { useTranslations } from "next-intl";
 import {
@@ -92,18 +96,7 @@ interface ReplyDraft {
   preview: string;
 }
 
-// Mirrors the previous chat-media bucket's allowed_mime_types (migration
-// 023) for the file picker so unsupported files are rejected before
-// upload rather than failing with a confusing Storage error. Audio has
-// no picker — it's captured via the recorder.
-const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
-  image: "image/png,image/jpeg,image/webp",
-  video: "video/mp4,video/3gpp",
-  document:
-    "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain",
-};
-
-interface MediaDraft {
+export interface MediaDraft {
   kind: ComposerMediaKind;
   /** R2 object key — used both to GC the object if the draft is
    *  discarded and to build the preview `src` (`mediaUrlFromKey`). */
@@ -400,6 +393,15 @@ export function MessageComposer({
         );
         return;
       }
+      // A 0-byte file (some Linux file managers, or a page-authored
+      // `new File([], …)`) uploads cleanly and only fails at Meta with an
+      // opaque 400 — reject it here instead. Unlike the recorder's silent
+      // empty-take return, this file was deliberately pasted or picked, so
+      // the agent gets told why nothing happened.
+      if (file.size === 0) {
+        toast.error("That file is empty — nothing to attach.");
+        return;
+      }
       setBusy(true);
       try {
         // R2 "kind" (the bucket-prefix taxonomy — inbound/outbound/
@@ -420,7 +422,14 @@ export function MessageComposer({
         );
         // Replacing an existing draft? GC the previous object first.
         removeStaged(draftRef.current?.mediaKey);
-        setDraft({ kind, mediaKey: key, filename: file.name, caption: "" });
+        // Paste can swap the attachment under a caption the agent already
+        // typed — carry it forward instead of wiping it on replace.
+        setDraft((prev) => ({
+          kind,
+          mediaKey: key,
+          filename: file.name,
+          caption: prev?.caption ?? "",
+        }));
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
@@ -435,6 +444,37 @@ export function MessageComposer({
       if (file) void stageUpload(kind, file);
     },
     [stageUpload],
+  );
+
+  // Ctrl/Cmd+V straight into the composer stages an attachment, reusing the
+  // same `stageUpload` path as the 📎 picker. Gated exactly like that menu:
+  // no pasting for viewers, outside the 24h window, mid-upload, or while
+  // the mic is live.
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLDivElement>) => {
+      if (inputsDisabled || busy || recording) return;
+
+      const decision = decidePasteAttachment(
+        Array.from(e.clipboardData.files),
+        Array.from(e.clipboardData.types),
+      );
+      if (decision.action === "ignore") return;
+
+      // Only past this point is the paste media rather than text — so this
+      // is the only branch that may suppress the browser's own paste.
+      e.preventDefault();
+
+      if (decision.action === "unsupported") {
+        toast.error(t("pasteUnsupported", { type: decision.mimeType }));
+        return;
+      }
+      if (decision.ignoredFileCount > 0) {
+        toast.info(t("pasteMultipleFiles"));
+      }
+      // stageUpload owns its own size-limit and upload-failure toasts.
+      void stageUpload(decision.kind, decision.file);
+    },
+    [inputsDisabled, busy, recording, t, stageUpload],
   );
 
   // ---- Voice recording (client-side Ogg/Opus, no server transcode) ---
@@ -620,6 +660,13 @@ export function MessageComposer({
         }}
       />
 
+      {/* Paste target. Deliberately NOT the component root: the dialogs
+          below render through a React portal, and synthetic events
+          propagate along the React tree, so a root-level onPaste would also
+          fire for pastes inside them. This covers the textarea and the
+          staged draft's caption input, which is exactly the surface where
+          a paste should attach. */}
+      <div onPaste={handlePaste}>
       {draft ? (
         <MediaDraftPreview
           draft={draft}
@@ -848,6 +895,7 @@ export function MessageComposer({
           )}
         </div>
       )}
+      </div>
 
       {/* Hint sits outside the flex row so its height doesn't push
           `items-end` buttons below the textarea. Indented to line up
@@ -855,7 +903,7 @@ export function MessageComposer({
       {/* Desktop-only hint. On mobile it's dropped — vertical space is scarce
           and the tinted ✨ button is self-evident. */}
       {!draft && !recording && (
-        <p className="mt-1 hidden pl-[5.5rem] text-[10px] text-muted-foreground sm:block">
+        <p className="mt-1 hidden pl-[5.5rem] text-[11px] text-muted-foreground sm:block">
           {t("draftHint")}
         </p>
       )}
@@ -909,7 +957,7 @@ export function MessageComposer({
  * across the parent's re-renders — a nested component would remount the
  * caption input on every keystroke and drop focus.
  */
-function MediaDraftPreview({
+export function MediaDraftPreview({
   draft,
   busy,
   readOnly,
@@ -926,6 +974,18 @@ function MediaDraftPreview({
   onSend: () => void;
   t: ReturnType<typeof useTranslations>;
 }) {
+  const captionRef = useRef<HTMLTextAreaElement>(null);
+
+  // Grow the caption box with its content, same 4-line ceiling as the
+  // main composer. Keyed on the caption rather than done in onChange so
+  // a caption carried over by paste-replace sizes itself too.
+  useEffect(() => {
+    const el = captionRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
+  }, [draft.caption]);
+
   return (
     <div className="rounded-xl border border-border bg-muted/40 p-3">
       <div className="flex items-start gap-3">
@@ -962,8 +1022,9 @@ function MediaDraftPreview({
         <button
           type="button"
           onClick={onDiscard}
+          disabled={busy}
           aria-label={t("removeAttachment")}
-          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           <X className="h-4 w-4" />
         </button>
@@ -971,9 +1032,16 @@ function MediaDraftPreview({
 
       <div className="mt-2 flex items-end gap-2">
         {draft.kind !== "audio" && (
-          <input
+          // Textarea, not input: a single-line <input> silently drops
+          // U+000A/U+000D from its value (HTML value sanitization), so a
+          // pasted multi-line caption arrived flattened and no Shift+Enter
+          // could put a break back. WhatsApp renders caption newlines, and
+          // everything downstream of here already preserves them.
+          <textarea
+            ref={captionRef}
             value={draft.caption}
             maxLength={MEDIA_CAPTION_MAX}
+            rows={1}
             onChange={(e) => onCaptionChange(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
@@ -982,7 +1050,7 @@ function MediaDraftPreview({
               }
             }}
             placeholder={t("addCaption")}
-            className="flex-1 rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50"
+            className="flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50"
           />
         )}
         <GatedButton

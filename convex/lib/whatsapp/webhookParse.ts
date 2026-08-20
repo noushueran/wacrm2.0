@@ -100,8 +100,6 @@ export interface MetaWebhookMessage {
     // fiction that the runtime payload is free to violate, and Meta has
     // shipped new ad surfaces/formats before without warning. Narrowing
     // happens once, in `normalizeSourceType`/`normalizeMediaType` below.
-    // See those functions for why an unrecognized value must not reach
-    // `ingest.ingestInbound`'s validator.
     source_type?: string;
     source_url?: string;
     headline?: string;
@@ -118,6 +116,35 @@ export interface MetaWebhookStatus {
   status: string;
   timestamp: string;
   recipient_id: string;
+  /** Present on billing-bearing statuses. Meta's conversation-window
+   *  record for this message. */
+  conversation?: {
+    id?: string;
+    /** Unix SECONDS, as a string. Meta's authoritative window expiry. */
+    expiration_timestamp?: string;
+    origin?: { type?: string };
+  };
+  /** Present on billing-bearing statuses. `type` exists only in the
+   *  per-message ("PMP") era; the conversation-based ("CBP") era carries
+   *  the signal in `category` / `conversation.origin.type` instead. */
+  pricing?: {
+    billable?: boolean;
+    pricing_model?: string;
+    category?: string;
+    type?: string;
+  };
+  /** Meta's stated reason the send could not be delivered. Documented as
+   *  present only on a `failed` status — but `parseStatusError` below
+   *  deliberately does not gate on that (see its own comment for why).
+   *  An array in Meta's payload; in practice always one entry. `message`
+   *  and `error_data.details` are not always present even when `code`/
+   *  `title` are. */
+  errors?: {
+    code?: number;
+    title?: string;
+    message?: string;
+    error_data?: { details?: string };
+  }[];
 }
 
 export interface MetaWebhookContact {
@@ -305,7 +332,7 @@ export interface FlattenedInboundMessage {
 
 /**
  * Narrow Meta's raw `referral.source_type` to the closed union the data
- * model stores, or DROP it (`undefined`) when it's anything else.
+ * model stores, or DROP it (`undefined`) when it is anything else.
  *
  * Why dropping — rather than passing the raw string through — is the only
  * safe option: `sourceType` is validated as
@@ -321,17 +348,21 @@ export interface FlattenedInboundMessage {
  * A cosmetic ad-card field must never cost us the actual message.
  *
  * The field is `v.optional` everywhere, so omitting it is always valid.
- * The one behavioural consumer is `adReferrals.ts`'s
- * `sourceType === "ad"` gate on campaign-ad resolution, which correctly
- * declines to resolve a source it cannot classify. The ad card still
- * renders — it reads `headline`/`body`/`imageUrl`, not `sourceType`.
+ * Every behavioural consumer gates on `sourceType === "ad"` — the
+ * campaign-ad resolution in `adReferrals.ts`, the ad-started counter in
+ * `messages.ts`, and the `conversationsStartedAd` rollup in `reports.ts` —
+ * so all three correctly decline to treat a source they cannot classify
+ * as a genuine ad. The ad card still renders: it reads
+ * `headline`/`body`/`imageUrl`, not `sourceType`.
  *
  * Case is folded because Meta's own casing has not been contractually
  * stable across surfaces; `"AD"` is unambiguously the documented `"ad"`.
  */
-function normalizeSourceType(raw: string | undefined): "ad" | "post" | undefined {
-  const v = raw?.trim().toLowerCase();
-  return v === "ad" || v === "post" ? v : undefined;
+function normalizeSourceType(
+  raw: string | undefined,
+): "ad" | "post" | undefined {
+  const value = raw?.trim().toLowerCase();
+  return value === "ad" || value === "post" ? value : undefined;
 }
 
 /** Same contract as `normalizeSourceType`, for `referral.media_type` —
@@ -339,9 +370,11 @@ function normalizeSourceType(raw: string | undefined): "ad" | "post" | undefined
  *  likewise fatal to the whole message when Meta sends a format outside
  *  it (a carousel/product ad, say). Dropping it costs only the media-kind
  *  hint on the ad card; keeping it costs the message. */
-function normalizeMediaType(raw: string | undefined): "image" | "video" | undefined {
-  const v = raw?.trim().toLowerCase();
-  return v === "image" || v === "video" ? v : undefined;
+function normalizeMediaType(
+  raw: string | undefined,
+): "image" | "video" | undefined {
+  const value = raw?.trim().toLowerCase();
+  return value === "image" || value === "video" ? value : undefined;
 }
 
 /**
@@ -516,4 +549,139 @@ function flattenByType(
         wamid,
       };
   }
+}
+
+// ============================================================
+// Status pricing / conversation-window capture
+//
+// Meta reports the real window expiry and billing outcome on every
+// outbound message's status webhook. Every field here is OPTIONAL and
+// every enum-ish value stays a RAW string: Meta is mid-migration between
+// conversation-based pricing ("CBP") and per-message pricing ("PMP"),
+// and the two eras spell the free-entry-point signal differently. An
+// unrecognized value must degrade to "unknown", never throw and never
+// drop the webhook.
+// ============================================================
+
+export interface ParsedStatusPricing {
+  conversationMetaId?: string;
+  /** Milliseconds since epoch (Meta sends unix SECONDS as a string). */
+  expiresAt?: number;
+  originType?: string;
+  pricingModel?: string;
+  pricingCategory?: string;
+  pricingType?: string;
+  billable?: boolean;
+  /** True when either era's spelling says this is a free entry point. */
+  isFreeEntryPoint: boolean;
+}
+
+/** CBP-era spelling, on `conversation.origin.type`. */
+const FEP_ORIGIN_TYPE = "referral_conversion";
+/** PMP-era spelling, on `pricing.type`. */
+const FEP_PRICING_TYPE = "free_entry_point";
+/** CBP-era spelling, on `pricing.category`. Deliberately the same string
+ *  as `FEP_ORIGIN_TYPE` above — Meta reuses "referral_conversion" as the
+ *  CBP-era free-entry-point signal on two different fields
+ *  (`conversation.origin.type` and `pricing.category`); the duplication
+ *  is intentional, not a copy-paste artifact. */
+const FEP_PRICING_CATEGORY = "referral_conversion";
+
+/**
+ * Lift Meta's billing/window facts off one status webhook entry.
+ * Returns `null` when the status carries neither object — ordinary for
+ * some `delivered`/`read` callbacks, and NOT an error.
+ */
+export function parseStatusPricing(
+  status: MetaWebhookStatus,
+): ParsedStatusPricing | null {
+  const { conversation, pricing } = status;
+  if (!conversation && !pricing) return null;
+
+  const seconds = Number(conversation?.expiration_timestamp);
+  const expiresAt =
+    Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+
+  const originType = conversation?.origin?.type;
+  const pricingType = pricing?.type;
+  const pricingCategory = pricing?.category;
+
+  return {
+    conversationMetaId: conversation?.id,
+    expiresAt,
+    originType,
+    pricingModel: pricing?.pricing_model,
+    pricingCategory,
+    pricingType,
+    billable: pricing?.billable,
+    isFreeEntryPoint:
+      originType === FEP_ORIGIN_TYPE ||
+      pricingType === FEP_PRICING_TYPE ||
+      pricingCategory === FEP_PRICING_CATEGORY,
+  };
+}
+
+// ============================================================
+// Status error capture — diagnostic for silent async delivery failures.
+//
+// Meta accepts a send synchronously (returns a wamid) and only reports
+// `failed` later, asynchronously, on this same status webhook. When it
+// does, `errors[0]` is the ONLY place Meta ever states why — and until
+// now this codebase parsed the status webhook without reading that
+// field at all, so a `failed` message's cause was unrecoverable the
+// moment it happened (self-hosted Convex keeps no log history to
+// reconstruct it from afterward). Every field is OPTIONAL and read as a
+// RAW value, same trade as `parseStatusPricing` above: Meta's `errors`
+// array is, in practice, always one entry, but that is not a documented
+// guarantee, and `message` / `error_data.details` are frequently absent
+// even when `code` / `title` are present.
+// ============================================================
+
+export interface ParsedStatusError {
+  code?: number;
+  title?: string;
+  message?: string;
+  details?: string;
+}
+
+/**
+ * Lift Meta's stated reason a status webhook entry could not be
+ * delivered. Returns `null` when there is no usable error: no `errors`
+ * array, an empty one, or an entry with no readable field set.
+ *
+ * Deliberately does NOT gate on `status.status === "failed"`, even
+ * though Meta's documentation states `errors` is failure-only.
+ * `deliveryError` (see its own comment in `schema.ts`) has no readers
+ * yet, so the asymmetry decides it: a stray capture on some other status
+ * is inert and trivially filtered later by querying `status === "failed"`
+ * first, but a wrongly-DROPPED error is unrecoverable — this deployment
+ * keeps no log history, which is the entire reason this function exists.
+ * A documented-but-unverified constraint is not worth risking a silently
+ * lost reason over, and this exact webhook's documented shape has already
+ * proven incomplete once in this codebase (`parseStatusPricing` above
+ * exists because the CBP/PMP pricing fields don't behave as a single
+ * documented shape either).
+ */
+export function parseStatusError(
+  status: MetaWebhookStatus,
+): ParsedStatusError | null {
+  const first = status.errors?.[0];
+  if (!first) return null;
+
+  const details = first.error_data?.details;
+  if (
+    first.code === undefined &&
+    !first.title &&
+    !first.message &&
+    !details
+  ) {
+    return null;
+  }
+
+  return {
+    code: first.code,
+    title: first.title,
+    message: first.message,
+    details,
+  };
 }

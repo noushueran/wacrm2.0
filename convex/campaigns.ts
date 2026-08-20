@@ -14,6 +14,11 @@ export const WINDOW_DAYS = 365;
 const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 
 /**
+ * @deprecated Superseded by `reports.funnelOverview`, which takes the
+ * caller's window instead of a hardcoded 365 days. Kept until `/reports` is
+ * verified in production — deleting a working query in the same change that
+ * replaces its UI would make a rollback harder than it needs to be.
+ *
  * Funnel performance overview for the /campaigns dashboard. Supervisor+
  * — deliberately looser than `conversionEvents.listRecent`'s admin-only
  * gate: the account owner explicitly asked for supervisors to reach

@@ -16,6 +16,37 @@
  * floor). Do not "simplify" this back to `.dark`. */
 @custom-variant dark (&:is(html[data-mode="dark"] *));
 
+/* CONTAINER QUERIES: a query never resolves against the element that
+ * declares the container.
+ *
+ * `@container/name` sets `container-type` on an element; `@lg/name:` and
+ * friends compile to a `@container name (min-width: …)` rule. Per the CSS
+ * Containment spec that rule matches an ANCESTOR container only — the
+ * element carrying `container-type` is not a candidate for its own query.
+ * So this looks right and is dead:
+ *
+ *   <div className="@container/ib flex flex-col gap-4 @lg/ib:flex-row" />
+ *
+ * `@lg/ib:flex-row` is emitted into the stylesheet and simply never
+ * matches. There is no build warning, no console error, and no failing
+ * selector to inspect — the element just keeps its base layout forever,
+ * which reads as a Tailwind or flexbox problem rather than a CSS one.
+ * That is exactly how it burned an afternoon in the automations send
+ * composer (`src/components/interactive/interactive-builder.tsx`).
+ *
+ * Always split the two roles across two elements:
+ *
+ *   <div className="@container/ib">
+ *     <div className="flex flex-col gap-4 @lg/ib:flex-row" />
+ *   </div>
+ *
+ * `eslint.config.mjs` fails the build on the one-element form when both
+ * halves sit in the same class string. It CANNOT see the form that
+ * crosses a component boundary — `<CardHeader className="@lg/card-header:…">`
+ * lands on the same element that `card.tsx` gave `@container/card-header`,
+ * in a different file, and is just as dead. When you query a named
+ * container, check where that name is declared. */
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -72,6 +103,48 @@
 }
 
 /* ============================================================
+ * TYPE SCALE — legibility pass
+ *
+ * This UI is built almost entirely out of `text-xs` (~450 uses)
+ * and `text-sm` (~390 uses), i.e. 12px/14px, which staff reported
+ * as too small to scan comfortably. Rather than touch ~900 call
+ * sites, the scale itself is redefined here: every existing
+ * utility keeps its name and its relative position, and just
+ * resolves one step larger.
+ *
+ * Sizes go up ~8% (xs 12→13, sm 14→15); line-heights go up by
+ * only ~1px so dense surfaces (the inbox list, tables) grow a
+ * hair rather than reflowing. `--text-base` stays at 1rem so the
+ * scale stays monotonic and the mobile 16px input rule below
+ * remains the floor it was written to be.
+ *
+ * Weights move with it: body text sits at 450 (see @layer base)
+ * and the medium/semibold steps shift up to match, keeping the
+ * same four-step hierarchy at higher contrast. Inter is loaded
+ * as a variable font (layout.tsx), so these intermediate weights
+ * render natively rather than being synthesised.
+ * ============================================================ */
+@theme {
+  --text-xs: 0.8125rem; /* 13px, was 12 */
+  --text-xs--line-height: 1.0625rem; /* 17px, was 16 */
+  --text-sm: 0.9375rem; /* 15px, was 14 */
+  --text-sm--line-height: 1.3125rem; /* 21px, was 20 */
+  --text-base: 1rem; /* unchanged */
+  --text-base--line-height: 1.5rem;
+  --text-lg: 1.1875rem; /* 19px, was 18 */
+  --text-lg--line-height: 1.75rem;
+  --text-xl: 1.3125rem; /* 21px, was 20 */
+  --text-xl--line-height: 1.8125rem;
+  --text-2xl: 1.5625rem; /* 25px, was 24 */
+  --text-2xl--line-height: 2.0625rem;
+
+  --font-weight-normal: 450; /* was 400 */
+  --font-weight-medium: 550; /* was 500 */
+  --font-weight-semibold: 650; /* was 600 */
+  /* --font-weight-bold stays 700 — the top of the ramp is already loud. */
+}
+
+/* ============================================================
  * THEMING — two orthogonal dimensions
  *
  *   1. MODE   (light / dark)  → neutral surfaces. Selected with
@@ -112,16 +185,38 @@ html[data-mode="dark"] {
   --secondary: oklch(0.22 0.01 260);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.22 0.01 260);
-  --muted-foreground: oklch(0.65 0.01 260);
+  /* Secondary text. Raised 0.65 → 0.72: at the old value the ~973
+   * `text-muted-foreground` call sites measured 5.5–6.2:1, which
+   * clears AA on paper but reads faint at 13px. Now 7.2–8.1:1,
+   * still well short of --foreground (18:1) so the primary /
+   * secondary distinction survives. */
+  --muted-foreground: oklch(0.72 0.01 260);
   --accent: oklch(0.22 0.01 260);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.28 0.01 260);
-  --input: oklch(0.28 0.01 260);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  /* Slightly firmer separators so cards and rows read as distinct. */
+  --border: oklch(0.32 0.01 260);
+  --input: oklch(0.32 0.01 260);
+  /* Categorical chart series, used by the /reports panels (the dashboard
+   * trend has its own `--chart-incoming` / `--chart-outgoing` below).
+   *
+   * These were the stock achromatic ramp — 0.556 / 0.439 / 0.371 / 0.269
+   * at chroma 0 — which is a LIGHT-surface scale left unconverted. Against
+   * this block's `--card` (L 0.18) it measured 3.96 / 2.40 / 1.81 / 1.24:1,
+   * so three of the four series sat under the 3:1 that WCAG 1.4.11 asks of
+   * a graphical object, and `--chart-5` at 1.24:1 was effectively invisible
+   * — a stacked billing bar you could not see you were missing.
+   *
+   * Retuned to 9.97 / 7.58 / 5.56 / 4.01:1. Same single-hue-260 structure
+   * the light block already uses, inverted for a dark surface: lightness
+   * DESCENDS here so prominence still tracks the series order the billing
+   * panel assigns (marketing → free), which on light is carried by the
+   * ramp ascending away from the page. Chroma stays low so none of them
+   * competes with `--chart-1`, the theme accent. */
+  --chart-2: oklch(0.8 0.11 260);
+  --chart-3: oklch(0.72 0.09 260);
+  --chart-4: oklch(0.64 0.07 260);
+  --chart-5: oklch(0.56 0.05 260);
   /* Dashboard conversation-trend series. `incoming` is a fixed blue tuned
    * for the dark surface; `outgoing` tracks the chosen accent so the chart
    * recolours with the theme. Light-mode counterparts live below. */
@@ -146,12 +241,15 @@ html[data-mode="light"] {
   --secondary: oklch(0.967 0.003 260);
   --secondary-foreground: oklch(0.25 0.01 260);
   --muted: oklch(0.967 0.003 260);
-  --muted-foreground: oklch(0.52 0.015 260);
+  /* Light-mode counterpart: 0.52 → 0.45 (darker = stronger here),
+   * taking secondary text from 5.3–5.5:1 to 7.1–7.4:1 so both
+   * modes land at the same perceived weight. */
+  --muted-foreground: oklch(0.45 0.015 260);
   --accent: oklch(0.96 0.004 260);
   --accent-foreground: oklch(0.25 0.01 260);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0.004 260);
-  --input: oklch(0.922 0.004 260);
+  --border: oklch(0.9 0.004 260);
+  --input: oklch(0.9 0.004 260);
   --chart-2: oklch(0.6 0.1 260);
   --chart-3: oklch(0.7 0.06 260);
   --chart-4: oklch(0.8 0.04 260);
@@ -246,6 +344,10 @@ html[data-theme="rose"] {
   }
   body {
     @apply bg-background text-foreground;
+    /* Default UI text sits one notch above hairline 400. Utilities
+     * (`font-medium` and up) still override this; see the weight
+     * tokens in the @theme block above for the full ramp. */
+    font-weight: var(--font-weight-normal);
   }
   html {
     @apply font-sans;

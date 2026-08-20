@@ -25,15 +25,16 @@
 //   export, this surfaces as `<meta name="referrer" content="no-referrer">`.
 // ============================================================
 
-import type { Metadata } from 'next';
+import type { Metadata } from 'next'
+import { BRAND, PRODUCT_NAME } from '@/lib/brand';;
 import type { ReactNode } from 'react';
 
 export const metadata: Metadata = {
   // Browser-tab title. The root layout's title template turns this into
-  // "You're invited to the team — Holidayys WA CRM".
+  // "You're invited to the team — <Brand> WA CRM".
   title: "You're invited to the team",
   description:
-    'Accept your invitation to join your team on Holidayys WA CRM — the shared WhatsApp inbox, contacts, and pipelines for Holidays Tours LLC.',
+    `Accept your invitation to join your team on ${PRODUCT_NAME} — the shared WhatsApp inbox, contacts, and pipelines for ${BRAND.legalName}.`,
   referrer: 'no-referrer',
   // Belt-and-braces against an invite URL ending up in search results if a
   // join page is ever crawled.
@@ -47,8 +48,8 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
   openGraph: {
     type: 'website',
-    siteName: 'Holidayys WA CRM',
-    title: "You're invited to Holidayys WA CRM",
+    siteName: PRODUCT_NAME,
+    title: `You're invited to ${PRODUCT_NAME}`,
     description:
       "Accept your invitation to join your team's shared WhatsApp inbox, contacts, and pipelines.",
     // og:image (+ width/height/alt) is supplied by `opengraph-image.tsx`
@@ -56,7 +57,7 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: 'summary_large_image',
-    title: "You're invited to Holidayys WA CRM",
+    title: `You're invited to ${PRODUCT_NAME}`,
     description:
       "Accept your invitation to join your team's shared WhatsApp inbox, contacts, and pipelines.",
     // twitter:image is supplied by `twitter-image.tsx` in this segment.

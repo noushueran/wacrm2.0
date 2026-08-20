@@ -2,6 +2,7 @@
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { internal } from "./_generated/api";
+import { isDeliverableUrl } from "./webhookDelivery";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 
@@ -224,3 +225,75 @@ test("dispatch auto-disables an endpoint after MAX_CONSECUTIVE_FAILURES consecut
   expect(endpoint!.failureCount).toBe(15);
   expect(endpoint!.isActive).toBe(false);
 });
+
+// ============================================================
+// SSRF guard — `isDeliverableUrl`.
+//
+// The IPv4-mapped IPv6 cases below are REGRESSION tests for a real
+// bypass: `new URL("http://[::ffff:127.0.0.1]/").hostname` normalizes to
+// the hex form `[::ffff:7f00:1]`, so the guard's original
+// `::ffff:<dotted-quad>` regex never matched and loopback / cloud-
+// metadata / private targets were accepted. Every spelling of the same
+// address must be rejected, so keep the "same target, many spellings"
+// grouping if this list is extended.
+// ============================================================
+
+const BLOCKED_URLS = [
+  // Plain IPv4 literals.
+  "http://127.0.0.1/",
+  "http://10.0.0.5/",
+  "http://172.16.0.1/",
+  "http://192.168.1.1/",
+  "http://169.254.169.254/latest/meta-data/",
+  "http://100.64.0.1/",
+  "http://0.0.0.0/",
+  // Alternative IPv4 encodings the URL parser normalizes for us.
+  "http://2130706433/",
+  "http://0177.0.0.1/",
+  // IPv6 loopback / link-local / unique-local.
+  "http://[::1]/",
+  "http://[::]/",
+  "http://[fe80::1]/",
+  "http://[fd00::1]/",
+  "http://[fc00::1]/",
+  // IPv4-mapped IPv6 — dotted-quad spelling AND the hex form the URL
+  // parser actually produces from it. This is the regressed bypass.
+  "http://[::ffff:127.0.0.1]/",
+  "http://[::ffff:7f00:1]/",
+  "http://[::ffff:169.254.169.254]/",
+  "http://[::ffff:a9fe:a9fe]/",
+  "http://[0:0:0:0:0:ffff:a9fe:a9fe]/",
+  "http://[::ffff:10.0.0.5]/",
+  "http://[::ffff:a00:5]/",
+  // Deprecated IPv4-compatible and NAT64 embeddings.
+  "http://[::127.0.0.1]/",
+  "http://[64:ff9b::169.254.169.254]/",
+  // Internal hostname suffixes.
+  "http://localhost/",
+  "http://foo.localhost/",
+  "http://db.local/",
+  "http://svc.internal/",
+  // Unparseable / malformed.
+  "http://[:::1]/",
+  "not-a-url",
+];
+
+for (const url of BLOCKED_URLS) {
+  test(`isDeliverableUrl rejects ${url}`, () => {
+    expect(isDeliverableUrl(url)).toBe(false);
+  });
+}
+
+const ALLOWED_URLS = [
+  "https://example.com/hooks",
+  "https://hooks.slack.com/services/T000/B000/xxx",
+  "http://93.184.216.34/",
+  "https://[2606:4700:4700::1111]/",
+  "https://sub.domain.example.co.uk:8443/path?q=1",
+];
+
+for (const url of ALLOWED_URLS) {
+  test(`isDeliverableUrl allows ${url}`, () => {
+    expect(isDeliverableUrl(url)).toBe(true);
+  });
+}

@@ -54,7 +54,7 @@ export default function NewBroadcastPage() {
     if (!template) return;
 
     try {
-      const broadcastId = await createAndSendBroadcast({
+      const { broadcastId, skipped } = await createAndSendBroadcast({
         name,
         template,
         audience: {
@@ -67,6 +67,11 @@ export default function NewBroadcastPage() {
         variables,
         headerMediaUrl,
       });
+      // A sender who thinks they messaged 200 people and actually
+      // messaged 197 (3 had asked not to be contacted) must be told.
+      if (skipped > 0) {
+        toast.info(t('skippedDoNotContact', { count: skipped }));
+      }
       router.push(`/broadcasts/${broadcastId}`);
     } catch (err) {
       // Previously swallowed with console.error — the wizard would

@@ -3,7 +3,9 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
-import { holidayysDefaultConfig } from "./lib/qualification/defaults";
+import { defaultQualificationConfig } from "./lib/qualification/defaults";
+import { tagContactForService } from "./qualificationEngine";
+import type { AnalysisResult } from "./lib/qualification/analyze";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -33,7 +35,7 @@ async function seed(
     });
     await ctx.db.insert("qualificationConfigs", {
       accountId,
-      ...holidayysDefaultConfig(),
+      ...defaultQualificationConfig(),
       enabled: opts.enabled,
       adminAlertPhones: opts.adminPhones ?? [],
     });
@@ -293,6 +295,124 @@ test("follow-up nudges yield once a human is assigned (assignment = takeover)", 
   expect(s.nextFollowUpAt).toBeGreaterThan(Date.now()); // parked, not sent
 });
 
+test("a follow-up is not sent to a do-not-contact customer", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: base.accountId,
+      contactId: base.contactId,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(base.contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const verdict = await t.query(internal.qualificationEngine.followUpContext, {
+    sessionId,
+  });
+  // "optOut", not "skip" and not "clear": "skip" leaves nextFollowUpAt
+  // in the past, so the session would stay in getDueSessions' due range
+  // and be re-offered to the sweep forever (see the livelock test
+  // below). "clear" fixes the livelock but leaves status "collecting"
+  // with no closedReason, so the leadsBoard would still show it as an
+  // active lead to work. "optOut" maps to markSessionOptedOut, the same
+  // terminal state (status "opted_out", closedReason "opted_out")
+  // applyAnalysis already uses when the LLM classifies a customer's own
+  // "stop messaging me" — see the terminal-state test below.
+  expect(verdict.kind).toBe("optOut");
+});
+
+test("a follow-up IS sent to a contact with notes but no do-not-contact flag", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  await t.run((ctx) =>
+    ctx.db.insert("contactNotes", {
+      accountId: base.accountId,
+      contactId: base.contactId,
+      noteText: "Called, will decide next week",
+      kind: "call",
+      outcome: "follow_up",
+    }),
+  );
+
+  const verdict = await t.query(internal.qualificationEngine.followUpContext, {
+    sessionId,
+  });
+  expect(verdict.kind).not.toBe("skip");
+  expect(verdict.kind).not.toBe("clear");
+  expect(verdict.kind).not.toBe("optOut");
+});
+
+test("a blocked session is opted out of the due sweep instead of livelocking it", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: base.accountId,
+      contactId: base.contactId,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(base.contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+  // Sanity: the session really is in the due range before we process it.
+  expect(await t.query(internal.qualificationEngine.getDueSessions, {})).toHaveLength(1);
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0); // never sent
+  // The livelock check: a "skip" verdict would leave nextFollowUpAt
+  // untouched and this session would show up here again on every sweep,
+  // forever, crowding out the 100-row budget in getDueSessions.
+  expect(await t.query(internal.qualificationEngine.getDueSessions, {})).toHaveLength(0);
+  const [s] = await sessionsFor(t, base.conversationId);
+  // Terminal status that tells the truth: NOT "collecting" (which the
+  // leadsBoard shows in its active-lead bucket) — "opted_out", the same
+  // closed bucket applyAnalysis's own opt-out path lands in, with the
+  // same closedReason leads-board-view.tsx already knows how to label
+  // ("Asked to stop").
+  expect(s.status).toBe("opted_out");
+  expect(s.closedReason).toBe("opted_out");
+  expect(s.nextFollowUpAt).toBeUndefined();
+});
+
+test("a blocked session that would also have expired is classified as opted-out, not expired", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  // 100h ago is well past the 72h sessionWindowHours default, so this
+  // session independently qualifies for `{ kind: "expire", reason:
+  // "no_response" }` too — do-not-contact must win that race.
+  const sessionId = await seedDueSession(t, base, {
+    lastCustomerMessageAt: Date.now() - 100 * 3_600_000,
+  });
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: base.accountId,
+      contactId: base.contactId,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(base.contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const verdict = await t.query(internal.qualificationEngine.followUpContext, {
+    sessionId,
+  });
+  expect(verdict.kind).toBe("optOut");
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.status).toBe("opted_out");
+  expect(s.closedReason).toBe("opted_out"); // not "no_response"
+});
+
 test("ask-admin with no admin numbers flags the thread pending but never silences the bot", async () => {
   const t = convexTest(schema, modules);
   const base = await seed(t);
@@ -351,7 +471,12 @@ test("getObjectives returns collected + next question for a collecting session, 
         { key: "budget", value: "5000", confidence: "low", updatedAt: 1 },
       ],
       expectedCount: 4, answeredCount: 1,
-      pendingQuestion: { key: "travel_dates", text: "When are you planning to travel?", alternates: [] },
+      pendingQuestion: {
+        key: "travel_dates",
+        text: "When are you planning to travel?",
+        alternates: [],
+        askedAt: Date.now(),
+      },
       followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
     });
   });
@@ -359,6 +484,9 @@ test("getObjectives returns collected + next question for a collecting session, 
     accountId, conversationId,
   });
   expect(objectives?.collected).toEqual([{ label: "Destination", value: "Bali" }]);
+  // Low-confidence rows are surfaced separately — the customer DID say
+  // this, so the assistant must confirm it rather than ask again.
+  expect(objectives?.unconfirmed).toEqual([{ label: "budget", value: "5000" }]);
   expect(objectives?.nextQuestion).toBe("When are you planning to travel?");
 
   const off = await seed(t, { enabled: false });
@@ -387,6 +515,115 @@ test("getObjectives falls back to the first unanswered required basic field when
   });
   // looking_for is answered → next required basic field is travel_dates
   expect(objectives?.nextQuestion).toContain("travel");
+});
+
+test("getObjectives stops steering from the basic fields once a service is identified", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "collecting", origin: "inbound",
+      // A live service thread: everything known is in the CHECKLIST key
+      // namespace, so no basicFields key can ever look answered — the
+      // same namespace mismatch that had the follow-up cron asking a visa
+      // applicant what they were looking for (see `pickFollowUpText`).
+      serviceName: "UAE visa",
+      fields: [
+        { key: "nationality", value: "Indian", confidence: "high", updatedAt: 1 },
+      ],
+      expectedCount: 4, answeredCount: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const objectives = await t.query(internal.qualificationEngine.getObjectives, {
+    accountId, conversationId,
+  });
+  // No steer at all beats a wrong one — the model reads the transcript.
+  expect(objectives?.nextQuestion).toBeNull();
+  expect(objectives?.collected).toEqual([{ label: "nationality", value: "Indian" }]);
+});
+
+test("getObjectives withholds a pendingQuestion the customer has already answered", async () => {
+  // The production shape (conversation nn7afrjd…): the analyst proposed
+  // "inside or outside the UAE?", the customer answered it two minutes
+  // later, and no newer analysis has landed. Steering the reply model
+  // with that question is how it re-asks an answered detail.
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  const answeredAt = Date.now();
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "collecting", origin: "inbound",
+      fields: [],
+      expectedCount: 4, answeredCount: 0,
+      pendingQuestion: {
+        key: "applicant_location",
+        text: "Is the applicant currently inside or outside the UAE?",
+        alternates: [],
+        askedAt: answeredAt - 2 * 60_000,
+      },
+      lastCustomerMessageAt: answeredAt,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  const objectives = await t.query(internal.qualificationEngine.getObjectives, {
+    accountId, conversationId,
+  });
+  // Stale → no steer at all this turn. Deliberately NOT swapped for a
+  // generic basic-field question: the model still has the transcript and
+  // picks better than the off-topic fallback would.
+  expect(objectives?.nextQuestion).toBeNull();
+});
+
+test("applyAnalysis clears the pending question instead of inheriting a stale one", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "collecting", origin: "inbound",
+      fields: [],
+      expectedCount: 4, answeredCount: 0,
+      pendingQuestion: {
+        key: "applicant_location",
+        text: "Is the applicant currently inside or outside the UAE?",
+        alternates: [],
+        askedAt: Date.now() - 60_000,
+      },
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+  });
+  // A pass that saw the transcript and named nothing missing.
+  await t.mutation(internal.qualificationEngine.applyAnalysis, {
+    accountId, conversationId, contactId,
+    analysis: {
+      serviceName: "UAE visa", fields: [], score: 40, scoreBreakdown: [],
+      checklistSatisfied: false, expectedCount: 4, nextQuestion: null,
+      intent: "none", summary: null, newInquiry: false,
+    },
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.pendingQuestion).toBeUndefined();
+});
+
+test("applyAnalysis drops a proposed question whose answer the same pass extracted", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seed(t);
+  await t.mutation(internal.qualificationEngine.applyAnalysis, {
+    accountId, conversationId, contactId,
+    analysis: {
+      serviceName: "UAE visa",
+      fields: [{ key: "travel_dates", value: "August", confidence: "high" }],
+      score: 40, scoreBreakdown: [], checklistSatisfied: false, expectedCount: 4,
+      nextQuestion: {
+        key: "travel_dates",
+        text: "When are you planning to travel?",
+        alternates: [],
+      },
+      intent: "none", summary: null, newInquiry: false,
+    },
+  });
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.pendingQuestion).toBeUndefined();
 });
 
 // ---- P2: completion pipeline ----
@@ -543,7 +780,45 @@ test("sendClosingMessage sends the configured text as a bot message on a qualifi
       .collect());
   expect(messages).toHaveLength(1);
   expect(messages[0].senderType).toBe("bot");
-  expect(messages[0].contentText).toContain("travel expert");
+  expect(messages[0].contentText).toContain("contact you shortly");
+
+  // Clearing the closing message disables the send entirely — a blank
+  // field must not produce an empty bubble on the next qualified turn.
+  await t.run(async (ctx) => {
+    const config = await ctx.db.query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId)).unique();
+    await ctx.db.patch(config!._id, { closingMessage: "" });
+  });
+  await t.action(internal.qualificationEngine.sendClosingMessage, { accountId, conversationId });
+  messages = await t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+  expect(messages).toHaveLength(1);
+});
+
+test("sendClosingMessage is not sent to a do-not-contact customer", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId } = await seedAttributed(t);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId, status: "qualified", origin: "inbound",
+      fields: [], expectedCount: 0, answeredCount: 3, qualifiedAt: 1,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    });
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId, contactId, noteText: "Asked us to stop", kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  await t.action(internal.qualificationEngine.sendClosingMessage, { accountId, conversationId });
+  const messages = await t.run((ctx) =>
+    ctx.db.query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect());
+  expect(messages).toHaveLength(0);
 });
 
 test("sendAdminAlerts creates a silenced internal conversation, sends the alert, and never opens a session on it", async () => {
@@ -614,6 +889,10 @@ async function seedDueSession(
         key: "travel_dates",
         text: "When are you planning to travel?",
         alternates: ["Rough month works too — when?"],
+        // Proposed by the analysis of that last inbound, i.e. AFTER it —
+        // a question stamped earlier is treated as already answered and
+        // is never replayed (see `pickFollowUpText`).
+        askedAt: Date.now() - 2 * 3_600_000 + 1_000,
       },
       lastCustomerMessageAt: Date.now() - 2 * 3_600_000, // 2h ago: inside 24h
       followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
@@ -662,6 +941,28 @@ test("sendFollowUp inside the 24h window sends the rotating free-form question",
   expect(msgs[1].contentText).toBe("Rough month works too — when?");
   [s] = await sessionsFor(t, base.conversationId);
   expect(s.followUpsSent).toBe(2);
+});
+
+test("a snoozed conversation gets no qualification follow-up", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t);
+  await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base);
+
+  // Parked by a human until tomorrow.
+  await t.run((ctx) => ctx.db.patch(base.conversationId, {
+    snoozedUntil: Date.now() + 86_400_000,
+  }));
+
+  const verdict = await t.query(internal.qualificationEngine.followUpContext, { sessionId });
+  // A snooze defers; it does not cancel. The session stays `collecting`
+  // so it resumes when the snooze lifts.
+  expect(verdict.kind).toBe("reschedule");
+
+  await t.action(internal.qualificationEngine.sweepFollowUps, {});
+  // Nothing was said to the customer.
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  expect((await t.run((ctx) => ctx.db.get(sessionId)))!.status).toBe("collecting");
 });
 
 test("sendFollowUp beyond 24h uses the re-engagement template, or waits for expiry without one", async () => {
@@ -940,6 +1241,7 @@ test("V3-B: a human-owned thread stops the auto-relay; non-admin numbers never a
 
   // a random customer's message never claims a pending inquiry
   const other = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+
   await t.run((ctx) =>
     ctx.db.insert("adminInquiries", {
       accountId: other.accountId, conversationId: other.conversationId,
@@ -956,6 +1258,31 @@ test("V3-B: a human-owned thread stops the auto-relay; non-admin numbers never a
         q.eq("accountId", other.accountId).eq("status", "pending"))
       .collect());
   expect(stillPending).toHaveLength(1);
+});
+
+test("V3-B: an admin's answer is not relayed to a do-not-contact customer", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971 55 999 8888"] });
+  await configureAi(base.asUser);
+  const inquiryId = await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: base.accountId, contactId: base.contactId,
+      noteText: "Asked us to stop", kind: "call", outcome: "do_not_contact",
+    });
+    await ctx.db.patch(base.contactId, { doNotContact: { at: Date.now(), noteId } });
+    return await ctx.db.insert("adminInquiries", {
+      accountId: base.accountId, conversationId: base.conversationId,
+      contactId: base.contactId, question: "Q?",
+      customerName: "Ravi", customerPhone: "+971500000001",
+      status: "answered", answer: "A", askedAt: 1, answeredAt: Date.now(),
+    });
+  });
+  await t.action(internal.qualificationEngine.relayAnswerToCustomer, { inquiryId });
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  // Stays "answered" — same as the human-owned-thread case above; no
+  // separate terminal state is forced (see `answerContext`'s own
+  // comment on why `pendingAnswers` injection is itself gated).
+  expect((await t.run((ctx) => ctx.db.get(inquiryId)))?.status).toBe("answered");
 });
 
 // ---- v3: multiple leads per contact ----
@@ -1308,12 +1635,81 @@ test("P6: qualification offers the lead to a matching agent; YES assigns, announ
   const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
   expect(conversation?.assignedToUserId).toBe(agent.userId);
 
+  // The `offer_accept` literal has no coverage anywhere else: a swapped
+  // source would phrase this handover wrongly in the thread forever
+  // while every assertion above still passed. The agent is both actor
+  // and target — they accepted the lead themselves.
+  const events = await t.run((ctx) =>
+    ctx.db.query("conversationEvents")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", base.conversationId))
+      .collect());
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    kind: "assigned", source: "offer_accept",
+    actorUserId: agent.userId, targetUserId: agent.userId,
+  });
+
   // announcement (scheduled) — run directly: customer gets the intro + card
   await t.action(internal.qualificationEngine.announceAssignment, { offerId: offers[0]._id });
   const customerMsgs = await messagesFor(t, base.conversationId);
   const bots = customerMsgs.filter((m) => m.senderType === "bot");
   expect(bots.some((m) => m.contentText?.includes("Sara"))).toBe(true);
   expect(bots.some((m) => m.contentText?.includes("📇"))).toBe(true);
+});
+
+test("P6: announceAssignment gates the CUSTOMER half on do-not-contact but still tells the agent it's theirs", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const agent = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  await seedCustomerMessage(t, base.accountId, base.conversationId,
+    "[[COMPLETE]] score:85 field:a=1;field:b=2;field:c=3");
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+  });
+  const [session] = (await sessionsFor(t, base.conversationId)).filter((s) => s.status === "qualified");
+  await t.action(internal.qualificationEngine.startLeadOffer, {
+    accountId: base.accountId, sessionId: session._id,
+  });
+  await t.mutation(internal.qualificationEngine.onAdminInbound, {
+    accountId: base.accountId, phoneNormalized: "971557008899", text: "yes",
+  });
+  const [accepted] = await offersFor(t, session._id);
+  expect(accepted.status).toBe("accepted");
+
+  // The customer is flagged do-not-contact AFTER acceptance — the exact
+  // window `announceAssignment` runs in (best-effort, right after
+  // `acceptOffer`).
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: base.accountId, contactId: base.contactId,
+      noteText: "Asked us to stop", kind: "call", outcome: "do_not_contact",
+    });
+    await ctx.db.patch(base.contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  await t.action(internal.qualificationEngine.announceAssignment, { offerId: accepted._id });
+
+  // Customer got NOTHING — neither the intro text nor the contact card.
+  const customerMsgs = await messagesFor(t, base.conversationId);
+  expect(customerMsgs.filter((m) => m.senderType === "bot")).toHaveLength(0);
+
+  // The agent still gets told the lead is theirs — this is the
+  // regression an over-eager fix would cause: gating the customer half
+  // must not silence the agent-facing confirmation too, or the agent
+  // never learns to check the do-not-contact banner and may chase the
+  // customer manually.
+  const staffContact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account_phone", (q) =>
+      q.eq("accountId", base.accountId).eq("phoneNormalized", "971557008899")).unique());
+  const staffConversation = await t.run((ctx) =>
+    ctx.db.query("conversations").withIndex("by_contact", (q) =>
+      q.eq("contactId", staffContact!._id)).first());
+  const staffMsgs = await messagesFor(t, staffConversation!._id);
+  expect(staffMsgs.some((m) => m.contentText?.includes("It's yours"))).toBe(true);
+  const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
+  expect(conversation?.assignedToUserId).toBe(agent.userId);
 });
 
 test("P6: NO passes the lead to the next agent (fewest recent accepts first); timeout sweep does the same", async () => {
@@ -1615,7 +2011,7 @@ test("staffLoopsDue reaches a freshly accepted offer instead of starving it behi
       });
       await ctx.db.insert("qualificationConfigs", {
         accountId,
-        ...holidayysDefaultConfig(),
+        ...defaultQualificationConfig(),
         enabled: true,
         adminAlertPhones: [],
         // 24/7 so the working-hours guard never skips this fixture.
@@ -2341,6 +2737,123 @@ test("failsafe: the three benign cases stay noop", async () => {
     .toEqual({ kind: "noop" });
 });
 
+// ============================================================
+// `autoAssignEnabled` is opt-OUT, and ABSENT is a real third state.
+// The field is `v.optional(v.boolean())` added in Phase 6, so every
+// config row written before then carries NO such key — and each of its
+// three readers decides those rows are ON with nothing but a `=== false`
+// / `!== false` test. Nothing pinned that: `seed` spreads
+// `defaultQualificationConfig()`, which supplies `true`, so every other test in
+// this file exercises the flag-present path only, and a regression to a
+// truthy test would switch lead offers off for every legacy account with
+// the suite still green. Chase-sweep's matching reader is pinned the same
+// way in `convex/inboxChaseAssign.test.ts`.
+// ============================================================
+
+/**
+ * Puts the account's `autoAssignEnabled` into one of its three REAL
+ * states. `"absent"` removes the key — Convex drops a field patched to
+ * `undefined` — reproducing a pre-Phase-6 row, which is the one state
+ * `defaultQualificationConfig()` cannot produce. Returns the stored row so a
+ * caller can assert the state it asked for is the state it got, rather
+ * than trusting a second mechanism to have done what it wanted.
+ */
+async function setAutoAssign(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  value: boolean | "absent",
+) {
+  return await t.run(async (ctx) => {
+    const row = await ctx.db.query("qualificationConfigs")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId)).unique();
+    await ctx.db.patch(row!._id, {
+      autoAssignEnabled: value === "absent" ? undefined : value,
+    });
+    return await ctx.db.get(row!._id);
+  });
+}
+
+test("an absent autoAssignEnabled still offers the lead — the flag is opt-OUT, not opt-in", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  const sara = await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  const session = await qualifyLead(t, base);
+
+  const config = await setAutoAssign(t, base.accountId, "absent");
+  expect(Object.hasOwn(config!, "autoAssignEnabled")).toBe(false); // the premise
+
+  const decision = await t.query(internal.qualificationEngine.offerContext, {
+    sessionId: session._id,
+  });
+  expect(decision.kind).toBe("offer");
+  if (decision.kind !== "offer") throw new Error("unreachable");
+  expect(decision.agent.userId).toBe(sara.userId);
+});
+
+// `offerContext` above is only ever consulted because COMPLETION decided
+// to schedule the offer at all, and that decision — the third reader of
+// the flag — was pinned by nothing in either direction: every
+// `startLeadOffer` reference in this file invokes the action directly, so
+// deleting the whole scheduling block left the suite green, exactly the
+// gap `ingest.test.ts` closed for `aiReply.ackInbound`. Asserted through
+// the `_scheduled_functions` system table, the same way.
+
+/** The `startLeadOffer` jobs completion left on the scheduler. */
+async function scheduledOffers(t: TestConvex<typeof schema>) {
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect());
+  return scheduled.filter((s) => s.name === "qualificationEngine:startLeadOffer");
+}
+
+test("completion schedules the lead offer when autoAssignEnabled is absent", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  // BEFORE qualifying: completion reads the flag as it runs, so a row
+  // edited afterwards would prove nothing about this branch.
+  const config = await setAutoAssign(t, base.accountId, "absent");
+  expect(Object.hasOwn(config!, "autoAssignEnabled")).toBe(false); // the premise
+
+  const session = await qualifyLead(t, base);
+
+  const offers = await scheduledOffers(t);
+  expect(offers).toHaveLength(1);
+  // Named args, not merely "something got scheduled" — this is the
+  // contract the scheduling call makes.
+  expect(offers[0]!.args[0]).toMatchObject({
+    accountId: base.accountId, sessionId: session._id,
+  });
+});
+
+test("completion does NOT schedule the lead offer when autoAssignEnabled is false", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAttributed(t);
+  await seedAgentWithTag(t, base.accountId, {
+    name: "Sara", phone: "+971 55 700 8899", tagName: "UAE visa",
+  });
+  await setAutoAssign(t, base.accountId, false);
+
+  const session = await qualifyLead(t, base);
+
+  // The controls. Without these, this test would also pass if the fixture
+  // quietly stopped qualifying anything at all — an empty filter over an
+  // empty table is not evidence that a guard held. `sendClosingMessage`
+  // is scheduled unconditionally a few lines ABOVE the guard, so its
+  // presence proves completion ran all the way to the scheduling block
+  // and the offer's absence is the guard's doing.
+  expect(session).toBeDefined();
+  const scheduled = await t.run((ctx) =>
+    ctx.db.system.query("_scheduled_functions").collect());
+  expect(scheduled.filter((s) => s.name === "qualificationEngine:sendClosingMessage"))
+    .toHaveLength(1);
+
+  expect(await scheduledOffers(t)).toHaveLength(0);
+});
+
 /** Every message sent to a staff/admin WhatsApp number, newest last. */
 async function staffMessagesTo(
   t: TestConvex<typeof schema>,
@@ -2370,6 +2883,136 @@ async function setAdminAlertPhone(
     if (config) await ctx.db.patch(config._id, { adminAlertPhones: [phone] });
   });
 }
+
+/**
+ * Pre-creates the staff/admin conversation for `phone` and backdates its
+ * `lastInboundAt` to "just now", so `notifyStaffText`'s messaging-window
+ * gate (below) reads it as open. `notifyStaffText` re-resolves the same
+ * conversation idempotently (`ensureAdminConversation`'s find-or-create),
+ * so calling it here first and patching afterward is safe.
+ */
+async function openStaffWindow(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  phone: string,
+) {
+  const target = await t.mutation(internal.qualificationEngine.ensureAdminConversation, {
+    accountId, phone,
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(target.conversationId, { lastInboundAt: Date.now() }));
+}
+
+// ============================================================
+// `notifyStaffText`'s messaging-window gate (P0 fix). Meta accepts a
+// free-form send outside the recipient's 24h customer service window,
+// returns a wamid, then reports `failed` asynchronously — code 131047,
+// "more than 24 hours have passed since the customer last replied to
+// this number." That failure is invisible at the call site.
+//
+// The gate is opt-in per caller (`skipWhenWindowClosed`), NOT uniform:
+// production data showed one caller (the SLA alert, gated) fails 51.6%
+// of the time the invisible way described above, while another
+// (`alertRoutingFailure`, NOT gated — see further down this file) was
+// delivering 100% of the time and has no fallback channel, so gating it
+// too would have turned a working channel into a silent, unrecoverable
+// loss. These four cases are `skipWhenWindowClosed`'s full contract;
+// the caller-level choice of who opts in is exercised separately by the
+// SLA-escalation tests in `ingest.test.ts` and the
+// `alertRoutingFailure` test further down this file.
+// ============================================================
+
+test("notifyStaffText sends the text when opted in and the recipient's window is open", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seed(t);
+  const phone = "+971500700001";
+  await openStaffWindow(t, accountId, phone);
+
+  await t.action(internal.qualificationEngine.notifyStaffText, {
+    accountId, phone, text: "window-open ping", skipWhenWindowClosed: true,
+  });
+
+  const msgs = await staffMessagesTo(t, accountId, "971500700001");
+  expect(msgs.some((m) => m.contentText === "window-open ping")).toBe(true);
+});
+
+test("notifyStaffText skips the send (without throwing) when opted in and the window is closed", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seed(t);
+  const phone = "+971500700002";
+  const target = await t.mutation(internal.qualificationEngine.ensureAdminConversation, {
+    accountId, phone,
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(target.conversationId, {
+      // 25h ago: one hour past Meta's 24h customer service window.
+      lastInboundAt: Date.now() - 25 * 60 * 60 * 1000,
+    }));
+
+  // Void action resolves to `null` over the test-client boundary (same
+  // convention as the "no admin numbers configured" failsafe test
+  // above) — `.resolves` is itself the "didn't throw" assertion.
+  await expect(t.action(internal.qualificationEngine.notifyStaffText, {
+    accountId, phone, text: "window-closed ping", skipWhenWindowClosed: true,
+  })).resolves.toBeNull();
+
+  const msgs = await staffMessagesTo(t, accountId, "971500700002");
+  expect(msgs).toHaveLength(0);
+});
+
+test("notifyStaffText treats a recipient with no inbound at all as closed, when opted in", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seed(t);
+  const phone = "+971500700003";
+  // Deliberately no `ensureAdminConversation`/`lastInboundAt` setup —
+  // this is the very first alert this number has ever received, the
+  // production shape of a freshly configured admin/supervisor number
+  // that has never texted the business back.
+
+  await expect(t.action(internal.qualificationEngine.notifyStaffText, {
+    accountId, phone, text: "cold ping", skipWhenWindowClosed: true,
+  })).resolves.toBeNull();
+
+  const msgs = await staffMessagesTo(t, accountId, "971500700003");
+  expect(msgs).toHaveLength(0);
+});
+
+test("notifyStaffText attempts the send by default, even on a closed window (skipWhenWindowClosed defaults false)", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seed(t);
+  const phone = "+971500700004";
+  // No `skipWhenWindowClosed` at all, and no window opened — the
+  // pre-fix, always-attempt behavior that `alertRoutingFailure` and the
+  // `onAdminInbound` reply-to-a-reply callers still rely on today.
+
+  await t.action(internal.qualificationEngine.notifyStaffText, {
+    accountId, phone, text: "default ping",
+  });
+
+  const msgs = await staffMessagesTo(t, accountId, "971500700004");
+  expect(msgs.some((m) => m.contentText === "default ping")).toBe(true);
+});
+
+// `alertRoutingFailure` (routing "exhausted"/"unroutable"/"misconfigured"
+// alerts) has NO in-app fallback — unlike the SLA alert, a skip here is a
+// real, silent information loss. Production data backs this: 61/61 of
+// these alerts were delivered (0% failure) against the SLA alert's 51.6%
+// failure rate, so this caller must default to attempting the send
+// regardless of window state — the opposite of the SLA caller's opt-in.
+test("alertRoutingFailure still sends when the admin's own window is closed (no fallback channel)", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seed(t, { enabled: true, adminPhones: ["+971559456999"] });
+  // Deliberately NOT opening the admin's window (no `openStaffWindow`
+  // call) — a freshly configured admin-alert number that has never
+  // texted the bot is the realistic, common case for this caller.
+
+  await t.action(internal.qualificationEngine.alertRoutingFailure, {
+    accountId: base.accountId, text: "⚠️ routing alert on a closed window",
+  });
+
+  const msgs = await staffMessagesTo(t, base.accountId, "971559456999");
+  expect(msgs.some((m) => m.contentText?.includes("closed window"))).toBe(true);
+});
 
 test("failsafe: a fallback offer tells admins the tag has no linked agent", async () => {
   const t = convexTest(schema, modules);
@@ -2450,7 +3093,7 @@ test("failsafe: an alert whose own config lookup throws is swallowed, never prop
   await t.run((ctx) =>
     ctx.db.insert("qualificationConfigs", {
       accountId: base.accountId,
-      ...holidayysDefaultConfig(),
+      ...defaultQualificationConfig(),
       enabled: true,
       adminAlertPhones: ["+971559456999"],
     }));
@@ -2702,4 +3345,507 @@ test("failsafe I2: each fallback cause names its own remedy", async () => {
   expect(unreachable).toContain("missing a WhatsApp number");
   // the false remedy from the old single message must NOT appear here
   expect(unreachable).not.toContain("No agent is linked to the tag");
+});
+
+// ============================================================
+// The human-activity yield is a DEFERRAL, not a death sentence
+// (fix 2026-07-26). Before this, both `assignedToUserId` and a newer
+// `humanTouchedAt` rescheduled to the expiry revisit, so the session
+// sat untouched until the 72h clock killed it — zero nudges ever sent.
+// That is the single most common real shape ("we answered, they went
+// quiet"), so the engine was silent exactly when it was needed.
+// ============================================================
+
+test("a human-touched session resumes once the quiet period has passed", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const sessionId = await seedDueSession(t, base, {
+    // Agent replied 5h ago; the customer has been silent since 6h ago.
+    // Both inside the 24h service window, so the resumed nudge is a
+    // plain text message — no approved template required.
+    humanTouchedAt: Date.now() - 5 * 3_600_000,
+    lastCustomerMessageAt: Date.now() - 6 * 3_600_000,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  const msgs = await messagesFor(t, base.conversationId);
+  expect(msgs).toHaveLength(1);
+  expect(msgs[0].contentText).toBe("When are you planning to travel?");
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(1);
+  expect(s.status).toBe("collecting");
+});
+
+test("a human-touched session still yields inside the quiet period", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const touchedAt = Date.now() - 1 * 3_600_000;
+  const sessionId = await seedDueSession(t, base, {
+    humanTouchedAt: touchedAt,
+    lastCustomerMessageAt: Date.now() - 2 * 3_600_000,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(0);
+  // Re-armed for the END of the quiet period, NOT the 72h expiry revisit
+  // — the regression this whole block exists to prevent.
+  expect(s.nextFollowUpAt).toBeGreaterThan(Date.now());
+  expect(s.nextFollowUpAt).toBeLessThanOrEqual(touchedAt + 4 * 3_600_000);
+});
+
+test("an assigned conversation resumes once the quiet period has passed", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await t.run((ctx) =>
+    ctx.db.patch(base.conversationId, { assignedToUserId: base.userId }),
+  );
+  const sessionId = await seedDueSession(t, base, {
+    lastCustomerMessageAt: Date.now() - 6 * 3_600_000,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(1);
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(1);
+});
+
+test("an assigned conversation yields while the agent is still active", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  await t.run((ctx) =>
+    ctx.db.patch(base.conversationId, { assignedToUserId: base.userId }),
+  );
+  const sessionId = await seedDueSession(t, base, {
+    humanTouchedAt: Date.now() - 30 * 60_000, // agent replied 30 min ago
+    lastCustomerMessageAt: Date.now() - 3 * 3_600_000,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(0);
+});
+
+test("an explicit Take over still silences the thread permanently", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const lastCustomerMessageAt = Date.now() - 6 * 3_600_000;
+  await t.run((ctx) =>
+    ctx.db.patch(base.conversationId, { aiAutoreplyDisabled: true }),
+  );
+  const sessionId = await seedDueSession(t, base, {
+    humanTouchedAt: Date.now() - 5 * 3_600_000,
+    lastCustomerMessageAt,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  // Pausing the bot is an EXPLICIT instruction, unlike an incidental
+  // reply or assignment — it is never auto-resumed. The session just
+  // waits out its expiry clock.
+  expect(await messagesFor(t, base.conversationId)).toHaveLength(0);
+  const [s] = await sessionsFor(t, base.conversationId);
+  expect(s.followUpsSent).toBe(0);
+  expect(s.nextFollowUpAt).toBeGreaterThan(lastCustomerMessageAt + 72 * 3_600_000);
+});
+
+test("the resume never outlives the session's own expiry clock", async () => {
+  const t = convexTest(schema, modules);
+  const base = await seedAllHours(t);
+  const lastCustomerMessageAt = Date.now() - 71 * 3_600_000; // expires in ~1h
+  const sessionId = await seedDueSession(t, base, {
+    humanTouchedAt: Date.now() - 30 * 60_000, // quiet period ends in 3.5h
+    lastCustomerMessageAt,
+  });
+
+  await t.action(internal.qualificationEngine.sendFollowUp, { sessionId });
+
+  const [s] = await sessionsFor(t, base.conversationId);
+  // Clamped to the expiry revisit, so the sweep still closes the file on
+  // time instead of leaving it stranded in "collecting".
+  expect(s.nextFollowUpAt).toBe(lastCustomerMessageAt + 72 * 3_600_000 + 60_000);
+});
+
+// ---- Debounce + freshness (token audit follow-up 2026-07-27) ----
+// The extraction used to run inline on EVERY inbound text, so a customer
+// fragmenting one thought across four messages bought four full calls
+// while the reply beside it collapsed to one. It is now debounced with
+// the reply's own staleness token, and carries a watermark so it can be
+// invoked from both the schedule and `dispatchInbound` for one charge.
+
+test("a stale trigger stands down — a burst costs ONE extraction, not one per fragment", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+
+  // Two fragments of one thought. The FIRST one's scheduled run is the
+  // stale one: a newer customer message already exists by the time it
+  // fires.
+  await seedCustomerMessage(t, accountId, conversationId, "field:nationality=Indian; score:40");
+  const firstId = (await messagesFor(t, conversationId))[0]._id;
+  await seedCustomerMessage(t, accountId, conversationId, "field:travel_dates=August; score:70");
+
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerMessageId: firstId,
+  });
+
+  // Stood down before touching the session at all.
+  expect(await sessionsFor(t, conversationId)).toHaveLength(0);
+});
+
+test("the newest trigger proceeds and stamps the watermark", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId, "field:nationality=Indian; score:70");
+  const newestId = (await messagesFor(t, conversationId))[0]._id;
+
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    triggerMessageId: newestId,
+  });
+
+  const [s] = await sessionsFor(t, conversationId);
+  expect(s.analyzedThroughMs).toBeDefined();
+});
+
+test("a second run over unchanged history is free — the watermark short-circuits it", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId, "field:nationality=Indian; score:70");
+
+  await t.action(internal.qualificationEngine.analyzeInbound, { accountId, conversationId, contactId });
+  const [first] = await sessionsFor(t, conversationId);
+
+  // This is the call `dispatchInbound` makes before reading objectives.
+  // Nothing new has arrived, so it must not re-extract.
+  await t.action(internal.qualificationEngine.analyzeInbound, { accountId, conversationId, contactId });
+  const [second] = await sessionsFor(t, conversationId);
+
+  // Untouched: same watermark, and the mutation never ran again.
+  expect(second.analyzedThroughMs).toBe(first.analyzedThroughMs);
+  expect(second._creationTime).toBe(first._creationTime);
+});
+
+test("force bypasses the watermark — a landed transcript is new content on an OLD message", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId, conversationId, asUser } = await seed(t);
+  await configureAi(asUser);
+  await seedCustomerMessage(t, accountId, conversationId, "field:nationality=Indian; score:40");
+
+  await t.action(internal.qualificationEngine.analyzeInbound, { accountId, conversationId, contactId });
+
+  // A transcript attaches to the message that already exists, so the
+  // newest-customer-message timestamp does NOT move. Without `force` the
+  // watermark would skip exactly the data that just became readable.
+  await seedCustomerMessage(t, accountId, conversationId, "field:travel_dates=August; score:70");
+  await t.run(async (ctx) => {
+    const rows = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect();
+    // Pretend the watermark already covers everything present.
+    await ctx.db.patch(rows[0]._id, { analyzedThroughMs: Date.now() + 60_000 });
+  });
+
+  await t.action(internal.qualificationEngine.analyzeInbound, {
+    accountId,
+    conversationId,
+    contactId,
+    force: true,
+  });
+
+  const [s] = await sessionsFor(t, conversationId);
+  const byKey = Object.fromEntries(s.fields.map((f) => [f.key, f.value]));
+  expect(byKey.travel_dates).toBe("August");
+});
+
+test("tagContactForService records the requested source", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId } = await seed(t);
+
+  await t.run(async (ctx) => {
+    await tagContactForService(ctx, {
+      accountId,
+      contactId,
+      serviceName: "UAE Visa",
+      source: "ad",
+    });
+  });
+
+  const link = await t.run(async (ctx) =>
+    ctx.db
+      .query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .first(),
+  );
+  expect(link?.source).toBe("ad");
+});
+
+test("tagContactForService still defaults to the ai source", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId } = await seed(t);
+
+  await t.run(async (ctx) => {
+    await tagContactForService(ctx, {
+      accountId,
+      contactId,
+      serviceName: "UAE Visa",
+    });
+  });
+
+  const link = await t.run(async (ctx) =>
+    ctx.db
+      .query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .first(),
+  );
+  expect(link?.source).toBe("ai");
+});
+
+test("tagContactForService leaves an existing link's source alone", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, contactId } = await seed(t);
+
+  await t.run(async (ctx) => {
+    await tagContactForService(ctx, { accountId, contactId, serviceName: "UAE Visa" });
+    await tagContactForService(ctx, {
+      accountId,
+      contactId,
+      serviceName: "UAE Visa",
+      source: "ad",
+    });
+  });
+
+  const links = await t.run(async (ctx) =>
+    ctx.db
+      .query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .collect(),
+  );
+  expect(links).toHaveLength(1);
+  expect(links[0].source).toBe("ai");
+});
+
+// ---- Checklist scheduled whenever the session has a service (Inbox
+// contact panel reach, 2026-08-14) ----
+// The checklist used to wait for `completeQualification`, which most
+// sessions never reach — this repo's own sales-coach spec measured 188
+// checklists against 1,802 conversations, i.e. the Inbox panel was empty
+// for nine leads in ten. `applyAnalysis` now ALSO schedules generation on
+// any pass where the `collecting` session has a service name, whether this
+// pass named it or it was already carried.
+//
+// The steady state, not the transition, is what is asserted here.
+// `serviceName` is only ever set and never cleared, so a transition-only
+// trigger would skip every lead that already had one — most of the active
+// ones, and exactly the chats whose empty panel prompted the change.
+// Firing on the steady state is self-healing: those leads acquire a
+// checklist on their next inbound message. What makes the repetition safe
+// is generation's own idempotence, which the third test below pins by
+// asserting an agent's ticked-off progress survives a later pass.
+// `completeQualification` keeps its own call as the safety net for a lead
+// that qualifies without a service ever being named.
+
+/** A `collecting` session with no service yet. */
+async function seedCollectingSession(
+  t: ReturnType<typeof convexTest>,
+  base: { accountId: Id<"accounts">; contactId: Id<"contacts">; conversationId: Id<"conversations"> },
+) {
+  return await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId: base.accountId, conversationId: base.conversationId, contactId: base.contactId,
+      status: "collecting", origin: "inbound",
+      fields: [], expectedCount: 4, answeredCount: 0,
+      followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+    }),
+  );
+}
+
+/** A complete, valid `applyAnalysis` payload — override only what a test
+ *  cares about, same shape as this file's existing inline literals. */
+function analysisWith(overrides: Partial<AnalysisResult>): AnalysisResult {
+  return {
+    serviceName: null,
+    fields: [],
+    score: 40,
+    scoreBreakdown: [],
+    checklistSatisfied: false,
+    expectedCount: 4,
+    nextQuestion: null,
+    intent: "none",
+    summary: null,
+    newInquiry: false,
+    ...overrides,
+  };
+}
+
+test("identifying the service schedules the checklist, before qualification", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seed(t);
+    const sessionId = await seedCollectingSession(t, base);
+
+    // Pre-condition: no serviceName yet, so no checklist has been asked for.
+    const before = await t.run((ctx) => ctx.db.get(sessionId));
+    expect(before!.serviceName).toBeUndefined();
+
+    await t.mutation(internal.qualificationEngine.applyAnalysis, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      analysis: analysisWith({ serviceName: "Bali Packages" }),
+    });
+
+    const after = await t.run((ctx) => ctx.db.get(sessionId));
+    expect(after!.serviceName).toBe("Bali Packages");
+    // The scheduled action runs the real generator, which falls back to the
+    // built-in default with no AI config — so a checklist row must exist.
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const checklist = await t.run((ctx) =>
+      ctx.db
+        .query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", sessionId))
+        .unique(),
+    );
+    expect(checklist).not.toBeNull();
+    expect(checklist!.items.length).toBeGreaterThan(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a session that already carried a service still gets its checklist", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seed(t);
+    const sessionId = await seedCollectingSession(t, base);
+    // The service was named on some EARLIER pass, before this trigger
+    // existed — the shape of every lead already in flight, and the whole
+    // reason the owner saw no checklist on their existing chats. A
+    // transition-only guard would read "already known" and skip forever;
+    // the steady-state guard heals it on the next inbound message.
+    await t.run((ctx) => ctx.db.patch(sessionId, { serviceName: "Bali Packages" }));
+
+    await t.mutation(internal.qualificationEngine.applyAnalysis, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      analysis: analysisWith({ serviceName: "Bali Packages" }),
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const rows = await t.run((ctx) =>
+      ctx.db
+        .query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", sessionId))
+        .collect(),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.items.length).toBeGreaterThan(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a later pass leaves an existing checklist — and its ticked items — alone", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seed(t);
+    const sessionId = await seedCollectingSession(t, base);
+    await t.run((ctx) => ctx.db.patch(sessionId, { serviceName: "Bali Packages" }));
+
+    // A checklist the agent has already started working. Now that the
+    // trigger fires on EVERY pass of a session with a service, this row
+    // faces a fresh generation attempt on every inbound message — so
+    // idempotence stopped being a nicety and became the thing that keeps
+    // the agent's progress.
+    //
+    // The row is seeded as `kb` with a tick, not left to the default
+    // generator, so the assertions catch a wholesale replacement as well
+    // as a duplicate: a regenerated row here would come back `default`,
+    // six items long, with the tick gone, and a bare length check would
+    // read 1 and pass. Idempotence is guarded twice over — once in
+    // `generateForSession` (`info.hasChecklist`) and again in
+    // `insertChecklist` (insert-if-absent) — so removing either alone is
+    // invisible; this fails the moment the property itself is gone.
+    const checklistId = await t.run((ctx) =>
+      ctx.db.insert("salesChecklists", {
+        accountId: base.accountId,
+        sessionId,
+        conversationId: base.conversationId,
+        contactId: base.contactId,
+        source: "kb",
+        items: [
+          { key: "passport", title: "Collect passport copy", done: true, doneAt: 1 },
+          { key: "dates", title: "Confirm travel dates", done: false },
+        ],
+        generatedAt: 1,
+      }),
+    );
+
+    await t.mutation(internal.qualificationEngine.applyAnalysis, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      analysis: analysisWith({ serviceName: "Bali Packages" }),
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const rows = await t.run((ctx) =>
+      ctx.db
+        .query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", sessionId))
+        .collect(),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!._id).toBe(checklistId);
+    expect(rows[0]!.source).toBe("kb");
+    expect(rows[0]!.items).toHaveLength(2);
+    expect(rows[0]!.items.find((i) => i.key === "passport")!.done).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("analysis with no service name generates nothing", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const base = await seed(t);
+    const sessionId = await seedCollectingSession(t, base);
+
+    await t.mutation(internal.qualificationEngine.applyAnalysis, {
+      accountId: base.accountId,
+      conversationId: base.conversationId,
+      contactId: base.contactId,
+      analysis: analysisWith({ serviceName: null }),
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+    const rows = await t.run((ctx) =>
+      ctx.db
+        .query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", sessionId))
+        .collect(),
+    );
+    expect(rows).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });

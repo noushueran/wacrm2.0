@@ -24,7 +24,7 @@ function ctx() {
 describe('POST /api/v1/broadcasts', () => {
   it('202s with the accepted/rejected counts and forwards recipients cleanly', async () => {
     requireApiKeyMock.mockResolvedValue(ctx());
-    actionMock.mockResolvedValue({ broadcastId: 'b1', totalRecipients: 2, rejected: 1 });
+    actionMock.mockResolvedValue({ broadcastId: 'b1', totalRecipients: 2, rejected: 1, skipped: 0 });
 
     const res = await POST(
       new Request('https://x.test/api/v1/broadcasts', {
@@ -48,6 +48,7 @@ describe('POST /api/v1/broadcasts', () => {
         total_recipients: 2,
         accepted: 2,
         rejected: 1,
+        skipped: 0,
       },
     });
 
@@ -57,6 +58,41 @@ describe('POST /api/v1/broadcasts', () => {
       { to: '+14155550124', params: undefined },
       { to: '', params: undefined },
     ]);
+  });
+
+  it('reports accepted/total_recipients as the count that will actually be messaged, with skipped additive alongside rejected', async () => {
+    // Of 3 posted recipients: 1 had an invalid phone (rejected), 1
+    // resolved to a contact who opted out (skipped), 1 is sendable.
+    // `accepted`/`total_recipients` must equal the persisted broadcast
+    // row's count — 1 — never the raw resolved/deduped count.
+    requireApiKeyMock.mockResolvedValue(ctx());
+    actionMock.mockResolvedValue({ broadcastId: 'b2', totalRecipients: 1, rejected: 1, skipped: 1 });
+
+    const res = await POST(
+      new Request('https://x.test/api/v1/broadcasts', {
+        method: 'POST',
+        body: JSON.stringify({
+          template_name: 'promo_july',
+          recipients: [
+            { to: '+14155550123' },
+            { to: '+14155550124' },
+            { to: 'not-a-phone' },
+          ],
+        }),
+      })
+    );
+
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({
+      data: {
+        broadcast_id: 'b2',
+        status: 'sending',
+        total_recipients: 1,
+        accepted: 1,
+        rejected: 1,
+        skipped: 1,
+      },
+    });
   });
 
   it('400s a non-object body before ever calling Convex', async () => {

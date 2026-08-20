@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useMutation } from 'convex/react';
-import { usePaginatedQuery, useQuery } from '@/lib/convex/cached';
+import { useQuery } from '@/lib/convex/cached';
 import { toast } from 'sonner';
 import type { Contact, Tag } from '@/types';
 import { toUiContact, toUiTag } from '@/lib/convex/adapters';
@@ -48,8 +48,6 @@ import {
   Trash2,
   Loader2,
   Users,
-  ChevronLeft,
-  ChevronRight,
   SlidersHorizontal,
   Filter,
   X,
@@ -61,6 +59,9 @@ import { CustomFieldsManager } from '@/components/contacts/custom-fields-manager
 import { useCan } from '@/hooks/use-can';
 import { useOpenContactChat } from '@/hooks/use-open-contact-chat';
 import { GatedButton } from '@/components/ui/gated-button';
+import { Pagination } from '@/components/ui/pagination';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useKeptResult } from '@/hooks/use-kept-result';
 import { useTranslations } from 'next-intl';
 
 import { api } from '../../../../convex/_generated/api';
@@ -99,7 +100,9 @@ export default function ContactsPage() {
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
 
   const usingTagFilter = selectedTagIds.length > 0;
-  const trimmedSearch = search.trim() || undefined;
+  // Debounced: search is a query argument, so an undebounced value would
+  // open a Convex subscription per keystroke. The input stays instant.
+  const debouncedSearch = useDebouncedValue(search.trim(), 300);
 
   // All tags — for the filter popover, the per-row tag chips, and the
   // active-filter chips. Reactive: a tag created/renamed/deleted in
@@ -123,53 +126,71 @@ export default function ContactsPage() {
   // Drop any filter selections whose tag no longer exists (e.g. deleted
   // elsewhere) — mirrors the Supabase-era `fetchTags`'s pruning, now
   // driven by the reactive tag list instead of a one-time fetch.
-  useEffect(() => {
-    if (tagsResult === undefined) return;
+  // Done DURING RENDER, guarded by the previous tag list, which is
+  // React's documented way to adjust state when the thing it derives from
+  // changes — not in an effect. That ordering is the point: the pruned
+  // selection feeds `usingTagFilter` and the `filterByTags` args below,
+  // so pruning after paint meant one render — and one issued query —
+  // against a selection already known to name a deleted tag.
+  //
+  // Guarded against the last-seen QUERY RESULT by reference, matching
+  // `components/inbox/contact-custom-fields.tsx`, which already does this
+  // for the same reason. Guarding on the derived `allTags` instead would
+  // stake a render loop on a `useMemo` staying stable — adjust-during-
+  // render has a failure mode an effect does not, in that a guard which
+  // never matches re-sets state on every render and the component never
+  // settles. `tagsResult` is the Convex result itself, which is
+  // referentially stable between updates and is what the existing
+  // instance of this pattern relies on.
+  //
+  // Still a functional updater, and still returns `prev` unchanged when
+  // nothing was dropped: the prune must react to the tag list, never to
+  // `selectedTagIds` itself.
+  const [lastTagsResult, setLastTagsResult] = useState(tagsResult);
+  if (tagsResult && tagsResult !== lastTagsResult) {
+    setLastTagsResult(tagsResult);
     setSelectedTagIds((prev) => {
       const validIds = new Set(allTags.map((tag) => tag.id));
       const pruned = prev.filter((id) => validIds.has(id));
       return pruned.length === prev.length ? prev : pruned;
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reacting to the tag list itself, not re-running on every selectedTagIds change
-  }, [allTags, tagsResult]);
+  }
 
-  // Base (no tag filter) list — cursor-paginated, reactive.
-  const paginated = usePaginatedQuery(
-    api.contacts.list,
-    usingTagFilter ? 'skip' : { search: trimmedSearch },
-    { initialNumItems: PAGE_SIZE },
-  );
+  // ONE offset-paginated query for both views. This page used to run two
+  // — `contacts.list` (cursor, "Load more") when untagged and
+  // `filterByTags` (offset, Prev/Next) when tagged — which is why only
+  // half of it could jump to a page, and why the untagged total was an
+  // approximation ("how many have loaded so far") rather than a count.
+  // `contacts.listPage` folds both into one shape: one page of rows plus
+  // an exact `total`. `contacts.list` is untouched and still serves its
+  // eight other callers, which genuinely want cursor semantics.
+  const result = useQuery(api.contacts.listPage, {
+    ...(debouncedSearch ? { search: debouncedSearch } : {}),
+    ...(usingTagFilter
+      ? { tagIds: selectedTagIds.map((id) => id as Id<'tags'>) }
+      : {}),
+    limit: PAGE_SIZE,
+    offset: page * PAGE_SIZE,
+  });
+  // Keep the current page on screen while the next one loads, so paging
+  // doesn't blank the table on every click.
+  const { data: pageResult, loading: fetching } = useKeptResult(result);
 
-  // Tag-filtered list — offset-paginated (`filterByTags` supports
-  // limit/offset). filterByTags searches name/phone/email only; contacts.list
-  // above additionally supports ID search.
-  const filtered = useQuery(
-    api.contacts.filterByTags,
-    usingTagFilter
-      ? {
-          tagIds: selectedTagIds.map((id) => id as Id<'tags'>),
-          search: trimmedSearch,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
-        }
-      : 'skip',
-  );
-
-  const rawContacts = usingTagFilter
-    ? (filtered?.items ?? [])
-    : paginated.results;
   const contacts = useMemo(
-    () => rawContacts.map(toUiContact),
-    [rawContacts],
+    () => (pageResult?.items ?? []).map(toUiContact),
+    [pageResult],
   );
-  const loading = usingTagFilter
-    ? filtered === undefined
-    : paginated.status === 'LoadingFirstPage';
+  // Only the FIRST load has nothing to show; later loads keep the
+  // previous rows and just dim them.
+  const loading = pageResult === undefined;
 
-  // Total count: exact while tag-filtered (`filterByTags` returns a real
-  // total); an approximation — "how many have loaded so far" — for the
-  // base cursor-paginated list, since `contacts.list` has no count query.
-  const totalCount = usingTagFilter ? (filtered?.total ?? 0) : contacts.length;
+  const totalCount = pageResult?.total ?? 0;
+  // The server clamps the offset (rows can be deleted out from under a
+  // client sitting on the last page), so the page actually being shown
+  // is whatever it echoed back — not necessarily the one we asked for.
+  const currentPage = pageResult
+    ? Math.floor(pageResult.offset / PAGE_SIZE)
+    : page;
 
   const removeContact = useMutation(api.contacts.remove);
 
@@ -282,11 +303,6 @@ export default function ContactsPage() {
     setSelected(new Set());
   }
 
-  // Tag-filtered pagination only (the base list uses "load more" below).
-  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
-  const hasNext = usingTagFilter && page < totalPages - 1;
-  const hasPrev = usingTagFilter && page > 0;
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -361,7 +377,7 @@ export default function ContactsPage() {
               <Filter className="size-4" />
               {t('filterByTags')}
               {selectedTagIds.length > 0 && (
-                <span className="ml-1 inline-flex items-center justify-center rounded-full bg-primary px-1.5 text-[10px] font-semibold text-primary-foreground">
+                <span className="ml-1 inline-flex items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground">
                   {selectedTagIds.length}
                 </span>
               )}
@@ -420,7 +436,7 @@ export default function ContactsPage() {
               return (
                 <span
                   key={id}
-                  className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium"
+                  className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[12px] font-medium"
                   style={{
                     backgroundColor: tag.color + '20',
                     color: tag.color,
@@ -571,7 +587,7 @@ export default function ContactsPage() {
                         contact.tags.slice(0, 3).map((tag) => (
                           <span
                             key={tag.id}
-                            className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium"
+                            className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium"
                             style={{
                               backgroundColor: tag.color + '20',
                               color: tag.color,
@@ -584,7 +600,7 @@ export default function ContactsPage() {
                         <span className="text-muted-foreground text-xs">-</span>
                       )}
                       {contact.tags && contact.tags.length > 3 && (
-                        <span className="text-[10px] text-muted-foreground">
+                        <span className="text-[11px] text-muted-foreground">
                           +{contact.tags.length - 3}
                         </span>
                       )}
@@ -661,69 +677,23 @@ export default function ContactsPage() {
         </Table>
       </div>
 
-      {/* Pagination — offset Prev/Next while tag-filtered (filterByTags
-          gives an exact total); cursor "Load more" for the base list
-          (usePaginatedQuery has no page-jump concept). */}
-      {usingTagFilter ? (
-        totalPages > 1 && (
-          <div className="flex items-center justify-between">
-            <p className="text-xs text-muted-foreground">
-              {t('showingPagination', {
-                start: page * PAGE_SIZE + 1,
-                end: Math.min((page + 1) * PAGE_SIZE, totalCount),
-                total: totalCount
-              })}
-            </p>
-            <div className="flex items-center gap-1">
-              <Button
-                variant="outline"
-                size="icon-sm"
-                disabled={!hasPrev}
-                onClick={() => {
-                  setPage((p) => p - 1);
-                  setSelected(new Set());
-                }}
-                className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-              >
-                <ChevronLeft className="size-4" />
-              </Button>
-              <span className="text-xs text-muted-foreground px-2">
-                {t('pageCount', { page: page + 1, total: totalPages })}
-              </span>
-              <Button
-                variant="outline"
-                size="icon-sm"
-                disabled={!hasNext}
-                onClick={() => {
-                  setPage((p) => p + 1);
-                  setSelected(new Set());
-                }}
-                className="border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-              >
-                <ChevronRight className="size-4" />
-              </Button>
-            </div>
-          </div>
-        )
-      ) : (
-        paginated.status === 'CanLoadMore' && (
-          <div className="flex justify-center">
-            <Button
-              variant="outline"
-              onClick={() => paginated.loadMore(PAGE_SIZE)}
-              className="border-border text-muted-foreground hover:bg-muted"
-            >
-              {t('loadMore')}
-            </Button>
-          </div>
-        )
-      )}
-      {!usingTagFilter && paginated.status === 'LoadingMore' && (
-        <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
-          <Loader2 className="size-3.5 animate-spin" />
-          {t('loadingMore')}
-        </div>
-      )}
+      {/* One pagination control for both views — the shared component
+          from `@/components/ui/pagination`, the same one /leads and
+          /lead-analysis use. Replaces the old split where a tag-filtered
+          list got Prev/Next and everything else got "Load more". */}
+      <Pagination
+        page={currentPage}
+        pageSize={PAGE_SIZE}
+        total={totalCount}
+        onPageChange={(next) => {
+          setPage(next);
+          // Selection is page-scoped: only loaded rows are selectable, so
+          // carrying it across a page turn would leave rows checked that
+          // are no longer on screen.
+          setSelected(new Set());
+        }}
+        busy={fetching}
+      />
 
       {/* Contact Form Dialog */}
       <ContactForm

@@ -408,6 +408,43 @@ export interface SendTextMessageArgs {
 }
 
 /**
+ * The exact Cloud API wire shape for a `type: "text"` send, extracted as
+ * a pure builder (same reason as `buildMarkReadPayload`/
+ * `buildContactsPayload`: it's pinned by `metaApi.test.ts` without a
+ * fetch).
+ *
+ * `preview_url: true` is the ONLY thing that makes the recipient's
+ * WhatsApp render a rich link preview — Meta does not unfurl by default,
+ * and without this flag a URL arrives as a bare clickable link, which is
+ * what every text send from this app did before. It is set
+ * unconditionally rather than gated on "does the text look like it has a
+ * URL": Meta already ignores the flag for text with no URL, and when it
+ * cannot build a preview (unreachable page, no OG tags, >10s crawl) it
+ * falls back to the same plain clickable link — so there is no case where
+ * asking for a preview is worse than not asking.
+ *
+ * Caveats that are Meta's, not ours, and can't be fixed here: only the
+ * FIRST URL in the body is ever previewed, and the preview is best-effort
+ * with no delivery guarantee. Templates can't preview at all — this flag
+ * is `type: "text"`-only, so `sendTemplateMessage` has no equivalent.
+ */
+export function buildTextPayload(
+  args: Pick<SendTextMessageArgs, "to" | "text" | "contextMessageId">,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: args.to,
+    type: "text",
+    text: { preview_url: true, body: args.text },
+  };
+  if (args.contextMessageId) {
+    body.context = { message_id: args.contextMessageId };
+  }
+  return body;
+}
+
+/**
  * Send a free-form WhatsApp text message.
  * Only works inside the 24-hour customer service window.
  */
@@ -416,16 +453,7 @@ export async function sendTextMessage(
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args;
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
-  const body: Record<string, unknown> = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to,
-    type: "text",
-    text: { body: text },
-  };
-  if (contextMessageId) {
-    body.context = { message_id: contextMessageId };
-  }
+  const body = buildTextPayload({ to, text, contextMessageId });
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -665,6 +693,9 @@ export interface SendTemplateMessageArgs {
   params?: string[];
   /** Meta's message_id of the message being replied to. */
   contextMessageId?: string;
+  /** Media header for templates whose HEADER component is image/video/
+   *  document. Meta requires header components to precede the body. */
+  header?: { type: "image" | "video" | "document"; link: string };
 }
 
 /**
@@ -683,6 +714,7 @@ export async function sendTemplateMessage(
     language = "en_US",
     params,
     contextMessageId,
+    header,
   } = args;
   const url = `${META_API_BASE}/${phoneNumberId}/messages`;
 
@@ -690,13 +722,24 @@ export async function sendTemplateMessage(
     name: templateName,
     language: { code: language },
   };
+
+  // Meta requires components in order: header, then body. Emitting them
+  // the other way round is a 400.
+  const components: Record<string, unknown>[] = [];
+  if (header) {
+    components.push({
+      type: "header",
+      parameters: [{ type: header.type, [header.type]: { link: header.link } }],
+    });
+  }
   if (params && params.length > 0) {
-    templatePayload.components = [
-      {
-        type: "body",
-        parameters: params.map((p) => ({ type: "text", text: String(p) })),
-      },
-    ];
+    components.push({
+      type: "body",
+      parameters: params.map((p) => ({ type: "text", text: String(p) })),
+    });
+  }
+  if (components.length > 0) {
+    templatePayload.components = components;
   }
 
   const body: Record<string, unknown> = {

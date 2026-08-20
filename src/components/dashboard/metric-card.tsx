@@ -30,7 +30,7 @@ export function MetricCard({ title, value, icon: Icon, delta, subtitle }: Metric
           <Icon className="h-4 w-4" />
         </div>
       </div>
-      <p className="mt-3 text-[28px] leading-none font-bold tabular-nums text-foreground">
+      <p className="mt-3 text-[29px] leading-none font-bold tabular-nums text-foreground">
         {value}
       </p>
       {delta ? <DeltaRow sign={delta.sign} label={delta.label} /> : subtitle ? (

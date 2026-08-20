@@ -1,4 +1,5 @@
 'use client';
+import { BRAND } from '@/lib/brand';
 
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery } from 'convex/react';
@@ -12,12 +13,15 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { SettingsPanelHead } from './settings-panel-head';
 
 import { api } from '../../../convex/_generated/api';
 
 // ============================================================
-// QualificationSettings — Settings → Lead qualification (P0 skeleton;
+// QualificationSettings — the Qualification agent's own settings,
+// rendered inside its agent window (moved out of Settings → Lead
+// qualification 2026-08-09). (P0 skeleton;
 // spec §11). Admin-gated on the same two layers as conversions-tab.tsx:
 // 'qualification' sits in CRITICAL_SECTIONS (page-level redirect) AND
 // <RequireRole min="admin"> below; the query itself is skipped until the
@@ -84,6 +88,12 @@ export function QualificationSettings() {
   const [cardSaving, setCardSaving] = useState(false);
   const [cardError, setCardError] = useState<string | null>(null);
   const [cardSaved, setCardSaved] = useState(false);
+  // Closing message — the one field that had no UI at all; it was
+  // API-editable only. Same hydrate-once pattern as the blocks above.
+  const [closing, setClosing] = useState('');
+  const [closingSaving, setClosingSaving] = useState(false);
+  const [closingError, setClosingError] = useState<string | null>(null);
+  const [closingSaved, setClosingSaved] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
     if (!config || hydrated) return;
@@ -92,6 +102,7 @@ export function QualificationSettings() {
     setAutoAssign(config.autoAssignEnabled !== false);
     setReengagementName(config.reengagementTemplateName ?? '');
     setAlertTemplateName(config.adminAlertTemplateName ?? '');
+    setClosing(config.closingMessage ?? '');
     const cc = config.contactCard;
     setCard({
       companyName: cc?.companyName ?? '',
@@ -180,6 +191,24 @@ export function QualificationSettings() {
       setCardError(data?.reason ?? t('contactCard.saveError'));
     } finally {
       setCardSaving(false);
+    }
+  };
+
+  const onSaveClosing = async () => {
+    setClosingSaving(true);
+    setClosingError(null);
+    setClosingSaved(false);
+    try {
+      // Not trimmed to empty-as-undefined: an empty string is a real,
+      // meaningful value here — it turns the closing message off
+      // (qualificationEngine.sendClosingMessage bails on a blank).
+      await updateConfig({ patch: { closingMessage: closing } });
+      setClosingSaved(true);
+    } catch (err) {
+      const data = (err as { data?: { reason?: string } })?.data;
+      setClosingError(data?.reason ?? t('closing.saveError'));
+    } finally {
+      setClosingSaving(false);
     }
   };
 
@@ -316,7 +345,7 @@ export function QualificationSettings() {
                     <Input
                       value={card.companyName}
                       onChange={(e) => setCardField('companyName')(e.target.value)}
-                      placeholder="Holidayys Tours LLC"
+                      placeholder={BRAND.legalName}
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -324,7 +353,7 @@ export function QualificationSettings() {
                     <Input
                       value={card.website}
                       onChange={(e) => setCardField('website')(e.target.value)}
-                      placeholder="https://holidayys.co"
+                      placeholder={BRAND.website}
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -333,7 +362,7 @@ export function QualificationSettings() {
                       type="email"
                       value={card.email}
                       onChange={(e) => setCardField('email')(e.target.value)}
-                      placeholder="hello@holidayys.co"
+                      placeholder={BRAND.email}
                     />
                   </div>
                   <div className="space-y-1.5">
@@ -469,6 +498,37 @@ export function QualificationSettings() {
                     })}
                   </div>
                 )}
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="space-y-3 pt-6 text-sm">
+                <p className="font-medium text-foreground">{t('closing.title')}</p>
+                <p className="text-muted-foreground">{t('closing.desc')}</p>
+                <Textarea
+                  value={closing}
+                  onChange={(e) => {
+                    setClosing(e.target.value);
+                    setClosingSaved(false);
+                    setClosingError(null);
+                  }}
+                  placeholder={t('closing.placeholder')}
+                  rows={3}
+                />
+                <p className="text-xs text-muted-foreground">{t('closing.hint')}</p>
+                <div className="flex items-center gap-3">
+                  <Button size="sm" onClick={onSaveClosing} disabled={closingSaving}>
+                    {closingSaving ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    {t('closing.save')}
+                  </Button>
+                  {closingSaved ? (
+                    <span className="text-xs text-emerald-500">{t('closing.saved')}</span>
+                  ) : null}
+                  {closingError ? (
+                    <span className="text-xs text-red-400">{closingError}</span>
+                  ) : null}
+                </div>
               </CardContent>
             </Card>
             <Card>

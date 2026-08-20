@@ -829,3 +829,160 @@ test("listRecent clamps to the ≤100 cap even when more rows exist", async () =
   const rows = await asOwner.query(api.conversionEvents.listRecent, { limit: 500 });
   expect(rows.length).toBe(100); // clamped even though the caller asked for 500 and 105 exist
 });
+
+// ============================================================
+// Delivery cutoff — CONVERSION_DELIVERY_START_MS.
+//
+// Configuring CAPI for the first time makes every dormant row eligible at
+// once. In production that is 1,574 conversions carrying their ORIGINAL
+// `event_time` (`deliverConversionEvent` derives it from `_creationTime`),
+// so switching the backend on would fire months of backdated purchases at a
+// dataset in one sweep — a first impression that misrepresents the business
+// and that Meta's optimisation would then learn from.
+//
+// The cutoff makes "from now on" expressible without deleting or rewriting
+// the backlog: rows older than it stay dormant and inert, and are still
+// there if the decision is ever reversed.
+//
+// The range is bound on the INDEX, not a `.filter()`. Convex indexes end
+// implicitly with `_creationTime`, which `by_account` already exploits
+// elsewhere in this file. A post-index filter would re-walk all 1,574 old
+// rows on every 15-minute tick to find the handful of new ones — the exact
+// scan-that-grows shape the `by_status_backend` comment in schema.ts exists
+// to avoid.
+// ============================================================
+
+test("getDormantToSweep skips dormant rows created before the cutoff", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", status: "dormant", attempts: 0,
+  });
+
+  const swept = await t.run(() =>
+    t.query(internal.conversionEvents.getDormantToSweep, {
+      backends: ["capi"],
+      cutoffMs: Date.now() + 60_000,
+    }),
+  );
+
+  expect(swept).toEqual([]);
+});
+
+test("getDormantToSweep still returns dormant rows created at or after the cutoff", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", status: "dormant", attempts: 0,
+  });
+
+  const swept = await t.run(() =>
+    t.query(internal.conversionEvents.getDormantToSweep, {
+      backends: ["capi"],
+      cutoffMs: Date.now() - 60_000,
+    }),
+  );
+
+  expect(swept.map((r) => r._id)).toEqual([id]);
+});
+
+test("an omitted cutoff sweeps the backlog exactly as before", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", status: "dormant", attempts: 0,
+  });
+
+  const swept = await t.run(() =>
+    t.query(internal.conversionEvents.getDormantToSweep, { backends: ["capi"] }),
+  );
+
+  expect(swept.map((r) => r._id)).toEqual([id]);
+});
+
+test("a backlog older than the cutoff does not consume the 100-row window", async () => {
+  // The failure this pins: the sweep takes 100 rows oldest-first, so with the
+  // eligibility test applied AFTER the read, 120 old rows fill the window and
+  // a genuinely new conversion never gets delivered — silently, forever.
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  for (let i = 0; i < 120; i++) {
+    await seedEvent(t, accountId, conversationId, contactId, {
+      backend: "capi", status: "dormant", attempts: 0, identifier: `old-${i}`,
+    });
+  }
+  await new Promise((r) => setTimeout(r, 5));
+  const cutoffMs = Date.now();
+  await new Promise((r) => setTimeout(r, 5));
+  const fresh = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", status: "dormant", attempts: 0, identifier: "new-1",
+  });
+
+  const swept = await t.run(() =>
+    t.query(internal.conversionEvents.getDormantToSweep, {
+      backends: ["capi"],
+      cutoffMs,
+    }),
+  );
+
+  expect(swept.map((r) => r._id)).toEqual([fresh]);
+});
+
+test("retryConversionEvents holds the backlog when CONVERSION_DELIVERY_START_MS is in the future", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  process.env.CONVERSION_DELIVERY_START_MS = String(Date.now() + 3_600_000);
+  try {
+    const t = convexTest(schema, modules);
+    const accountId = await seedAccount(t);
+    const { contactId, conversationId } = await seedConversation(t, accountId);
+    await seedWaba(t, accountId);
+    await seedEvent(t, accountId, conversationId, contactId, {
+      backend: "capi", lane: "ctwa", status: "dormant", attempts: 0,
+    });
+
+    await t.action(internal.conversionEvents.retryConversionEvents, {});
+
+    // Nothing scheduled: the backend is configured, so without the cutoff
+    // this row would have been swept and delivered.
+    expect(
+      await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect()),
+    ).toHaveLength(0);
+  } finally {
+    delete process.env.CONVERSION_DELIVERY_START_MS;
+    delete process.env.META_CAPI_DATASET_ID;
+    delete process.env.META_CAPI_ACCESS_TOKEN;
+  }
+});
+
+test("a malformed CONVERSION_DELIVERY_START_MS holds the backlog rather than flooding it", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  process.env.CONVERSION_DELIVERY_START_MS = "2026-08-07"; // a date, not epoch ms
+  try {
+    const t = convexTest(schema, modules);
+    const accountId = await seedAccount(t);
+    const { contactId, conversationId } = await seedConversation(t, accountId);
+    await seedWaba(t, accountId);
+    await seedEvent(t, accountId, conversationId, contactId, {
+      backend: "capi", lane: "ctwa", status: "dormant", attempts: 0,
+    });
+
+    await t.action(internal.conversionEvents.retryConversionEvents, {});
+
+    // Fails CLOSED. Failing open would fire the whole backdated backlog at a
+    // third party over a typo, and that cannot be taken back.
+    expect(
+      await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect()),
+    ).toHaveLength(0);
+  } finally {
+    delete process.env.CONVERSION_DELIVERY_START_MS;
+    delete process.env.META_CAPI_DATASET_ID;
+    delete process.env.META_CAPI_ACCESS_TOKEN;
+  }
+});

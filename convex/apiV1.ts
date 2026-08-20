@@ -4,6 +4,8 @@ import { v, ConvexError } from "convex/values";
 import { encrypt } from "./lib/whatsappEncryption";
 import { normalizePhone, isValidE164 } from "./lib/phone";
 import { findOrCreateContactByPhone } from "./contacts";
+import { blockedReason } from "./lib/notes/gate";
+import { dispatchTagAdded } from "./lib/automations/triggers";
 import { loadActiveApiKey } from "./apiKeys";
 import { clampLimit } from "./lib/cronSummary";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -159,7 +161,7 @@ async function embedContactTags(ctx: { db: QueryCtx["db"] }, contact: Doc<"conta
  * reasoning) so a mid-operation failure can't wipe tags meant to stay.
  */
 async function setContactTagsByName(
-  ctx: { db: MutationCtx["db"] },
+  ctx: { db: MutationCtx["db"]; scheduler: MutationCtx["scheduler"] },
   accountId: Id<"accounts">,
   contactId: Id<"contacts">,
   tagNames: string[],
@@ -200,6 +202,9 @@ async function setContactTagsByName(
   for (const tagId of desiredIds) {
     if (!current.has(tagId)) {
       await ctx.db.insert("contactTags", { accountId, contactId, tagId });
+      // Newly attached (not merely still present) — same
+      // insert-only rule every other tagging path follows.
+      await dispatchTagAdded(ctx, { accountId, contactId, tagId });
     }
   }
 }
@@ -540,6 +545,26 @@ export const sendMessage = action({
       internal.contacts.findOrCreateByPhoneInternal,
       { accountId: key.accountId, phone: args.to, name: args.name },
     );
+
+    // `doNotContact` gate (`blockedReason`, `convex/lib/notes/gate.ts`).
+    // Unlike `createBroadcast` below (bulk — silently dropping one
+    // recipient out of many and reporting an accurate count is right),
+    // this endpoint was asked to send exactly ONE message: silently
+    // succeeding while doing nothing would leave the caller believing a
+    // message went out that never did. Reject instead, the same
+    // `badRequest` shape every other validation failure in this action
+    // already uses, so `toApiErrorResponse` maps it to 400 — a
+    // client-correctable condition, not a server fault.
+    const contact = await ctx.runQuery(internal.contacts.getOwnedInternal, {
+      accountId: key.accountId,
+      contactId,
+    });
+    if (blockedReason(contact) !== null) {
+      badRequest(
+        "This contact has been marked do-not-contact; automated and API messages to them are blocked. Message them manually from the inbox instead.",
+      );
+    }
+
     const conversationId = await ctx.runMutation(
       internal.conversations.findOrCreateForContactInternal,
       { accountId: key.accountId, contactId },
@@ -639,6 +664,7 @@ export const createBroadcast = action({
     broadcastId: Id<"broadcasts">;
     totalRecipients: number;
     rejected: number;
+    skipped: number;
   }> => {
     const key = await requireScopeAction(ctx, args.keyHash, "broadcasts:send");
 
@@ -700,17 +726,39 @@ export const createBroadcast = action({
     const templateVariables =
       distinctParams.size === 1 ? deduped.find((r) => r.params)?.params : undefined;
 
-    const broadcastId: Id<"broadcasts"> = await ctx.runMutation(
-      internal.broadcasts.createInternal,
-      {
-        accountId: key.accountId,
-        name: args.name || `API broadcast (${args.templateName})`,
-        templateName: args.templateName,
-        templateLanguage,
-        contactIds: deduped.map((r) => r.contactId),
-        templateVariables,
-      },
-    );
+    // `createInternal` also drops any contact carrying a live
+    // `doNotContact` gate (`blockedReason`, `convex/lib/notes/gate.ts`)
+    // before it ever writes a `broadcastRecipients` row — same
+    // drop-don't-reject behavior as the dashboard's `broadcasts.create`.
+    // `totalRecipients`/`accepted` below MUST report the count that will
+    // actually be messaged (== the persisted `broadcasts.totalRecipients`
+    // row), not `deduped.length` — a field named "accepted" that reports
+    // more than was accepted is a wrong number, not a contract worth
+    // preserving. `skipped` is surfaced additively so a caller can see
+    // *why* accepted is lower than the recipient list they posted.
+    //
+    // `totalRecipients` is taken VERBATIM from `createInternal`'s return
+    // — the exact `sendable.length` it just persisted — rather than
+    // re-derived here as `deduped.length - skipped`. Re-deriving it only
+    // holds today because `createInternal`'s loop happens to partition
+    // every id into either `sendable` or `skipped++`; a future second
+    // filter there (a suppression list, a per-broadcast dedupe, a rate
+    // cap) could shrink `sendable` without touching `skipped`, and a
+    // locally-recomputed count here would silently drift from what was
+    // actually persisted. Reading the value back instead of recomputing
+    // it makes that drift structurally impossible, not just improbable.
+    const {
+      broadcastId,
+      skipped,
+      totalRecipients,
+    } = await ctx.runMutation(internal.broadcasts.createInternal, {
+      accountId: key.accountId,
+      name: args.name || `API broadcast (${args.templateName})`,
+      templateName: args.templateName,
+      templateLanguage,
+      contactIds: deduped.map((r) => r.contactId),
+      templateVariables,
+    });
 
     // Trigger delivery immediately — reuses the exact same fan-out
     // `broadcasts.send` (the dashboard-authed action) uses, minus the
@@ -726,7 +774,7 @@ export const createBroadcast = action({
       });
     }
 
-    return { broadcastId, totalRecipients: deduped.length, rejected };
+    return { broadcastId, totalRecipients, rejected, skipped };
   },
 });
 

@@ -90,7 +90,7 @@ function VerdictBadge({
   t: ReturnType<typeof useTranslations>;
 }) {
   return (
-    <Badge variant="outline" className={cn('shrink-0 text-[10px]', softBadge(VERDICT_TONE[verdict]))}>
+    <Badge variant="outline" className={cn('shrink-0 text-[11px]', softBadge(VERDICT_TONE[verdict]))}>
       {t(`verdict.${verdict}`)}
     </Badge>
   );
@@ -112,7 +112,7 @@ export function EntryStatusBadge({
   return (
     <Badge
       variant="outline"
-      className={cn('text-[10px]', softBadge(status === 'published' ? 'success' : 'info'))}
+      className={cn('text-[11px]', softBadge(status === 'published' ? 'success' : 'info'))}
     >
       {status === 'published' ? t('detail.publishedBadge') : t('detail.draftBadge')}
     </Badge>

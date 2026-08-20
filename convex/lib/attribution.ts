@@ -11,7 +11,7 @@
 // ============================================================
 
 // Compact invisible reference code — a shared wire format with the landing site
-// (go-holidayys `src/lib/tracking/hidden-code.ts`, which keeps an IDENTICAL codec).
+// (go-amani `src/lib/tracking/hidden-code.ts`, which keeps an IDENTICAL codec).
 // The code is 6 Crockford base32 chars, encoded DIRECTLY as 30 bits — 5 bits per
 // char, MSB first — into ZWSP (U+200B) = 0 / ZWNJ (U+200C) = 1, anchored right after
 // the first word of the message. 30 hidden chars carry the whole code (down from 72

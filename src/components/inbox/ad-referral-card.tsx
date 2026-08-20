@@ -16,7 +16,7 @@ export function AdReferralCard({ referral }: { referral: MessageAdReferral }) {
 
   return (
     <div className="mb-2 overflow-hidden rounded-lg border border-border bg-background/50">
-      <div className="flex items-center gap-1 px-2 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+      <div className="flex items-center gap-1 px-2 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         <Megaphone className="h-3 w-3" />
         {t("fromAd")}
       </div>
@@ -47,7 +47,7 @@ export function AdReferralCard({ referral }: { referral: MessageAdReferral }) {
               href={referral.source_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="mt-0.5 inline-flex items-center gap-0.5 text-[11px] text-primary hover:underline"
+              className="mt-0.5 inline-flex items-center gap-0.5 text-[12px] text-primary hover:underline"
             >
               {t("viewAd")}
               <ExternalLink className="h-3 w-3" />

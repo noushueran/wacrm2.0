@@ -1,5 +1,5 @@
 import { AiError, type AiProvider, type AiUsage, type ChatMessage, type GenerateResult } from "./types";
-import { HANDOFF_SENTINEL, aiRequestTimeoutMs } from "./defaults";
+import { HANDOFF_SENTINEL, aiRequestTimeoutMs, type ReasoningEffort } from "./defaults";
 import { generateOpenAi } from "./providers/openai";
 import { generateAnthropic } from "./providers/anthropic";
 
@@ -27,10 +27,22 @@ export interface GenerateArgs {
   systemPrompt: string;
   /** Recent conversation turns, oldest first. */
   messages: ChatMessage[];
-  /** Per-call output cap. Omit for the WhatsApp-reply default
-   *  (`MAX_OUTPUT_TOKENS`); structured callers must raise it — see
-   *  `ANALYSIS_MAX_OUTPUT_TOKENS` and `ProviderArgs.maxTokens`. */
-  maxTokens?: number;
+  /**
+   * Reasoning budget for this call — `aiReplyReasoningEffort()` for the
+   * customer-facing reply, `aiJudgeReasoningEffort()` for the JSON
+   * modes. Omitted = send nothing = the model's own default, which is
+   * what every caller did before the 2026-07-27 token audit; kept
+   * optional so a caller that genuinely wants the provider default (and
+   * every existing test) stays byte-identical.
+   */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Cache-routing hint — see `ProviderArgs.promptCacheKey`. Callers pass
+   * `promptCacheKey(accountId, shape)` so that every request sharing a
+   * prompt PREFIX also shares a key, and requests with different
+   * prefixes do not.
+   */
+  promptCacheKey?: string;
 }
 
 /**
@@ -41,9 +53,18 @@ export interface GenerateArgs {
  * what makes the auto-reply dispatch as a whole never throw.
  */
 export async function generateReply(args: GenerateArgs): Promise<GenerateResult> {
-  const { provider, model, apiKey, systemPrompt, messages, maxTokens } = args;
+  const { provider, model, apiKey, systemPrompt, messages, reasoningEffort, promptCacheKey } =
+    args;
   const timeoutMs = aiRequestTimeoutMs();
-  const providerArgs = { apiKey, model, systemPrompt, messages, timeoutMs, maxTokens };
+  const providerArgs = {
+    apiKey,
+    model,
+    systemPrompt,
+    messages,
+    timeoutMs,
+    reasoningEffort,
+    promptCacheKey,
+  };
 
   let result: { text: string; usage: AiUsage | null };
   switch (provider) {

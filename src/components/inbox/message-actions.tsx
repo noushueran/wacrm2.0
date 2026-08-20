@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
-import { CornerUpLeft, Copy, SmilePlus } from "lucide-react";
+import { CornerUpLeft, Copy, SmilePlus, Download } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
@@ -11,10 +11,24 @@ import {
 } from "@/components/ui/popover";
 import type { Message } from "@/types";
 import { useTranslations } from "next-intl";
+import { useMediaDownload } from "./use-media-download";
+import type { MediaKind } from "@/lib/media/download";
 
 // WhatsApp's own quick-reaction bar starts with these six. Picking the same
 // set keeps the affordance familiar without pulling in a 300KB emoji library.
 const QUICK_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+/** Content types that carry a file worth saving. Audio is deliberately
+ *  absent: a voice note is played in place and already carries its own
+ *  transcript, so a download control would be noise. */
+const DOWNLOADABLE_TYPES = new Set<string>(["image", "video", "document"]);
+
+function downloadKind(message: Message): MediaKind | null {
+  if (!message.media_url) return null;
+  return DOWNLOADABLE_TYPES.has(message.content_type)
+    ? (message.content_type as MediaKind)
+    : null;
+}
 
 interface MessageActionsProps {
   message: Message;
@@ -40,6 +54,14 @@ export function MessageActions({
   children,
 }: MessageActionsProps) {
   const t = useTranslations("Inbox.actions");
+  // Media copy lives in the bubble's namespace so the bubble's own
+  // download controls and this one share one set of strings.
+  const tMedia = useTranslations("Inbox.bubble");
+  const { download, pending: downloadPending } = useMediaDownload({
+    failed: tMedia("downloadFailed"),
+    openInTab: tMedia("openInTab"),
+  });
+  const mediaKind = downloadKind(message);
 
   // Touch devices have no hover. Long-press fires `contextmenu`; we capture
   // it, suppress the native menu, and pin the toolbar open until the user
@@ -78,6 +100,17 @@ export function MessageActions({
 
   const handleReply = () => {
     onReply();
+    setTouchOpen(false);
+  };
+
+  const handleDownload = () => {
+    if (!mediaKind || !message.media_url) return;
+    void download({
+      kind: mediaKind,
+      url: message.media_url,
+      createdAt: message.created_at,
+      documentName: mediaKind === "document" ? message.content_text : null,
+    });
     setTouchOpen(false);
   };
 
@@ -157,6 +190,17 @@ export function MessageActions({
         >
           <Copy className="h-3.5 w-3.5" />
         </button>
+        {mediaKind && (
+          <button
+            type="button"
+            onClick={handleDownload}
+            disabled={downloadPending}
+            className="flex h-5 w-5 items-center justify-center rounded-full text-popover-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+            aria-label={tMedia("download")}
+          >
+            <Download className="h-3.5 w-3.5" />
+          </button>
+        )}
       </div>
       </div>
     </div>

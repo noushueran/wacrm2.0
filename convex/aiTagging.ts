@@ -6,8 +6,14 @@ import type { Id, Doc } from "./_generated/dataModel";
 import type { MutationCtx } from "./_generated/server";
 import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { accountMutation, accountQuery } from "./lib/auth";
+import { dispatchTagAdded } from "./lib/automations/triggers";
 import { toChatMessages } from "./lib/ai/context";
-import { aiContextMessageLimit } from "./lib/ai/defaults";
+import {
+  aiContextMessageLimit,
+  aiJudgeModel,
+  aiJudgeReasoningEffort,
+  promptCacheKey,
+} from "./lib/ai/defaults";
 import { generateReply } from "./lib/ai/generate";
 import { AiError, type AiUsage } from "./lib/ai/types";
 import { buildClassifyPrompt, parseClassification, type Catalogue } from "./lib/ai/classify";
@@ -279,7 +285,15 @@ export const suggest = action({
       limit: aiContextMessageLimit(),
     });
     const messages = toChatMessages(historyRows);
-    const systemPrompt = buildClassifyPrompt(catalogue);
+    const extraInstructions = await ctx.runQuery(
+      internal.agentInstructions.forAgent,
+      { accountId, agentKey: "tags" },
+    );
+    const systemPrompt = buildClassifyPrompt(catalogue, extraInstructions);
+    // Resolved once and reused for the call, the recorded
+    // suggestion, and the usage row, so all three agree on which
+    // model actually produced this classification.
+    const judgeModelId = aiJudgeModel(config.provider, config.model);
 
     let raw: string;
     let usage: AiUsage | null = null;
@@ -287,12 +301,16 @@ export const suggest = action({
       raw = syntheticClassifyRaw(catalogue);
     } else {
       try {
+        // Output is parsed by `parseClassification` into tag ids — the
+        // agent sees the tags, never the model's text — so the judge tier.
         const gen = await generateReply({
           provider: config.provider,
-          model: config.model,
+          model: judgeModelId,
           apiKey: config.apiKey,
           systemPrompt,
           messages,
+          reasoningEffort: aiJudgeReasoningEffort(),
+          promptCacheKey: promptCacheKey(accountId, "classify"),
         });
         raw = gen.text;
         usage = gen.usage;
@@ -318,10 +336,12 @@ export const suggest = action({
             conversationId: args.conversationId,
             mode: "classify",
             provider: config.provider,
-            model: config.model,
+            model: judgeModelId,
             promptTokens: usage.promptTokens,
             completionTokens: usage.completionTokens,
             totalTokens: usage.totalTokens,
+            cachedPromptTokens: usage.cachedPromptTokens,
+            reasoningTokens: usage.reasoningTokens,
           });
         } catch (err) {
           console.warn("[ai tag suggest] usage log failed:", err);
@@ -348,7 +368,7 @@ export const suggest = action({
       suggestedTagIds: parsed.tagIds as Id<"tags">[],
       note: parsed.note,
       confidence: parsed.confidence,
-      model: config.model,
+      model: judgeModelId,
     });
 
     if (usage) {
@@ -358,10 +378,12 @@ export const suggest = action({
           conversationId: args.conversationId,
           mode: "classify",
           provider: config.provider,
-          model: config.model,
+          model: judgeModelId,
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
           totalTokens: usage.totalTokens,
+          cachedPromptTokens: usage.cachedPromptTokens,
+          reasoningTokens: usage.reasoningTokens,
         });
       } catch (err) {
         console.warn("[ai tag suggest] usage log failed:", err);
@@ -446,6 +468,12 @@ export const acceptSuggestion = accountMutation({
           contactId: sug.contactId,
           tagId,
           source: "ai",
+        });
+        // An AI-applied tag is still a tag added to this contact.
+        await dispatchTagAdded(ctx, {
+          accountId: ctx.accountId,
+          contactId: sug.contactId,
+          tagId,
         });
       }
     }

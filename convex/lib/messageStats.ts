@@ -30,13 +30,32 @@
 // timezone nobody here uses.
 // ============================================================
 
-import { localDayKeyFromMs } from "./dashboardDate";
+import { localDayKeyFromMs, localMondayIndexFromMs } from "./dashboardDate";
 
 export const HOUR_MS = 3_600_000;
 
 /** The start of the UTC hour containing `ms`. The bucket key. */
 export function hourStartMs(ms: number): number {
   return Math.floor(ms / HOUR_MS) * HOUR_MS;
+}
+
+export const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * The start of the UTC day containing `ms`. The dedup key for
+ * `activeConversations`.
+ *
+ * UTC and not local, for the same reason the buckets themselves are UTC: a
+ * Convex function runs in UTC and the viewer's offset arrives per request, so
+ * a local-day key would have to choose a timezone at write time.
+ *
+ * The consequence is documented rather than hidden — a UTC+4 local day spans
+ * two UTC days, so a thread active both before ~04:00 local and again later
+ * counts twice in that local day. Business-hours traffic (09:00-18:00 local =
+ * 05:00-14:00 UTC) falls in one UTC day and counts once.
+ */
+export function utcDayStartMs(ms: number): number {
+  return Math.floor(ms / DAY_MS) * DAY_MS;
 }
 
 export type HourBucket = {
@@ -75,4 +94,108 @@ export function foldHoursIntoDays(
   }
 
   return buckets;
+}
+
+// ============================================================
+// Reply-latency rollup — the same trick, for `dashboard.responseTime`.
+//
+// That query used to `.collect()` every message in its 14-day window and pair
+// customer messages with the next reply in JS. Identical failure mode to the
+// chart above (a window bounds the SPAN, not the ROW COUNT), and it is what
+// actually took /dashboard down: `Your request timed out performing too many
+// system operations`, thrown inside `useQuery` on a page with no Error
+// Boundary, so the whole route died rather than one card.
+//
+// The pairing now happens once, on write (`recordResponseSample` in
+// messages.ts), and each sample is accumulated into the hour its CUSTOMER
+// message landed in. Sum + count survive re-bucketing into any grouping the
+// read wants — day-of-week here — and still divide out to an exact mean.
+//
+// Inherits the whole-hour-offset caveat documented above: a bucket is placed
+// by its hour START, so a non-whole-hour zone (India +05:30) can attribute an
+// hour straddling local midnight to the adjacent day. Asia/Dubai is UTC+04:00,
+// so this is exact where the CRM runs.
+// ============================================================
+
+export type HourResponseBucket = {
+  hourStartMs: number;
+  responseCount?: number;
+  responseTotalMs?: number;
+};
+
+export type ResponseDowBucket = {
+  dow: number;
+  avgMinutes: number | null;
+  samples: number;
+};
+
+export type ResponseSummary = {
+  buckets: ResponseDowBucket[];
+  thisWeekAvg: number | null;
+  lastWeekAvg: number | null;
+};
+
+type Running = { totalMs: number; count: number };
+
+/**
+ * Fold hourly reply-latency buckets into per-local-day-of-week averages plus
+ * this-week / last-week figures.
+ *
+ * All seven days are always present (a day with no samples reports
+ * `avgMinutes: null` and `samples: 0`, which the chart renders muted) so the
+ * caller gets a stable seven-bar shape regardless of how quiet the window was
+ * — the same contract the per-message implementation had.
+ *
+ * `thisWeekStartMs`/`lastWeekStartMs` are absolute local-midnight instants
+ * computed by the caller, which is the only party that knows "now".
+ */
+export function foldHoursIntoResponseBuckets(
+  rows: readonly HourResponseBucket[],
+  tzOffsetMinutes: number,
+  thisWeekStartMs: number,
+  lastWeekStartMs: number,
+): ResponseSummary {
+  const byDow: Running[] = Array.from({ length: 7 }, () => ({
+    totalMs: 0,
+    count: 0,
+  }));
+  const thisWeek: Running = { totalMs: 0, count: 0 };
+  const lastWeek: Running = { totalMs: 0, count: 0 };
+
+  for (const row of rows) {
+    // Absent means "this hour predates the rollup", which is not the same as
+    // "nobody replied in this hour" — but both contribute nothing, so both
+    // read as zero here. Skipping early also keeps an hour that only carries
+    // message COUNTS from being mistaken for a zero-latency sample.
+    const count = row.responseCount ?? 0;
+    if (count <= 0) continue;
+    const totalMs = row.responseTotalMs ?? 0;
+
+    const dow = localMondayIndexFromMs(row.hourStartMs, tzOffsetMinutes);
+    byDow[dow]!.totalMs += totalMs;
+    byDow[dow]!.count += count;
+
+    // Week boundaries are local midnights, which line up exactly with an
+    // hour start for every whole-hour offset (see the caveat above).
+    if (row.hourStartMs >= thisWeekStartMs) {
+      thisWeek.totalMs += totalMs;
+      thisWeek.count += count;
+    } else if (row.hourStartMs >= lastWeekStartMs) {
+      lastWeek.totalMs += totalMs;
+      lastWeek.count += count;
+    }
+  }
+
+  const avgMinutes = (r: Running) =>
+    r.count === 0 ? null : r.totalMs / r.count / 60_000;
+
+  return {
+    buckets: byDow.map((running, dow) => ({
+      dow,
+      avgMinutes: avgMinutes(running),
+      samples: running.count,
+    })),
+    thisWeekAvg: avgMinutes(thisWeek),
+    lastWeekAvg: avgMinutes(lastWeek),
+  };
 }

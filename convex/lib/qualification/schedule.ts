@@ -89,7 +89,18 @@ export function withinServiceWindow(lastCustomerMessageAt: number, nowMs: number
 
 type PickInput = {
   phrasingCursor: number;
-  pendingQuestion?: { key: string; text: string; alternates: string[] };
+  pendingQuestion?: {
+    key: string;
+    text: string;
+    alternates: string[];
+    askedAt?: number;
+  };
+  /** The customer's last inbound. A `pendingQuestion` stamped before it
+   *  is ignored — see `pickFollowUpText`. */
+  lastCustomerMessageAt?: number;
+  /** Set once the analyst has identified what the customer wants. Its
+   *  presence retires the basic-field ladder — see `pickFollowUpText`. */
+  serviceName?: string;
   // Structurally compatible with the session's stored field rows —
   // extra props (value, updatedAt, label) are welcome and ignored.
   fields: {
@@ -102,29 +113,78 @@ type PickInput = {
 };
 
 /**
+ * Content-free check-ins, used once (or instead of) the specific
+ * phrasings are spent. They ask for nothing in particular, which is
+ * precisely their value: this function runs hours later with no model in
+ * the loop, so whenever it cannot prove a question is still open, the
+ * only text that CANNOT be wrong is one that re-asks nothing. Safe both
+ * on a thread where the whole checklist is already collected and on one
+ * where nothing at all is known.
+ */
+const GENERIC_NUDGES = [
+  "Just checking in — still keen to plan this? Happy to pick it up whenever you are.",
+  "No rush at all — whenever you're ready, send us a message and we'll carry on from here.",
+];
+
+/**
  * The varied re-ask (spec §8): rotate through the analysis pass's
  * pre-written question + alternates; before any analysis has run (or if
  * it never produced one) fall back to the first unanswered required
  * basic field's phrasings. Deterministic — the cron never calls an LLM.
+ *
+ * The stored question is only used while it post-dates the customer's
+ * last message. This function is the ONLY thing that decides what a
+ * nudge says, hours after the fact and with no model in the loop, so a
+ * question the customer has already spoken past would be replayed at
+ * them verbatim — the exact defect that guard exists for.
+ *
+ * The basic fields are then only reachable while `serviceName` is unset,
+ * and that gate is the fix for the 2026-07-30 report (two threads, one
+ * customer answering with 😡😡). They are the OFF-TOPIC fallback set:
+ * the analysis prompt tells the model to use their keys ONLY when no
+ * service checklist matched, so on a normal thread every extracted key
+ * belongs to the CHECKLIST namespace instead and no basic-field key is
+ * ever present in `fields`. `looking_for` cannot be, even in principle —
+ * it names the service, which lands on `serviceName` (the same reasoning
+ * `contactFields.ts` records for leaving it out of its alias map). So
+ * `find(required && !answered)` returned basic field #0 on every rung of
+ * every service thread, and the cron asked "What are you looking for — a
+ * holiday package, a visa, or flights & hotels?" of a customer who had
+ * opened with "I need family visa 2 year's". Once a service is
+ * identified, that whole question set is the wrong namespace to read
+ * "still missing" from — the same conclusion `getObjectives` reached for
+ * the reply path ("pushing 'how many travellers?' at a visa applicant is
+ * worse than saying nothing"). It also retires the aliasing hazard for
+ * free: no basicFields `travelers` re-ask on a thread that recorded
+ * `pax: 3`.
+ *
+ * Finally the cursor CLAMPS instead of wrapping. It used to index modulo
+ * the candidate list, so a 4-rung ladder over 2 phrasings sent each
+ * sentence twice, word for word — visible in the report as the same
+ * question 24 hours apart. Walking off the end into the generic
+ * check-ins keeps every rung of a default ladder distinct.
  */
 export function pickFollowUpText(
   session: PickInput,
   config: Pick<Doc<"qualificationConfigs">, "basicFields">,
 ): { text: string; nextCursor: number } {
-  let candidates: string[] = [];
-  if (session.pendingQuestion) {
-    candidates = [session.pendingQuestion.text, ...session.pendingQuestion.alternates];
-  } else {
+  let specific: string[] = [];
+  const pending = session.pendingQuestion;
+  const fresh =
+    pending !== undefined &&
+    pending.askedAt !== undefined &&
+    pending.askedAt >= (session.lastCustomerMessageAt ?? 0);
+  if (pending && fresh) {
+    specific = [pending.text, ...pending.alternates];
+  } else if (!(session.serviceName ?? "").trim()) {
     const answered = new Set(
       session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
     );
     const missing = config.basicFields.find((f) => f.required && !answered.has(f.key));
-    candidates = missing?.phrasings ?? [];
+    specific = missing?.phrasings ?? [];
   }
-  if (candidates.length === 0) {
-    // Nothing configured to ask — a gentle generic nudge (still a question).
-    candidates = ["Just checking in — could you share a few more details so we can prepare your options?"];
-  }
-  const index = ((session.phrasingCursor % candidates.length) + candidates.length) % candidates.length;
+  const candidates = [...specific, ...GENERIC_NUDGES];
+  const cursor = Math.max(0, session.phrasingCursor);
+  const index = Math.min(cursor, candidates.length - 1);
   return { text: candidates[index], nextCursor: session.phrasingCursor + 1 };
 }

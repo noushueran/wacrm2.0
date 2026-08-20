@@ -40,8 +40,8 @@ async function allRows(t: TestConvex<typeof schema>): Promise<Doc<"adLandingPage
   return await t.run((ctx) => ctx.db.query("adLandingPages").collect());
 }
 
-const AD_URL = "https://holidayys.co/packages/georgia-summer?fbclid=AbC123#gallery";
-const AD_URL_KEY = "https://holidayys.co/packages/georgia-summer";
+const AD_URL = "https://amaniworld.com/packages/georgia-summer?fbclid=AbC123#gallery";
+const AD_URL_KEY = "https://amaniworld.com/packages/georgia-summer";
 
 test("ensureFresh (dry-run) stores one ok row under the normalized key", async () => {
   const t = convexTest(schema, modules);
@@ -68,7 +68,7 @@ test("a fresh row makes ensureFresh a no-op — one row per ad, however many cli
   // Same ad, different click id — same normalized key, still fresh.
   await t.action(internal.adLanding.ensureFresh, {
     accountId,
-    url: "https://holidayys.co/packages/georgia-summer?fbclid=another-click",
+    url: "https://amaniworld.com/packages/georgia-summer?fbclid=another-click",
   });
 
   const rows = await allRows(t);

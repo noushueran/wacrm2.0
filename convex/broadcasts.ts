@@ -10,6 +10,7 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { hasMinRole } from "./lib/roles";
+import { blockedReason, optedOutReason } from "./lib/notes/gate";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -247,6 +248,46 @@ async function requireOwnContact(
   return contact;
 }
 
+/**
+ * How many `opted_out` sessions one audience check may read.
+ *
+ * Bounded like every other read in this codebase, but generously: the
+ * consequence of truncation here is messaging someone who opted out, so
+ * the cap sits far above any plausible count (production had 6 on
+ * 2026-08-09) and `buildOptedOutSet` logs if it is ever reached.
+ */
+const OPTED_OUT_SCAN = 4000;
+
+/**
+ * The contacts who told the bot to stop, as a set.
+ *
+ * ONE indexed query per broadcast rather than a session lookup per
+ * recipient — a 5,000-recipient audience would otherwise cost 5,000
+ * extra reads to find a handful of rows.
+ *
+ * This is the second half of the outbound gate. `blockedReason` covers
+ * `contacts.doNotContact`, which only a human note sets; this covers the
+ * qualification engine's own opt-out, which writes nothing to the
+ * contact. Both are needed — see `lib/notes/gate.ts`.
+ */
+async function buildOptedOutSet(
+  ctx: { db: QueryCtx["db"] },
+  accountId: Id<"accounts">,
+): Promise<Set<string>> {
+  const sessions = await ctx.db
+    .query("qualificationSessions")
+    .withIndex("by_account_status", (q) =>
+      q.eq("accountId", accountId).eq("status", "opted_out"),
+    )
+    .take(OPTED_OUT_SCAN);
+  if (sessions.length >= OPTED_OUT_SCAN) {
+    console.error(
+      `[broadcasts] opted-out scan hit its cap (${OPTED_OUT_SCAN}) — some opt-outs may not be honoured; raise OPTED_OUT_SCAN`,
+    );
+  }
+  return new Set(sessions.map((s) => s.contactId as string));
+}
+
 export const list = accountQuery({
   args: {},
   handler: async (ctx) => {
@@ -314,20 +355,39 @@ export const create = accountMutation({
     // Validate every contactId belongs to this account BEFORE inserting
     // anything — a single foreign id rejects the whole broadcast rather
     // than partially creating one with some recipients silently
-    // dropped.
+    // dropped. Ownership is still fatal: a foreign id is a bug or an
+    // attack. Opting out is NOT — dropping the opted-out recipients and
+    // telling the sender is right, where rejecting a 200-person
+    // broadcast because one person unsubscribed is not (`blockedReason`,
+    // `convex/lib/notes/gate.ts` — the single outbound-to-customer gate
+    // every automated send path shares).
+    const optedOut = await buildOptedOutSet(ctx, ctx.accountId);
+    const sendable: Id<"contacts">[] = [];
+    let skipped = 0;
     for (const contactId of contactIds) {
-      await requireOwnContact(ctx, contactId);
+      const contact = await requireOwnContact(ctx, contactId);
+      // Two independent wishes, both honoured: a human-flagged contact
+      // and a customer who told the bot to stop are recorded by
+      // different paths, and neither writes the other's field.
+      if (blockedReason(contact) !== null || optedOut.has(contactId)) {
+        skipped++;
+        continue;
+      }
+      sendable.push(contactId);
     }
 
     // Counts always start at 0 — derived purely from recipient status
     // changes via `setRecipientStatus` below, never seeded here (see
-    // the file header comment).
+    // the file header comment). `totalRecipients` counts only `sendable`
+    // — the opted-out contacts above never get a `broadcastRecipients`
+    // row, so counting them here would make every downstream progress
+    // percentage (sentCount/totalRecipients) wrong.
     const broadcastId = await ctx.db.insert("broadcasts", {
       accountId: ctx.accountId,
       createdByUserId: ctx.userId,
       ...rest,
       status: status ?? "sending",
-      totalRecipients: contactIds.length,
+      totalRecipients: sendable.length,
       sentCount: 0,
       deliveredCount: 0,
       readCount: 0,
@@ -335,7 +395,7 @@ export const create = accountMutation({
       failedCount: 0,
     });
 
-    for (const contactId of contactIds) {
+    for (const contactId of sendable) {
       await ctx.db.insert("broadcastRecipients", {
         accountId: ctx.accountId,
         broadcastId,
@@ -344,7 +404,7 @@ export const create = accountMutation({
       });
     }
 
-    return broadcastId;
+    return { broadcastId, skipped };
   },
 });
 
@@ -367,7 +427,17 @@ export const create = accountMutation({
  * REST layer's pre-migration `resolveAuditUserId` being simplified away
  * for this migration; see the Phase 8 Task 5 report for the full
  * rationale). Always starts "sending" (never "draft"), matching the
- * REST contract's own immediate-fan-out behavior.
+ * REST contract's own immediate-fan-out behavior. Ownership is trusted
+ * (not rechecked), but `blockedReason` (do-not-contact) IS checked here
+ * — that's a live per-send fact, not something the caller could have
+ * verified ahead of time — so this returns `{ broadcastId, skipped,
+ * totalRecipients }`, the last being the exact `sendable.length` this
+ * function persisted as `broadcasts.totalRecipients` below. That value
+ * is the single source of truth for "how many will actually be
+ * messaged" — `apiV1.createBroadcast` reports it back to the caller
+ * verbatim rather than re-deriving it (`deduped.length - skipped`),
+ * so the two can never drift apart even if a future filter here
+ * shrinks `sendable` without touching `skipped`.
  */
 export const createInternal = internalMutation({
   args: {
@@ -381,11 +451,29 @@ export const createInternal = internalMutation({
   handler: async (ctx, args) => {
     const { accountId, contactIds, ...rest } = args;
 
+    // Same drop-don't-reject treatment as the public `create` above.
+    // Ownership of `contactIds` is already guaranteed by the caller (see
+    // this function's doc comment), but do-not-contact is a live,
+    // per-send check — this path fires real WhatsApp sends
+    // (`apiV1.createBroadcast`), exactly like the dashboard composer, so
+    // it must honor an opt-out too.
+    const optedOut = await buildOptedOutSet(ctx, accountId);
+    const sendable: Id<"contacts">[] = [];
+    let skipped = 0;
+    for (const contactId of contactIds) {
+      const contact = await ctx.db.get(contactId);
+      if (blockedReason(contact) !== null || optedOut.has(contactId)) {
+        skipped++;
+        continue;
+      }
+      sendable.push(contactId);
+    }
+
     const broadcastId = await ctx.db.insert("broadcasts", {
       accountId,
       ...rest,
       status: "sending",
-      totalRecipients: contactIds.length,
+      totalRecipients: sendable.length,
       sentCount: 0,
       deliveredCount: 0,
       readCount: 0,
@@ -393,7 +481,7 @@ export const createInternal = internalMutation({
       failedCount: 0,
     });
 
-    for (const contactId of contactIds) {
+    for (const contactId of sendable) {
       await ctx.db.insert("broadcastRecipients", {
         accountId,
         broadcastId,
@@ -402,7 +490,10 @@ export const createInternal = internalMutation({
       });
     }
 
-    return broadcastId;
+    // `totalRecipients` here is `sendable.length` verbatim — the exact
+    // number just persisted above as `broadcasts.totalRecipients` — not
+    // re-derived by the caller, so the two can never disagree.
+    return { broadcastId, skipped, totalRecipients: sendable.length };
   },
 });
 
@@ -739,7 +830,28 @@ export const getRecipientForDeliveryInternal = internalQuery({
       ? await ctx.db.get(recipient.contactId)
       : null;
 
-    return { recipient, contact, broadcast };
+    // Computed here rather than in `deliverOne` because this query
+    // already has db access and the action does not. Two indexed reads
+    // for ONE recipient — the per-broadcast set built by
+    // `buildOptedOutSet` would be wasteful for a single row.
+    let optedOut = false;
+    if (contact) {
+      const conversation = await ctx.db
+        .query("conversations")
+        .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+        .first();
+      if (conversation) {
+        const session = await ctx.db
+          .query("qualificationSessions")
+          .withIndex("by_conversation", (q) =>
+            q.eq("conversationId", conversation._id),
+          )
+          .first();
+        optedOut = optedOutReason(session) !== null;
+      }
+    }
+
+    return { recipient, contact, broadcast, optedOut };
   },
 });
 
@@ -815,6 +927,31 @@ export const deliverOne = internalAction({
         recipientId: args.recipientId,
         status: "failed",
         errorMessage: "Contact no longer exists",
+      });
+      return;
+    }
+
+    // do-not-contact gate — re-checked HERE, at actual send time, not
+    // just at `create`'s own snapshot check (see that function's own
+    // comment). A broadcast fans out over minutes via `DELIVER_STAGGER_MS`,
+    // so a 5,000-recipient send has a real window in which an agent can
+    // flag a contact mid-run after this recipient row was already queued
+    // "pending". `blockedReason` fails closed the same way it does
+    // everywhere else — reuses this function's own existing "failed"
+    // terminal status (never invents a new one) so `maybeFinalizeBroadcast`
+    // below settles the broadcast exactly the same way any other
+    // undeliverable recipient does.
+    // Both wishes re-checked here, at actual send time. `loaded.optedOut`
+    // covers the customer who told the BOT to stop — recorded on the
+    // qualification session, never on the contact — which the
+    // `blockedReason` half cannot see.
+    const blocked = blockedReason(contact) ?? (loaded.optedOut ? "opted_out" : null);
+    if (blocked !== null) {
+      await ctx.runMutation(internal.broadcasts.setRecipientStatusInternal, {
+        accountId: args.accountId,
+        recipientId: args.recipientId,
+        status: "failed",
+        errorMessage: `${blocked}: recipient opted out before this send fired`,
       });
       return;
     }

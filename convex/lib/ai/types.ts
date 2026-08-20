@@ -29,6 +29,32 @@ export interface AiUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /**
+   * Prompt tokens the provider served from its prefix cache (OpenAI's
+   * `usage.prompt_tokens_details.cached_tokens`, Anthropic's
+   * `usage.cache_read_input_tokens`). A SUBSET of `promptTokens`, never
+   * additional to it — the provider still counts a cached token as a
+   * prompt token, it just bills it at ~10% of the input rate.
+   *
+   * Optional because both adapters only started reporting it with the
+   * token-spend audit (2026-07-27); rows written before that carry no
+   * value, and `normalizeUsage` returns 0 rather than `undefined` when a
+   * provider omits the block entirely. The whole point of recording it
+   * is that the static ~3.9k-token prompt prefix (scaffold + the
+   * account's Business Context) is the dominant cost of every reply, and
+   * whether it is actually hitting cache was previously unobservable.
+   */
+  cachedPromptTokens?: number;
+  /**
+   * Reasoning tokens (OpenAI's
+   * `usage.completion_tokens_details.reasoning_tokens`). A SUBSET of
+   * `completionTokens`, billed at the OUTPUT rate — and, crucially,
+   * drawn from the same `max_completion_tokens` budget as the visible
+   * reply, which is why `defaults.ts`'s `maxOutputTokensFor` sizes that
+   * budget from the effort level. Optional for the same reason as
+   * `cachedPromptTokens`.
+   */
+  reasoningTokens?: number;
 }
 
 /** Raw text + usage a provider adapter returns before handoff parsing. */

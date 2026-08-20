@@ -1,4 +1,5 @@
 import { AiError, type AiUsage, type ChatMessage } from "../types";
+import type { ReasoningEffort } from "../defaults";
 
 // ============================================================
 // Convex port of `src/lib/ai/providers/shared.ts` — bits shared by the
@@ -13,14 +14,30 @@ export interface ProviderArgs {
   systemPrompt: string;
   messages: ChatMessage[];
   timeoutMs: number;
-  /** Output-token cap for THIS call. Defaults to `MAX_OUTPUT_TOKENS`,
-   *  which is tuned for a short WhatsApp reply (see `defaults.ts`). A
-   *  caller whose expected output is structured rather than
-   *  conversational — the qualification analysis emits a JSON object
-   *  with `fields[]`, `scoreBreakdown[]` and a `nextQuestion` carrying
-   *  two alternates — must raise it, or the response is truncated
-   *  mid-object (`finish_reason: "length"`) and fails to parse. */
-  maxTokens?: number;
+  /**
+   * How hard a reasoning model should think before answering. Passed
+   * straight through to OpenAI's `reasoning_effort` when the model
+   * supports it (`defaults.ts`'s `supportsReasoningEffort`) and ignored
+   * otherwise; Anthropic's adapter ignores it entirely.
+   *
+   * Optional so existing callers/tests keep their exact request body.
+   * Absent = send nothing = the model's own default, which is what every
+   * chat call did before the 2026-07-27 audit — and why reasoning tokens
+   * were silently eating the 320-token output budget.
+   */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Cache-routing hint (OpenAI `prompt_cache_key`). On GPT-5.6 and later
+   * this is what actually makes prefix caching land: without it requests
+   * sharing a prefix scatter across cache shards and miss. Measured on
+   * this account before it existed — a 6% hit rate against a ~3.9k-token
+   * static prefix that should have cached almost every call.
+   *
+   * Optional so existing callers/tests keep their exact request body;
+   * ignored by the Anthropic adapter, which caches via explicit
+   * `cache_control` breakpoints rather than routing.
+   */
+  promptCacheKey?: string;
 }
 
 /**
@@ -34,6 +51,10 @@ export function normalizeUsage(raw: {
   prompt?: unknown;
   completion?: unknown;
   total?: unknown;
+  /** Cached prompt tokens — a subset of `prompt`, see `AiUsage`. */
+  cached?: unknown;
+  /** Reasoning tokens — a subset of `completion`, see `AiUsage`. */
+  reasoning?: unknown;
 }): AiUsage | null {
   const num = (v: unknown): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
@@ -41,10 +62,24 @@ export function normalizeUsage(raw: {
   const completionTokens = num(raw.completion);
   const total = num(raw.total);
   const totalTokens = total > 0 ? total : promptTokens + completionTokens;
+  // The emptiness test deliberately ignores `cached`/`reasoning`: both
+  // are subsets of counts already tested above, so they can never be the
+  // only thing a provider reported, and letting them keep a row alive
+  // would resurrect exactly the all-zero rows `aiUsage.log` drops.
   if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) {
     return null;
   }
-  return { promptTokens, completionTokens, totalTokens };
+  // Clamped to their parent counts: a provider that reported more cached
+  // tokens than prompt tokens (or more reasoning than completion) is
+  // reporting nonsense, and an out-of-range subset would make the usage
+  // page's cache-hit rate read above 100%.
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    cachedPromptTokens: Math.min(num(raw.cached), promptTokens),
+    reasoningTokens: Math.min(num(raw.reasoning), completionTokens),
+  };
 }
 
 /** Map a fetch rejection (timeout / DNS / offline) to a typed AiError. */

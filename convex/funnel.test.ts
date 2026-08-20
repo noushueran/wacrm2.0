@@ -1,6 +1,6 @@
 import { convexTest, type TestConvex } from "convex-test";
 import { expect, test } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
@@ -469,4 +469,155 @@ test("moving a purchased conversation to another stage PRESERVES funnel.saleValu
   const purchaseTr = trans.find((x) => x.stage === "purchased");
   expect(purchaseTr?.saleValue).toBe(3000);
   expect(purchaseTr?.saleCurrency).toBe("AED");
+});
+
+// ============================================================
+// funnelDailyStats — the /reports Funnel tab's rollup, maintained live by
+// the write paths below. See the table comment in schema.ts for why it
+// exists (4,041 documents per 30-day window, growing with traffic) and why
+// every counter in it has to be additive.
+//
+// These tests are about the LIVE path. `reports.test.ts` covers the read
+// and the backfill, where the pre-existing expectations doubling as
+// backfill-vs-live-scan equivalence assertions.
+// ============================================================
+
+/** Every rollup bucket for an account, oldest first. */
+async function funnelBuckets(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  return await t.run((ctx) =>
+    ctx.db
+      .query("funnelHourlyStats")
+      .withIndex("by_account_hour", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+}
+
+test("a stage move through the live path folds into the rollup", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Rolla", email: "rolla@example.com", role: "admin",
+  });
+  const { conversationId } = await seedConv(t, accountId);
+
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "qualified",
+  });
+
+  const buckets = await funnelBuckets(t, accountId);
+  expect(buckets).toHaveLength(1);
+  expect(buckets[0]!.stageFirstReached.qualified).toBe(1);
+  expect(buckets[0]!.stageFirstReached.purchased).toBe(0);
+});
+
+test("re-entering a stage does not count the conversation twice", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Rolla", email: "rolla@example.com", role: "admin",
+  });
+  const { conversationId } = await seedConv(t, accountId);
+
+  // Forward, back, forward again. The manual `setStage` path does not pass
+  // `neverDowngrade`, so reopening a deal is reachable through the UI —
+  // which is exactly why the counter is defined as FIRST arrival. Counting
+  // arrivals instead would make this conversation two qualified leads.
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "qualified" });
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "price_quoted" });
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "qualified" });
+
+  const buckets = await funnelBuckets(t, accountId);
+  const qualified = buckets.reduce((n, b) => n + b.stageFirstReached.qualified, 0);
+  expect(qualified).toBe(1);
+  expect(buckets.reduce((n, b) => n + b.stageFirstReached.price_quoted, 0)).toBe(1);
+});
+
+test("a revised sale value adjusts the original purchase day rather than adding a second", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Rolla", email: "rolla@example.com", role: "admin",
+  });
+  const { conversationId } = await seedConv(t, accountId);
+
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "purchased", saleValue: 1_000,
+  });
+  // Reopen, then re-close at a corrected amount.
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "price_quoted" });
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId, stage: "purchased", saleValue: 1_250,
+  });
+
+  const buckets = await funnelBuckets(t, accountId);
+  // One purchase, at the CURRENT amount — not two purchases, and not the
+  // first amount quoted.
+  expect(buckets.reduce((n, b) => n + b.stageFirstReached.purchased, 0)).toBe(1);
+  expect(buckets.reduce((n, b) => n + b.purchaseValueTotal, 0)).toBe(1_250);
+});
+
+test("a conversion event's status change moves within its creation-day bucket", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Rolla", email: "rolla@example.com", role: "admin",
+  });
+  // Attributed, so advancing the stage seeds a real conversionEvents row.
+  const { conversationId } = await seedConv(t, accountId, {
+    lane: "ctwa", identifier: "clid-rollup",
+  });
+
+  await asUser.mutation(api.funnel.setStage, { conversationId, stage: "qualified" });
+
+  let buckets = await funnelBuckets(t, accountId);
+  expect(buckets).toHaveLength(1);
+  expect(buckets[0]!.eventsByStatus.pending).toBe(1);
+  expect(buckets[0]!.eventsByStatus.sent).toBe(0);
+
+  const eventId = await t.run(async (ctx) => {
+    const row = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_event_id", (q) =>
+        q.eq("eventId", `${conversationId}:qualified`),
+      )
+      .unique();
+    return row!._id;
+  });
+  await t.mutation(internal.conversionEvents.patchStatus, {
+    conversionEventId: eventId, status: "sent",
+  });
+
+  buckets = await funnelBuckets(t, accountId);
+  // Still ONE bucket: a status change moves the event between counters in
+  // the day it was CREATED, never into the day the change happened. A
+  // change-day rollup would leave it counted in two.
+  expect(buckets).toHaveLength(1);
+  expect(buckets[0]!.eventsByStatus.pending).toBe(0);
+  expect(buckets[0]!.eventsByStatus.sent).toBe(1);
+});
+
+test("rollup counters stay scoped to their own account", async () => {
+  const t = convexTest(schema, modules);
+  const alice = await seedAccountMember(t, {
+    name: "Alice", email: "alice-r@example.com", role: "admin",
+  });
+  const bob = await seedAccountMember(t, {
+    name: "Bob", email: "bob-r@example.com", role: "admin",
+  });
+  const a = await seedConv(t, alice.accountId);
+  const b = await seedConv(t, bob.accountId);
+
+  await alice.asUser.mutation(api.funnel.setStage, {
+    conversationId: a.conversationId, stage: "qualified",
+  });
+  for (const stage of ["qualified", "price_quoted"] as const) {
+    await bob.asUser.mutation(api.funnel.setStage, {
+      conversationId: b.conversationId, stage,
+    });
+  }
+
+  const aliceBuckets = await funnelBuckets(t, alice.accountId);
+  const bobBuckets = await funnelBuckets(t, bob.accountId);
+  expect(aliceBuckets.reduce((n, x) => n + x.stageFirstReached.qualified, 0)).toBe(1);
+  expect(aliceBuckets.reduce((n, x) => n + x.stageFirstReached.price_quoted, 0)).toBe(0);
+  expect(bobBuckets.reduce((n, x) => n + x.stageFirstReached.price_quoted, 0)).toBe(1);
 });

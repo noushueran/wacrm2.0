@@ -34,6 +34,7 @@ export default function NewAutomationPage() {
         trigger_config: t.trigger_config as Record<string, unknown>,
         is_active: false,
         steps,
+        stop_on_reply: false,
       }
     }
     return {
@@ -43,6 +44,7 @@ export default function NewAutomationPage() {
       trigger_config: {},
       is_active: false,
       steps: [],
+      stop_on_reply: false,
     }
   }, [template])
 

@@ -1,4 +1,5 @@
 'use client';
+import { BRAND } from '@/lib/brand';
 
 // ============================================================
 // InviteMemberDialog
@@ -136,7 +137,7 @@ export function InviteMemberDialog({
         // string if `account` hasn't loaded yet (shouldn't happen
         // — the dialog requires admin+ which requires a loaded
         // profile — but stay safe).
-        accountName: account?.name ?? 'our Holidayys account',
+        accountName: account?.name ?? `our ${BRAND.name} account`,
       });
       // No manual list refresh needed — `MembersTab`'s pending-invites
       // list comes from a reactive `useQuery(api.invitations.list)`,
@@ -166,9 +167,9 @@ export function InviteMemberDialog({
   function whatsappShareUrl(url: string): string {
     // Include the account name so the recipient knows which team
     // they're being invited to before clicking through. This matters
-    // for users in multi-team contexts where "our Holidayys account"
+    // for users in multi-team contexts where "our <Brand> account"
     // wouldn't be enough to disambiguate.
-    const accountName = result?.accountName ?? 'our Holidayys account';
+    const accountName = result?.accountName ?? `our ${BRAND.name} account`;
     const message = t('whatsappMessage', { accountName, expiresInDays: result?.expiresInDays ?? 0, url });
     return `https://wa.me/?text=${encodeURIComponent(message)}`;
   }

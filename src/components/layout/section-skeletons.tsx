@@ -60,6 +60,36 @@ export function ListSectionSkeleton({ rows = 7 }: { rows?: number }) {
   );
 }
 
+/**
+ * The automation builder (`/automations/[id]/edit`). Unlike every other
+ * skeleton here it mirrors a `fixed inset-0` full-screen overlay rather
+ * than a page inside the dashboard shell — the builder deliberately
+ * escapes that shell (see `automation-builder.tsx`'s own comment on
+ * `pt-safe`), so a shell-shaped skeleton would visibly jump when the
+ * real editor replaced it.
+ */
+export function BuilderSectionSkeleton() {
+  return (
+    <div className="fixed inset-0 flex flex-col bg-background pt-safe">
+      {/* Top bar: back button, name field, then the trailing controls. */}
+      <div className="flex flex-shrink-0 items-center gap-2 border-b border-border bg-card/80 px-3 py-3 sm:gap-3 sm:px-4">
+        <Skeleton className="h-9 w-9 shrink-0 rounded-md" />
+        <Skeleton className="h-9 flex-1 max-w-sm rounded-md" />
+        <Skeleton className="h-6 w-11 shrink-0 rounded-full" />
+        <Skeleton className="h-9 w-24 shrink-0 rounded-md" />
+      </div>
+      {/* Canvas: a centred column of trigger + step cards. */}
+      <div className="flex-1 overflow-hidden">
+        <div className="mx-auto flex max-w-2xl flex-col items-center gap-4 px-4 py-10">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-24 w-full rounded-xl" />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Contacts: header + search/toolbar + a table of rows. */
 export function TableSectionSkeleton({ rows = 10 }: { rows?: number }) {
   return (
@@ -170,7 +200,9 @@ export function InboxSectionSkeleton() {
   return (
     <div className="-m-4 flex h-app-content overflow-hidden sm:-m-6">
       {/* Conversation list */}
-      <div className="flex w-full flex-col border-r border-border md:w-80 lg:w-96">
+      {/* Width tracks the real list's `lg:w-96` — a skeleton pane that
+          resizes as it hands over is a visible jump. */}
+      <div className="flex w-full flex-col border-r border-border lg:w-96">
         <div className="border-b border-border p-4">
           <Skeleton className="h-10 w-full rounded-md" />
         </div>

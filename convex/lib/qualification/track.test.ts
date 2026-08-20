@@ -2,7 +2,7 @@ import { convexTest, type TestConvex } from "convex-test";
 import { expect, test } from "vitest";
 import schema from "../../schema";
 import type { Id } from "../../_generated/dataModel";
-import { holidayysDefaultConfig } from "./defaults";
+import { defaultQualificationConfig } from "./defaults";
 import {
   ensureSession,
   recordInboundActivity,
@@ -24,7 +24,7 @@ async function seed(
     });
     await ctx.db.insert("qualificationConfigs", {
       accountId,
-      ...holidayysDefaultConfig(),
+      ...defaultQualificationConfig(),
       enabled: opts.enabled,
       adminAlertPhones: opts.adminPhones ?? [],
     });
@@ -54,8 +54,8 @@ function sessionsFor(
   );
 }
 
-test("holidayysDefaultConfig matches the approved spec defaults", () => {
-  const d = holidayysDefaultConfig();
+test("defaultQualificationConfig matches the approved spec defaults", () => {
+  const d = defaultQualificationConfig();
   expect(d.enabled).toBe(false);
   expect(d.qualifyThresholdScore).toBe(60);
   expect(d.workStartMinute).toBe(600); // 10:00
@@ -65,6 +65,14 @@ test("holidayysDefaultConfig matches the approved spec defaults", () => {
   expect(d.followUpDelaysMinutes).toEqual([60, 180, 720, 1440]);
   expect(d.maxFollowUps).toBe(4);
   expect(d.sessionWindowHours).toBe(72);
+  // Not just a spec value — this is the seed the whole opt-OUT reading of
+  // the flag rests on. Every reader tests `autoAssignEnabled === false`
+  // (or `!== false`), so a new account is auto-assigning because THIS is
+  // `true`; seeding it `false` here would leave those reads untouched and
+  // silently ship every new account with lead offers and the chase sweep
+  // off. Its absent-means-on counterpart is pinned in
+  // `convex/inboxChaseAssign.test.ts` and `convex/qualificationEngine.test.ts`.
+  expect(d.autoAssignEnabled).toBe(true);
   const keys = d.basicFields.map((f) => f.key);
   expect(keys).toEqual(["looking_for", "travel_dates", "travelers", "email"]);
   expect(d.basicFields.every((f) => f.phrasings.length >= 2)).toBe(true);

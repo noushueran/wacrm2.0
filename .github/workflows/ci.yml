@@ -5,6 +5,11 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Manual trigger. Worth having on a workflow that spent its first
+  # sixteen days never running: it gives a way to exercise CI without
+  # inventing a commit, which is exactly what was needed to find out
+  # whether it worked at all.
+  workflow_dispatch:
 
 # Cancel older CI runs for the same branch when a new commit arrives —
 # saves minutes when someone pushes a stack of fixes to one PR.
@@ -25,12 +30,30 @@ jobs:
     env:
       ENCRYPTION_KEY: '0000000000000000000000000000000000000000000000000000000000000000'
       META_APP_SECRET: 'ci-dummy-meta-secret'
+      # Company identity. `src/lib/brand.ts` THROWS on a missing value by
+      # design, so the build cannot run without these — which is the point:
+      # a deployment that forgets them fails loudly instead of shipping
+      # under another company's name. Deliberately a fictional company, so
+      # a green build proves identity comes from configuration rather than
+      # from a literal that happens to be committed.
+      NEXT_PUBLIC_BRAND_NAME: 'Testco'
+      NEXT_PUBLIC_BRAND_LEGAL_NAME: 'Testco Holdings LLC'
+      NEXT_PUBLIC_SITE_URL: 'https://wa.testco.example'
+      NEXT_PUBLIC_BRAND_WEBSITE: 'https://testco.example'
+      NEXT_PUBLIC_BRAND_EMAIL: 'hello@testco.example'
+      BRAND_NAME: 'Testco'
+      BRAND_SITE_URL: 'https://wa.testco.example'
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          # 22, not the 20 this was pinned to. `engines` allows >=20, but
+          # nobody develops or tests on 20 — the whole suite, the build
+          # and every local verification run on 22. A CI on a different
+          # major is a gate that can disagree with the machine the code
+          # was written on, in either direction.
+          node-version: 22
           cache: npm
 
       - name: Install dependencies

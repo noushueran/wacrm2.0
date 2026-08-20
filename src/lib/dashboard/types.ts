@@ -7,31 +7,14 @@ export interface MetricDelta {
   previous: number
 }
 
-export interface MetricsBundle {
-  activeConversations: MetricDelta
-  newContactsToday: MetricDelta
-  /**
-   * Today's + yesterday's new leads split into Click-to-WhatsApp ad leads vs
-   * "direct" (everything else). Optional: a client shipped before the matching
-   * `convex deploy` reads `undefined` here and shows the total without a split
-   * rather than crashing.
-   */
-  newLeadsBySource?: {
-    adToday: number
-    directToday: number
-    adYesterday: number
-    directYesterday: number
-  }
-  openDealsValue: number
-  openDealsCount: number
-  messagesSentToday: MetricDelta
-}
-
-export interface ConversationsSeriesPoint {
-  day: string // YYYY-MM-DD local
-  incoming: number
-  outgoing: number
-}
+// `MetricsBundle` and `ConversationsSeriesPoint` used to live here, for
+// the dashboard's KPI tiles and its conversations chart respectively.
+// Both are gone: the tiles now read `api.dashboard.snapshot`, whose return
+// type is inferred straight off the Convex function (so it cannot drift
+// from the backend the way a hand-written mirror can), and the chart was
+// removed outright because /reports' Conversations tab renders a strict
+// superset of it. `MetricDelta` and the response shapes below are still
+// used, so the file stays.
 
 export interface ResponseTimeBucket {
   /** 0 = Mon … 6 = Sun (Monday-first). */

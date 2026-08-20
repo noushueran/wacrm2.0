@@ -205,6 +205,102 @@ describe("validateStepsForActivation", () => {
       "steps[0].subject",
     ]);
   });
+
+  it("a send_message with only media is valid — text is no longer required", () => {
+    const issues = validateStepsForActivation([
+      { step_type: "send_message", step_config: { media: { type: "image", url: "https://x/a.jpg" } } },
+    ]);
+    expect(issues).toEqual([]);
+  });
+
+  it("a send_message with only buttons is valid", () => {
+    const issues = validateStepsForActivation([
+      {
+        step_type: "send_message",
+        step_config: { interactive: { kind: "buttons", body: "pick", buttons: [{ id: "a", title: "A" }] } },
+      },
+    ]);
+    expect(issues).toEqual([]);
+  });
+
+  it("a send_message with nothing to send is rejected", () => {
+    const issues = validateStepsForActivation([
+      { step_type: "send_message", step_config: {} },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].message).toMatch(/needs text, media or buttons/);
+  });
+
+  it("media and buttons together are rejected", () => {
+    // The interactive payload's button title is deliberately over Meta's
+    // 20-char limit (also invalid on its own — see the next test) so that
+    // the exclusivity check's `break` is actually exercised: without it,
+    // `validateInteractivePayload` would run too and push a second issue,
+    // which is exactly what `toHaveLength(1)` below is pinned to catch. A
+    // validly-shaped interactive payload can't do this — with `media` set,
+    // `planSend(...).kind` is always "media", never "empty", so the
+    // "needs text, media or buttons" check can never fire here regardless
+    // of `break`; the interactive-validity check is the only other check
+    // `break` is actually guarding against for a send step with media set.
+    const issues = validateStepsForActivation([
+      {
+        step_type: "send_message",
+        step_config: {
+          media: { type: "image", url: "https://x/a.jpg" },
+          interactive: {
+            kind: "buttons",
+            body: "pick",
+            buttons: [{ id: "a", title: "This title is far too long for Meta" }],
+          },
+        },
+      },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].message).toMatch(/cannot carry both media and buttons/);
+  });
+
+  it("an invalid interactive payload still reports Meta's own limit message", () => {
+    const issues = validateStepsForActivation([
+      {
+        step_type: "send_message",
+        step_config: {
+          interactive: {
+            kind: "buttons",
+            body: "pick",
+            buttons: [{ id: "a", title: "This title is far too long for Meta" }],
+          },
+        },
+      },
+    ]);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].message).toBe(
+      'Button label "This title is far too long for Meta" exceeds the 20-character limit.',
+    );
+  });
+
+  it("a fallback template with no name is rejected", () => {
+    const issues = validateStepsForActivation([
+      { step_type: "send_message", step_config: { text: "hi", fallback: { language: "en_US" } } },
+    ]);
+    expect(issues[0].message).toMatch(/fallback template name is required/);
+  });
+
+  it("a legacy { text } config is still valid", () => {
+    expect(
+      validateStepsForActivation([{ step_type: "send_message", step_config: { text: "hello" } }]),
+    ).toEqual([]);
+  });
+
+  it("a stored send_buttons step is still valid", () => {
+    expect(
+      validateStepsForActivation([
+        {
+          step_type: "send_buttons",
+          step_config: { kind: "buttons", body: "pick", buttons: [{ id: "a", title: "A" }] },
+        },
+      ]),
+    ).toEqual([]);
+  });
 });
 
 describe("validateTriggerForActivation", () => {
@@ -249,13 +345,47 @@ describe("validateTriggerForActivation", () => {
     ).toEqual([]);
   });
 
-  it("requires schedule on time_based triggers", () => {
+  it("requires both a daily schedule and an audience tag on time_based triggers", () => {
     expect(validateTriggerForActivation("time_based", {})).toEqual([
       { path: "trigger.schedule", message: "schedule is required" },
+      { path: "trigger.tag_id", message: "tag is required" },
     ]);
     expect(
-      validateTriggerForActivation("time_based", { schedule: "0 9 * * *" }),
+      validateTriggerForActivation("time_based", {
+        schedule: "09:00",
+        tag_id: "tag-uuid",
+      }),
     ).toEqual([]);
+  });
+
+  it("rejects a time_based schedule the engine could never fire", () => {
+    // This is the shape the old builder's "Cron expression or HH:mm"
+    // placeholder invited, and the old validation accepted: it activated
+    // cleanly and then never ran, because the sweep only understands a
+    // daily HH:mm.
+    expect(
+      validateTriggerForActivation("time_based", {
+        schedule: "0 9 * * *",
+        tag_id: "tag-uuid",
+      }),
+    ).toEqual([
+      {
+        path: "trigger.schedule",
+        message: 'schedule must be a daily time in 24-hour "HH:mm" form, e.g. "09:00"',
+      },
+    ]);
+    expect(
+      validateTriggerForActivation("time_based", {
+        schedule: "25:00",
+        tag_id: "tag-uuid",
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("requires an audience even when the schedule is valid", () => {
+    expect(
+      validateTriggerForActivation("time_based", { schedule: "09:00" }),
+    ).toEqual([{ path: "trigger.tag_id", message: "tag is required" }]);
   });
 
   it("requires tag_id on tag_added triggers", () => {

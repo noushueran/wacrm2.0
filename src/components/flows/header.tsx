@@ -84,7 +84,7 @@ export function EditorHeader() {
         <StatusChip status={state.status} />
         {dirty && (
           <span
-            className="inline-flex shrink-0 items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-amber-300"
+            className="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-amber-300"
             title="Unsaved changes — hit Save to persist"
             aria-live="polite"
           >
@@ -102,7 +102,7 @@ export function EditorHeader() {
           >
             <History className="h-3.5 w-3.5" />
             Runs
-            <span className="ml-0.5 rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+            <span className="ml-0.5 rounded bg-muted px-1.5 py-0.5 font-mono text-[12px] text-muted-foreground">
               {flow.execution_count}
             </span>
           </Button>
@@ -168,7 +168,7 @@ export function EditorHeader() {
         }
         placeholder="Add a short description (internal — customers don't see this)"
         aria-label="Flow description"
-        className="w-full max-w-[78ch] rounded-md border border-transparent bg-transparent px-2 py-1 text-[13px] text-muted-foreground outline-none transition-colors placeholder:text-muted-foreground/60 hover:bg-muted/50 focus:border-primary focus:bg-transparent focus:text-foreground"
+        className="w-full max-w-[78ch] rounded-md border border-transparent bg-transparent px-2 py-1 text-[14px] text-muted-foreground outline-none transition-colors placeholder:text-muted-foreground/60 hover:bg-muted/50 focus:border-primary focus:bg-transparent focus:text-foreground"
       />
     </div>
   );
@@ -194,7 +194,7 @@ function StatusChip({ status }: { status: BuilderState["status"] }) {
   return (
     <span
       className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11.5px] font-medium",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12.5px] font-medium",
         cfg.cls,
       )}
     >

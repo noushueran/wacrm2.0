@@ -130,7 +130,7 @@ export function TagSuggestionBanner({
             return tag ? (
               <span
                 key={id}
-                className="rounded-full px-2 py-0.5 text-[10px] font-medium"
+                className="rounded-full px-2 py-0.5 text-[11px] font-medium"
                 style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
               >
                 {tag.name}

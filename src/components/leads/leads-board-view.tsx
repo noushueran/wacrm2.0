@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { format, formatDistanceToNow } from 'date-fns';
@@ -24,6 +24,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Pagination } from '@/components/ui/pagination';
 import { LeadChecklist, type LeadChecklistData } from '@/components/leads/lead-checklist';
 import {
   LeadsPipelineView,
@@ -87,6 +88,8 @@ export interface LeadRow {
 
 export type LeadsView = 'list' | 'pipeline';
 
+export type StatusFilter = 'all' | 'qualified' | 'collecting' | 'closed';
+
 export interface LeadsBoardData {
   summary: {
     collecting: number;
@@ -98,7 +101,26 @@ export interface LeadsBoardData {
     qualificationRate: number;
     avgScore: number;
   };
+  /**
+   * In LIST view this is one page. In PIPELINE view the page asks for
+   * no paging at all and this is the whole board — the kanban groups
+   * every lead by stage, so a page of 25 would silently empty its
+   * columns.
+   */
   leads: LeadRow[];
+  /** Size of the filtered result set the page was taken from. */
+  total: number;
+  page: number;
+  pageCount: number;
+  /** Every service on the WHOLE board, so the dropdown keeps all its options. */
+  services: string[];
+}
+
+export interface LeadsFilters {
+  status: StatusFilter;
+  /** `'all'`, or an exact `serviceName`. */
+  service: string;
+  search: string;
 }
 
 const STATUS_STYLE: Record<string, string> = {
@@ -111,9 +133,6 @@ const STATUS_STYLE: Record<string, string> = {
 
 const SOURCE_ICON = { ad: Megaphone, website: Globe, organic: MessageCircle } as const;
 
-type StatusFilter = 'all' | 'qualified' | 'collecting' | 'closed';
-const CLOSED = new Set(['expired', 'opted_out', 'disqualified']);
-
 function scoreTone(score: number): string {
   if (score >= 70) return 'text-emerald-500 border-emerald-500/50';
   if (score >= 40) return 'text-amber-500 border-amber-500/50';
@@ -124,7 +143,7 @@ function scoreTone(score: number): string {
 function ScoreRing({ score }: { score: number | null }) {
   if (score === null) {
     return (
-      <div className="flex size-11 shrink-0 items-center justify-center rounded-full border-2 border-dashed border-border text-[10px] text-muted-foreground">
+      <div className="flex size-11 shrink-0 items-center justify-center rounded-full border-2 border-dashed border-border text-[11px] text-muted-foreground">
         —
       </div>
     );
@@ -196,7 +215,7 @@ function PurchaseSignalCard({
             <BadgeDollarSign className="h-3.5 w-3.5" />
             {t('purchase.sent')}
             {p.manual ? (
-              <span className="text-[10px] font-normal text-muted-foreground">
+              <span className="text-[11px] font-normal text-muted-foreground">
                 {t('purchase.manual')}
               </span>
             ) : null}
@@ -288,7 +307,7 @@ function LeadDetail({
                 <dt className="shrink-0 text-muted-foreground">{f.label ?? f.key}:</dt>
                 <dd className="min-w-0 break-words font-medium text-foreground">{f.value}</dd>
                 {f.confidence === 'low' ? (
-                  <span className="text-[10px] text-muted-foreground">({t('detail.unsure')})</span>
+                  <span className="text-[11px] text-muted-foreground">({t('detail.unsure')})</span>
                 ) : null}
               </div>
             ))}
@@ -404,6 +423,13 @@ export interface LeadsBoardViewProps {
     stage: PipelineStageKey,
     extras?: StageChangeExtras,
   ) => Promise<boolean>;
+  /** Controlled: these values ARE the query's arguments, owned by the page. */
+  filters: LeadsFilters;
+  onFiltersChange: (filters: LeadsFilters) => void;
+  pageSize: number;
+  onPageChange: (page: number) => void;
+  /** A page/filter change is in flight — the rows below are the previous ones. */
+  busy?: boolean;
 }
 
 export function LeadsBoardView({
@@ -416,41 +442,30 @@ export function LeadsBoardView({
   onReopenItem,
   onSendPurchaseSignal,
   onStageChange,
+  filters,
+  onFiltersChange,
+  pageSize,
+  onPageChange,
+  busy = false,
 }: LeadsBoardViewProps) {
   const t = useTranslations('Leads');
   const tFunnel = useTranslations('Inbox.funnel');
   const [openId, setOpenId] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [serviceFilter, setServiceFilter] = useState<string>('all');
-  const [search, setSearch] = useState('');
 
-  const services = useMemo(
-    () => [...new Set(board.leads.map((l) => l.serviceName).filter((s): s is string => !!s))].sort(),
-    [board.leads],
-  );
-
-  const visible = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return board.leads.filter((l) => {
-      if (statusFilter === 'qualified' && l.status !== 'qualified') return false;
-      if (statusFilter === 'collecting' && l.status !== 'collecting') return false;
-      if (statusFilter === 'closed' && !CLOSED.has(l.status)) return false;
-      if (serviceFilter !== 'all' && l.serviceName !== serviceFilter) return false;
-      if (
-        q &&
-        ![l.contactName, l.contactPhone, l.serviceName ?? '', l.assigneeName ?? '', l.summary ?? '']
-          .join(' ')
-          .toLowerCase()
-          .includes(q)
-      ) {
-        return false;
-      }
-      return true;
-    });
-  }, [board.leads, statusFilter, serviceFilter, search]);
+  // Status/service/search used to be local state filtering `board.leads`.
+  // They are query arguments now — `qualification.leadsBoard` filters the
+  // whole board server-side and returns one page — so they arrive as
+  // props. Left in here they would have narrowed from "search the board"
+  // to "search these 25 rows" the moment paging landed.
+  const { status: statusFilter, service: serviceFilter, search } = filters;
+  const services = board.services;
+  const filtering =
+    statusFilter !== 'all' || serviceFilter !== 'all' || search.trim() !== '';
 
   const pills: { id: StatusFilter; label: string; count: number }[] = [
-    { id: 'all', label: t('filters.all'), count: board.leads.length },
+    // `summary.total`, not `leads.length`: the latter is now one page, so
+    // this pill would have read "All 25" on a 400-lead board.
+    { id: 'all', label: t('filters.all'), count: board.summary.total },
     { id: 'qualified', label: t('summary.qualified'), count: board.summary.qualified },
     { id: 'collecting', label: t('summary.collecting'), count: board.summary.collecting },
     {
@@ -528,7 +543,7 @@ export function LeadsBoardView({
           <button
             key={p.id}
             type="button"
-            onClick={() => setStatusFilter(p.id)}
+            onClick={() => onFiltersChange({ ...filters, status: p.id })}
             className={cn(
               'rounded-full border px-3 py-1 text-xs font-medium transition-colors',
               statusFilter === p.id
@@ -542,7 +557,7 @@ export function LeadsBoardView({
         {services.length > 0 ? (
           <select
             value={serviceFilter}
-            onChange={(e) => setServiceFilter(e.target.value)}
+            onChange={(e) => onFiltersChange({ ...filters, service: e.target.value })}
             className="h-7 rounded-full border border-border bg-background px-2 text-xs text-foreground"
             aria-label={t('filters.service')}
           >
@@ -556,22 +571,22 @@ export function LeadsBoardView({
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => onFiltersChange({ ...filters, search: e.target.value })}
             placeholder={t('filters.searchPlaceholder')}
             className="h-8 pl-8 text-sm"
           />
         </div>
       </div>
 
-      <div className="mt-4 space-y-2">
-        {visible.length === 0 ? (
+      <div className={cn('mt-4 space-y-2', busy && 'opacity-60')} aria-busy={busy || undefined}>
+        {board.leads.length === 0 ? (
           <Card>
             <CardContent className="py-10 text-center text-sm text-muted-foreground">
-              {board.leads.length === 0 ? t('empty') : t('filters.noMatches')}
+              {filtering ? t('filters.noMatches') : t('empty')}
             </CardContent>
           </Card>
         ) : (
-          visible.map((lead) => {
+          board.leads.map((lead) => {
             const SourceIcon = SOURCE_ICON[lead.source];
             const open = openId === lead.sessionId;
             return (
@@ -592,7 +607,7 @@ export function LeadsBoardView({
                           ) : null}
                           <Badge
                             variant="outline"
-                            className={cn('gap-1 text-[10px]', STATUS_STYLE[lead.status])}
+                            className={cn('gap-1 text-[11px]', STATUS_STYLE[lead.status])}
                           >
                             {lead.status === 'qualified' ? <BadgeCheck className="h-3 w-3" /> : null}
                             {t(`status.${lead.status}` as never)}
@@ -601,7 +616,7 @@ export function LeadsBoardView({
                             <Badge
                               variant="outline"
                               className={cn(
-                                'text-[10px]',
+                                'text-[11px]',
                                 lead.funnelStage === 'purchased'
                                   ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-500'
                                   : lead.funnelStage === 'lost'
@@ -615,7 +630,7 @@ export function LeadsBoardView({
                           {lead.purchase?.status === 'sent' ? (
                             <Badge
                               variant="outline"
-                              className="gap-1 border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-500"
+                              className="gap-1 border-emerald-500/40 bg-emerald-500/10 text-[11px] text-emerald-500"
                               title={t('purchase.sentTooltip')}
                             >
                               <BadgeDollarSign className="h-3 w-3" />
@@ -693,6 +708,15 @@ export function LeadsBoardView({
           })
         )}
       </div>
+
+      <Pagination
+        page={board.page}
+        pageSize={pageSize}
+        total={board.total}
+        onPageChange={onPageChange}
+        busy={busy}
+        className="mt-4"
+      />
         </>
       )}
     </div>

@@ -1,8 +1,9 @@
-import { expect, test } from "vitest";
+import { describe, expect, it, test } from "vitest";
 import {
   localDayKeyFromMs,
   localMidnightMsDaysAgo,
   localMondayIndexFromMs,
+  localMondayStartMsFromMs,
 } from "./dashboardDate";
 
 // ============================================================
@@ -83,4 +84,22 @@ test("localMondayIndexFromMs uses the LOCAL day-of-week, not the UTC one, near a
   expect(
     localMondayIndexFromMs(Date.parse("2026-07-08T20:00:00.000Z"), tzOffsetMinutes),
   ).toBe(3);
+});
+
+describe("localMondayStartMsFromMs", () => {
+  it("returns local midnight of the week's Monday", () => {
+    const wed = Date.parse("2026-08-05T10:00:00Z");
+    expect(localMondayStartMsFromMs(wed, 0)).toBe(Date.parse("2026-08-03T00:00:00Z"));
+  });
+
+  it("is idempotent on a Monday midnight", () => {
+    const mon = Date.parse("2026-08-03T00:00:00Z");
+    expect(localMondayStartMsFromMs(mon, 0)).toBe(mon);
+  });
+
+  it("offsets the boundary by the caller's timezone", () => {
+    // UTC+4 (-240): local Monday midnight is 2026-08-02T20:00Z.
+    const wed = Date.parse("2026-08-05T10:00:00Z");
+    expect(localMondayStartMsFromMs(wed, -240)).toBe(Date.parse("2026-08-02T20:00:00Z"));
+  });
 });

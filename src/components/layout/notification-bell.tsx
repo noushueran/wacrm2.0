@@ -129,7 +129,7 @@ export function NotificationBell() {
         {badge && (
           <span
             aria-hidden
-            className="absolute right-1.5 top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold leading-none text-white ring-2 ring-background"
+            className="absolute right-1.5 top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[11px] font-semibold leading-none text-white ring-2 ring-background"
           >
             {badge}
           </span>
@@ -231,7 +231,7 @@ export function NotificationBell() {
                           {n.body}
                         </span>
                       )}
-                      <span className="mt-1 block text-[11px] text-muted-foreground/70">
+                      <span className="mt-1 block text-[12px] text-muted-foreground/70">
                         {formatDistanceToNow(new Date(n.created_at), {
                           addSuffix: true,
                         })}
