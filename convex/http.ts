@@ -2,12 +2,15 @@ import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { auth } from "./auth";
+import { runBestEffort } from "./ingest";
 import type { ActionCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import {
   flattenInboundMessage,
   isRecipientStatus,
   isTemplateWebhookField,
+  parseStatusError,
+  parseStatusPricing,
   parseTemplateStatusUpdate,
   resolveContactName,
   type MetaWebhookBody,
@@ -110,6 +113,44 @@ async function processChange(
 
   if (value.statuses) {
     for (const status of value.statuses) {
+      // Billing/window capture runs FIRST and independently of the
+      // recipient-status guard below: Meta attaches `pricing` /
+      // `conversation` to statuses whose `status` string we may not
+      // recognize, and that data is authoritative for the messaging
+      // window. Dropping it because of an unknown status value would
+      // lose the only signal Meta gives us about what a send costs.
+      // Best-effort: pricing capture must never take down the delivery-status
+      // and inbound-message handling that follow it. `processChange` is only
+      // wrapped per-CHANGE, so an unguarded throw here would skip the rest of
+      // this change's statuses AND its `value.messages` branch — and
+      // `ingestWebhook` answers 200 regardless, so Meta would never retry.
+      const pricing = parseStatusPricing(status);
+      if (pricing) {
+        await runBestEffort("messages.applyStatusPricing", () =>
+          ctx.runMutation(internal.messages.applyStatusPricing, {
+            wamid: status.id,
+            accountId: accountId ?? undefined,
+            pricing,
+          }),
+        );
+      }
+
+      // Failure-reason capture — same independent, best-effort treatment as
+      // pricing above, and for the same reason: it must never take down the
+      // delivery-status/inbound handling that follows. Diagnostic only
+      // (see `deliveryError`'s comment in schema.ts) — nothing downstream
+      // reads it yet.
+      const statusError = parseStatusError(status);
+      if (statusError) {
+        await runBestEffort("messages.applyStatusError", () =>
+          ctx.runMutation(internal.messages.applyStatusError, {
+            wamid: status.id,
+            accountId: accountId ?? undefined,
+            error: statusError,
+          }),
+        );
+      }
+
       if (!isRecipientStatus(status.status)) {
         console.warn(
           "[webhook httpAction] unrecognized recipient status, skipping:",

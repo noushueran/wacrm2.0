@@ -221,7 +221,7 @@ function StageColumn({
         <h3 className="truncate text-sm font-semibold text-foreground">
           {stage.name}
         </h3>
-        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[12px] font-medium text-muted-foreground">
           {deals.length}
         </span>
       </div>

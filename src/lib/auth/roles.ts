@@ -146,7 +146,7 @@ export function canAssignToOthers(role: AccountRole): boolean {
 
 // ── Section access (nav + settings rail) ────────────────────────────
 /** Top-level nav hrefs. */
-export const AGENT_NAV = ["/inbox", "/notifications", "/leads"] as const;
+export const AGENT_NAV = ["/inbox", "/notifications", "/leads", "/lead-analysis"] as const;
 export const VIEWER_NAV = ["/inbox"] as const;
 
 /**
@@ -167,10 +167,11 @@ export const SUPERVISOR_NAV = [
   "/inbox",
   "/notifications",
   "/leads",
+  "/lead-analysis",
   "/contacts",
   "/pipelines",
   "/broadcasts",
-  "/campaigns",
+  "/reports",
   "/settings",
 ] as const;
 
@@ -210,6 +211,7 @@ export type SettingsSectionKey =
   | "api"
   | "conversions"
   | "qualification"
+  | "lead-sequence"
   | "cron";
 
 const PERSONAL_SECTIONS: SettingsSectionKey[] = [
@@ -223,11 +225,17 @@ const PERSONAL_SECTIONS: SettingsSectionKey[] = [
 // they cannot invite, remove, or change anyone's role.
 // `qualification` IS here — it configures the AI agent's question flow,
 // which supervisors are deliberately kept out of.
+// `lead-sequence` IS here too, and for a sharper reason: it is the
+// on/off switch (and template wiring) for sending real WhatsApp
+// marketing templates to real customers on the owner's Meta account.
+// A misconfiguration here costs Meta quality rating and can spam a
+// customer — admin+ only, never supervisor.
 const CRITICAL_SECTIONS: SettingsSectionKey[] = [
   "whatsapp",
   "api",
   "conversions",
   "qualification",
+  "lead-sequence",
   "cron",
 ];
 

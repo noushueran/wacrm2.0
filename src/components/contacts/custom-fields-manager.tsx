@@ -320,7 +320,7 @@ function FieldRow({
       {(field.field_type === 'select' || field.field_type === 'multiselect') && (
         <OptionsEditor field={field} onSave={onSaveOptions} />
       )}
-      <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
+      <span className="shrink-0 text-[11px] uppercase text-muted-foreground">
         {t(TYPE_LABEL_KEY[field.field_type] ?? 'typeText')}
       </span>
       <Button

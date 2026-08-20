@@ -454,7 +454,7 @@ test("sendMedia in DRY-RUN persists BOTH mediaKey and mediaUrl when a mediaKey i
     conversationId,
     to: "15551234567",
     kind: "image" as const,
-    link: "https://objs.holidayys.co/acc1/outbound/photo.png",
+    link: "https://objs.amaniworld.com/acc1/outbound/photo.png",
     mediaKey: `${accountId}/outbound/photo.png`,
     caption: "Here's the photo",
   });
@@ -472,7 +472,7 @@ test("sendMedia in DRY-RUN persists BOTH mediaKey and mediaUrl when a mediaKey i
   // prefers the key anyway, so keeping both is safe and matches every
   // other row in this migration (`messages.mediaKey` dual-write).
   expect(messages[0]!.mediaUrl).toBe(
-    "https://objs.holidayys.co/acc1/outbound/photo.png",
+    "https://objs.amaniworld.com/acc1/outbound/photo.png",
   );
   expect(messages[0]!.messageId).toBe(result.whatsappMessageId);
 

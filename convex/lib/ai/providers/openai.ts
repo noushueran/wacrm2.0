@@ -1,6 +1,5 @@
-import { AiError, type ChatMessage, type ProviderResult } from "../types";
-import { MAX_OUTPUT_TOKENS } from "../defaults";
-import { reasoningEffortFor } from "../reasoning";
+import { AiError, type ProviderResult } from "../types";
+import { maxOutputTokensFor, supportsReasoningEffort } from "../defaults";
 import {
   mergeConsecutive,
   normalizeUsage,
@@ -26,34 +25,12 @@ interface OpenAiResponse {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
-  };
-}
-
-/**
- * The exact JSON body sent to Chat Completions. Extracted as a pure
- * builder so the wire shape — specifically the presence/absence of
- * `reasoning_effort` and the effective token cap — is pinned by
- * `openai.test.ts` without any fetch, the same way
- * `whatsapp/metaApi.ts`'s payload builders are.
- */
-export function buildOpenAiRequestBody(args: {
-  model: string;
-  systemPrompt: string;
-  messages: ChatMessage[];
-  maxTokens?: number;
-}): Record<string, unknown> {
-  const { model, systemPrompt, messages, maxTokens } = args;
-  // `max_completion_tokens` is shared between reasoning tokens and the
-  // reply itself. Left unpinned, a reasoning-by-default model can spend
-  // the whole budget thinking and return a 200 with empty `content`,
-  // which surfaces below as an `empty_response` AiError. `null` ⇒ the
-  // model would 400 on the argument, so omit it. See `../reasoning.ts`.
-  const effort = reasoningEffortFor(model);
-  return {
-    model,
-    messages: [{ role: "system", content: systemPrompt }, ...mergeConsecutive(messages)],
-    max_completion_tokens: maxTokens ?? MAX_OUTPUT_TOKENS,
-    ...(effort ? { reasoning_effort: effort } : {}),
+    /** Prefix-cache hits. Billed at ~10% of the input rate — see
+     *  `AiUsage.cachedPromptTokens`. */
+    prompt_tokens_details?: { cached_tokens?: number };
+    /** Reasoning tokens, billed at the output rate and drawn from
+     *  `max_completion_tokens` — see `AiUsage.reasoningTokens`. */
+    completion_tokens_details?: { reasoning_tokens?: number };
   };
 }
 
@@ -63,7 +40,15 @@ export function buildOpenAiRequestBody(args: {
  * in `generate.ts`'s `generateReply`).
  */
 export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult> {
-  const { apiKey, model, systemPrompt, messages, timeoutMs, maxTokens } = args;
+  const { apiKey, model, systemPrompt, messages, timeoutMs, reasoningEffort, promptCacheKey } =
+    args;
+
+  // `reasoning_effort` is only valid on reasoning models and is rejected
+  // outright by older chat models, so it is sent ONLY when both the
+  // caller asked for a level and the model can take one — the same guard
+  // `media.ts` has always applied to its vision calls.
+  const effort =
+    reasoningEffort && supportsReasoningEffort(model) ? reasoningEffort : null;
 
   let res: Response;
   try {
@@ -73,9 +58,22 @@ export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(
-        buildOpenAiRequestBody({ model, systemPrompt, messages, maxTokens }),
-      ),
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "system", content: systemPrompt }, ...mergeConsecutive(messages)],
+        // Sized from the effort level, NOT the flat visible-reply budget:
+        // reasoning tokens come out of this same allowance, so a bare 320
+        // could be consumed entirely by reasoning, returning empty
+        // `content` — which this adapter throws as `empty_response`,
+        // costing a full retry and landing the customer on the generic
+        // fallback. See `maxOutputTokensFor`.
+        max_completion_tokens: maxOutputTokensFor(effort),
+        ...(effort ? { reasoning_effort: effort } : {}),
+        // Routes this request to the shard already holding its prefix.
+        // Omitted entirely when absent so the body stays byte-identical
+        // for callers that don't set one.
+        ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+      }),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
@@ -97,6 +95,8 @@ export async function generateOpenAi(args: ProviderArgs): Promise<ProviderResult
     prompt: data?.usage?.prompt_tokens,
     completion: data?.usage?.completion_tokens,
     total: data?.usage?.total_tokens,
+    cached: data?.usage?.prompt_tokens_details?.cached_tokens,
+    reasoning: data?.usage?.completion_tokens_details?.reasoning_tokens,
   });
   return { text, usage };
 }

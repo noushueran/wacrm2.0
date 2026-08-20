@@ -170,10 +170,11 @@ describe("capability predicates", () => {
     expect(canAccessNav("supervisor", "/dashboard")).toBe(true);
     expect(canAccessNav("supervisor", "/inbox")).toBe(true);
     expect(canAccessNav("supervisor", "/leads")).toBe(true);
+    expect(canAccessNav("supervisor", "/lead-analysis")).toBe(true);
     expect(canAccessNav("supervisor", "/contacts")).toBe(true);
     expect(canAccessNav("supervisor", "/pipelines")).toBe(true);
     expect(canAccessNav("supervisor", "/broadcasts")).toBe(true);
-    expect(canAccessNav("supervisor", "/campaigns")).toBe(true);
+    expect(canAccessNav("supervisor", "/reports")).toBe(true);
     // Must stay granted: the sidebar filters the Settings link through
     // canAccessNav, and the route guard uses canAccessRoute.
     expect(canAccessNav("supervisor", "/settings")).toBe(true);
@@ -183,10 +184,25 @@ describe("capability predicates", () => {
     expect(canAccessNav("supervisor", "/agents")).toBe(false);
     expect(canAccessNav("supervisor", "/automations")).toBe(false);
     expect(canAccessNav("supervisor", "/flows")).toBe(false);
+    // /campaigns was replaced by /reports in the allowlist, not joined by
+    // it — see SUPERVISOR_NAV's own "allowlist by deliberate design"
+    // comment.
+    expect(canAccessNav("supervisor", "/campaigns")).toBe(false);
+  });
+
+  it("supervisors reach /reports (including nested paths) and no longer reach /campaigns", () => {
+    expect(canAccessNav("supervisor", "/reports")).toBe(true);
+    expect(canAccessNav("supervisor", "/reports/anything")).toBe(true);
+    expect(canAccessNav("supervisor", "/campaigns")).toBe(false);
+  });
+
+  it("agents and viewers do not reach /reports", () => {
+    expect(canAccessNav("agent", "/reports")).toBe(false);
+    expect(canAccessNav("viewer", "/reports")).toBe(false);
   });
 
   it("canAccessNav still admits admin and owner everywhere", () => {
-    for (const href of ["/agents", "/automations", "/flows", "/campaigns"]) {
+    for (const href of ["/agents", "/automations", "/flows", "/reports"]) {
       expect(canAccessNav("admin", href)).toBe(true);
       expect(canAccessNav("owner", href)).toBe(true);
     }
@@ -196,6 +212,13 @@ describe("capability predicates", () => {
     expect(canAccessNav("agent", "/inbox")).toBe(true);
     expect(canAccessNav("agent", "/notifications")).toBe(true);
     expect(canAccessNav("agent", "/leads")).toBe(true);
+    // The board is agent-visible (the query narrows it to their own
+    // assigned leads); viewers have no lead board at all. `roles.ts` is
+    // an allowlist, so without its entry the route guard would lock
+    // agents and supervisors out of the page entirely.
+    expect(canAccessNav("agent", "/lead-analysis")).toBe(true);
+    expect(canAccessRoute("agent", "/lead-analysis")).toBe(true);
+    expect(canAccessNav("viewer", "/lead-analysis")).toBe(false);
     expect(canAccessNav("agent", "/campaigns")).toBe(false);
     expect(canAccessNav("agent", "/agents")).toBe(false);
     expect(canAccessNav("viewer", "/inbox")).toBe(true);

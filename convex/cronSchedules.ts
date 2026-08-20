@@ -130,6 +130,22 @@ export const runSweepFollowUps = internalAction({
     ),
 });
 
+export const runSweepLeadScoring = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(ctx, "lead-scoring", internal.leadAnalysisEngine.sweepScoring),
+});
+
+export const runSweepLeadSequence = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(
+      ctx,
+      "lead-sequence",
+      internal.leadAnalysisEngine.sweepLeadSequence,
+    ),
+});
+
 export const runSweepLeadOffers = internalAction({
   args: {},
   handler: (ctx): Promise<void> =>
@@ -148,6 +164,91 @@ export const runStaffLoops = internalAction({
       "qualification-staff-loops",
       internal.qualificationEngine.runStaffLoops,
     ),
+});
+
+// `sweepChaseAssign` (spec 2026-07-27-inbox-lanes §Chasing ownership) is
+// an `internalMutation`, not an `internalAction` like every other sweep
+// target above — `runWrapped` is typed to `ctx.runAction` an action
+// reference, so it can't dispatch this one. Same recordStart/try/
+// recordResult shape, just `ctx.runMutation` in place of `ctx.runAction`.
+async function runWrappedMutation(
+  ctx: ActionCtx,
+  name: CronName,
+  target: FunctionReference<"mutation", "internal", Record<string, never>>,
+): Promise<void> {
+  const runId: Id<"cronRuns"> = await ctx.runMutation(
+    internal.cronSchedules.recordStart,
+    { name },
+  );
+  try {
+    await ctx.runMutation(target, {});
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await ctx.runMutation(internal.cronSchedules.recordResult, {
+      runId,
+      ok: false,
+      error: message,
+    });
+    throw err;
+  }
+  await ctx.runMutation(internal.cronSchedules.recordResult, {
+    runId,
+    ok: true,
+  });
+}
+
+export const runSweepChaseAssign = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrappedMutation(
+      ctx,
+      "inbox-chase-assign",
+      internal.inboxChaseAssign.sweepChaseAssign,
+    ),
+});
+
+export const runSweepSnoozeWake = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrappedMutation(
+      ctx,
+      "inbox-snooze-wake",
+      internal.inboxOverrides.sweepSnoozeWake,
+    ),
+});
+
+export const runRefreshDashboardSnapshots = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrappedMutation(
+      ctx,
+      "dashboard-snapshot",
+      internal.dashboard.refreshSnapshots,
+    ),
+});
+
+export const runRevivalSweep = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(ctx, "revival-sweep", internal.revivalEngine.sweep),
+});
+
+export const runKbGapSweep = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(ctx, "kbgap-sweep", internal.kbGapEngine.sweep),
+});
+
+export const runSalesCoachSweep = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(ctx, "sales-coach-sweep", internal.salesCoachEngine.sweep),
+});
+
+export const runSweepTimeBased = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(ctx, "automations-time-based", internal.automationsEngine.sweepTimeBased),
 });
 
 function pickRun(row: Doc<"cronRuns">) {

@@ -40,11 +40,17 @@ const FETCH_TIMEOUT_MS = 20_000;
 /** Reject up front on Content-Length; pages this size are never landing
  *  pages. (The body read is additionally capped at `LANDING_HTML_MAX`.) */
 const MAX_CONTENT_LENGTH_BYTES = 5_000_000;
+import { brandName, brandSiteUrl } from "./lib/brand";
 /** Some hosts (fb.me permalinks included) serve bots a bare shell; a
  *  browsery UA with an honest product token gets the real page + og:
  *  metadata in practice. */
-const FETCH_USER_AGENT =
-  "Mozilla/5.0 (compatible; HolidayysCRM-AdContext/1.0; +https://wa.holidayys.co)";
+function fetchUserAgent(): string {
+  // A FUNCTION, not a module-level const: `brandName()` throws when the
+  // deployment has no BRAND_NAME, and at module scope that throw would
+  // break every Convex function importing this file rather than the one
+  // fetch that needs the header.
+  return `Mozilla/5.0 (compatible; ${brandName()}CRM-AdContext/1.0; +${brandSiteUrl()})`;
+}
 
 /** The cache row for a normalized landing URL, or `null`. Callers use
  *  whatever content fields are present regardless of `status` — see the
@@ -210,7 +216,7 @@ async function fetchAndExtract(url: string): Promise<FetchOutcome> {
         redirect: "follow",
         signal: controller.signal,
         headers: {
-          "User-Agent": FETCH_USER_AGENT,
+          "User-Agent": fetchUserAgent(),
           Accept: "text/html,application/xhtml+xml",
         },
       });

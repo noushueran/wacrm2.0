@@ -1,6 +1,7 @@
 "use client";
 
 import { List, Reply } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { cn } from "@/lib/utils";
 import type { InteractiveMessagePayload } from "@/lib/whatsapp/interactive";
 
@@ -10,9 +11,11 @@ import type { InteractiveMessagePayload } from "@/lib/whatsapp/interactive";
  * sent buttons/list message shows the same way it does on the phone.
  *
  * Purely presentational — the buttons/rows are not clickable here (the
- * customer taps them on their own device). Kept namespace-free (plain
- * English) so it can be dropped into the composer, the automation
- * builder, and the quick-replies manager without namespace coupling.
+ * customer taps them on their own device). Its handful of empty-state
+ * strings live in a dedicated top-level `InteractivePreview` namespace
+ * rather than any caller's, so it can be dropped into the composer, the
+ * automation builder, and the quick-replies manager without coupling to
+ * whichever namespace happens to be around it.
  */
 export function InteractivePreview({
   payload,
@@ -21,6 +24,8 @@ export function InteractivePreview({
   payload: InteractiveMessagePayload;
   className?: string;
 }) {
+  const t = useTranslations("InteractivePreview");
+
   return (
     <div
       className={cn(
@@ -36,11 +41,11 @@ export function InteractivePreview({
         ) : null}
         <p className="whitespace-pre-wrap break-words text-sm">
           {payload.body || (
-            <span className="text-muted-foreground">Message body…</span>
+            <span className="text-muted-foreground">{t("bodyPlaceholder")}</span>
           )}
         </p>
         {payload.footer ? (
-          <p className="mt-1 break-words text-[11px] text-muted-foreground">
+          <p className="mt-1 break-words text-[12px] text-muted-foreground">
             {payload.footer}
           </p>
         ) : null}
@@ -56,7 +61,7 @@ export function InteractivePreview({
               className="flex items-center justify-center gap-1.5 border-t border-border py-2 text-sm font-medium text-primary first:border-t-0"
             >
               <Reply className="h-3.5 w-3.5" />
-              <span className="truncate">{b.title || "Button"}</span>
+              <span className="truncate">{b.title || t("buttonFallback")}</span>
             </button>
           ))}
         </div>
@@ -67,7 +72,7 @@ export function InteractivePreview({
           className="flex w-full items-center justify-center gap-1.5 border-t border-border py-2 text-sm font-medium text-primary"
         >
           <List className="h-3.5 w-3.5" />
-          <span className="truncate">{payload.button_label || "Menu"}</span>
+          <span className="truncate">{payload.button_label || t("menuFallback")}</span>
         </button>
       )}
     </div>

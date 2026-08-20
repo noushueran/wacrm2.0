@@ -76,7 +76,13 @@ export function SettingsOverview({
   const [whatsappHealthLoading, setWhatsappHealthLoading] = useState(true);
 
   useEffect(() => {
-    if (!user || !accountId || !canSeeWhatsapp) return;
+    // Gate on `user?.id`, the same thing the dependency list tracks.
+    // Guarding on the whole `user` object instead made the body depend on
+    // something the deps did not name, which is what the rule was
+    // pointing at; widening the deps to `user` would have re-run this
+    // action on every identity change of that object rather than on an
+    // actual change of signed-in user.
+    if (!user?.id || !accountId || !canSeeWhatsapp) return;
     let cancelled = false;
 
     (async () => {

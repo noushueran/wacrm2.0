@@ -34,7 +34,7 @@ import { buildMediaKey, parseMediaKey, MEDIA_KINDS } from "./lib/r2/keys";
 // this task).
 //
 // Reading is no longer a privileged operation either, which is why
-// there is no `getUrl` here anymore: `objs.holidayys.co` is a PUBLIC
+// there is no `getUrl` here anymore: the R2 public host is a PUBLIC
 // custom domain, so the object's URL is pure string concatenation from
 // its key (`src/lib/storage/media-url.ts`'s `mediaUrlFromKey`) — it
 // needs no auth, no signing, and no per-caller ownership check. Only

@@ -6,7 +6,7 @@ import { canAccessConversation, hasMinRole } from "./lib/roles";
 import type { Id } from "./_generated/dataModel";
 import { r2ConfigFromEnv } from "./lib/r2/config";
 import { resolveMediaUrlLazy } from "./lib/r2/url";
-import { parseMediaKey } from "./lib/r2/keys";
+import { parseMediaKey, type MediaKind } from "./lib/r2/keys";
 
 // ============================================================
 // `send` — the authed, PUBLIC entrypoint the Inbox + contact-detail
@@ -37,6 +37,25 @@ import { parseMediaKey } from "./lib/r2/keys";
 // decrypt, send, persist" already means there; this module only routes
 // to it via `ctx.runAction`.
 // ============================================================
+
+/**
+ * The ONLY `convex/lib/r2/keys.ts` `MediaKind`s this action's media
+ * branch (`image`/`video`/`document`/`audio`) may ever forward to Meta.
+ * `message-composer.tsx` (this action's one real caller for these
+ * message types) unconditionally mints its upload as `"outbound"` — see
+ * that file's own comment on why the R2 kind and the WhatsApp content-
+ * type taxonomy are different axes. Every other `MediaKind` exists for
+ * a DIFFERENT purpose that never reaches this argument: `"note"` is
+ * internal-only evidence attached via `contactNotes.add`/`update` and
+ * must never be sent to a customer — the one invariant this whole
+ * feature exists to protect — while `"inbound"`/`"template"`/`"flow"`/
+ * `"avatar"`/`"ad"` are written or read by entirely different code
+ * paths (inbound media storage, template-header submission, flow-node
+ * config, profile avatars, CTWA ad images) that don't hand a key to
+ * `send`. Rejected the same non-leaky way as an unowned or malformed
+ * key — `NOT_FOUND`, never a distinguishable error.
+ */
+const SENDABLE_MEDIA_KINDS: ReadonlySet<MediaKind> = new Set(["outbound"]);
 
 export const send = action({
   args: {
@@ -176,11 +195,23 @@ export const send = action({
         // doesn't own getting silently resolved to a fetchable URL on
         // its behalf) — it is not a general guarantee that every
         // persisted `mediaUrl` points at this account's own media.
-        if (
-          args.mediaKey &&
-          parseMediaKey(args.mediaKey)?.accountId !== accountId
-        ) {
-          throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+        //
+        // The `kind` half of this check (`SENDABLE_MEDIA_KINDS`) closes
+        // a narrower but sharper gap: even a key this account DOES own
+        // could name a `kind` this action must never forward to a
+        // customer — most importantly `"note"`, an internal-only
+        // attachment. No UI path ever constructs such a call (see
+        // `SENDABLE_MEDIA_KINDS`'s own comment), but nothing upstream of
+        // this action enforces that a hand-crafted one couldn't.
+        if (args.mediaKey) {
+          const parsed = parseMediaKey(args.mediaKey);
+          if (
+            !parsed ||
+            parsed.accountId !== accountId ||
+            !SENDABLE_MEDIA_KINDS.has(parsed.kind)
+          ) {
+            throw new ConvexError({ code: "NOT_FOUND", entity: "file" });
+          }
         }
         // `resolveMediaUrlLazy` only builds the R2 config (which throws
         // when R2 env vars are unset — `lib/r2/config.ts`) when

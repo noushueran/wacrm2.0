@@ -7,6 +7,7 @@ import { debounceMsForText } from "./lib/ai/pacing";
 import { hasMinRole } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import { allocateContactCode } from "./contacts";
+import { insertConversation } from "./conversations";
 import {
   insertMessageAndUpdateConversation,
   type AppendMessageArgs,
@@ -159,6 +160,10 @@ export const ingestInbound = internalMutation({
         wasCreated: false,
         isFirstInboundMessage: false,
         duplicate: true,
+        // Dead on this path in practice — `processInbound` early-returns
+        // on `duplicate` before ever reading it — kept only so both
+        // return shapes stay identical rather than diverging.
+        conversationAdReferral: existingConversation.adReferral !== undefined,
       };
     }
 
@@ -207,11 +212,17 @@ export const ingestInbound = internalMutation({
     if (conversation) {
       conversationId = conversation._id;
     } else {
-      conversationId = await ctx.db.insert("conversations", {
+      // Through `insertConversation` like every other create path. This
+      // is the ONE site where the `awaitingReply: true` it writes is not
+      // load-bearing: `insertMessageAndUpdateConversation` runs below in
+      // this same transaction and sets the field from the message's own
+      // direction (`true` here, since this branch only ever runs for an
+      // inbound). It still goes through the helper so there is no
+      // second, hand-rolled shape of a new `conversations` row to keep
+      // in sync — do NOT "optimise" it back to a bare `ctx.db.insert`.
+      conversationId = await insertConversation(ctx, {
         accountId,
         contactId,
-        status: "open",
-        unreadCount: 0,
       });
       // Re-read so `insertMessageAndUpdateConversation` below gets a
       // real `Doc` (it reads `.unreadCount` off it) — `ctx.db.get`
@@ -329,6 +340,14 @@ export const ingestInbound = internalMutation({
       wasCreated,
       isFirstInboundMessage,
       duplicate: false,
+      // Whether this conversation carries the ad-lead display denorm —
+      // set from `conversation`, the PRE-patch doc read in step (2)/(4b)
+      // above (not a fresh read), so a follow-up message on an
+      // already-ad-tagged conversation still reports true even though
+      // this call didn't touch the field itself. `processInbound` reads
+      // this to decide whether a non-referral message is a follow-up on
+      // an ad lead worth a retry ad→service tagging pass — see there.
+      conversationAdReferral: conversation.adReferral !== undefined,
     };
   },
 });
@@ -681,6 +700,49 @@ export const processInbound = internalAction({
       }),
     );
 
+    // ---- Lead Analysis (spec 2026-07-26 §Scoring engine). Every inbound
+    // customer message re-arms the debounced re-score timer. Dormant-safe
+    // (no enabled config → the mutation no-ops) and best-effort: scoring
+    // is an analytics concern and must never fail message ingestion.
+    await runBestEffort("leadAnalysisEngine.onInbound", () =>
+      ctx.runMutation(internal.leadAnalysisEngine.onInbound, {
+        accountId,
+        conversationId: res.conversationId,
+        contactId: res.contactId,
+        // Fix 6: the admin alert channel is not a lead — see
+        // `onInbound`'s own doc comment for why this is excluded here
+        // rather than filtered at read time.
+        phoneNormalized: normalizePhone(from),
+      }),
+    );
+
+    // ---- Un-archive: NOT here any more (fix 2026-07-28). A customer
+    // reply always brings an archived thread back, and that is a
+    // correctness property of the Inbox rather than a courtesy — so it
+    // now runs inside `messages.ts`'s
+    // `insertMessageAndUpdateConversation`, in the same transaction as
+    // the message insert.
+    //
+    // It lived here, in `runBestEffort`, from P2 until 2026-07-28,
+    // contradicting P2's own spec. The failure mode was silent and bad:
+    // a swallowed error left an archived customer invisible in every
+    // lane while they were actively writing in, with nothing to retry
+    // it. Do not restore this call.
+
+    // ---- Stop the follow-up sequence (spec 2026-07-26 §"Stopping and
+    // returning"). Any inbound customer message means the customer is
+    // no longer quiet, so the sequence (if one is running) stops right
+    // here — the mirror image of `messages.ts`'s `armOnOutbound`, which
+    // arms it on our own outbound sends. Dormant-safe (no `leadAnalyses`
+    // row → the mutation no-ops) and best-effort: stopping a sequence
+    // must never fail message ingestion.
+    await runBestEffort("leadAnalysisEngine.stopOnInbound", () =>
+      ctx.runMutation(internal.leadAnalysisEngine.stopOnInbound, {
+        accountId,
+        conversationId: res.conversationId,
+      }),
+    );
+
     // ---- Ask-admin relay (v3): an inbound from a configured admin
     // number is the team ANSWERING the assistant's latest question —
     // record it and schedule the customer-facing relay. Self-guarding
@@ -714,21 +776,39 @@ export const processInbound = internalAction({
 
     const inboundText = message.text ?? "";
 
-    // ---- Qualification ANALYSIS (P1 — spec §7). After Flows (so a
-    // scripted reply is never delayed by an LLM call), BEFORE the AI
-    // reply below (so the assistant's prompt sees freshly-extracted
-    // state). Awaited + best-effort; runs even when a flow consumed the
-    // message or a human owns the thread — extraction is passive
-    // tracking, not replying. Text-only: media/interactive taps carry
-    // nothing to extract (their activity bump already happened in
-    // `qualificationEngine.onInbound` above).
+    // ---- Qualification ANALYSIS (P1 — spec §7). DEBOUNCED, not inline:
+    // this used to be awaited on every inbound text, so a customer
+    // fragmenting one thought across four messages bought four full
+    // extraction calls while the reply beside it collapsed to one. Same
+    // token + staleness pattern as the reply — at fire time only the run
+    // whose trigger is still the newest customer message proceeds.
+    //
+    // The ordering this replaces still holds. It used to be structural:
+    // the analysis was awaited HERE, so it always finished before the
+    // reply's debounce clock even started, which is what keeps the
+    // assistant from re-asking a question the customer just answered.
+    // Scheduling alone would have raced that away, so `dispatchInbound`
+    // now awaits the analysis itself before it reads objectives — and
+    // `analyzeInbound`'s watermark makes that second call free when this
+    // scheduled one already did the work.
+    //
+    // Still runs when a flow consumed the message or a human owns the
+    // thread: extraction is passive tracking, not replying, and those are
+    // exactly the cases where no dispatch will run it. Text-only:
+    // media/interactive taps carry nothing to extract (their activity
+    // bump already happened in `qualificationEngine.onInbound` above).
     if (inboundText.trim() && !message.interactiveReplyId) {
       await runBestEffort("qualificationEngine.analyzeInbound", () =>
-        ctx.runAction(internal.qualificationEngine.analyzeInbound, {
-          accountId,
-          conversationId: res.conversationId,
-          contactId: res.contactId,
-        }),
+        ctx.scheduler.runAfter(
+          debounceMsForText(inboundText),
+          internal.qualificationEngine.analyzeInbound,
+          {
+            accountId,
+            conversationId: res.conversationId,
+            contactId: res.contactId,
+            triggerMessageId: res.messageId,
+          },
+        ),
       );
     }
 
@@ -741,8 +821,8 @@ export const processInbound = internalAction({
       isFirstInboundMessage: res.isFirstInboundMessage,
       interactiveReplyId: message.interactiveReplyId,
     });
-    await Promise.all(
-      automationTriggers.map((triggerType) =>
+    await Promise.all([
+      ...automationTriggers.map((triggerType) =>
         runBestEffort(`automationsEngine.runForTrigger(${triggerType})`, () =>
           ctx.runAction(internal.automationsEngine.runForTrigger, {
             accountId,
@@ -756,7 +836,47 @@ export const processInbound = internalAction({
           }),
         ),
       ),
-    );
+      // Task 5, cancellation path 5: any inbound message is "the contact
+      // replied", so this runs unconditionally on which (if any)
+      // triggers matched above — `cancelRunsForContact`'s own
+      // `onlyStopOnReply` filter is what narrows this to automations
+      // that opted in via `stopOnReply`. This is an action (this
+      // function's own ctx has `runMutation`), so the cancellation
+      // happens inline rather than via a scheduled hop — no race with
+      // the run's own scheduled resume the way a plain mutation's
+      // `ctx.scheduler.runAfter` path would risk.
+      runBestEffort("automationsEngine.cancelRunsForContact", () =>
+        ctx.runMutation(internal.automationsEngine.cancelRunsForContact, {
+          accountId,
+          contactId: res.contactId,
+          reason: "contact replied",
+          onlyStopOnReply: true,
+        }),
+      ),
+    ]);
+
+    // ---- Media understanding (voice note → transcript, image →
+    // description). Deliberately OUTSIDE the auto-reply branch below and
+    // gated only on the attachment type: understanding what a customer
+    // sent is for the humans working the inbox, so it must not depend on
+    // `autoReplyEnabled`, on flows having stood down, or on there being
+    // no active auto-responder. Before 2026-07-25 it lived inside
+    // `dispatchInbound` below that gate, so an account with auto-reply
+    // off — the default — never got a transcript at all and every voice
+    // note stayed a bare "[voice note]" in the inbox.
+    //
+    // Best-effort and fire-and-forget: it sends nothing to the customer,
+    // and `dispatchInbound` re-runs the same idempotent step if it needs
+    // the text and this hasn't landed yet.
+    if ((AI_VISIBLE_MEDIA_TYPES as readonly string[]).includes(message.type)) {
+      await runBestEffort("aiReply.understandInboundMedia", () =>
+        ctx.scheduler.runAfter(0, internal.aiReply.understandInboundMedia, {
+          accountId,
+          conversationId: res.conversationId,
+          contactId: res.contactId,
+        }),
+      );
+    }
 
     // ---- AI auto-reply (route.ts:799-811) — flows win over the LLM,
     // an interactive tap never reaches the LLM either, and (closing
@@ -935,6 +1055,52 @@ export const processInbound = internalAction({
           referral: message.referral ?? {},
         }),
       );
+
+      // ---- Ad→service tagging, first (rule) pass. Scheduled rather
+      // than inline: the landing-page fetch and the Meta ad-name
+      // resolution this benefits from are both still in flight right
+      // now, and neither is worth waiting for — the retry pass below
+      // picks them up. Best-effort like everything else in this
+      // fan-out. See convex/adServiceTagging.ts.
+      await runBestEffort("adServiceTagging.tagFromAd(referral)", () =>
+        ctx.scheduler.runAfter(0, internal.adServiceTagging.tagFromAd, {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          trigger: "referral" as const,
+        }),
+      );
+    }
+
+    // ---- Ad→service tagging, retry (rule) pass. Fires on a FOLLOW-UP
+    // message in a conversation that started from an ad — the click
+    // itself is handled above. Gated on the `conversation.adReferral`
+    // display denorm, which is already on the doc `ingestInbound`
+    // returned, so a non-ad inbound costs no extra read at all.
+    // `tagFromAd`'s own status/attempt guards make a redundant
+    // schedule a no-op, so this needs no cleverness about whether the
+    // earlier pass already succeeded.
+    //
+    // Excludes BOTH `message.referral` and `message.ctwaClid` — matching
+    // the capture block's own `message.referral || message.ctwaClid`
+    // guard above, not just half of it. `webhookParse.ts` can hand back
+    // a `ctwaClid` with no `referral` (a creative-less ad click still
+    // carries the click id but has nothing previewable to surface), so
+    // a `referral`-only check would let a SECOND such click into an
+    // already-ad-tagged conversation satisfy this gate too — booking
+    // the retry pass on the same inbound as the first pass instead of
+    // reserving it for the customer's own next words, and burning both
+    // rule-pass attempts (plus triggering the paid AI fallback) on one
+    // message.
+    if (!message.referral && !message.ctwaClid && res.conversationAdReferral) {
+      await runBestEffort("adServiceTagging.tagFromAd(followup)", () =>
+        ctx.scheduler.runAfter(0, internal.adServiceTagging.tagFromAd, {
+          accountId,
+          contactId: res.contactId,
+          conversationId: res.conversationId,
+          trigger: "followup" as const,
+        }),
+      );
     }
 
     return { duplicate: false, flowConsumed };
@@ -989,6 +1155,11 @@ export const checkAgentReplySla = internalMutation({
     if (!conversation || conversation.accountId !== args.accountId) return;
     if (!conversation.assignedToUserId) return; // bot-owned — bot always replies
     if (conversation.status === "closed") return;
+    // Archived (P2 final-fixes Fix 7): a thread archived inside the SLA
+    // window is a dead conversation, same as a closed one — nobody is
+    // meant to be watching it, so the alert must not fire even though
+    // `status` itself is untouched by archiving.
+    if (conversation.archivedAt !== undefined) return;
     const inbound = await ctx.db.get(args.inboundMessageId);
     if (!inbound || inbound.conversationId !== args.conversationId) return;
 
@@ -1044,6 +1215,11 @@ export const checkAgentReplySla = internalMutation({
           accountId: args.accountId,
           phone: member.phone,
           text: `⚠️ ${body} Please check the inbox.`,
+          // The `insertNotification` bell above already covers this
+          // alert, so a skip on a closed window loses nothing — unlike
+          // `notifyStaffText`'s other callers, which default to always
+          // attempting (see that action's doc comment for why).
+          skipWhenWindowClosed: true,
         });
       }
     }

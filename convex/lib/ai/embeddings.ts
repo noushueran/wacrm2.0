@@ -49,6 +49,9 @@ function requestTimeoutMs(): number {
 
 interface EmbeddingResponse {
   data?: { embedding?: number[]; index?: number }[];
+  /** The embeddings endpoint reports input tokens only — there is no
+   *  completion side, and no prefix cache. */
+  usage?: { prompt_tokens?: number; total_tokens?: number };
 }
 
 /**
@@ -60,8 +63,18 @@ interface EmbeddingResponse {
 export async function embedTexts(
   apiKey: string,
   inputs: string[],
+  /**
+   * Optional spend sink, summed across batches. Embeddings are cheap per
+   * call but relentless — every knowledge-base retrieval embeds its
+   * query, and a fully-enabled inbound retrieves up to three times
+   * (auto-reply, qualification analysis, purchase judge) — and none of
+   * it was recorded anywhere before the 2026-07-27 audit.
+   */
+  onUsage?: (usage: { model: string; promptTokens: number; totalTokens: number }) => void,
 ): Promise<number[][]> {
   if (inputs.length === 0) return [];
+  let promptTokens = 0;
+  let totalTokens = 0;
   const timeoutMs = requestTimeoutMs();
   const out: number[][] = [];
 
@@ -103,6 +116,14 @@ export async function embedTexts(
     }
 
     const data = (await res.json().catch(() => null)) as EmbeddingResponse | null;
+    // Accumulated before the validity checks below: a malformed batch was
+    // still billed, and throwing away the count would under-report spend
+    // on exactly the failures worth noticing.
+    const num = (v: unknown): number =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+    promptTokens += num(data?.usage?.prompt_tokens);
+    totalTokens += num(data?.usage?.total_tokens);
+
     const rows = data?.data;
     if (!rows || rows.length !== batch.length) {
       throw new Error("OpenAI embeddings response was malformed.");
@@ -122,6 +143,12 @@ export async function embedTexts(
       out.push(r.embedding);
     }
   }
+
+  // One report for the whole call, not one per batch — the caller logs a
+  // single usage row per retrieval, and a 200-chunk ingest would
+  // otherwise write three rows for what is logically one operation.
+  const billed = totalTokens > 0 ? totalTokens : promptTokens;
+  if (billed > 0) onUsage?.({ model: EMBEDDING_MODEL, promptTokens, totalTokens: billed });
 
   return out;
 }

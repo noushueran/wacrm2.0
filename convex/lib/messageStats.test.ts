@@ -76,3 +76,35 @@ describe("foldHoursIntoDays", () => {
     expect(HOUR_MS).toBe(3_600_000);
   });
 });
+
+import { utcDayStartMs, DAY_MS } from "./messageStats";
+
+describe("utcDayStartMs", () => {
+  it("floors to the containing UTC day", () => {
+    const t = Date.parse("2026-08-06T13:42:17.512Z");
+    expect(utcDayStartMs(t)).toBe(Date.parse("2026-08-06T00:00:00.000Z"));
+  });
+
+  it("is idempotent on an exact day boundary", () => {
+    const t = Date.parse("2026-08-06T00:00:00.000Z");
+    expect(utcDayStartMs(t)).toBe(t);
+  });
+
+  it("puts the last millisecond of a day in that day, not the next", () => {
+    const t = Date.parse("2026-08-06T23:59:59.999Z");
+    expect(utcDayStartMs(t)).toBe(Date.parse("2026-08-06T00:00:00.000Z"));
+  });
+
+  // The dedup marker is compared for equality against this, so two instants
+  // in the same UTC day must produce the SAME number — that equality is the
+  // whole mechanism.
+  it("returns the same value for any two instants in one UTC day", () => {
+    const a = utcDayStartMs(Date.parse("2026-08-06T00:00:00.000Z"));
+    const b = utcDayStartMs(Date.parse("2026-08-06T23:00:00.000Z"));
+    expect(a).toBe(b);
+  });
+
+  it("exposes DAY_MS as 24 hours", () => {
+    expect(DAY_MS).toBe(24 * 60 * 60 * 1000);
+  });
+});

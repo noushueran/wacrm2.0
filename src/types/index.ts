@@ -1,5 +1,9 @@
 import type { AccountRole } from "@/lib/auth/roles";
 import type { InteractiveMessagePayload } from "@/lib/whatsapp/interactive";
+// Pure, dependency-free module (see its own header) — safe to import
+// straight into a client-facing type file, unlike anything that pulls in
+// `convex/_generated` or `convex/server`.
+import type { RunCounts } from "../../convex/lib/automations/runStats";
 
 export type {
   InteractiveMessagePayload,
@@ -142,6 +146,19 @@ export interface Contact {
   /** Hydrated by queries that embed `contact_tags(tags(*))` (e.g. the
    *  Inbox conversation list, for tag filtering). Absent otherwise. */
   tags?: Tag[];
+  /** Set once by `contactNotes.setOutcome` when a note's outcome is
+   *  `do_not_contact`, and the only path that clears it is
+   *  `contactNotes.clearDoNotContact`. Every automated path (auto-reply,
+   *  qualification follow-ups, lead-sequence steps, broadcasts, chase
+   *  auto-assignment) gates on this — `DoNotContactBanner` is the
+   *  visible half, surfacing it to agents in the thread. Passed through
+   *  from `Doc<"contacts">.doNotContact` as-is (inner fields stay
+   *  camelCase, matching the Convex doc) rather than remapped. */
+  do_not_contact?: {
+    at: number;
+    byUserId?: string;
+    noteId: string;
+  };
 }
 
 export interface Tag {
@@ -150,6 +167,8 @@ export interface Tag {
   name: string;
   color: string;
   group_id?: string;
+  /** Where this label came from. Unset = manual. */
+  source?: 'ai' | 'manual' | 'ad';
   created_at: string;
 }
 
@@ -235,6 +254,73 @@ export interface Conversation {
   ai_handoff_summary?: string | null;
   /** Present when this conversation began from a Click-to-WhatsApp ad. */
   ad_referral?: ConversationAdReferral;
+  /**
+   * ISO timestamp of a manual archive (lead-analysis P2). Presence, not a
+   * boolean, is the signal — mirrors `conversations.archivedAt` in
+   * `convex/schema.ts`, the system of record. The Inbox's Archived tab
+   * filters on this server-side (`api.conversations.list`'s `archived`
+   * arg); the client only reads it to show the archived banner + Restore
+   * action on the selected conversation.
+   */
+  archived_at?: string;
+  /**
+   * Manual lane overrides (spec 2026-07-28-inbox-manual-overrides).
+   * Presence, not a boolean, is the signal for both — mirroring
+   * `archived_at` above and `conversations.snoozedUntil`/
+   * `chasingForcedAt` in `convex/schema.ts`, the system of record. Kept
+   * snake_case (unlike `followUpsSent`/`sequenceStatus` below, which is
+   * a read-time PROJECTION of `leadAnalyses` with no existing snake_case
+   * precedent) — these two mirror real columns on `conversations`
+   * itself, the same convention every other field on this type follows.
+   * Mutually exclusive at the source (`inboxOverrides.ts`'s
+   * `CLEAR_FORCE`/`CLEAR_SNOOZE`), so a row never carries both at once.
+   */
+  snoozed_until?: string;
+  chasing_forced_at?: string;
+  /**
+   * TRUE = the customer spoke last, so we owe a reply — the Active lane.
+   * Mirrors `conversations.awaitingReply` in `convex/schema.ts`, the
+   * system of record; `undefined` only on a pre-backfill row.
+   *
+   * The client reads it for exactly one thing: hiding "Chase now" on a
+   * thread the customer is waiting on. `inboxOverrides.forceChasing`
+   * rejects that case outright — this is the display half, so the agent
+   * never gets a button whose only outcome is an error.
+   */
+  awaiting_reply?: boolean;
+  /**
+   * Meta's two messaging windows. These drive two INDEPENDENT clocks:
+   *  - `last_inbound_at` anchors the 24h customer service window, which
+   *    decides whether a free-form (non-template) message may be sent.
+   *  - `first_reply_at` anchors the local 72h free-entry-point ESTIMATE,
+   *    used only until `meta_window` arrives.
+   *  - `meta_window` is Meta's own AUTHORITATIVE record, captured from
+   *    outbound status webhooks. It decides whether messages are FREE.
+   * A conversation can be template-only and free at the same time.
+   */
+  last_inbound_at?: string;
+  first_reply_at?: string;
+  meta_window?: ConversationMetaWindow;
+  /**
+   * Follow-up sequence detail (Task 7, spec 2026-07-27-inbox-lanes) —
+   * populated by `conversations.list` ONLY on the Chasing lane (a
+   * per-page `leadAnalyses` join gated on `lane === "chasing"`, so no
+   * other tab pays for it). `undefined` on every other lane/tab and on
+   * `conversations.get`. Kept camelCase (unlike every other field on
+   * this type) rather than translated to `follow_ups_sent`/
+   * `sequence_status`: this is a read-time projection of `leadAnalyses`,
+   * not a column this type has ever mirrored, so there is no existing
+   * snake_case precedent to match. `sequenceStatus` carries
+   * `leadAnalyses.sequenceStatus` verbatim (`"exhausted"` is a VALUE of
+   * this field, not a separate boolean) — and as the exact four-literal
+   * union `schema.ts` declares, not a bare string, so a typo in a
+   * comparison (`conversation-list.tsx`'s `=== "exhausted"` badge,
+   * `message-thread.tsx`'s `=== "running"` Stop chasing gate) fails at
+   * compile time instead of silently never matching. `undefined` remains
+   * the "not joined" case.
+   */
+  followUpsSent?: number;
+  sequenceStatus?: "idle" | "running" | "exhausted" | "stopped";
 }
 
 // ============================================================
@@ -245,7 +331,9 @@ export type NotificationType =
   | 'conversation_assigned'
   | 'lead_qualified'
   | 'sla_alert'
-  | 'purchase_signal';
+  | 'purchase_signal'
+  | 'lead_returned'
+  | 'chase_unassigned';
 
 export interface Notification {
   id: string;
@@ -321,6 +409,24 @@ export interface ConversationAdReferral {
   stored_image_url?: string;
   /** ISO timestamp the ad conversation started — anchors the 72h free window. */
   started_at: string;
+}
+
+/**
+ * Meta's authoritative conversation-window record, captured from outbound
+ * message status webhooks (`statuses[].conversation` + `statuses[].pricing`).
+ * Preferred over any locally estimated window whenever present.
+ *
+ * `origin_type` and `is_free_entry_point` are raw/derived Meta values —
+ * Meta is mid-migration between conversation-based (`CBP`) and per-message
+ * (`PMP`) pricing, so `origin_type` stays an open string rather than a union.
+ */
+export interface ConversationMetaWindow {
+  conversation_meta_id?: string;
+  origin_type?: string;
+  /** ISO timestamp Meta says this conversation's window closes. */
+  expires_at?: string;
+  /** True when Meta reported this as a free-entry-point conversation. */
+  is_free_entry_point: boolean;
 }
 
 export interface Message {
@@ -615,8 +721,35 @@ export type AutomationTriggerConfig =
   | InteractiveReplyTriggerConfig
   | Record<string, unknown>;
 
+export interface SendMessageMediaConfig {
+  type: 'image' | 'video' | 'audio' | 'document';
+  /** R2 object key, account-scoped. Preferred over `url`. */
+  key?: string;
+  /** Legacy/external public URL. */
+  url?: string;
+  /** Document only — Meta rejects a filename on other kinds. */
+  filename?: string;
+}
+
+export interface SendMessageFallbackConfig {
+  template_name: string;
+  language: string;
+  variables?: Record<string, string>;
+  header?: { type: 'image' | 'video' | 'document'; key?: string; url?: string };
+}
+
+/**
+ * The unified send step. Every field is optional so a legacy
+ * `{ text: "hello" }` config remains a valid instance — this is what
+ * makes the composer a zero-migration change. `media` and `interactive`
+ * are mutually exclusive (the composer enforces it; `planSend` resolves
+ * the tie in media's favour if both somehow appear).
+ */
 export interface SendMessageStepConfig {
-  text: string;
+  text?: string;
+  media?: SendMessageMediaConfig;
+  interactive?: InteractiveMessagePayload;
+  fallback?: SendMessageFallbackConfig;
 }
 
 /**
@@ -631,6 +764,9 @@ export interface SendTemplateStepConfig {
   template_name: string;
   language?: string;
   variables?: Record<string, string>;
+  /** Media header for templates whose HEADER component is image/video/
+   *  document. Mirrors `SendMessageFallbackConfig.header` above. */
+  header?: { type: 'image' | 'video' | 'document'; key?: string; url?: string };
 }
 
 export interface TagStepConfig {
@@ -671,7 +807,8 @@ export type ConditionSubject =
   | 'contact_field'
   | 'tag_presence'
   | 'message_content'
-  | 'time_of_day';
+  | 'time_of_day'
+  | 'session_window';
 
 export interface ConditionStepConfig {
   subject: ConditionSubject;
@@ -720,6 +857,20 @@ export interface Automation {
   last_executed_at?: string | null;
   created_at: string;
   updated_at: string;
+  /** Cancel this automation's queued runs for a contact the instant they
+   *  reply — see `convex/schema.ts`'s comment on `automations.stopOnReply`
+   *  for the full rationale. Defaults to `false` for automations saved
+   *  before this field existed. */
+  stop_on_reply: boolean;
+  /** Cumulative run outcomes (`convex/lib/automations/runStats.ts`'s pure
+   *  `RunCounts`), present when this doc came from `automations.list`
+   *  (which computes it per-automation) and absent from `automations.get`
+   *  (which doesn't). Left camelCase rather than re-cased to `run_counts`
+   *  like this type's other fields: it's a straight pass-through of the
+   *  shape the server query and the UI already share — see that module's
+   *  own header on why there must be exactly one definition of it, not a
+   *  scalar worth a naming-convention detour. */
+  runCounts?: RunCounts;
 }
 
 export interface AutomationStep {

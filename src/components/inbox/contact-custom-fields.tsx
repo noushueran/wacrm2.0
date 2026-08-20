@@ -122,7 +122,7 @@ function FieldInput({
               key={o}
               type="button"
               onClick={() => toggle(o)}
-              className={`rounded-full px-2 py-0.5 text-[11px] ${
+              className={`rounded-full px-2 py-0.5 text-[12px] ${
                 selected.includes(o)
                   ? 'bg-primary text-primary-foreground'
                   : 'bg-muted text-muted-foreground'

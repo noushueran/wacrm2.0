@@ -1,6 +1,7 @@
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { api } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import type { AccountRole } from "./lib/roles";
 
@@ -398,9 +399,9 @@ test("updateConfig contactCard: valid card persists (and round-trips via getConf
   await admin.as.mutation(api.qualification.updateConfig, {
     patch: {
       contactCard: {
-        companyName: "Holidayys Tours LLC",
-        website: "https://holidayys.co",
-        email: "hello@holidayys.co",
+        companyName: "Amani Tours LLC",
+        website: "https://amaniworld.com",
+        email: "hello@amaniworld.com",
         phone: "+971 4 000 0000",
         city: "Dubai",
         countryCode: "AE",
@@ -409,9 +410,9 @@ test("updateConfig contactCard: valid card persists (and round-trips via getConf
   });
   const after = await admin.as.query(api.qualification.getConfig, {});
   expect(after.contactCard).toMatchObject({
-    companyName: "Holidayys Tours LLC",
-    website: "https://holidayys.co",
-    email: "hello@holidayys.co",
+    companyName: "Amani Tours LLC",
+    website: "https://amaniworld.com",
+    email: "hello@amaniworld.com",
     phone: "+971 4 000 0000",
     city: "Dubai",
     countryCode: "AE",
@@ -451,4 +452,390 @@ test("updateConfig round-trips purchaseSignalsEnabled and rejects non-boolean", 
       patch: { purchaseSignalsEnabled: "yes" },
     }),
   ).rejects.toThrow(); // BAD_REQUEST — boolean only
+});
+
+test("updateConfig round-trips chasingAfterDays and rejects out-of-range values", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const before = await admin.as.query(api.qualification.getConfig, {});
+  // Absent = "exactly where the qualification engine gives up"
+  // (`sessionWindowHours / 24`); the Inbox's lane cutoff derives it, so
+  // there is nothing to seed (spec 2026-07-27-inbox-lanes §Data model).
+  expect(before.chasingAfterDays).toBeUndefined();
+
+  await admin.as.mutation(api.qualification.updateConfig, {
+    patch: { chasingAfterDays: 7 },
+  });
+  const after = await admin.as.query(api.qualification.getConfig, {});
+  // Was silently stripped before this fix: the key was missing from
+  // CONFIG_PATCH_KEYS, so the spec's "set it explicitly" was only
+  // reachable by a direct database write.
+  expect(after.chasingAfterDays).toBe(7);
+
+  for (const bad of [0, -1, 91, "7"]) {
+    await expect(
+      admin.as.mutation(api.qualification.updateConfig, {
+        patch: { chasingAfterDays: bad },
+      }),
+    ).rejects.toThrow(); // BAD_REQUEST — 1–90, number only
+  }
+  // The rejected patches left the stored value alone.
+  expect((await admin.as.query(api.qualification.getConfig, {})).chasingAfterDays)
+    .toBe(7);
+});
+
+// ── leadsBoard: server-side filtering + paging ──────────────────────
+// /leads used to receive its whole (capped) list and filter/render it in
+// the browser. Both moved here. What these cover is the part that breaks
+// quietly: filters must span the WHOLE board rather than the returned
+// page, `summary` must stay whole-board because it labels the filter
+// pills themselves, and callers that pass no paging args (the Pipeline
+// kanban, the dashboard card) must still get everything.
+
+/** Seed `n` qualified sessions with descending scores under one account. */
+async function seedLeadsBoardRows(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  rows: { score: number; status?: "collecting" | "qualified" | "expired"; service?: string; name?: string }[],
+) {
+  await t.run(async (ctx) => {
+    for (const [i, row] of rows.entries()) {
+      const phone = `+9715000${String(i).padStart(5, "0")}`;
+      const contactId = await ctx.db.insert("contacts", {
+        accountId, phone, phoneNormalized: phone.replace(/\D/g, ""),
+        name: row.name ?? `C${row.score}`,
+      });
+      const conversationId = await ctx.db.insert("conversations", {
+        accountId, contactId, status: "open" as const, unreadCount: 0,
+      });
+      const status = row.status ?? "qualified";
+      await ctx.db.insert("qualificationSessions", {
+        accountId, conversationId, contactId,
+        status, origin: "inbound",
+        fields: [], expectedCount: 4, answeredCount: 1,
+        score: row.score, serviceName: row.service ?? "Packages",
+        followUpsSent: 0, phrasingCursor: 0, sendAttemptErrors: 0,
+        ...(status === "qualified" ? { qualifiedAt: 5 } : {}),
+      });
+    }
+  });
+}
+
+test("leadsBoard returns one page and reports the filtered total", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90 }, { score: 80 }, { score: 70 }, { score: 60 }, { score: 50 },
+  ]);
+
+  const first = await admin.as.query(api.qualification.leadsBoard, { page: 0, pageSize: 2 });
+
+  expect(first.leads.map((l) => l.score)).toEqual([90, 80]);
+  expect(first.total).toBe(5);
+  expect(first.pageCount).toBe(3);
+});
+
+test("leadsBoard returns everything when pageSize is omitted", async () => {
+  // The Pipeline kanban groups EVERY lead by stage and still calls this
+  // with `{}`. The pipeline CARD used to as well, and no longer does —
+  // `pipelineSummary` returns it the dozen numbers it actually renders,
+  // instead of 459 hydrated leads and ~2.4 MB.
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [{ score: 90 }, { score: 80 }, { score: 70 }]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {});
+
+  expect(board.leads).toHaveLength(3);
+  expect(board.pageCount).toBe(1);
+});
+
+test("leadsBoard clamps a page past the end onto the last page", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [{ score: 90 }, { score: 80 }, { score: 70 }]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, { page: 99, pageSize: 2 });
+
+  expect(board.page).toBe(1);
+  expect(board.leads.map((l) => l.score)).toEqual([70]);
+});
+
+test("leadsBoard filters by status across the whole board, not just the page", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  // `collecting` sorts after every `qualified` row, so it falls off page
+  // 1 — a client-side filter over one page could never have found it.
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90 }, { score: 80 }, { score: 40, status: "collecting" },
+  ]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {
+    status: "collecting", page: 0, pageSize: 2,
+  });
+
+  expect(board.leads.map((l) => l.score)).toEqual([40]);
+  expect(board.total).toBe(1);
+});
+
+test("leadsBoard groups the terminal statuses behind the Closed filter", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90 }, { score: 20, status: "expired" },
+  ]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, { status: "closed" });
+
+  expect(board.leads.map((l) => l.status)).toEqual(["expired"]);
+});
+
+test("leadsBoard filters by service and lists every service on the whole board", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90, service: "Visa" }, { score: 80, service: "Packages" },
+  ]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, {
+    service: "Visa", page: 0, pageSize: 1,
+  });
+
+  expect(board.leads.map((l) => l.serviceName)).toEqual(["Visa"]);
+  // The dropdown's options come from here now. Derived from the returned
+  // page instead, it would offer only "Visa" — the option you already
+  // picked — and the others would vanish as you paged.
+  expect(board.services).toEqual(["Packages", "Visa"]);
+});
+
+test("leadsBoard searches contact name server-side", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90, name: "Priya" }, { score: 80, name: "Rahul" },
+  ]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, { search: "rahul" });
+
+  expect(board.leads.map((l) => l.contactName)).toEqual(["Rahul"]);
+});
+
+test("leadsBoard keeps the summary whole-board while the list is filtered", async () => {
+  // summary.* are the filter pills' own counts — deriving them from the
+  // filtered set would make each pill report its own selection.
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedLeadsBoardRows(t, admin.accountId, [
+    { score: 90 }, { score: 40, status: "collecting" },
+  ]);
+
+  const board = await admin.as.query(api.qualification.leadsBoard, { status: "qualified" });
+
+  expect(board.leads).toHaveLength(1);
+  expect(board.total).toBe(1);
+  expect(board.summary.qualified).toBe(1);
+  expect(board.summary.collecting).toBe(1);
+  expect(board.summary.total).toBe(2);
+});
+
+// ============================================================
+// pipelineSummary — the cheap aggregate behind the pipeline card.
+//
+// It exists because that card used to render from `leadsBoard({})`, which
+// measured in production at 1,668 document reads and a ~2.4 MB payload to
+// produce the dozen numbers asserted below. These tests pin the numbers,
+// not the cost; the cost is guarded by the shape of the handler (one
+// status range, one parallel wave of conversation lookups, no offers or
+// checklist reads at all).
+// ============================================================
+
+/** One qualified deal: contact → conversation (optionally staged, with a
+ *  recorded sale) → qualification session. Returns the conversation id so a
+ *  test can hang a SECOND session off the same thread and check the
+ *  one-card-per-conversation collapse. */
+async function seedDeal(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: {
+    phone: string;
+    stage?:
+      | "new_lead"
+      | "qualified"
+      | "price_quoted"
+      | "itinerary_created"
+      | "itinerary_sent"
+      | "invoice_sent"
+      | "purchased"
+      | "lost";
+    saleValue?: number;
+    saleCurrency?: string;
+    status?: "collecting" | "qualified";
+    assignedToUserId?: Id<"users">;
+    conversationId?: Id<"conversations">;
+  },
+) {
+  return await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: opts.phone,
+      phoneNormalized: opts.phone.replace(/\D/g, ""),
+    });
+    const conversationId =
+      opts.conversationId ??
+      (await ctx.db.insert("conversations", {
+        accountId,
+        contactId,
+        status: "open" as const,
+        unreadCount: 0,
+        ...(opts.assignedToUserId
+          ? { assignedToUserId: opts.assignedToUserId }
+          : {}),
+        ...(opts.stage
+          ? {
+              funnel: {
+                stage: opts.stage,
+                stageUpdatedAt: 1,
+                ...(opts.saleValue !== undefined
+                  ? { saleValue: opts.saleValue }
+                  : {}),
+                ...(opts.saleCurrency ? { saleCurrency: opts.saleCurrency } : {}),
+              },
+            }
+          : {}),
+      }));
+    const status = opts.status ?? "qualified";
+    await ctx.db.insert("qualificationSessions", {
+      accountId,
+      conversationId,
+      contactId,
+      status,
+      origin: "inbound",
+      fields: [],
+      expectedCount: 4,
+      answeredCount: 4,
+      score: 80,
+      followUpsSent: 0,
+      phrasingCursor: 0,
+      sendAttemptErrors: 0,
+      ...(status === "qualified" ? { qualifiedAt: 5 } : {}),
+    });
+    return conversationId;
+  });
+}
+
+test("pipelineSummary counts deals by their CURRENT funnel stage", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedDeal(t, admin.accountId, { phone: "+971500001001", stage: "price_quoted" });
+  await seedDeal(t, admin.accountId, { phone: "+971500001002", stage: "price_quoted" });
+  await seedDeal(t, admin.accountId, { phone: "+971500001003", stage: "itinerary_sent" });
+  // No funnel stage yet, and one still parked at the pre-deal `new_lead`:
+  // both belong in the first column, not off-board.
+  await seedDeal(t, admin.accountId, { phone: "+971500001004" });
+  await seedDeal(t, admin.accountId, { phone: "+971500001005", stage: "new_lead" });
+
+  const res = await admin.as.query(api.qualification.pipelineSummary, {});
+
+  const byStage = Object.fromEntries(res.stages.map((s) => [s.key, s.count]));
+  expect(byStage.qualified).toBe(2);
+  expect(byStage.price_quoted).toBe(2);
+  expect(byStage.itinerary_sent).toBe(1);
+  expect(res.total).toBe(5);
+  expect(res.capped).toBe(false);
+});
+
+test("pipelineSummary counts one deal per conversation, not per session", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  // A re-qualified conversation: two qualified sessions, one thread. The
+  // stage lives on the CONVERSATION, so both sessions would otherwise be
+  // counted in the same column and move together — two cards for one deal.
+  const conversationId = await seedDeal(t, admin.accountId, {
+    phone: "+971500002001",
+    stage: "invoice_sent",
+  });
+  await seedDeal(t, admin.accountId, {
+    phone: "+971500002002",
+    conversationId,
+  });
+
+  const res = await admin.as.query(api.qualification.pipelineSummary, {});
+
+  expect(res.total).toBe(1);
+  const byStage = Object.fromEntries(res.stages.map((s) => [s.key, s.count]));
+  expect(byStage.invoice_sent).toBe(1);
+});
+
+test("pipelineSummary reports win rate, won value per currency, and leads still qualifying", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedDeal(t, admin.accountId, {
+    phone: "+971500003001", stage: "purchased", saleValue: 1_200, saleCurrency: "AED",
+  });
+  await seedDeal(t, admin.accountId, {
+    phone: "+971500003002", stage: "purchased", saleValue: 800, saleCurrency: "AED",
+  });
+  await seedDeal(t, admin.accountId, {
+    phone: "+971500003003", stage: "purchased", saleValue: 500, saleCurrency: "USD",
+  });
+  await seedDeal(t, admin.accountId, { phone: "+971500003004", stage: "lost" });
+  // Not a deal — it is still being qualified, so it must not enter the win
+  // rate, but it is what `inQualification` reports.
+  await seedDeal(t, admin.accountId, { phone: "+971500003005", status: "collecting" });
+
+  const res = await admin.as.query(api.qualification.pipelineSummary, {});
+
+  expect(res.winRate).toBe(75); // 3 purchased of 4 closed
+  expect(
+    [...res.wonByCurrency].sort((a, b) => a.currency.localeCompare(b.currency)),
+  ).toEqual([
+    { currency: "AED", value: 2_000 },
+    { currency: "USD", value: 500 },
+  ]);
+  expect(res.inQualification).toBe(1);
+  expect(res.total).toBe(4); // the collecting lead is not on the pipeline
+});
+
+test("pipelineSummary reports a null win rate when nothing has closed", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  await seedDeal(t, admin.accountId, { phone: "+971500004001", stage: "price_quoted" });
+
+  const res = await admin.as.query(api.qualification.pipelineSummary, {});
+
+  // `null`, not 0 — "nothing has closed yet" is a different claim from
+  // "nothing that closed was won", and 0% would read as the latter.
+  expect(res.winRate).toBeNull();
+});
+
+test("pipelineSummary: agents see only their own deals; viewers are denied", async () => {
+  const t = convexTest(schema, modules);
+  const admin = await seedMember(t, "admin");
+  const agent = await seedMember(t, "agent");
+  const agentUserId = await t.run(async (ctx) => {
+    const uid = await ctx.db.insert("users", { name: "Agent P", email: "ap@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId: admin.accountId, role: "agent",
+      fullName: "Agent P", email: "ap@example.com",
+    });
+    return uid;
+  });
+  const asAgent = t.withIdentity({ subject: `${agentUserId}|sp` });
+
+  await seedDeal(t, admin.accountId, {
+    phone: "+971500005001", stage: "price_quoted", assignedToUserId: agentUserId,
+  });
+  await seedDeal(t, admin.accountId, { phone: "+971500005002", stage: "price_quoted" });
+
+  // Same floor as `leadsBoard`: supervisor+ see everything…
+  expect((await admin.as.query(api.qualification.pipelineSummary, {})).total).toBe(2);
+  // …an agent only their own…
+  expect((await asAgent.query(api.qualification.pipelineSummary, {})).total).toBe(1);
+  // …an unrelated agent on their OWN account sees nothing of this one…
+  expect((await agent.as.query(api.qualification.pipelineSummary, {})).total).toBe(0);
+  // …and a viewer has no lead queue at all.
+  const viewer = await seedMember(t, "viewer");
+  await expect(
+    viewer.as.query(api.qualification.pipelineSummary, {}),
+  ).rejects.toThrow();
 });

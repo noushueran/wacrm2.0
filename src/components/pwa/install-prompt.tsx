@@ -25,7 +25,19 @@ export function InstallPrompt() {
     try {
       if (localStorage.getItem(DISMISS_KEY) === "true") return;
     } catch {}
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time mount check of localStorage/standalone-mode gating whether to show the card, not a render-driven cascade
+    // STAYS AN EFFECT. Every input to this decision is browser-only —
+    // `isStandalone()` reads matchMedia, the guard above reads
+    // localStorage, and the branch below reads navigator. None exist
+    // while the component renders on the server, and reading them during
+    // render on the client would make the render impure and produce
+    // markup that disagrees with the server's.
+    //
+    // Hence the state starts at `dismissed: true`: the card renders as
+    // nothing until an effect has been able to look at the browser, which
+    // is the standard shape for client-only UI and cannot be expressed as
+    // a render-time derivation or a lazy `useState` initialiser (that
+    // runs during render too).
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time mount check of browser-only APIs (matchMedia/localStorage/navigator), which cannot be read during render
     setDismissed(false);
 
     if (isIOS(navigator.userAgent, navigator.maxTouchPoints)) {

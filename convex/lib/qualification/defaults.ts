@@ -1,11 +1,11 @@
 import type { Doc } from "../../_generated/dataModel";
 
 // ============================================================
-// Approved default configuration — spec §11 (Holidayys preset) + §17
+// Approved default configuration — spec §11 (owner preset) + §17
 // (decision log) of docs/superpowers/specs/
 // 2026-07-18-lead-qualification-followup-design.md. Hours are the
 // VERIFIED company hours (10:00–21:00 GST, closed Sunday — see
-// holidayys-ai-agent/SPEC.md), deliberately not the 9–6 example from
+// amani-ai-agent/SPEC.md), deliberately not the 9–6 example from
 // the original request; the owner can change everything in Settings.
 // `basicFields` is only the OFF-TOPIC fallback — per-service questions
 // live in the AI knowledge-base docs' QUALIFICATION CHECKLIST sections.
@@ -16,7 +16,7 @@ export type QualificationConfigSeed = Omit<
   "_id" | "_creationTime" | "accountId"
 >;
 
-export function holidayysDefaultConfig(): QualificationConfigSeed {
+export function defaultQualificationConfig(): QualificationConfigSeed {
   return {
     enabled: false,
     basicFields: [
@@ -74,7 +74,10 @@ export function holidayysDefaultConfig(): QualificationConfigSeed {
     reengagementTemplateLanguage: "en_US",
     adminAlertTemplateName: "lead_alert",
     adminAlertTemplateLanguage: "en_US",
-    closingMessage: "Thank you! Our travel expert will contact you shortly.",
+    // Deliberately generic: this is the default for EVERY new account, so
+    // it must not carry one tenant's team name or phone number. Owners set
+    // their own wording in Settings → Lead qualification.
+    closingMessage: "Thank you! Our team will contact you shortly.",
     adminAlertEnabled: false,
     adminAlertPhones: [],
     // Phase 6: offer qualified leads to matching agents over WhatsApp,

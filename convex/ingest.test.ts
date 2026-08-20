@@ -1290,7 +1290,7 @@ test("processInbound resolves an inbound voice note's media into R2 and attaches
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
   process.env.R2_SECRET_ACCESS_KEY = "test-secret";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
 
@@ -1475,6 +1475,248 @@ test("processInbound captures an adReferrals row from an inbound ad referral", a
   expect(rows[0].ctwaClid).toBe("clid-xyz789");
   expect(rows[0].adId).toBe("AD1");
   expect(rows[0].isFirstTouch).toBe(true);
+});
+
+// ============================================================
+// Ad->service tagging wiring (Task 5) — `processInbound` schedules
+// `adServiceTagging.tagFromAd` for both the click itself (`trigger:
+// "referral"`) and, on a follow-up in a conversation that started from
+// an ad, a retry pass (`trigger: "followup"`). `tagFromAd` runs as a
+// scheduled zero-delay mutation, not inline, so these tests drain it
+// with `finishInProgressScheduledFunctions()` under fake timers — NOT
+// `finishAllScheduledFunctions(vi.runAllTimers)`, which would also fire
+// the ten-minute agent-reply SLA check `processInbound` books on every
+// inbound (see `convex/ingest.ts:970`) and, with it, unrelated
+// notification machinery this test has no business touching. A bounded
+// handful of small `vi.advanceTimersByTime` steps is enough to cross
+// the zero-delay scheduling gap without reaching anywhere near either
+// that 10-minute SLA timer or the (2s+) debounced AI-reply timer —
+// same technique `convex/ingest.test.ts`'s "bot reply before takeover"
+// test already relies on.
+async function seedUaeVisaService(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  await t.run(async (ctx) => {
+    await ctx.db.insert("kbServices", {
+      accountId,
+      key: "uae-visa",
+      name: "UAE Visa",
+      aliases: ["dubai visa"],
+      status: "active",
+      sortOrder: 0,
+      updatedAt: Date.now(),
+    });
+  });
+}
+
+async function contactTagNames(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  return await t.run(async (ctx) => {
+    const contact = await ctx.db
+      .query("contacts")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first();
+    if (!contact) return [];
+    const links = await ctx.db
+      .query("contactTags")
+      .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+      .collect();
+    return await Promise.all(
+      links.map(async (l) => (await ctx.db.get(l.tagId))?.name),
+    );
+  });
+}
+
+async function referralRow(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  return await t.run((ctx) =>
+    ctx.db
+      .query("adReferrals")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+}
+
+/**
+ * The MOST RECENT `adReferrals` row for the account — mirrors
+ * `adServiceTagging.referralFor`'s own "newest wins" resolution
+ * (collect + sort by `_creationTime` desc), needed once a test has more
+ * than one row on the account (a second ad click inserts its own fresh
+ * row rather than updating the first — see `adReferrals.recordAdReferral`).
+ * `referralRow` above's plain `.first()` only happens to work for the
+ * single-row tests; this is the one to reach for once a test seeds two.
+ */
+async function newestReferralRow(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+) {
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("adReferrals")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .collect(),
+  );
+  return rows.sort((a, b) => b._creationTime - a._creationTime)[0] ?? null;
+}
+
+/**
+ * Drains the zero-delay `tagFromAd` schedule booked inside `t.action`
+ * above, under fake timers — see the block comment above this section
+ * for why `finishInProgressScheduledFunctions()` (bounded small steps)
+ * is used instead of `finishAllScheduledFunctions(vi.runAllTimers)`.
+ */
+async function drainAdTagging(t: TestConvex<typeof schema>) {
+  for (let i = 0; i < 4; i++) {
+    vi.advanceTimersByTime(100);
+    await t.finishInProgressScheduledFunctions();
+  }
+}
+
+test("processInbound tags the contact from the ad it came in on", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedUaeVisaService(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.ADTAG1",
+      referral: {
+        sourceType: "ad",
+        sourceId: "AD1",
+        headline: "Apply for your UAE Visa today",
+      },
+    },
+  });
+  await drainAdTagging(t);
+
+  expect(await contactTagNames(t, accountId)).toEqual(["UAE Visa"]);
+  const row = await referralRow(t, accountId);
+  expect(row?.serviceMatchStatus).toBe("matched");
+  expect(row?.serviceMatchedOn).toBe("headline");
+});
+
+test("processInbound retries the ad match on the customer's next message", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedUaeVisaService(t, accountId);
+
+  // The click itself: a vague ad names no service, so nothing is tagged.
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.ADTAG2A",
+      referral: { sourceType: "ad", sourceId: "AD2", headline: "Talk to our team" },
+    },
+  });
+  await drainAdTagging(t);
+
+  expect(await contactTagNames(t, accountId)).toEqual([]);
+  expect((await referralRow(t, accountId))?.serviceMatchStatus).toBe("unmatched");
+
+  // The follow-up carries the customer's own words — no referral of its own.
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "i need a dubai visa please",
+      wamid: "wamid.ADTAG2B",
+    },
+  });
+  await drainAdTagging(t);
+
+  expect(await contactTagNames(t, accountId)).toEqual(["UAE Visa"]);
+  const row = await referralRow(t, accountId);
+  expect(row?.serviceMatchStatus).toBe("matched");
+  expect(row?.serviceMatchedOn).toBe("customerText");
+});
+
+test("processInbound does not double-spend the retry pass when a second ad click carries only a ctwaClid", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedUaeVisaService(t, accountId);
+
+  // First click: sets the conversation's `adReferral` denorm.
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "hi",
+      wamid: "wamid.ADTAG3A",
+      referral: { sourceType: "ad", sourceId: "AD3", headline: "Talk to our team" },
+    },
+  });
+  await drainAdTagging(t);
+
+  // A second ad click on a creative-less ad: `webhookParse.ts` can hand
+  // back a `ctwaClid` with no `referral` object at all. This still
+  // satisfies the capture block's `referral || ctwaClid` guard above (a
+  // fresh `adReferrals` row gets inserted for it) but must NOT also
+  // satisfy the retry gate — that gate is reserved for a genuine
+  // customer follow-up, not a second click event. Without excluding
+  // `ctwaClid` too, this single inbound would spend BOTH rule passes on
+  // the fresh row and fire the paid AI fallback immediately.
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: {
+      type: "text",
+      text: "hi again",
+      wamid: "wamid.ADTAG3B",
+      ctwaClid: "clid-creativeless",
+    },
+  });
+  await drainAdTagging(t);
+
+  const row = await newestReferralRow(t, accountId);
+  expect(row?.ctwaClid).toBe("clid-creativeless");
+  // Only the first (referral) pass ran against this fresh row — one
+  // attempt spent, not two.
+  expect(row?.serviceMatchAttempts).toBe(1);
+});
+
+test("processInbound never ad-tags a conversation that came in organically", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  await seedAiConfig(t, accountId);
+  await seedUaeVisaService(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "i need a dubai visa please", wamid: "wamid.ORG1" },
+  });
+  await drainAdTagging(t);
+
+  expect(await contactTagNames(t, accountId)).toEqual([]);
 });
 
 test("processInbound: an HY- code in the text wins over a ctwaClid also present on the same message", async () => {
@@ -1680,11 +1922,11 @@ test("integration seam: a RAW Meta CTWA message whose referral carries an UNRECO
 
   // Meta is free to introduce ad surfaces/formats outside the closed
   // unions this codebase stores. Before the narrowing in
-  // `flattenInboundMessage`, these two fields reached
-  // `ingestInbound`'s validator verbatim and threw an
-  // ArgumentValidationError — and since `http.ts` schedules
-  // `processInbound` AFTER acking Meta 200, the throw was invisible:
-  // Meta never retried and the lead vanished. The message must land.
+  // `flattenInboundMessage`, these two fields reached `ingestInbound`'s
+  // validator verbatim and threw an ArgumentValidationError — and since
+  // `http.ts` schedules `processInbound` AFTER acking Meta 200, the throw
+  // was invisible: Meta never retried and the lead vanished. The message
+  // must land.
   const raw: MetaWebhookMessage = {
     id: "wamid.INT-CTWA-UNKNOWN-ENUM",
     from: "15551230009",
@@ -1696,9 +1938,9 @@ test("integration seam: a RAW Meta CTWA message whose referral carries an UNRECO
       source_id: "120237861630560444",
       source_type: "story_mention",
       media_type: "carousel",
-      headline: "Georgia Holiday from AED 2699",
+      headline: "Dubai City Tour from AED 199",
       body: "Tap Send Message",
-    } as MetaWebhookMessage["referral"],
+    },
   };
 
   const flattened = flattenInboundMessage(raw);
@@ -1720,7 +1962,7 @@ test("integration seam: a RAW Meta CTWA message whose referral carries an UNRECO
   expect(message).not.toBeNull();
   expect(message!.contentText).toBe("I saw your ad, send me details");
   // The creative still renders; only the unrecognized enums are absent.
-  expect(message!.referral?.headline).toBe("Georgia Holiday from AED 2699");
+  expect(message!.referral?.headline).toBe("Dubai City Tour from AED 199");
   expect(message!.referral?.sourceType).toBeUndefined();
   expect(message!.referral?.mediaType).toBeUndefined();
   // Attribution still captured: the adReferrals row (the durable ad-lane
@@ -1733,7 +1975,7 @@ test("integration seam: a RAW Meta CTWA message whose referral carries an UNRECO
   );
   expect(referralRow).not.toBeNull();
   expect(referralRow!.ctwaClid).toBe("clid-unknown-enum");
-  expect(referralRow!.headline).toBe("Georgia Holiday from AED 2699");
+  expect(referralRow!.headline).toBe("Dubai City Tour from AED 199");
 });
 
 test("integration seam: a RAW Meta message with neither a code nor a referral flattens via flattenInboundMessage and ingests via processInbound with NO attribution signal", async () => {
@@ -1873,7 +2115,7 @@ test("processInbound downloads the ad image into R2 and attaches a storedImageKe
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
   process.env.R2_SECRET_ACCESS_KEY = "test-secret";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
@@ -1948,7 +2190,7 @@ test("processInbound gives each ad message its OWN storedImageKey — the conver
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
   process.env.R2_SECRET_ACCESS_KEY = "test-secret";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   await seedAiConfig(t, accountId);
@@ -2192,8 +2434,62 @@ test("an assigned agent staying silent escalates to the supervisor — bell + st
   expect(supervisorBells[0]!.conversationId).toBe(conversation!._id);
   // The silent agent is never the escalation target.
   expect(notifications.filter((n) => n.userId === agentUserId)).toHaveLength(0);
-  // Staff WhatsApp alert went out (dry-run persists it as a bot message
-  // in the supervisor's staff conversation).
+  // Staff WhatsApp alert is gated on the supervisor's OWN 24h messaging
+  // window (P0 fix — see `qualificationEngine.ts`'s `notifyStaffText`:
+  // Meta silently rejects a free-form send outside it, hours later,
+  // invisibly to this action). Sam never messaged the bot, so this is
+  // the realistic case — production's own failure mode — and the send
+  // is now correctly skipped rather than doomed. The bell notification
+  // asserted above is the channel this scenario can actually rely on;
+  // the sibling test below covers the window-open case.
+  const allMessages = await t.run((ctx) =>
+    ctx.db.query("messages").withIndex("by_account", (q) => q.eq("accountId", accountId)).collect(),
+  );
+  expect(allMessages.some((m) => (m.contentText ?? "").includes("hasn't replied"))).toBe(false);
+}, 30_000);
+
+test("an assigned agent staying silent — the staff WhatsApp alert lands when the supervisor's own window is open", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId, supervisorUserId } = await seedSlaTeam(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "is my quote ready?", wamid: "wamid.SLA-OPEN1" },
+  });
+  // `.first()` below is unqualified beyond `accountId`, so the staff/
+  // admin contact `ensureAdminConversation` creates must come AFTER this
+  // lookup — otherwise it, not the customer, is what "first" returns.
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  await t.run((ctx) => ctx.db.patch(conversation!._id, { assignedToUserId: agentUserId }));
+
+  // Unlike the sibling test above, Sam texted the staff-alert bot
+  // recently (e.g. about a prior lead) — his own 24h customer service
+  // window is open when the escalation fires, so the send can actually
+  // reach him. Same fixture otherwise; this is the control proving the
+  // skip above is the window gate, not a broken wire.
+  const staffTarget = await t.mutation(internal.qualificationEngine.ensureAdminConversation, {
+    accountId, phone: "+971 55 111 2222",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(staffTarget.conversationId, { lastInboundAt: Date.now() }));
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const supervisorBells = (await notificationsFor(t, accountId)).filter(
+    (n) => n.userId === supervisorUserId && n.type === "sla_alert",
+  );
+  expect(supervisorBells).toHaveLength(2); // unaffected control, mirrors the sibling test
+
   const allMessages = await t.run((ctx) =>
     ctx.db.query("messages").withIndex("by_account", (q) => q.eq("accountId", accountId)).collect(),
   );
@@ -2341,6 +2637,42 @@ test("a bot reply before takeover satisfies the SLA — no false alarm after ass
   expect(await notificationsFor(t, accountId)).toHaveLength(0);
 }, 30_000);
 
+test("an archived conversation never escalates, even assigned and inside the SLA window (P2 final-fixes Fix 7)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { agentUserId } = await seedSlaTeam(t, accountId);
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "is my quote ready?", wamid: "wamid.SLA-ARCHIVED" },
+  });
+  const contact = await t.run((ctx) =>
+    ctx.db.query("contacts").withIndex("by_account", (q) => q.eq("accountId", accountId)).first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db.query("conversations").filter((q) => q.eq(q.field("contactId"), contact!._id)).first(),
+  );
+  // Assigned (so it would otherwise escalate) AND archived — archiving a
+  // thread inside the SLA window must suppress the alert exactly like
+  // closing it already does. Without the `archivedAt` guard, this fires
+  // an `sla_alert` for a conversation nobody is meant to be watching
+  // anymore.
+  await t.run((ctx) =>
+    ctx.db.patch(conversation!._id, {
+      assignedToUserId: agentUserId,
+      archivedAt: Date.now(),
+    }),
+  );
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  expect(await notificationsFor(t, accountId)).toHaveLength(0);
+}, 30_000);
+
 // ============================================================
 // Instant acknowledgement wiring (whole-branch review Fix F5) — the
 // headline behaviour of this branch (blue tick + "typing…" the moment
@@ -2399,4 +2731,303 @@ test("processing a normal text inbound schedules aiReply.ackInbound at delay 0, 
   const dispatchRows = scheduled.filter((s) => s.name === "aiReply:dispatchInbound");
   expect(dispatchRows).toHaveLength(1);
   expect(dispatchRows[0]!.scheduledTime - ackRow.scheduledTime).toBeGreaterThan(1000);
+});
+
+// ============================================================
+// Lead Analysis follow-up sequence — stop on inbound (P3 Task 6).
+// `leadAnalysisEngine.stopOnInbound` runs inside `runBestEffort` — a
+// throw there must never fail ingestion (proven below by the "no row"
+// no-op case resolving normally, and by the "different account" test not
+// existing here since `processInbound` always resolves the correct
+// account).
+//
+// It USED to sit beside P2's `unarchiveOnInbound`. That one moved into
+// the message transaction on 2026-07-28: stopping a sequence is
+// automation and may be lost, but un-archiving is a correctness
+// property of the Inbox — a swallowed failure there hid a customer who
+// was actively writing in. See `messages.ts`'s own comment.
+// ============================================================
+
+test("a second inbound message stops a running follow-up sequence and resets the counter", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  // Plain `ingestInbound` (not `processInbound`) for the FIRST message —
+  // it returns `conversationId`/`contactId` directly, and only the
+  // SECOND message below needs to go through the full `processInbound`
+  // fan-out that carries this suite's new `stopOnInbound` hook.
+  const first = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hi", wamid: "wamid.SEQ1" },
+  });
+  const conversationId = first.conversationId;
+  const contactId = first.contactId;
+
+  const analysisId = await t.run((ctx) =>
+    ctx.db.insert("leadAnalyses", {
+      accountId,
+      conversationId,
+      contactId,
+      score: 9,
+      band: "hot",
+      scoreStatus: "scored",
+      attempts: 0,
+      sequenceStatus: "running",
+      followUpsSent: 2,
+      nextFollowUpAt: Date.now() + 24 * 60 * 60_000,
+    }),
+  );
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "still there?", wamid: "wamid.SEQ2" },
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(analysisId));
+  expect(row!.sequenceStatus).toBe("stopped");
+  expect(row!.stoppedReason).toBe("replied");
+  expect(row!.followUpsSent).toBe(0);
+  expect(row!.nextFollowUpAt).toBeUndefined();
+});
+
+test("an inbound message on a conversation with no leadAnalyses row is a cheap no-op — ingestion still completes normally", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const result = await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    message: { type: "text", text: "hello", wamid: "wamid.SEQ3" },
+  });
+
+  expect(result.duplicate).toBe(false);
+  expect(await t.run((ctx) => ctx.db.query("leadAnalyses").collect())).toHaveLength(0);
+});
+
+// ============================================================
+// Media understanding runs on ARRIVAL, independent of auto-reply
+// (2026-07-25). Before this, transcription lived inside
+// `aiReply.dispatchInbound` BELOW its `autoReplyEnabled` gate, so an
+// account with auto-reply off — the default — never produced a single
+// transcript and every inbound voice note stayed a bare "[voice note]"
+// in the inbox. Reading what a customer said and letting the bot answer
+// them are different decisions.
+// ============================================================
+
+test("processInbound transcribes an inbound voice note even with auto-reply OFF, and still sends no reply", { timeout: 15_000 }, async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.CONVEX_AI_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const apiKey = await encrypt("sk-test-key");
+  await t.run((ctx) =>
+    ctx.db.insert("aiConfigs", {
+      accountId,
+      provider: "openai" as const,
+      model: "gpt-4o-mini",
+      apiKey,
+      isActive: true,
+      autoReplyEnabled: false, // the default the owner has to turn on
+    }),
+  );
+
+  vi.useFakeTimers();
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15551234567",
+    name: "Jamie Customer",
+    message: {
+      type: "audio",
+      mediaUrl: "https://example.com/voice.ogg",
+      wamid: "wamid.VOICE",
+    },
+  });
+  // Understanding is scheduled off the ingest path, not awaited inline.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const contact = await t.run((ctx) =>
+    ctx.db
+      .query("contacts")
+      .withIndex("by_account", (q) => q.eq("accountId", accountId))
+      .first(),
+  );
+  const conversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .filter((q) => q.eq(q.field("contactId"), contact!._id))
+      .first(),
+  );
+  const messages = await messagesFor(t, conversation!._id);
+
+  // The transcript reaches the inbox for the humans working it…
+  const audio = messages.find((m) => m.contentType === "audio");
+  expect(audio).toBeDefined();
+  expect(audio!.aiTranscription).toBe("[dry-run transcript]");
+  // …and the bot still says nothing to the customer.
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+});
+
+// ============================================================
+// Task 5 — cancellation path 5: `stopOnReply`. `processInbound`'s
+// automations block also schedules
+// `automationsEngine.cancelRunsForContact` (best-effort, unconditional
+// on which triggers matched) so a contact who replies stops any
+// `stopOnReply` automation's still-waiting run.
+// ============================================================
+
+test("stopOnReply cancels a waiting run when the contact replies", async () => {
+  vi.useFakeTimers();
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "StopOnReply");
+  const tagId = await seedTag(t, accountId, "post-wait");
+
+  const automationId = await t.run((ctx) =>
+    ctx.db.insert("automations", {
+      accountId,
+      name: "Nudge",
+      triggerType: "keyword_match",
+      triggerConfig: { keywords: ["quote"], match_type: "contains" },
+      isActive: true,
+      executionCount: 0,
+      stopOnReply: true,
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("automationSteps", {
+      accountId,
+      automationId,
+      stepType: "wait",
+      stepConfig: { amount: 1, unit: "minutes" },
+      position: 0,
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("automationSteps", {
+      accountId,
+      automationId,
+      stepType: "add_tag",
+      stepConfig: { tag_id: tagId },
+      position: 1,
+    }),
+  );
+  // A customer-facing effect, not just a DB-only one — a `messages`-zero
+  // assertion needs something that could actually send if cancellation
+  // were broken (post-review fix; `add_tag` alone has no such effect).
+  await t.run((ctx) =>
+    ctx.db.insert("automationSteps", {
+      accountId,
+      automationId,
+      stepType: "send_message",
+      stepConfig: { text: "Still interested?" },
+      position: 2,
+    }),
+  );
+
+  const first = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15550009999",
+    message: { type: "text", text: "quote please", wamid: "wamid.FIRST" },
+  });
+
+  await t.action(internal.automationsEngine.runForTrigger, {
+    accountId,
+    triggerType: "keyword_match",
+    contactId: first.contactId,
+    context: { messageText: "quote please", conversationId: first.conversationId },
+  });
+
+  const parked = await t.run((ctx) =>
+    ctx.db
+      .query("automationRuns")
+      .withIndex("by_account_automation", (q) =>
+        q.eq("accountId", accountId).eq("automationId", automationId),
+      )
+      .unique(),
+  );
+  expect(parked?.status).toBe("waiting");
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15550009999",
+    message: { type: "text", text: "yes please", wamid: "wamid.SECOND" },
+  });
+
+  const run = await t.run((ctx) => ctx.db.get(parked!._id));
+  expect(run?.status).toBe("cancelled");
+  expect(run?.errorMessage).toMatch(/replied/);
+
+  // Zero sends: the original wait's own resume, once it fires, must not
+  // apply either post-wait step.
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  expect(await tagLink(t, first.contactId, tagId)).toBeNull();
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", first.conversationId))
+      .collect(),
+  );
+  // Only the two real inbound messages from the customer — never the
+  // automation's own post-wait send.
+  expect(messages.filter((m) => m.senderType === "bot")).toHaveLength(0);
+});
+
+test("without stopOnReply, a reply leaves the waiting run alone", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "NoStopOnReply");
+
+  const automationId = await t.run((ctx) =>
+    ctx.db.insert("automations", {
+      accountId,
+      name: "Nudge",
+      triggerType: "keyword_match",
+      triggerConfig: { keywords: ["quote"], match_type: "contains" },
+      isActive: true,
+      executionCount: 0,
+      // stopOnReply intentionally omitted — default-off.
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("automationSteps", {
+      accountId,
+      automationId,
+      stepType: "wait",
+      stepConfig: { amount: 1, unit: "minutes" },
+      position: 0,
+    }),
+  );
+
+  const first = await t.mutation(internal.ingest.ingestInbound, {
+    accountId,
+    from: "15550008888",
+    message: { type: "text", text: "quote please", wamid: "wamid.FIRST2" },
+  });
+
+  await t.action(internal.automationsEngine.runForTrigger, {
+    accountId,
+    triggerType: "keyword_match",
+    contactId: first.contactId,
+    context: { messageText: "quote please", conversationId: first.conversationId },
+  });
+
+  const parked = await t.run((ctx) =>
+    ctx.db
+      .query("automationRuns")
+      .withIndex("by_account_automation", (q) =>
+        q.eq("accountId", accountId).eq("automationId", automationId),
+      )
+      .unique(),
+  );
+  expect(parked?.status).toBe("waiting");
+
+  await t.action(internal.ingest.processInbound, {
+    accountId,
+    from: "15550008888",
+    message: { type: "text", text: "still there?", wamid: "wamid.SECOND2" },
+  });
+
+  const run = await t.run((ctx) => ctx.db.get(parked!._id));
+  expect(run?.status).toBe("waiting");
 });

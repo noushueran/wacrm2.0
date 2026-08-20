@@ -12,6 +12,21 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 // only (the WhatsApp webhook proxy), never by the browser.
 const CONVEX_URL =
   process.env.NEXT_PUBLIC_CONVEX_URL || "https://placeholder.convex.cloud";
+// The R2 custom domain media is served from (`objs.amaniworld.com`),
+// mirroring `NEXT_PUBLIC_R2_PUBLIC_HOST` the same way CONVEX_URL mirrors
+// the Convex origin. `img-src https:` already covers DISPLAYING these, but
+// two things need the host named explicitly:
+//   - connect-src: the inbox's download control fetch()es the object to
+//     turn it into a blob (an <a download> is ignored cross-origin — see
+//     `src/lib/media/download.ts`). Without this entry, enforcing the CSP
+//     would break every media download.
+//   - media-src: <video>/<audio> in a bubble stream straight from R2.
+// Empty string when unset, filtered out below, so a deployment without R2
+// configured emits the same policy it always did.
+const R2_PUBLIC_HOST = (process.env.NEXT_PUBLIC_R2_PUBLIC_HOST || "").replace(
+  /\/+$/,
+  "",
+);
 // https:// → wss:// (and http:// → ws:// for local dev) for the Convex
 // reactive-query WebSocket.
 const CONVEX_WS_URL = CONVEX_URL.replace(/^http/, "ws");
@@ -66,7 +81,9 @@ const SECURITY_HEADERS = [
       // and the audio/video the inbox renders, which Convex file storage
       // (files.getUrl → ctx.storage.getUrl) serves from the deployment
       // origin.
-      `media-src 'self' blob: ${CONVEX_URL}`,
+      ["media-src 'self' blob:", CONVEX_URL, R2_PUBLIC_HOST]
+        .filter(Boolean)
+        .join(" "),
       "font-src 'self' data:",
       "worker-src 'self'",
       "manifest-src 'self'",
@@ -74,7 +91,9 @@ const SECURITY_HEADERS = [
       // and the file-upload POST files.generateUploadUrl hands back) plus
       // its wss:// twin for the reactive-query socket. All Meta API calls
       // happen server-side, so graph.facebook.com does not belong here.
-      `connect-src 'self' ${CONVEX_URL} ${CONVEX_WS_URL}`,
+      ["connect-src 'self'", CONVEX_URL, CONVEX_WS_URL, R2_PUBLIC_HOST]
+        .filter(Boolean)
+        .join(" "),
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",

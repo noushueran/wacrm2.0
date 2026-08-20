@@ -20,7 +20,7 @@ import { DealsSettings } from '@/components/settings/deals-settings';
 import { MembersTab } from '@/components/settings/members-tab';
 import { ApiKeysSettings } from '@/components/settings/api-keys-settings';
 import { ConversionsTab } from '@/components/settings/conversions-tab';
-import { QualificationSettings } from '@/components/settings/qualification-settings';
+import { MovedToAgent } from '@/components/settings/moved-to-agent';
 import { CronSchedulesPanel } from '@/components/settings/cron-schedules';
 import {
   resolveSection,
@@ -84,7 +84,20 @@ export default function SettingsPage() {
     members: <MembersTab />,
     api: <ApiKeysSettings />,
     conversions: <ConversionsTab />,
-    qualification: <QualificationSettings />,
+    qualification: (
+      <MovedToAgent
+        agentKey="qualify"
+        agentName="Qualification agent"
+        what="How leads are qualified"
+      />
+    ),
+    'lead-sequence': (
+      <MovedToAgent
+        agentKey="score"
+        agentName="Lead scorer"
+        what="Scoring and the follow-up sequence"
+      />
+    ),
     cron: <CronSchedulesPanel />,
   };
 

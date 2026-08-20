@@ -1030,7 +1030,10 @@ describe("retrieve merge", () => {
       embedding: syntheticEmbedding(legacyContent),
     });
 
-    // Default `k` and no `audience` — what every live caller passes.
+    // Default `k` and no `audience` — the shape the qualification and
+    // sales engines pass (they NEED internal checklist chunks). The
+    // customer-facing reply paths in `aiReply.ts` pass
+    // `audience: "customer"` instead.
     const results = await t.action(internal.aiKnowledge.retrieve, {
       accountId,
       queryText: "Georgia",
@@ -1082,7 +1085,10 @@ describe("retrieve merge", () => {
       }
     });
 
-    // Default `k` and no `audience` — what every live caller passes.
+    // Default `k` and no `audience` — the shape the qualification and
+    // sales engines pass (they NEED internal checklist chunks). The
+    // customer-facing reply paths in `aiReply.ts` pass
+    // `audience: "customer"` instead.
     const results = await t.action(internal.aiKnowledge.retrieve, {
       accountId,
       queryText: "Georgia",

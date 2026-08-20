@@ -1,16 +1,35 @@
-import { AlarmClock, BadgeCheck, BadgeDollarSign, UserPlus } from "lucide-react";
+import {
+  AlarmClock,
+  ArchiveRestore,
+  BadgeCheck,
+  BadgeDollarSign,
+  UserPlus,
+  UserX,
+} from "lucide-react";
 
 import type { Notification, NotificationType } from "@/types";
 
 /**
  * Icon per notification type. Shared by the full notifications page and
  * the header notification bell so the two can never drift on iconography.
+ *
+ * This `Record<NotificationType, ...>` is exhaustive: it is the hand-
+ * maintained counterpart of the `notifications.type` union in
+ * `convex/schema.ts`. Widening that schema union without adding an entry
+ * here fails to compile — that's the intended guardrail, so the next
+ * person widening the schema union knows to come here too.
  */
 export const TYPE_ICON: Record<NotificationType, typeof UserPlus> = {
   conversation_assigned: UserPlus,
   lead_qualified: BadgeCheck,
   sla_alert: AlarmClock,
   purchase_signal: BadgeDollarSign,
+  // An archived conversation came back — the customer replied
+  // (spec 2026-07-26 §"Stopping and returning").
+  lead_returned: ArchiveRestore,
+  // The auto-assign sweep reached an unowned Chasing thread with no
+  // eligible agent to give it to (spec 2026-07-27-inbox-lanes).
+  chase_unassigned: UserX,
 };
 
 /**

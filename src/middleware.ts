@@ -4,6 +4,7 @@ import {
   nextjsMiddlewareRedirect,
 } from "@convex-dev/auth/nextjs/server";
 import { NextResponse } from "next/server";
+import { SESSION_COOKIE_MAX_AGE_SECONDS } from "../convex/lib/sessionDuration";
 
 // Auth pages — a signed-in user has no business here.
 const isAuthPage = createRouteMatcher(["/login", "/signup", "/forgot-password"]);
@@ -88,7 +89,20 @@ export default convexAuthNextjsMiddleware(async (request, { convexAuth }) => {
   if (onProtectedApi && !authed) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-});
+},
+  {
+    // Without this, Convex Auth defaults to `{ maxAge: null }` and writes
+    // `__Host-__convexAuthJWT` / `__Host-__convexAuthRefreshToken` as
+    // SESSION cookies — which a standalone PWA discards the moment iOS or
+    // Android tears the app down, so every cold start landed on /login
+    // even though the server-side session was still perfectly valid.
+    //
+    // Re-stamped on every token refresh (the 1-hour JWT refreshes when it
+    // comes within a minute of expiry), so the window slides forward under
+    // normal use rather than counting down from first sign-in.
+    cookieConfig: { maxAge: SESSION_COOKIE_MAX_AGE_SECONDS },
+  },
+);
 
 export const config = {
   // Run on everything except static assets. This still matches

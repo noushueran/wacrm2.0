@@ -1,10 +1,9 @@
 "use client"
 
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { useQuery } from '@/lib/convex/cached'
 import { api } from '../../../../convex/_generated/api'
 import { useAuth } from '@/hooks/use-auth'
-import { canAccessNav } from '@/lib/auth/roles'
 import { formatCurrency } from '@/lib/currency'
 import {
   MessageSquare,
@@ -13,44 +12,77 @@ import {
   Clock,
 } from 'lucide-react'
 
-import { startOfLocalDay, daysAgoStart, lastNDayKeys } from '@/lib/dashboard/date-utils'
-import type { ConversationsSeriesPoint } from '@/lib/dashboard/types'
+import { startOfLocalDay, daysAgoStart } from '@/lib/dashboard/date-utils'
 
 import { MetricCard } from '@/components/dashboard/metric-card'
 import { SkeletonCard } from '@/components/dashboard/skeleton'
 import { LeadSpendCard } from '@/components/dashboard/lead-spend-card'
+import { MyCoachingCard } from '@/components/dashboard/my-coaching-card'
 import { QuickActions } from '@/components/dashboard/quick-actions'
-import { ConversationsChart } from '@/components/dashboard/conversations-chart'
-import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
-import { ResponsePerformance } from '@/components/dashboard/response-performance'
 import { NeedsAttentionCard } from '@/components/dashboard/needs-attention-panel'
-import { ActivityFeed } from '@/components/dashboard/activity-feed'
+import { SnapshotAge } from '@/components/dashboard/snapshot-age'
 
 import { useTranslations } from 'next-intl'
 
-type RangeDays = 7 | 30 | 90
+// ============================================================
+// /dashboard — the operational home screen.
+//
+// WHAT THIS PAGE IS FOR, since that is what decides what may live on it:
+// the things a salesperson ACTS on. A queue to work, four numbers that set
+// the day's context, and the buttons that start work. Analysis — charts,
+// trends, feeds, anything a reader studies rather than acts on — lives at
+// /reports, where waiting for a computation is the accepted bargain.
+//
+// This page used to carry both, and paid for it. It fired NINE concurrent
+// Convex subscriptions on mount; measured against production data the two
+// worst were `dashboard.metrics` at 1,882 document reads / ~8s and
+// `qualification.leadsBoard` at 1,668 reads / ~2.4 MB — the latter to draw
+// a stage bar the reader takes ten numbers off. Worse, the metrics query
+// scanned ~1,300 `messages` rows for a figure NO tile rendered, and on this
+// deployment the first read to touch `messages` pays a large cold penalty
+// (measured: 12.7s for a single document, ~1.4s warm). The route's
+// time-to-content was therefore set almost entirely by work nobody was
+// waiting for.
+//
+// What moved to /reports: the conversations chart (the Conversations tab's
+// volume series is a strict superset of it), the leads pipeline card (Funnel
+// tab, rebuilt on a cheap aggregate), response performance (Response tab),
+// and the activity feed (its own tab).
+//
+// What is left fires four subscriptions, measured on production data at
+// ~51 document reads between them, against roughly 4,000 before:
+//
+//   dashboard.snapshot        1  — one indexed point read of the cron row
+//   conversations.list       50  — the Needs Attention queue
+//   leadCharges.report        0  — returns early while `leadValue` is unset
+//   salesCoach.forMe          0  — take(N) over an empty table
+//
+// The last two still SUBSCRIBE even though they usually render nothing —
+// they decide whether to show themselves from the result — so they are
+// four subscriptions, not two. They are cheap rather than absent.
+//
+// Needs Attention deliberately stays live rather than joining the
+// snapshot: it is the one thing on this page someone acts on immediately,
+// and a work queue that lags is a work queue that misroutes.
+// ============================================================
 
 export default function DashboardPage() {
   const t = useTranslations('Dashboard.page')
   // `accountId` is the account-readiness signal: `accountQuery` (which
-  // backs every `api.dashboard.*` below) derives the account server-side
-  // and THROWS `NO_ACCOUNT`/`UNAUTHENTICATED` if a query runs before the
-  // caller's membership resolves. Gating each query on `accountId` (via
-  // the "skip" sentinel) means they only ever fire once the account is
-  // known, so a fresh sign-in shows skeletons instead of a thrown error.
-  const { defaultCurrency, accountId, accountRole } = useAuth()
+  // backs `api.dashboard.snapshot`) derives the account server-side and
+  // THROWS `NO_ACCOUNT`/`UNAUTHENTICATED` if a query runs before the
+  // caller's membership resolves. Gating on `accountId` (via the "skip"
+  // sentinel) means it only ever fires once the account is known, so a
+  // fresh sign-in shows skeletons instead of a thrown error.
+  const { defaultCurrency, accountId } = useAuth()
 
-  const [range, setRange] = useState<RangeDays>(30)
-
-  // Local-day boundaries ("today", the chart's day buckets, "this week")
-  // are the caller's-timezone concept, so they're computed here in the
-  // browser and passed to the UTC-only Convex aggregations — see
-  // convex/dashboard.ts and convex/lib/dashboardDate.ts. `tzOffsetMinutes`
-  // matches `Date.prototype.getTimezoneOffset()` (the convention those
-  // helpers document). Memoised so "today" is captured once (per account /
-  // per range), mirroring how the old client-side loader computed it once
-  // per fetch rather than drifting every render.
-  const metricsArgs = useMemo(
+  // Local-day boundaries are the caller's-timezone concept, so they are
+  // computed here and passed to the UTC-only backend — see
+  // convex/dashboard.ts. Same arg contract the old live `metrics` query
+  // had; what changed is that they now fold a stored 72-hour rollup rather
+  // than driving three fresh table scans. Memoised so "today" is captured
+  // once per account rather than drifting every render.
+  const snapshotArgs = useMemo(
     () =>
       accountId
         ? {
@@ -61,76 +93,14 @@ export default function DashboardPage() {
     [accountId],
   )
 
-  const seriesArgs = useMemo(
-    () =>
-      accountId
-        ? {
-            sinceMs: daysAgoStart(range - 1).getTime(),
-            dayKeys: lastNDayKeys(range),
-            tzOffsetMinutes: new Date().getTimezoneOffset(),
-          }
-        : ('skip' as const),
-    [accountId, range],
-  )
-
-  const responseTimeArgs = useMemo(
-    () =>
-      accountId
-        ? {
-            // 14-day window (today + 13 prior days) — matches the original
-            // loadResponseTime's `daysAgoStart(13)`.
-            sinceMs: daysAgoStart(13).getTime(),
-            tzOffsetMinutes: new Date().getTimezoneOffset(),
-          }
-        : ('skip' as const),
-    [accountId],
-  )
-
-  // Reactive subscriptions. Each returns `undefined` while loading (or
-  // while skipped), so `=== undefined` is the per-widget loading flag and
-  // each card/chart shows its own skeleton independently — same
-  // independent-loading UX the old per-query `finally(setLoading)` gave.
-  const metricsData = useQuery(api.dashboard.metrics, metricsArgs)
-  const seriesData = useQuery(api.dashboard.conversationsSeries, seriesArgs)
-  // The leads-pipeline card self-gates its query; viewers (no lead queue)
-  // just get the chart at full width.
-  const showLeadsPipeline = accountRole !== 'viewer'
-  const responseTimeData = useQuery(api.dashboard.responseTime, responseTimeArgs)
-  // Fetch up to 50 so the biggest page-size option in the feed (50 rows)
-  // is already in memory — switching sizes is then a pure client slice.
-  //
-  // Skip until the role is BOTH known and sufficient. `api.dashboard
-  // .activity` is supervisor-gated server-side (it returns per-row
-  // detail, unlike the aggregates beside it); firing it below that floor
-  // throws FORBIDDEN synchronously inside `useQuery` (no Error Boundary
-  // in this app), which would crash the page before `RequireSection` can
-  // redirect. Same `canAccessNav` + 'skip' idiom as `campaigns/page.tsx`,
-  // which keeps the nav floor and the query floor coupled.
-  const canReadActivity = !!accountId && !!accountRole && canAccessNav(accountRole, '/dashboard')
-  const activityData = useQuery(api.dashboard.activity, canReadActivity ? { limit: 50 } : 'skip')
-  // Exact, role-scoped count of conversations awaiting a reply — powers the
-  // lead "Waiting on reply" KPI. Already deployed (backs the sidebar badge).
-  const unreadData = useQuery(api.conversations.unreadTotal, accountId ? {} : 'skip')
-
-  const metrics = metricsData ?? null
-  const metricsLoading = metricsData === undefined
-  const responseTime = responseTimeData ?? null
-  const responseTimeLoading = responseTimeData === undefined
-  const activity = activityData ?? null
-  const activityLoading = activityData === undefined
-  const waiting = unreadData ?? 0
-  const waitingLoading = unreadData === undefined
-
-  // ConversationsChart takes a per-range record (its contract, so a
-  // future full-cache variant stays a drop-in). We only ever subscribe to
-  // the active range — Convex re-subscribes reactively when `range`
-  // changes — so fill just that slot; the chart reads `series[range]`.
-  const series: Record<RangeDays, ConversationsSeriesPoint[] | null> = {
-    7: range === 7 ? (seriesData ?? null) : null,
-    30: range === 30 ? (seriesData ?? null) : null,
-    90: range === 90 ? (seriesData ?? null) : null,
-  }
-  const seriesLoading = seriesData === undefined
+  const snapshotData = useQuery(api.dashboard.snapshot, snapshotArgs)
+  // Three states, not two. `undefined` is "still loading" (render
+  // skeletons); `null` is "the cron has not built this account's row yet"
+  // — a real state on a freshly deployed backend or a brand-new account,
+  // and one the tiles must NOT render as zeros, which would read as "no
+  // work today" rather than "not computed yet".
+  const loading = snapshotData === undefined
+  const snapshot = snapshotData ?? null
 
   return (
     <div className="space-y-5">
@@ -138,26 +108,21 @@ export default function DashboardPage() {
 
       {/* Metric cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {/* Waiting on reply — the act-now number; loads independently of
-            the metrics bundle so it can render as soon as it resolves. */}
-        {waitingLoading ? (
-          <SkeletonCard />
-        ) : (
-          <MetricCard
-            title={t('waitingOnReply')}
-            value={waiting.toLocaleString()}
-            icon={Clock}
-            subtitle={t('awaitingReply')}
-          />
-        )}
-        {metricsLoading || !metrics ? (
+        {loading || !snapshot ? (
           <>
+            <SkeletonCard />
             <SkeletonCard />
             <SkeletonCard />
             <SkeletonCard />
           </>
         ) : (
           <>
+            <MetricCard
+              title={t('waitingOnReply')}
+              value={snapshot.waitingOnReply.toLocaleString()}
+              icon={Clock}
+              subtitle={t('awaitingReply')}
+            />
             <MetricCard
               title={t('activeConversations')}
               // `capped` means the backend stopped counting at its ceiling
@@ -165,93 +130,61 @@ export default function DashboardPage() {
               // ACTIVE_CONVERSATIONS_CAP in convex/dashboard.ts), so the
               // real figure is higher than `current`. Render "500+" — a
               // bare "500" would read as exact and be wrong.
-              value={`${metrics.activeConversations.current.toLocaleString()}${
-                metrics.activeConversations.capped ? '+' : ''
+              value={`${snapshot.activeConversations.current.toLocaleString()}${
+                snapshot.activeConversations.capped ? '+' : ''
               }`}
               icon={MessageSquare}
               delta={{
-                sign: metrics.activeConversations.previous,
+                sign: snapshot.activeConversations.previous,
                 label: deltaLabel(
-                  metrics.activeConversations.previous,
+                  snapshot.activeConversations.previous,
                   t('newTodayVsYesterday'),
-                  t('noChange', { suffix: t('newTodayVsYesterday') })
+                  t('noChange', { suffix: t('newTodayVsYesterday') }),
                 ),
               }}
             />
             <MetricCard
               title={t('newContactsToday')}
-              value={metrics.newContactsToday.current.toLocaleString()}
+              value={snapshot.newContactsToday.current.toLocaleString()}
+              subtitle={t('leadsSplit', {
+                ad: snapshot.newLeadsBySource.adToday,
+                direct: snapshot.newLeadsBySource.directToday,
+              })}
               icon={UserPlus}
-              {...(metrics.newLeadsBySource
-                ? {
-                    subtitle: t('leadsSplit', {
-                      ad: metrics.newLeadsBySource.adToday,
-                      direct: metrics.newLeadsBySource.directToday,
-                    }),
-                  }
-                : {
-                    delta: {
-                      sign:
-                        metrics.newContactsToday.current -
-                        metrics.newContactsToday.previous,
-                      label: deltaLabel(
-                        metrics.newContactsToday.current -
-                          metrics.newContactsToday.previous,
-                        t('vsYesterday'),
-                        t('noChange', { suffix: t('vsYesterday') })
-                      ),
-                    },
-                  })}
             />
             <MetricCard
               title={t('openDealsValue')}
-              value={formatCurrency(metrics.openDealsValue, defaultCurrency)}
+              value={formatCurrency(snapshot.openDealsValue, defaultCurrency)}
               icon={DollarSign}
-              subtitle={t('openDeals', { count: metrics.openDealsCount })}
+              subtitle={t('openDeals', { count: snapshot.openDealsCount })}
             />
           </>
         )}
       </div>
 
+      {/* The tiles above are a snapshot, so they carry their age rather
+          than presenting a lagging figure as live. Renders the
+          not-yet-computed case too, which is why it sits outside the
+          `snapshot &&` guard. */}
+      {!loading ? <SnapshotAge computedAtMs={snapshot?.computedAtMs ?? null} /> : null}
+
       {/* Needs attention — the operational queue (open conversations
-          awaiting a reply), role-scoped with Unassigned/Mine/All tabs. */}
+          awaiting a reply), role-scoped with Unassigned/Mine/All tabs.
+          Deliberately live rather than snapshotted: this is the one thing
+          on the page someone acts on immediately. */}
       <NeedsAttentionCard />
 
       {/* Lead spend — self-hides (renders null) until an admin sets a
           positive lead value, so no conditional needed here. */}
       <LeadSpendCard />
 
+      {/* Renders nothing until this person actually has coaching, so it
+          never sits on the home screen as a standing reminder of being
+          watched. */}
+      <MyCoachingCard />
+
       {/* Quick actions */}
       <QuickActions />
-
-      {/* Charts row */}
-      {/* items-stretch (the grid default) stretches the two columns to
-          match the tallest sibling; adding h-full on each wrapper and
-          on the inner panels makes both cards actually fill that
-          stretched height so their rounded borders line up. Without
-          this, the pipeline card rendered at its natural (shorter)
-          height while the line chart drove the row height. */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
-        <div className={showLeadsPipeline ? 'h-full lg:col-span-3' : 'h-full lg:col-span-5'}>
-          <ConversationsChart
-            series={series}
-            loading={seriesLoading}
-            range={range}
-            onRangeChange={setRange}
-          />
-        </div>
-        {showLeadsPipeline ? (
-          <div className="h-full lg:col-span-2">
-            <LeadsPipelineCard />
-          </div>
-        ) : null}
-      </div>
-
-      {/* Response performance — week-over-week averages vs SLA target. */}
-      <ResponsePerformance data={responseTime} loading={responseTimeLoading} />
-
-      {/* Activity feed */}
-      <ActivityFeed items={activity} loading={activityLoading} />
     </div>
   )
 }

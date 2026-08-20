@@ -1,10 +1,11 @@
 import { accountMutation, accountQuery } from "./lib/auth";
-import { internalMutation } from "./_generated/server";
+import { internalMutation, internalQuery } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { normalizePhone, maskPhone } from "./lib/phone";
 import { hasMinRole } from "./lib/roles";
 import { matchesContactSearch } from "./lib/contactSearch";
+import { dispatchTagAdded } from "./lib/automations/triggers";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
@@ -31,8 +32,18 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
     .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
     .collect();
   const tags = (
-    await Promise.all(links.map((link) => ctx.db.get(link.tagId)))
-  ).filter((tag): tag is Doc<"tags"> => tag !== null);
+    await Promise.all(
+      links.map(async (link) => {
+        const tag = await ctx.db.get(link.tagId);
+        // Provenance rides along with the tag so the UI can mark an
+        // ad-derived label without a second round trip.
+        return tag ? { ...tag, source: link.source } : null;
+      }),
+    )
+  ).filter(
+    (tag): tag is Doc<"tags"> & { source: "ai" | "manual" | "ad" | undefined } =>
+      tag !== null,
+  );
   return { ...contact, tags };
 }
 
@@ -347,6 +358,107 @@ export const filterByTags = accountQuery({
 });
 
 /**
+ * The contact directory as NUMBERED PAGES — one page of rows plus an
+ * exact `total`, so the UI can render "Page 3 of 12" and jump.
+ *
+ * Why this exists next to `list` rather than replacing it: `list` is
+ * cursor-paginated (`paginationOpts`) and has eight other callers — the
+ * broadcast composer's audience steps, /pipelines, the deal form — all
+ * of which want exactly the "keep appending" behaviour a cursor gives.
+ * Cursors cannot express "jump to page 7"; offsets can. So /contacts
+ * gets its own offset query and every other caller is left alone.
+ *
+ * It also folds in `filterByTags`, so the tagged and untagged views are
+ * one code path with one shape instead of the two the page previously
+ * had to switch between (offset Prev/Next while tagged, cursor "Load
+ * more" otherwise).
+ *
+ * COST: an exact `total` means counting, and counting means reading the
+ * account's contacts rather than a cursor window. That is the same scan
+ * `filterByTags` and `list`'s search branch already perform, and it is
+ * bounded by one account's contact count — but it is the reason this
+ * query is offered alongside `list` rather than as a wholesale
+ * replacement for it.
+ */
+export const listPage = accountQuery({
+  args: {
+    search: v.optional(v.string()),
+    /** Empty (or omitted) means "no tag filter" — OR-matched when present. */
+    tagIds: v.optional(v.array(v.id("tags"))),
+    limit: v.number(),
+    offset: v.number(),
+  },
+  handler: async (ctx, args) => {
+    // Supervisor+, the same floor `list`/`filterByTags` carry, and for
+    // the same reason: this runs `matchesContactSearch` against raw docs
+    // before masking, so leaving it open would just reopen the
+    // phone-search oracle those two were gated to close.
+    ctx.requireRole("supervisor");
+    const { search, limit, offset } = args;
+    const tagIds = args.tagIds ?? [];
+
+    let contacts: Doc<"contacts">[];
+    if (tagIds.length > 0) {
+      // OR across tags, with the same defense-in-depth `filterByTags`
+      // applies: a caller can supply another account's real tagId, and
+      // `contactTags.by_tag` would happily return that account's links.
+      const contactIds = new Set<Id<"contacts">>();
+      for (const tagId of tagIds) {
+        const links = await ctx.db
+          .query("contactTags")
+          .withIndex("by_tag", (q) => q.eq("tagId", tagId))
+          .collect();
+        for (const link of links) contactIds.add(link.contactId);
+      }
+      const fetched = await Promise.all([...contactIds].map((id) => ctx.db.get(id)));
+      contacts = fetched.filter(
+        (contact): contact is Doc<"contacts"> =>
+          contact !== null && contact.accountId === ctx.accountId,
+      );
+    } else {
+      contacts = await ctx.db
+        .query("contacts")
+        .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+        .order("desc")
+        .collect();
+    }
+
+    const term = search?.trim();
+    const matched = term
+      ? contacts.filter((contact) => matchesContactSearch(contact, term))
+      : contacts;
+
+    // Newest-first, matching `list` and `filterByTags`. Applied even on
+    // the untagged path, whose index order is already descending — the
+    // tag path arrives in Set-insertion order and would otherwise be
+    // arbitrary, and one sort for both keeps the two orders identical.
+    matched.sort((a, b) => b._creationTime - a._creationTime);
+
+    const total = matched.length;
+    const size = Math.max(1, Math.trunc(limit));
+    // Clamped to a PAGE BOUNDARY, so an offset past the end returns the
+    // last full page rather than nothing (or, if it were clamped to
+    // `total - 1`, a ragged one-row page). Contacts is a live
+    // subscription: rows can be deleted out from under a client already
+    // sitting on the final page.
+    const lastOffset = total === 0 ? 0 : Math.floor((total - 1) / size) * size;
+    const safeOffset = Math.min(Math.max(Math.trunc(offset), 0), lastOffset);
+    const page = matched.slice(safeOffset, safeOffset + size);
+
+    const items = await Promise.all(
+      page.map(async (contact) => {
+        const withTags = await embedTags(ctx, contact);
+        return hasMinRole(ctx.role, "supervisor")
+          ? withTags
+          : maskContactPhone(withTags);
+      }),
+    );
+
+    return { items, total, offset: safeOffset };
+  },
+});
+
+/**
  * Contacts whose `customFieldId` custom-field value matches `value`
  * under `operator` (`is`/`is_not`/exact, or `contains` — case-
  * insensitive substring) — the Convex equivalent of the pre-Convex
@@ -451,6 +563,13 @@ export const update = accountMutation({
     travelers: v.optional(v.string()),
     budget: v.optional(v.string()),
     notes: v.optional(v.string()),
+    // Contact photo. Same dual-field, patch-only-when-supplied convention
+    // as `accounts.updateProfile`: an R2 key from `uploadAccountMedia`
+    // sets the photo, and `""` for BOTH clears it — clearing only the url
+    // would leave a stale key still winning `resolveMediaUrl`'s
+    // key-over-url precedence and silently undo the removal.
+    avatarKey: v.optional(v.string()),
+    avatarUrl: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
@@ -473,6 +592,8 @@ export const update = accountMutation({
       travelers: string;
       budget: string;
       notes: string;
+      avatarKey: string;
+      avatarUrl: string;
     }> = { ...rest };
 
     if (phone !== undefined) {
@@ -626,11 +747,19 @@ export const assignTag = accountMutation({
       .first();
     if (existing) return existing._id;
 
-    return await ctx.db.insert("contactTags", {
+    const linkId = await ctx.db.insert("contactTags", {
       accountId: ctx.accountId,
       contactId: args.contactId,
       tagId: args.tagId,
     });
+    // Only on a real insert — re-applying a tag the contact already
+    // holds returned above and must not re-fire the automation.
+    await dispatchTagAdded(ctx, {
+      accountId: ctx.accountId,
+      contactId: args.contactId,
+      tagId: args.tagId,
+    });
+    return linkId;
   },
 });
 
@@ -719,5 +848,23 @@ export const findOrCreateByPhoneInternal = internalMutation({
   handler: async (ctx, args) => {
     const { accountId, ...input } = args;
     return await findOrCreateContactByPhone(ctx, accountId, input);
+  },
+});
+
+/**
+ * Loads `contactId`, but only if it belongs to `accountId` — `null`
+ * otherwise (a foreign contact and a missing one read identically,
+ * matching this file's own tenant-isolation convention). Returns the
+ * full contact doc so callers can feed it straight into `blockedReason`
+ * (`convex/lib/notes/gate.ts`) without a second read — mirrors
+ * `automationsEngine.ts`'s own `getOwnedContact`. For `action`-shaped
+ * callers with no `ctx.db` (e.g. `apiV1.ts`'s `sendMessage`), same as
+ * `findOrCreateByPhoneInternal` above needing a mutation counterpart.
+ */
+export const getOwnedInternal = internalQuery({
+  args: { accountId: v.id("accounts"), contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    const contact = await ctx.db.get(args.contactId);
+    return contact && contact.accountId === args.accountId ? contact : null;
   },
 });

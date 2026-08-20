@@ -15,9 +15,10 @@
     "createAccount": "Create account"
   },
   "Sidebar": {
-    "title": "Holidayys WA CRM",
+    "title": "__PRODUCT_NAME__",
     "dashboard": "Dashboard",
     "leads": "Leads",
+    "leadAnalysis": "Lead Analysis",
     "inbox": "Inbox",
     "notifications": "Notifications",
     "contacts": "Contacts",
@@ -27,6 +28,7 @@
     "flows": "Flows",
     "aiAgents": "AI Agents",
     "campaigns": "Campaigns",
+    "reports": "Reports",
     "settings": "Settings",
     "beta": "Beta",
     "unreadConversations": "{count} unread {count, plural, =1 {conversation} other {conversations}}",
@@ -50,7 +52,7 @@
     "menuSignOut": "Sign out"
   },
   "Header": {
-    "brand": "Holidayys WA CRM",
+    "brand": "__PRODUCT_NAME__",
     "dashboard": "Dashboard",
     "inbox": "Inbox",
     "notifications": "Notifications",
@@ -90,7 +92,11 @@
       "noChange": "No change {suffix}",
       "waitingOnReply": "Waiting on Reply",
       "awaitingReply": "awaiting a reply",
-      "leadsSplit": "{ad} ads · {direct} direct"
+      "leadsSplit": "{ad} ads · {direct} direct",
+      "snapshotJustNow": "Updated just now",
+      "snapshotMinutesAgo": "Updated {minutes}m ago",
+      "snapshotHoursAgo": "Updated {hours}h ago",
+      "snapshotPreparing": "Preparing today’s figures…"
     },
     "quickActions": {
       "newContact": "New Contact",
@@ -184,7 +190,10 @@
   },
   "Inbox": {
     "page": {
-      "whatsappNotConnected": "WhatsApp® is not connected. Go to Settings to connect your account."
+      "whatsappNotConnected": "WhatsApp® is not connected. Go to Settings to connect your account.",
+      "archivedBanner": "This conversation is archived. It will return automatically if the customer replies.",
+      "restore": "Restore",
+      "markUnreadFailed": "Couldn't mark this chat as unread"
     },
     "ownSpend": {
       "line": "This month: {amount} on {count} leads"
@@ -206,9 +215,28 @@
       "tabAll": "All",
       "tabMine": "Mine",
       "tabUnassigned": "Unassigned",
+      "archivedTab": "Archived",
       "assignedToYou": "You",
       "emptyMine": "No chats assigned to you yet",
-      "emptyUnassigned": "No unassigned chats"
+      "emptyUnassigned": "No unassigned chats",
+      "emptyArchived": "No archived conversations",
+      "markUnread": "Mark as unread",
+      "laneActive": "Active",
+      "laneWaiting": "Waiting",
+      "laneChasing": "Chasing",
+      "laneArchived": "Archived",
+      "laneSnoozed": "Snoozed",
+      "laneActiveEmpty": "Nothing waiting on a reply. Good place to be.",
+      "laneWaitingEmpty": "No threads waiting on a customer.",
+      "laneChasingEmpty": "Nothing has gone quiet long enough to chase.",
+      "laneArchivedEmpty": "Nothing archived yet.",
+      "laneSnoozedEmpty": "Nothing snoozed.",
+      "chasingQuietDays": "Quiet {days}d",
+      "chasingProgress": "{sent, plural, =0 {no nudges} =1 {1 nudge} other {# nudges}}",
+      "chasingNeedsDecision": "Needs your decision",
+      "snoozedUntilRow": "Snoozed until {when}",
+      "forcedChasingBadge": "Marked",
+      "fromAd": "From an ad"
     },
     "messageThread": {
       "backToConversations": "Back to conversations",
@@ -239,7 +267,36 @@
       "selectConversationHint": "Choose a conversation from the left to start messaging",
       "today": "Today",
       "yesterday": "Yesterday",
-      "adLeadBadge": "Ad lead"
+      "adLeadBadge": "Ad lead",
+      "fromAd": "From an ad",
+      "more": "More actions",
+      "markUnread": "Mark as unread",
+      "stopChasing": "Stop chasing",
+      "stopChasingFailed": "Could not stop chasing this conversation.",
+      "archive": "Archive",
+      "archiveTooltip": "Shelve this conversation. Any reply brings it straight back.",
+      "archivedToast": "Archived. Any reply brings it back.",
+      "archiveFailed": "Could not archive this conversation.",
+      "snooze": "Snooze",
+      "snoozeThreeHours": "3 hours",
+      "snoozeTomorrow": "Tomorrow morning",
+      "snoozeNextWeek": "Next Monday",
+      "snoozeCustom": "Pick a time…",
+      "snoozeReasonPlaceholder": "Why? (optional)",
+      "snoozeConfirm": "Snooze",
+      "snoozeFailed": "Could not snooze this conversation.",
+      "snoozedToast": "Snoozed until {when}.",
+      "wake": "Wake now",
+      "chaseNow": "Chase now",
+      "chaseNowTooltip": "Move to Chasing now — for a lead you can already tell has gone quiet.",
+      "chaseNowFailed": "Could not move this conversation to Chasing.",
+      "chasedToast": "Moved to Chasing.",
+      "undo": "Undo",
+      "leadFallback": "Lead",
+      "leadSectionStage": "Stage",
+      "leadSectionAssignee": "Assigned to",
+      "leadSectionContext": "Context",
+      "leadSectionTags": "Tags"
     },
     "qualification": {
       "qualifiedBadge": "Qualified",
@@ -252,6 +309,15 @@
       "noCustomerMessages": "No customer messages",
       "adFreeXhRemaining": "{hours}h",
       "adFreeXmRemaining": "{minutes}m"
+    },
+    "messagingWindow": {
+      "freeBadge": "Free {remaining}",
+      "freeBadgeTitle": "Free entry point window — every message, including templates, is free of charge for another {remaining}",
+      "freeBadgeEstimatedTitle": "Free entry point window — every message, including templates, should be free for another {remaining}. Estimated; Meta confirms this once your reply is delivered.",
+      "listFreeBadge": "Free",
+      "listFreeBadgeTitle": "Ad lead inside its free messaging window",
+      "unlockNudge": "Reply within {remaining} to unlock 72 hours of free messaging",
+      "unlockNudgeTitle": "This lead arrived from a Click-to-WhatsApp ad. If you reply within 24 hours of the click, Meta makes every message — templates included — free for the next 72 hours."
     },
     "composer": {
       "draftHint": "Tap the ✨ to draft a reply with AI — you can edit it before sending",
@@ -274,6 +340,8 @@
       "draftWithAI": "Draft a reply with AI",
       "addCaption": "Add a caption…",
       "removeAttachment": "Remove attachment",
+      "pasteUnsupported": "Can't attach a {type} file — supported: PNG/JPEG/WebP images, MP4/3GP video, PDF and Office documents.",
+      "pasteMultipleFiles": "One attachment per message — only the first file is used.",
       "moreActions": "More",
       "interactiveMessage": "Interactive message",
       "quickReplies": "Quick replies",
@@ -288,10 +356,6 @@
       "photo": "Photo",
       "video": "Video",
       "audio": "Audio",
-      "viewImage": "View full size",
-      "viewVideo": "View full screen",
-      "download": "Download",
-      "closeViewer": "Close",
       "unavailable": "{label} unavailable",
       "document": "Document",
       "locationShared": "Location shared",
@@ -307,7 +371,16 @@
       "transcriptShowLess": "Show less",
       "fromAd": "From an ad",
       "viewAd": "View ad",
-      "contactCard": "Contact card"
+      "contactCard": "Contact card",
+      "viewLarger": "View larger",
+      "download": "Download",
+      "downloadFailed": "Couldn't download that file",
+      "openInTab": "Open in new tab",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "close": "Close",
+      "imageViewer": "Image viewer",
+      "videoViewer": "Video viewer"
     },
     "actions": {
       "reply": "Reply",
@@ -360,7 +433,17 @@
       "saving": "Saving…",
       "saved": "Contact updated",
       "saveError": "Couldn't save contact",
+      "uploadPhoto": "Add photo",
+      "changePhoto": "Change photo",
+      "removePhoto": "Remove photo",
+      "photoHint": "WhatsApp doesn't share customer photos, so this one is yours to set.",
+      "unsupportedImage": "Unsupported image type",
+      "unsupportedImageDesc": "Use PNG, JPG, WebP, or GIF.",
+      "imageTooLarge": "Image is too large",
+      "imageTooLargeDesc": "Maximum 2 MB.",
+      "photoUploadError": "Couldn't upload the photo",
       "sectionContact": "Contact",
+      "copyNumber": "Copy number",
       "sectionLocation": "Location",
       "sectionTravel": "Travel profile",
       "sectionAbout": "About",
@@ -380,14 +463,99 @@
       "notFilled": "—",
       "sectionAcquisition": "Acquisition",
       "acquiredViaAd": "Acquired via a Click-to-WhatsApp ad",
-      "viewAd": "View ad"
+      "viewAd": "View ad",
+      "expandSection": "Show {label}",
+      "collapseSection": "Hide {label}",
+      "sectionHasContent": "Has content"
+    },
+    "notes": {
+      "internal": "Internal · not sent",
+      "addNote": "Add note",
+      "placeholder": "What happened? e.g. Called him, wants March, will confirm Tuesday",
+      "save": "Save note",
+      "cancel": "Cancel",
+      "edited": "edited",
+      "attach": "Attach file",
+      "attachmentNotice": "Don't attach passports or ID documents yet.",
+      "removeAttachment": "Remove {name}",
+      "earlierNotes": "{count, plural, one {# earlier note} other {# earlier notes}}",
+      "earlierItems": "{count, plural, one {# earlier note or update} other {# earlier notes and updates}}",
+      "tooManyFiles": "Up to {max} files per note.",
+      "fileTooLarge": "{name} is too large. Maximum {max} MB per file.",
+      "uploadFailed": "Couldn't upload {name}.",
+      "saveFailed": "Couldn't save the note.",
+      "deleteFailed": "Couldn't delete the note.",
+      "confirmDoNotContact": "Stop all automated messages to this customer?",
+      "doNotContactTitle": "Do not contact",
+      "doNotContactBody": "A team member recorded that this customer asked not to be contacted. Automatic replies, follow-ups and broadcasts are stopped. You can still message them manually.",
+      "doNotContactSetBy": "Set by {name} on {date}",
+      "doNotContactSetByUnknown": "Set on {date}",
+      "doNotContactClear": "Clear",
+      "doNotContactCleared": "Do-not-contact cleared",
+      "doNotContactClearFailed": "Couldn't clear it — you may not have permission.",
+      "more": "More actions",
+      "delete": "Delete",
+      "edit": "Edit",
+      "systemAuthor": "System",
+      "kind": {
+        "call": "Phone call",
+        "whatsapp_external": "WhatsApp",
+        "meeting": "Meeting",
+        "email": "Email",
+        "payment": "Payment",
+        "general": "Note",
+        "system": "System"
+      },
+      "outcome": {
+        "no_answer": "No answer",
+        "follow_up": "Follow up",
+        "do_not_contact": "Do not contact",
+        "not_interested": "Not interested"
+      },
+      "cleared": "cleared"
+    },
+    "assignmentEvents": {
+      "assigned": "{actor} assigned this chat to {target}",
+      "reassigned": "{actor} moved this chat from {previous} to {target}",
+      "selfAssigned": "{actor} took this chat",
+      "autoAssigned": "Auto-assigned to {target}",
+      "automationAssigned": "An automation assigned this chat to {target}",
+      "offerAccepted": "{target} accepted this lead",
+      "takeover": "{actor} took over from the AI",
+      "unassigned": "{actor} unassigned this chat from {previous}",
+      "released": "Returned to the pool when the AI resumed",
+      "unknownMember": "a former teammate"
+    },
+    "activity": {
+      "title": "Activity",
+      "filterAll": "All",
+      "filterNotes": "Notes only",
+      "empty": "Nothing recorded yet.",
+      "assignedTo": "Assigned to {name}",
+      "unassigned": "Unassigned",
+      "lastContacted": "Last contacted {when}",
+      "neverContacted": "Not contacted yet",
+      "nextFollowUp": "Follow up {when}",
+      "autoStage": "automatically",
+      "stageMoved": "Stage → {stage}",
+      "stage": {
+        "new_lead": "New lead",
+        "qualified": "Qualified",
+        "price_quoted": "Price quoted",
+        "itinerary_created": "Itinerary created",
+        "itinerary_sent": "Itinerary sent",
+        "invoice_sent": "Invoice sent",
+        "purchased": "Purchased",
+        "lost": "Lost"
+      }
     },
     "labels": {
       "title": "Labels",
       "add": "Add label",
       "none": "No labels yet",
       "ungrouped": "Other",
-      "failed": "Couldn’t update labels"
+      "failed": "Couldn’t update labels",
+      "fromAd": "From an ad"
     },
     "tagSuggestions": {
       "title": "AI suggestion",
@@ -417,6 +585,8 @@
       "crmOnly": "CRM only — not from an ad or tracked link, so not reported to Meta.",
       "reportedToMeta": "Reported to Meta",
       "notReportedYet": "Not reported yet",
+      "showAllStages": "All stages",
+      "hideAllStages": "Hide stages",
       "saleAmountTitle": "Record the sale",
       "saleAmountLabel": "Sale amount",
       "saleAmountConfirm": "Mark purchased",
@@ -456,11 +626,20 @@
       "selectPlaceholder": "—"
     }
   },
+  "Pagination": {
+    "label": "Pagination",
+    "showing": "Showing {start}–{end} of {total}",
+    "pageOf": "Page {page} of {total}",
+    "previous": "Previous page",
+    "next": "Next page",
+    "goToPage": "Go to page {page}"
+  },
   "Leads": {
     "pageTitle": "Leads",
     "pageDesc": "Every qualification session the AI is running — qualified leads first, highest score on top.",
     "loading": "Loading leads…",
     "empty": "No qualification sessions yet. They appear as soon as lead qualification is enabled and customers write in.",
+    "noAccess": "You don't have access to leads. Ask an admin if you need it.",
     "openChat": "Open chat",
     "assignedTo": "→ {name}",
     "summary": {
@@ -565,6 +744,48 @@
       "updateError": "Couldn't update the checklist."
     }
   },
+  "LeadAnalysis": {
+    "title": "Lead Analysis",
+    "loading": "Loading leads…",
+    "empty": "No leads scored yet. Scoring runs in the background.",
+    "noAccess": "You don't have access to lead analysis. Ask an admin if you need it.",
+    "selectLead": "Select a lead to open its conversation.",
+    "back": "Back to leads",
+    "tiles": {
+      "hot": "Hot",
+      "warm": "Warm",
+      "cold": "Cold",
+      "awaitingUs": "Awaiting us",
+      "unscored": "Unscored",
+      "avgScore": "Avg score"
+    },
+    "filters": {
+      "all": "All",
+      "band": "Band",
+      "lane": "Lane",
+      "search": "Search name or phone"
+    },
+    "lane": {
+      "awaiting_us": "Awaiting us",
+      "awaiting_them": "Awaiting them"
+    },
+    "view": { "active": "Active", "archived": "Archived" },
+    "row": {
+      "unscored": "Unscored",
+      "daysSilent": "{days}d silent",
+      "today": "Today",
+      "reanalyze": "Re-analyze",
+      "archive": "Archive",
+      "restore": "Restore",
+      "returned": "Returned"
+    },
+    "reanalyzeQueued": "Re-analysis queued",
+    "reanalyzeError": "Could not queue re-analysis",
+    "archivedToast": "Lead archived",
+    "restoredToast": "Lead restored",
+    "archiveError": "Could not archive this lead",
+    "restoreError": "Could not restore this lead"
+  },
   "Contacts": {
     "page": {
       "title": "Contacts",
@@ -597,10 +818,6 @@
       "openChatAction": "Open chat",
       "editAction": "Edit",
       "deleteAction": "Delete",
-      "showingPagination": "Showing {start}-{end} of {total}",
-      "pageCount": "Page {page} of {total}",
-      "loadMore": "Load more",
-      "loadingMore": "Loading more...",
       "deleteContactTitle": "Delete Contact",
       "deleteContactDesc": "Are you sure you want to delete {name}? This action cannot be undone.",
       "cancel": "Cancel",
@@ -984,7 +1201,8 @@
       "toastNotSignedIn": "Not signed in.",
       "toastNotLinked": "Your profile is not linked to an account.",
       "toastFailedDraft": "Failed to save draft: {error}",
-      "toastDraftSaved": "Draft saved"
+      "toastDraftSaved": "Draft saved",
+      "skippedDoNotContact": "{count, plural, one {# contact skipped — marked do not contact} other {# contacts skipped — marked do not contact}}"
     },
     "wizard": {
       "next": "Next",
@@ -1073,6 +1291,7 @@
         "audienceCsv": "CSV upload",
         "variables": "Variables:",
         "variablesMapped": "{count} mapped",
+        "willSkipDoNotContact": "{count, plural, one {# selected contact is marked do not contact and will be skipped} other {# selected contacts are marked do not contact and will be skipped}}",
         "saveDraft": "Save as Draft",
         "sendNow": "Send Broadcast",
         "sending": "Sending...",
@@ -1102,7 +1321,144 @@
       "total": "Total"
     }
   },
+  "Reports": {
+    "title": "Reports",
+    "subtitle": "Conversation volume, ad performance, response times, funnel and Meta billing.",
+    "range": "{days} days",
+    "exportCsv": "Export CSV",
+    "tabs": {
+      "conversations": "Conversations",
+      "ads": "Ads",
+      "response": "Response",
+      "funnel": "Funnel",
+      "billing": "Billing",
+      "activity": "Activity"
+    },
+    "conversations": {
+      "started": "New conversations",
+      "startedSubtitle": "Each contact's first conversation — not message activity",
+      "fromAds": "From ads",
+      "direct": "Direct",
+      "received": "Messages received",
+      "sent": "Messages sent",
+      "adShare": "{pct}% of all new conversations",
+      "chartTitle": "Volume over time",
+      "day": "Daily",
+      "week": "Weekly",
+      "partialWeekAxis": "{key}*",
+      "partialWeekTooltip": "Week of {key} (partial)",
+      "partialWeekNote": "* Partial week — only part of it falls inside the selected range, so its bars cover fewer than seven days.",
+      "hourTitle": "Busiest hour: {hour}:00",
+      "hourTitleEmpty": "Busiest hour",
+      "hourTooltip": "{hour}:00 — {count} messages received",
+      "mixTitle": "Current conversations by status",
+      "emptyTitle": "No activity in this range",
+      "emptyHint": "No conversations or messages were recorded for the selected range.",
+      "hourEmptyTitle": "No messages received in this range",
+      "hourEmptyHint": "This heatmap counts incoming messages only, and none were recorded for the selected range.",
+      "active": "Conversations with activity",
+      "activeSubtitle": "Average per day — threads with any message, in or out",
+      "activeTitle": "Conversations with activity over time",
+      "activePerDay": "avg/day",
+      "activeEmptyTitle": "No conversation activity in this range",
+      "activeEmptyHint": "Threads appear here on any message, sent or received.",
+      "activeCaveat": "A thread active both overnight and later the same day may count twice, since a local day spans two UTC days.",
+      "status": {
+        "open": "Open",
+        "pending": "Pending",
+        "closed": "Closed",
+        "archived": "Archived"
+      }
+    },
+    "ads": {
+      "title": "Ad performance",
+      "countingNote": "Each conversation is counted under every ad that touched it, so these figures are not comparable to the Conversations tab.",
+      "ad": "Ad",
+      "conversations": "Conversations",
+      "firstTouchLeads": "First-touch contacts",
+      "firstTouchLeadsTooltip": "Contacts whose first-ever ad referral was this ad. A per-contact count, not a funnel step between conversations and qualified.",
+      "qualified": "Qualified",
+      "purchased": "Purchased",
+      "value": "Value",
+      "valueNote": "Value gives every ad that touched a conversation the full sale amount, so this column cannot be added up. It also leaves out older purchases whose value was only recorded as a Meta conversion event, which the Funnel tab does count — the two tabs will not match.",
+      "service": "Service",
+      "toggleDetails": "Details for {ad}",
+      "unresolved": "This ad's name has not been resolved from Meta yet.",
+      "truncated": "Showing the top {limit} ads by conversations. {n} more are not shown.",
+      "resolutionBacklog": "Ad names still resolving: {pending} pending, {dormant} waiting on a Meta access token, {abandoned} gave up.",
+      "emptyTitle": "No ad-attributed conversations in this range",
+      "emptyHint": "No Click-to-WhatsApp ad referrals were recorded for the selected range."
+    },
+    "response": {
+      "avg": "Average first reply",
+      "withinTarget": "Within {n} min",
+      "p50": "Median (p50)",
+      "p90": "p90",
+      "target": "Target",
+      "minutes": "{n} min",
+      "samples": "{n} replies measured",
+      "trendTitle": "Average reply time",
+      "hourTitle": "Average reply time by hour of day",
+      "betweenMinutes": "{low}–{high} min",
+      "overMinutes": "Over {n} min",
+      "histogramCaveat": "Target and percentile figures reflect {histogramSamples} of {countSamples} replies with detailed timing — the rest predate that tracking and will be included once the backlog is backfilled.",
+      "emptyTitle": "No replies measured in this range",
+      "emptyHint": "No reply-latency data was recorded for the selected range.",
+      "backlogTitle": "Still awaiting a reply",
+      "backlogCapped": "Sampled the {limit} oldest waiting threads; the real backlog is larger.",
+      "backlog": {
+        "under1h": "Under 1 hour",
+        "h1to4": "1–4 hours",
+        "h4to24": "4–24 hours",
+        "over24h": "Over 24 hours"
+      }
+    },
+    "funnel": {
+      "newLeads": "New leads",
+      "qualified": "Qualified",
+      "purchases": "Purchases",
+      "recordedValue": "Recorded value",
+      "recordedValueNote": "Includes organic purchases that were never reported to Meta.",
+      "funnelTitle": "Funnel by stage",
+      "metaTitle": "Meta delivery",
+      "meta": {
+        "sent": "Sent",
+        "pending": "Pending",
+        "dormant": "Dormant",
+        "unmatched": "Unmatched",
+        "error": "Error",
+        "abandoned": "Abandoned",
+        "total": "Total"
+      }
+    },
+    "billing": {
+      "note": "Meta reports billing categories and counts, not amounts. These are message and conversation volumes, not spend.",
+      "billableConversations": "Billable conversations (derived)",
+      "billableNote": "{total} Meta conversations minus {free} free entry-point.",
+      "freeEntryPoint": "Free entry point (from ads)",
+      "freeEntryPointNote": "Counted in Meta's conversation total, and already excluded from Billable conversations.",
+      "categoriesTitle": "Messages by billing category",
+      "emptyTitle": "No billing data in this range",
+      "backfillNote": "Billing figures start from when this report shipped; earlier periods show zero.",
+      "category": {
+        "marketing": "Marketing",
+        "utility": "Utility",
+        "service": "Service",
+        "authentication": "Authentication",
+        "free": "Free",
+        "other": "Other"
+      }
+    }
+  },
   "Automations": {
+    "stats": {
+      "enrolled": "Enrolled",
+      "waiting": "Waiting",
+      "sent": "Sent",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "truncated": "Showing at least these counts — the exact totals are higher than what fits in one read."
+    },
     "list": {
       "title": "Automations",
       "subtitle": "Build workflows that react to WhatsApp® events automatically.",
@@ -1153,9 +1509,42 @@
         "failed": "failed"
       },
       "back": "Back",
-      "backAria": "Back"
+      "backAria": "Back",
+      "tabs": {
+        "history": "History",
+        "waiting": "Waiting"
+      },
+      "waiting": {
+        "emptyTitle": "Nobody is queued right now.",
+        "atStep": "Waiting at {step}",
+        "unknownStep": "an unknown step",
+        "cancel": "Cancel",
+        "cancelTitle": "Cancel this run?",
+        "cancelDesc": "This stops the queued steps for {name}. They won't receive any more scheduled messages from this automation.",
+        "keepWaiting": "Keep waiting",
+        "cancelConfirm": "Cancel run",
+        "cancelSuccess": "Run cancelled",
+        "cancelError": "Couldn't cancel this run",
+        "alreadyFinished": "This run already finished and can't be cancelled."
+      },
+      "countdown": {
+        "due": "Any moment now",
+        "minutes": "in {count, plural, =1 {# minute} other {# minutes}}",
+        "hours": "in {count, plural, =1 {# hour} other {# hours}}",
+        "days": "in {count, plural, =1 {# day} other {# days}}"
+      }
     },
     "builder": {
+      "settings": {
+        "title": "Automation settings",
+        "stopOnReply": "Stop if the contact replies",
+        "stopOnReplyHelp": "Cancels any queued steps for a contact as soon as they answer, so they don't keep getting scheduled messages."
+      },
+      "stepStats": {
+        "reached": "{count} reached",
+        "waiting": "{count} waiting",
+        "failed": "{count} failed"
+      },
       "steps": {
         "send_message": "Send Message",
         "send_buttons": "Send Buttons",
@@ -1216,6 +1605,12 @@
       "scheduleHint": "Cron expression (e.g. 0 9 * * 1-5)",
       "active": "Active",
       "activeAria": "Active",
+      "issues": {
+        "one": "1 issue",
+        "other": "{count} issues",
+        "cannotActivate": "Fix these before turning the automation on.",
+        "stepHasIssues": "This step has validation issues"
+      },
       "save": "Save",
       "saveDraft": "Save Draft",
       "delete": "Delete",
@@ -1260,13 +1655,38 @@
         "languageLabel": "Language",
         "select": "Select a template…",
         "unknown": "{name} ({lang}) — not in approved list",
-        "unknownLang": "unknown"
+        "unknownLang": "unknown",
+        "variableLabel": "'{{'{n}'}}'",
+        "headerLabel": "Header attachment"
       },
       "branches": {
         "yes": "Yes",
         "no": "No"
       },
       "addStep": "Add step",
+      "actionPicker": {
+        "searchPlaceholder": "Search actions…",
+        "empty": "No actions match \"{query}\".",
+        "groups": {
+          "message": "Message",
+          "contact": "Contact",
+          "flow": "Flow control",
+          "advanced": "Advanced"
+        },
+        "descriptions": {
+          "send_message": "Text, image, video, audio or document — with optional reply buttons.",
+          "send_template": "An approved template. The only thing you can send outside the 24-hour window.",
+          "add_tag": "Attach a tag to the contact.",
+          "remove_tag": "Take a tag off the contact.",
+          "update_contact_field": "Set a built-in or custom field on the contact.",
+          "create_deal": "Open a deal in a pipeline stage.",
+          "assign_conversation": "Hand the conversation to an agent.",
+          "wait": "Pause before the next step.",
+          "condition": "Branch on a tag, a field, the message, the time, or the 24-hour window.",
+          "send_webhook": "POST the trigger context to a URL.",
+          "close_conversation": "Mark the conversation resolved."
+        }
+      },
       "config": {
         "messageText": "Message text",
         "placeholderMessageText": "Hi! Thanks for reaching out…",
@@ -1293,7 +1713,12 @@
           "tag_presence": "Tag presence",
           "contact_field": "Contact field",
           "message_content": "Message content",
-          "time_of_day": "Time of day"
+          "time_of_day": "Time of day",
+          "session_window": "24-hour window"
+        },
+        "windowStates": {
+          "open": "is open",
+          "closed": "is closed"
         },
         "operandLabel": "Operand",
         "placeholderTime": "HH:mm-HH:mm",
@@ -1308,6 +1733,45 @@
         "matchContains": "Contains",
         "matchExact": "Exact",
         "closeConversationHint": "Sets the conversation status to \"closed\". No configuration needed."
+      },
+      "composer": {
+        "attachmentLabel": "Attachment",
+        "imageLabel": "Image",
+        "videoLabel": "Video",
+        "audioLabel": "Audio",
+        "documentLabel": "Document",
+        "clickToUpload": "Click to upload (max 16 MB)",
+        "uploading": "Uploading…",
+        "removeFile": "Remove",
+        "uploadSuccess": "File uploaded.",
+        "uploadFailed": "Upload failed.",
+        "uploadDiscardedStale": "This file finished uploading after the form changed, so it wasn't attached. Try again if you still need it.",
+        "fileTooLarge": "File is {size} MB — limit is 16 MB.",
+        "audioCaptionNote": "WhatsApp can't caption audio — your text will send as a second message.",
+        "interactiveLabel": "Buttons or list",
+        "interactiveNone": "None",
+        "interactiveButtons": "Buttons",
+        "interactiveList": "List",
+        "mediaDisablesInteractive": "WhatsApp can't put media on a message with buttons. Remove the attachment to add buttons.",
+        "interactiveDisablesMedia": "WhatsApp can't put buttons on a message with media. Remove the buttons to add an attachment.",
+        "interactiveDisablesText": "Buttons and lists send their own body text below — the text above won't be sent. Remove them to send plain text instead.",
+        "fallbackExplainer": "WhatsApp only allows free-form messages within 24 hours of the contact's last message. Outside that window, only an approved template can be sent.",
+        "fallbackToggle": "If the 24-hour window is closed",
+        "fallbackTemplateLabel": "Fallback template",
+        "fallbackNone": "No fallback",
+        "fallbackNoTemplates": "No approved templates yet.",
+        "fallbackNoTemplateWarning": "Without a fallback template, this step will fail whenever the 24-hour window is closed.",
+        "fallbackVariableLabel": "'{{'{n}'}}'",
+        "fallbackVariablesHelp": "Sent exactly as typed for every contact — this section does not fill in variables from the contact or message.",
+        "fallbackHeaderLabel": "Header attachment",
+        "headerRequiredWarning": "This template requires a header attachment. Without one, the send will fail."
+      },
+      "preview": {
+        "label": "Preview",
+        "empty": "Nothing to send yet.",
+        "unavailable": "{label} unavailable",
+        "tokenWontSend": "Not filled in — this is deleted before sending, so the customer receives it blank.",
+        "loading": "Loading template…"
       }
     }
   },
@@ -1619,7 +2083,7 @@
       "labelTooLong": "Label must be {max} characters or fewer",
       "copied": "Invite link copied",
       "clipboardBlocked": "Clipboard blocked — copy the link manually",
-      "whatsappMessage": "Join {accountName} on Holidayys WA CRM using this link (valid for {expiresInDays} days): {url}"
+      "whatsappMessage": "Join {accountName} on __PRODUCT_NAME__ using this link (valid for {expiresInDays} days): {url}"
     },
     "tagsAndFields": {
       "title": "Fields & tags",
@@ -1750,8 +2214,8 @@
       "saveResubmit": "Save & Resubmit",
       "submitApproval": "Submit for Approval",
       "deleteDialogTitle": "Delete template?",
-      "deleteMetaDesc": "\"{name}\" will be deleted from Meta and from Holidayys WA CRM. Active broadcasts using this template will start failing on their next send. This can't be undone.",
-      "deleteLocalDesc": "\"{name}\" will be deleted from Holidayys WA CRM. It was never submitted to Meta, so no remote cleanup is needed.",
+      "deleteMetaDesc": "\"{name}\" will be deleted from Meta and from __PRODUCT_NAME__. Active broadcasts using this template will start failing on their next send. This can't be undone.",
+      "deleteLocalDesc": "\"{name}\" will be deleted from __PRODUCT_NAME__. It was never submitted to Meta, so no remote cleanup is needed.",
       "deleting": "Deleting…",
       "delete": "Delete",
       "toastLoadFailed": "Failed to load templates",
@@ -1794,7 +2258,7 @@
       "notConnected": "Not Connected",
       "connectedDesc": "Your access token authenticates with Meta. See Registration status below for whether webhooks are actually wired.",
       "notConnectedDesc": "Configure your Meta API credentials below to connect your WhatsApp Business account.",
-      "registered": "Registered — Meta will deliver events to Holidayys WA CRM",
+      "registered": "Registered — Meta will deliver events to __PRODUCT_NAME__",
       "notRegistered": "Not registered — Meta will not deliver events",
       "verifyWithMeta": "Verify with Meta",
       "subscribedSince": "Subscribed since {date}. Click Verify with Meta if events stop arriving.",
@@ -1818,7 +2282,7 @@
       "twoStepPin": "Two-step verification PIN",
       "optional": "(optional)",
       "pinPlaceholder": "6-digit PIN from Meta WhatsApp Manager",
-      "pinHint": "Needed only to wire inbound messages for a production number. Set it in Meta Business Manager → WhatsApp Accounts → Phone Numbers → Two-step verification, then paste it here so Holidayys WA CRM can subscribe the number — otherwise Meta routes inbound events to whichever app last claimed it (the symptom that hits second numbers under a shared WABA). Meta test numbers have no PIN and are pre-registered — leave this blank for them. Leaving it blank also keeps an existing registration untouched.",
+      "pinHint": "Needed only to wire inbound messages for a production number. Set it in Meta Business Manager → WhatsApp Accounts → Phone Numbers → Two-step verification, then paste it here so __PRODUCT_NAME__ can subscribe the number — otherwise Meta routes inbound events to whichever app last claimed it (the symptom that hits second numbers under a shared WABA). Meta test numbers have no PIN and are pre-registered — leave this blank for them. Leaving it blank also keeps an existing registration untouched.",
       "webhookTitle": "Webhook Configuration",
       "webhookDesc": "Use this URL as your webhook callback in the Meta App Dashboard.",
       "webhookUrl": "Webhook Callback URL",
@@ -1864,6 +2328,7 @@
       "api": "API keys",
       "conversions": "Conversions",
       "qualification": "Lead qualification",
+      "lead-sequence": "Follow-up sequence",
       "cron": "Cron schedules"
     },
     "groups": {
@@ -2005,6 +2470,69 @@
         "save": "Save contact card",
         "saved": "Saved.",
         "saveError": "Could not save the contact card."
+      },
+      "closing": {
+        "title": "Closing message",
+        "desc": "The final message sent automatically once a lead has answered everything, just before a human takes over. Use it to set expectations and give your direct number.",
+        "placeholder": "Thank you! Our team will contact you shortly.",
+        "hint": "Leave this empty to send no closing message at all. Written exactly as the customer receives it — no placeholders are substituted.",
+        "save": "Save closing message",
+        "saved": "Saved",
+        "saveError": "Could not save the closing message."
+      }
+    },
+    "leadSequence": {
+      "title": "Follow-up sequence",
+      "description": "Automated WhatsApp follow-ups for leads that have gone quiet on you. Sends real marketing templates on your Meta account — review the preview before turning this on.",
+      "hoursWarning": {
+        "title": "Working hours are not set",
+        "body": "Lead qualification's working hours are not configured for this account — until they are, nothing will send, even with the sequence enabled below.",
+        "link": "Set working hours"
+      },
+      "enable": {
+        "title": "Enable the follow-up sequence",
+        "desc": "Off by default. While off, leads are still scored and banded — nothing is sent.",
+        "blockedHint": "Every band step below needs an approved template before this can be enabled.",
+        "saveError": "Could not update — check that every band step has a template."
+      },
+      "preview": {
+        "title": "Preview: who gets messaged",
+        "desc": "Runs the real send-time logic against your current leads as if the sequence were already on, so you can see the effect before flipping the switch.",
+        "loading": "Loading preview…",
+        "countLabel": "will receive a message in the next {days} days",
+        "empty": "No leads currently in scope for the sequence.",
+        "warningsTitle": "Warnings"
+      },
+      "cadence": {
+        "title": "Cadence & limits",
+        "idleDaysLabel": "Days idle before the sequence starts",
+        "idleDaysHint": "Counted from the customer's last message to us.",
+        "humanQuietHoursLabel": "Quiet hours after a human reply",
+        "humanQuietHoursHint": "The sequence stays paused this long after an agent last wrote to the lead.",
+        "dailySendCapLabel": "Daily send cap",
+        "dailySendCapHint": "Hard limit on marketing sends per day, account-wide.",
+        "save": "Save cadence",
+        "saved": "Saved",
+        "saveError": "Could not save — check the values."
+      },
+      "bands": {
+        "title": "Bands & steps",
+        "desc": "Each band's own cadence: how many days after the previous step, and which approved template to send.",
+        "hot": "Hot",
+        "warm": "Warm",
+        "cold": "Cold",
+        "autoArchiveLabel": "Auto-archive when the sequence runs out with no reply",
+        "hotAutoArchiveLockedReason": "Hot leads are never auto-archived — they are your best leads, so an unanswered sequence leaves them for a human to review instead of filing them away.",
+        "step": "Step {n}",
+        "delayDaysLabel": "Days after the previous step",
+        "templateLabel": "Template",
+        "noTemplate": "— choose a template —",
+        "noApprovedTemplates": "No approved templates yet",
+        "paramTemplatesExcluded": "{count} approved {count, plural, =1 {template needs} other {templates need}} variables this sequence can't fill, so {count, plural, =1 {it isn't} other {they aren't}} offered here.",
+        "missingTemplateHint": "No template chosen — this step blocks enabling the sequence.",
+        "save": "Save schedule",
+        "saved": "Saved",
+        "saveError": "Could not save — check the values."
       }
     },
     "profile": {
@@ -2030,7 +2558,16 @@
       "imageTooLargeDesc": "Maximum 2 MB.",
       "nameRequired": "Display name is required",
       "uploadFailed": "Upload failed. Please try again.",
-      "profileSaved": "Profile saved"
+      "profileSaved": "Profile saved",
+      "security": "Security",
+      "signOutOthers": "Sign out other devices",
+      "signOutOthersHint": "Ends your session everywhere except here. Use this if you lose a phone — changing your password will not sign other devices out.",
+      "signOutOthersBtn": "Sign out other devices",
+      "signOutOthersDialogTitle": "Sign out other devices?",
+      "signOutOthersDialogDesc": "Every other phone, tablet, and browser signed in as you will be signed out immediately. This device stays signed in.",
+      "signingOutOthers": "Signing out…",
+      "signedOutOthers": "Other devices signed out",
+      "cancel": "Cancel"
     },
     "appearance": {
       "title": "Appearance",
@@ -2126,7 +2663,7 @@
     },
     "aiConfig": {
       "title": "Agent setup",
-      "description": "Bring your own OpenAI or Anthropic key. Holidayys WA CRM calls the provider directly with your key — no per-seat AI fees, and your data stays yours. This powers AI-drafted replies in the inbox, the auto-reply bot, and the Playground.",
+      "description": "Bring your own OpenAI or Anthropic key. __PRODUCT_NAME__ calls the provider directly with your key — no per-seat AI fees, and your data stays yours. This powers AI-drafted replies in the inbox, the auto-reply bot, and the Playground.",
       "adminOnlyConfig": "Only admins and owners can change the AI configuration.",
       "loadFailed": "Failed to load AI configuration",
       "providerAndKey": "Provider & key",
@@ -2185,10 +2722,31 @@
       "reindex": "Reindex",
       "reindexTooltip": "Re-embed all documents (e.g. after adding an embeddings key)",
       "loading": "Loading…"
+    },
+    "quickReplies": {
+      "title": "Quick replies",
+      "description": "Reusable snippets — plain text or a saved interactive message — that agents can insert from the inbox composer.",
+      "newQuickReply": "New quick reply",
+      "empty": "No quick replies yet. Create one to reuse it across conversations.",
+      "newTitle": "New quick reply",
+      "editTitle": "Edit quick reply",
+      "nameLabel": "Name",
+      "namePlaceholder": "e.g. Business hours",
+      "kindText": "Text",
+      "kindInteractive": "Interactive",
+      "textPlaceholder": "The message text to insert",
+      "cancel": "Cancel",
+      "save": "Save",
+      "nameRequired": "Give the quick reply a name.",
+      "created": "Quick reply created.",
+      "updated": "Quick reply updated.",
+      "saveFailed": "Couldn't save the quick reply.",
+      "deleteConfirm": "Delete this quick reply?",
+      "deleteFailed": "Couldn't delete the quick reply."
     }
   },
   "Pwa": {
-    "installTitle": "Install Holidayys",
+    "installTitle": "Install __BRAND_NAME__",
     "installBody": "Add the app to your device for faster access and notifications.",
     "installButton": "Install app",
     "iosInstallTitle": "Install on iPhone/iPad",
@@ -2347,5 +2905,31 @@
       "notCreatedBadge": "Not created",
       "saveFailed": "Something went wrong. Please try again."
     }
+  },
+  "InteractiveBuilder": {
+    "kindButtons": "Reply buttons",
+    "kindList": "List",
+    "body": "Body",
+    "bodyPlaceholder": "What the customer reads above the options",
+    "header": "Header (optional)",
+    "footer": "Footer (optional)",
+    "buttonsCount": "Buttons ({n}/{max})",
+    "buttonLabelPlaceholder": "Button label",
+    "addButton": "Add button",
+    "listButtonLabel": "List button label",
+    "rowsCount": "Rows ({n}/{max})",
+    "sectionTitlePlaceholder": "Section title (optional)",
+    "rowTitlePlaceholder": "Row title",
+    "rowDescriptionPlaceholder": "Description (optional)",
+    "addRow": "Add row",
+    "addSection": "Add section",
+    "idPlaceholder": "id",
+    "showReplyIds": "Show reply IDs (advanced)",
+    "preview": "Preview"
+  },
+  "InteractivePreview": {
+    "bodyPlaceholder": "Message body…",
+    "buttonFallback": "Button",
+    "menuFallback": "Menu"
   }
 }

@@ -137,7 +137,7 @@ export const connectionState = accountQuery({
  *
  * `phoneNumberId` is checked against `by_phone_number_id` FIRST: if a
  * row with that number already exists for a DIFFERENT account, this
- * throws `PHONE_NUMBER_CLAIMED` before touching anything. Holidayys WA CRM is
+ * throws `PHONE_NUMBER_CLAIMED` before touching anything. This CRM is
  * single-tenant-per-WhatsApp-number (see `src/app/api/whatsapp/config/
  * route.ts`'s own comment on issue #136) — letting two accounts bind
  * the same number would make inbound-webhook routing ambiguous. A row
@@ -386,7 +386,7 @@ export const getForAccount = internalQuery({
  * the owning account/config before calling `ingest.processInbound` (or
  * the status/template handlers). Mirrors `getForAccount`'s exact "never
  * throws, `null` for not-configured" contract, just keyed by
- * `by_phone_number_id` instead of `by_account` — Holidayys WA CRM is
+ * `by_phone_number_id` instead of `by_account` — this CRM is
  * single-tenant-per-WhatsApp-number (see `upsert`'s own comment on this),
  * so at most one row can ever match.
  *

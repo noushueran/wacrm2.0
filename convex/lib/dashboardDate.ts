@@ -80,3 +80,21 @@ export function localMidnightMsDaysAgo(
   );
   return localMidnightShiftedMs + tzOffsetMinutes * 60_000;
 }
+
+/**
+ * Absolute UTC ms of local midnight on the MONDAY of the week containing
+ * `ms`. The week key for every report grouping.
+ *
+ * Monday-start (not Sunday) matches `localMondayIndexFromMs`, which
+ * `dashboard.responseTime` already uses for its week-over-week figures.
+ */
+export function localMondayStartMsFromMs(
+  ms: number,
+  tzOffsetMinutes: number,
+): number {
+  return localMidnightMsDaysAgo(
+    ms,
+    tzOffsetMinutes,
+    localMondayIndexFromMs(ms, tzOffsetMinutes),
+  );
+}

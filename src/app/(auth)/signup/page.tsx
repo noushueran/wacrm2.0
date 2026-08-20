@@ -1,4 +1,5 @@
-"use client";
+"use client"
+import { PRODUCT_NAME } from "@/lib/brand";;
 
 import { Suspense, useState } from "react";
 import Link from "next/link";
@@ -124,7 +125,7 @@ function SignupPageInner() {
           <CardDescription className="text-muted-foreground">
             {displayInvite
               ? "Create your account, then accept the invitation to join your team."
-              : "Get started with Holidayys WA CRM"}
+              : `Get started with ${PRODUCT_NAME}`}
           </CardDescription>
         </CardHeader>
         <CardContent>

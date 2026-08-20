@@ -11,6 +11,8 @@
 // + `_id`/`_creationTime`, instead of a Postgres row).
 // ============================================================
 
+import { resolveMediaUrl } from "@/lib/storage/media-url";
+
 export interface ApiContact {
   id: string;
   phone: string;
@@ -42,6 +44,7 @@ export interface ConvexApiContact {
   name?: string;
   email?: string;
   company?: string;
+  avatarKey?: string;
   avatarUrl?: string;
   tags: { _id: string; name: string; color: string }[];
 }
@@ -59,7 +62,12 @@ export function serializeContact(doc: ConvexApiContact): ApiContact {
     name: doc.name ?? null,
     email: doc.email ?? null,
     company: doc.company ?? null,
-    avatar_url: doc.avatarUrl ?? null,
+    // Dual-read, same as `toUiContact`. The WIRE SHAPE is unchanged — a
+    // resolved absolute URL or null, exactly as before — but a photo
+    // uploaded from the contact panel is stored as an R2 key, so reading
+    // `avatarUrl` alone would report `null` for every contact that
+    // actually has one.
+    avatar_url: resolveMediaUrl({ key: doc.avatarKey, url: doc.avatarUrl }),
     tags: doc.tags.map((t) => ({ id: t._id, name: t.name, color: t.color })),
     created_at: createdAt,
     updated_at: createdAt,

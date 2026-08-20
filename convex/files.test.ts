@@ -64,7 +64,7 @@ beforeEach(() => {
   process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "test-key";
   process.env.R2_SECRET_ACCESS_KEY = "test-secret";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
 });
 
 afterEach(() => {
@@ -280,7 +280,7 @@ test("remove rejects a malformed key as NOT_FOUND, not a crash", async () => {
 // record"). None apply: there is no more `files.getUrl` query at all.
 // A Convex `_storage` id needed a privileged, authenticated lookup to
 // become a URL (hence `fileOwners`-gated `getUrl`). An R2 object key
-// needs no such thing — `objs.holidayys.co` is a PUBLIC custom domain,
+// needs no such thing — `objs.amaniworld.com` is a PUBLIC custom domain,
 // and the URL is pure string concatenation
 // (`src/lib/storage/media-url.ts`'s `mediaUrlFromKey`, already covered
 // by that module's own test suite). Reading is no longer a privileged

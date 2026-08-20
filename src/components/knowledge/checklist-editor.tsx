@@ -334,7 +334,7 @@ export function ChecklistEditor({
             // markup (Badge variant="outline" + softBadge) rather than
             // widening a shared component's contract for a state it will
             // never see.
-            <Badge variant="outline" className={cn('text-[10px]', softBadge('neutral'))}>
+            <Badge variant="outline" className={cn('text-[11px]', softBadge('neutral'))}>
               {t('checklist.notCreatedBadge')}
             </Badge>
           ) : (

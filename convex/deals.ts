@@ -1,6 +1,6 @@
 import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
-import type { Doc, Id } from "./_generated/dataModel";
+import type { Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 
 // ============================================================

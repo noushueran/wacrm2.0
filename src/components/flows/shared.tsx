@@ -72,7 +72,7 @@ export interface BuilderNode {
 // the picker stays scannable as the type list grows, and so new
 // node types have an obvious place to slot them.
 //
-// Note there's no "Events / Triggers" category: in Holidayys WA CRM a flow is
+// Note there's no "Events / Triggers" category: in this CRM a flow is
 // triggered by flow-level config (`trigger_type`), not by a node on
 // the canvas, so `start` is just the entry point under Flow control.
 // ------------------------------------------------------------

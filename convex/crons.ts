@@ -57,4 +57,123 @@ crons.interval(
   {},
 );
 
+// Lead Analysis scoring (spec 2026-07-26): sweep due leadAnalyses rows
+// (by_score_due, leased claim) and score each against the account's BYO
+// key. On an idle sweep it advances the historical backfill instead.
+// No-op while the feature is disabled (no rows exist).
+crons.interval(
+  "lead-scoring",
+  { minutes: 5 },
+  internal.cronSchedules.runSweepLeadScoring,
+  {},
+);
+
+// P3 Task 9: the follow-up sequence's own sweep (spec §8, P3 Task 8's
+// `sweepLeadSequence`) — claims due `leadAnalyses` rows (`by_sequence_due`)
+// and re-checks every gate at send time via `sequenceContext` before a
+// real WhatsApp marketing template goes out. No-op while the feature is
+// disabled (no `running` rows with a due `nextFollowUpAt` exist).
+crons.interval(
+  "lead-sequence",
+  { minutes: 15 },
+  internal.cronSchedules.runSweepLeadSequence,
+  {},
+);
+
+// Auto-assign unowned Chasing threads (spec 2026-07-27-inbox-lanes
+// §Chasing ownership). Sends NOTHING — patches `assignedToUserId` and
+// notifies when nobody is eligible (in-app rows only — no customer
+// message). Bounded per run.
+//
+// TWO gates, and the difference matters. It is a no-op for an account
+// whose master `qualificationConfigs.enabled` is off — the same check
+// every other job on this table makes. It is ALSO a no-op when
+// `autoAssignEnabled` is explicitly `false`; but that field is
+// `v.optional`, so an ABSENT flag means ON, not off. A config row
+// written before Phase 6 added the field is therefore active, by
+// design — `inboxChaseAssign.test.ts` pins it, because flipping it to a
+// truthy test would silently disable both this sweep and the lead
+// offers that share the flag.
+crons.interval(
+  "inbox-chase-assign",
+  { minutes: 30 },
+  internal.cronSchedules.runSweepChaseAssign,
+  {},
+);
+
+// Wake snoozed conversations whose time has come (spec
+// 2026-07-28-inbox-manual-overrides §Waking). Clearing the field is what
+// returns the thread to a lane — an expired-but-uncleared snooze is
+// invisible forever — so this sweep is load-bearing, not cosmetic.
+crons.interval(
+  "inbox-snooze-wake",
+  { minutes: 5 },
+  internal.cronSchedules.runSweepSnoozeWake,
+  {},
+);
+
+// Revival agent (spec 2026-08-09): draft nudges for leads that went
+// quiet while still inside Meta's 24h window. Sends NOTHING — every
+// draft waits for a human tap in `convex/revival.ts`, which re-checks
+// every guard at that moment. No-op while the feature is disabled (no
+// enabled `revivalConfigs` row exists).
+crons.interval(
+  "revival-sweep",
+  { minutes: 30 },
+  internal.cronSchedules.runRevivalSweep,
+  {},
+);
+
+// Knowledge gap agent (spec 2026-08-09): turn answered escalations into
+// knowledge-base drafts, and cluster the ones nobody answered. Six-hourly
+// because a knowledge gap is not urgent and the inputs change slowly.
+// Sends NOTHING to customers. No-op while the feature is disabled.
+crons.interval(
+  "kbgap-sweep",
+  { minutes: 360 },
+  internal.cronSchedules.runKbGapSweep,
+  {},
+);
+
+// Sales coach (spec 2026-08-09): review threads a person handled and
+// write quotable observations about the handling. Daily, because
+// coaching is not an hourly concern and a person should not find fresh
+// critique waiting every hour. Sends NOTHING to customers.
+crons.interval(
+  "sales-coach-sweep",
+  { minutes: 1440 },
+  internal.cronSchedules.runSalesCoachSweep,
+  {},
+);
+
+// Time-based automations: fire each active `time_based` automation once
+// per account-local day, at its configured "HH:mm", across the contacts
+// holding its configured tag. The 15-minute interval sits well inside
+// `schedule.ts`'s 60-minute catch-up window, so a missed tick still runs
+// rather than skipping the day. No-op with no such automation.
+crons.interval(
+  "automations-time-based",
+  { minutes: 15 },
+  internal.cronSchedules.runSweepTimeBased,
+  {},
+);
+
+// Rebuild the /dashboard KPI tiles. Purely a read-side cache: it sends
+// nothing, writes only `dashboardSnapshots`, and is idempotent, so a
+// missed tick costs staleness and nothing else.
+//
+// Two minutes is chosen against what the tiles MEAN, not against cost.
+// They are day-scale figures (new contacts today, open pipeline value) on
+// a screen a salesperson leaves open; a two-minute lag is invisible in
+// that reading, while the tiles that must be exact to the second — the
+// Needs Attention queue and the unread badges — were deliberately left as
+// live subscriptions rather than snapshotted. The rendered "as of" line is
+// what keeps the trade honest.
+crons.interval(
+  "dashboard-snapshot",
+  { minutes: 2 },
+  internal.cronSchedules.runRefreshDashboardSnapshots,
+  {},
+);
+
 export default crons;

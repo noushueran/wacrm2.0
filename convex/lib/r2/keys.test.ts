@@ -101,3 +101,15 @@ test("parseMediaKey rejects malformed and unknown-kind keys", () => {
   expect(parseMediaKey("acc123/bogus/file.png")).toBeNull();
   expect(parseMediaKey("")).toBeNull();
 });
+
+test("buildMediaKey mints a note key under the account's own prefix", () => {
+  const key = buildMediaKey({
+    accountId: "acc123",
+    kind: "note",
+    filename: "passport.pdf",
+    contentType: "application/pdf",
+  });
+  expect(key.startsWith("acc123/note/")).toBe(true);
+  expect(key.endsWith(".pdf")).toBe(true);
+  expect(parseMediaKey(key)).toEqual({ accountId: "acc123", kind: "note" });
+});

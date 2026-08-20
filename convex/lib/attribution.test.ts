@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 import { extractRefCode, extractCtwaClid, decodeHidden } from "./attribution";
 
-// Mirror the landing-side encoder (go-holidayys src/lib/tracking/hidden-code.ts) so
+// Mirror the landing-side encoder (go-amani src/lib/tracking/hidden-code.ts) so
 // these tests also prove the two sides agree on the exact COMPACT wire format:
 // 6 base32 chars → 5 bits each → 30 zero-width chars.
 const ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTVWXYZ".replace(/[ILOU]/g, "");

@@ -75,7 +75,7 @@ export function SettingsRail({
             className="flex shrink-0 gap-1 lg:flex-col lg:gap-0.5"
           >
             {label ? (
-              <div className="hidden px-3 pt-3.5 pb-1.5 text-[11px] font-semibold tracking-[0.09em] text-muted-foreground uppercase lg:block">
+              <div className="hidden px-3 pt-3.5 pb-1.5 text-[12px] font-semibold tracking-[0.09em] text-muted-foreground uppercase lg:block">
                 {t(`groups.${group}`)}
               </div>
             ) : null}

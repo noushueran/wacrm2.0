@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2, Upload, Trash2, CircleAlert } from 'lucide-react';
-import { useConvex, useMutation } from 'convex/react';
+import { Loader2, Upload, Trash2, CircleAlert, AlertTriangle, LogOut } from 'lucide-react';
+import { useConvex, useMutation, useAction } from 'convex/react';
 
 import { useAuth } from '@/hooks/use-auth';
 import { convexErrorMessage } from '@/lib/convex/adapters';
@@ -18,6 +18,14 @@ import {
   AvatarImage,
 } from '@/components/ui/avatar';
 import { Card, CardContent } from '@/components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { useTranslations } from 'next-intl';
 import { SettingsPanelHead } from './settings-panel-head';
 
@@ -37,6 +45,7 @@ export function ProfileForm() {
   const convex = useConvex();
   const startUpload = useMutation(api.files.startUpload);
   const updateProfile = useMutation(api.accounts.updateProfile);
+  const signOutOtherDevices = useAction(api.sessions.signOutOtherDevices);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [fullName, setFullName] = useState('');
@@ -44,6 +53,8 @@ export function ProfileForm() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [removeAvatar, setRemoveAvatar] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [signOutOthersOpen, setSignOutOthersOpen] = useState(false);
+  const [signingOutOthers, setSigningOutOthers] = useState(false);
 
   // Seed form state once the profile loads.
   useEffect(() => {
@@ -170,6 +181,20 @@ export function ProfileForm() {
       toast.error(convexErrorMessage(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onSignOutOtherDevices = async () => {
+    setSigningOutOthers(true);
+    try {
+      await signOutOtherDevices({});
+      setSignOutOthersOpen(false);
+      toast.success(t('signedOutOthers'));
+    } catch (err) {
+      console.error('[ProfileForm] sign out other devices error:', err);
+      toast.error(convexErrorMessage(err));
+    } finally {
+      setSigningOutOthers(false);
     }
   };
 
@@ -303,6 +328,29 @@ export function ProfileForm() {
             </dl>
           </div>
 
+          {/* Security — the only way to evict a device you no longer
+              hold. Deliberately outside the <form>'s submit path: it
+              acts immediately rather than on Save. */}
+          <div className="space-y-2 border-t border-border pt-6">
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {t('security')}
+            </p>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="max-w-md text-sm text-muted-foreground">
+                {t('signOutOthersHint')}
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setSignOutOthersOpen(true)}
+                disabled={saving || !profile}
+              >
+                <LogOut className="size-4" />
+                {t('signOutOthers')}
+              </Button>
+            </div>
+          </div>
+
           {!profile && (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
               <CircleAlert className="size-4" />
@@ -326,6 +374,44 @@ export function ProfileForm() {
           </Button>
         </div>
       </form>
+
+      <Dialog open={signOutOthersOpen} onOpenChange={setSignOutOthersOpen}>
+        <DialogContent className="bg-popover border-border sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-popover-foreground">
+              <AlertTriangle className="size-4 text-amber-400" />
+              {t('signOutOthersDialogTitle')}
+            </DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              {t('signOutOthersDialogDesc')}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="bg-popover border-border">
+            <Button
+              variant="outline"
+              onClick={() => setSignOutOthersOpen(false)}
+              disabled={signingOutOthers}
+              className="border-border text-muted-foreground hover:bg-muted"
+            >
+              {t('cancel')}
+            </Button>
+            <Button
+              onClick={onSignOutOtherDevices}
+              disabled={signingOutOthers}
+              className="bg-red-600 hover:bg-red-700 text-white"
+            >
+              {signingOutOthers ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  {t('signingOutOthers')}
+                </>
+              ) : (
+                t('signOutOthersBtn')
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

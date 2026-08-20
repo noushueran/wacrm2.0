@@ -1948,3 +1948,170 @@ test("update round-trips the travel-profile fields", async () => {
     budget: "around AED 3,000 per person",
   });
 });
+
+// ── listPage — offset pagination for /contacts ──────────────────────
+// /contacts previously ran two different queries: `list` (cursor, "Load
+// more") when untagged and `filterByTags` (offset, Prev/Next) when
+// tagged. Only half of it could jump to a page, and the untagged total
+// was an approximation of "how many have loaded so far". `listPage`
+// folds both into one shape. `list` is deliberately left alone — its
+// eight other callers genuinely want cursor semantics.
+
+test("listPage returns one page plus an exact total", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  for (let i = 0; i < 5; i++) {
+    await asUser.mutation(api.contacts.create, { phone: `+9715000000${i}`, name: `C${i}` });
+  }
+
+  const first = await asUser.query(api.contacts.listPage, { limit: 2, offset: 0 });
+
+  expect(first.items).toHaveLength(2);
+  // Exact, not "loaded so far" — this is what makes "Page 1 of 3"
+  // possible without a second query.
+  expect(first.total).toBe(5);
+});
+
+test("listPage pages do not overlap and cover the whole set", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  for (let i = 0; i < 5; i++) {
+    await asUser.mutation(api.contacts.create, { phone: `+9715000000${i}`, name: `C${i}` });
+  }
+
+  const seen: string[] = [];
+  for (const offset of [0, 2, 4]) {
+    const page = await asUser.query(api.contacts.listPage, { limit: 2, offset });
+    seen.push(...page.items.map((c) => c.name ?? ""));
+  }
+
+  expect(seen).toHaveLength(5);
+  expect(new Set(seen).size).toBe(5);
+});
+
+test("listPage clamps an offset past the end to the last full page", async () => {
+  // Contacts is a live subscription: rows can be deleted out from under
+  // a client already sitting on the final page. Clamping to a PAGE
+  // BOUNDARY (not to `total - 1`) is what keeps that from returning a
+  // blank list or a ragged one-row page.
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  for (let i = 0; i < 5; i++) {
+    await asUser.mutation(api.contacts.create, { phone: `+9715000000${i}`, name: `C${i}` });
+  }
+
+  const page = await asUser.query(api.contacts.listPage, { limit: 2, offset: 999 });
+
+  expect(page.offset).toBe(4);
+  expect(page.items).toHaveLength(1);
+});
+
+test("listPage searches the whole set, not just the requested page", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  await asUser.mutation(api.contacts.create, { phone: "+971501234567", name: "Jonas" });
+  for (let i = 0; i < 4; i++) {
+    await asUser.mutation(api.contacts.create, { phone: `+9715009999${i}`, name: `Other${i}` });
+  }
+
+  // "Jonas" was created first, so it sorts LAST under newest-first and
+  // would not appear on page 1 at all.
+  const byName = await asUser.query(api.contacts.listPage, {
+    search: "jonas", limit: 2, offset: 0,
+  });
+  expect(byName.items.map((c) => c.name)).toEqual(["Jonas"]);
+  expect(byName.total).toBe(1);
+
+  // Same matcher as `list`/`filterByTags` — digits, so punctuation and
+  // the country code are optional.
+  const byPhone = await asUser.query(api.contacts.listPage, {
+    search: "50123", limit: 2, offset: 0,
+  });
+  expect(byPhone.items.map((c) => c.name)).toEqual(["Jonas"]);
+});
+
+test("listPage applies a tag filter with the same offset paging", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  const tagId = await asUser.mutation(api.tags.create, { name: "VIP", color: "#f00" });
+  const tagged = await asUser.mutation(api.contacts.create, { phone: "111", name: "Vip" });
+  await asUser.mutation(api.contacts.assignTag, { contactId: tagged, tagId });
+  await asUser.mutation(api.contacts.create, { phone: "222", name: "Plain" });
+
+  const page = await asUser.query(api.contacts.listPage, {
+    tagIds: [tagId], limit: 25, offset: 0,
+  });
+
+  expect(page.items.map((c) => c.name)).toEqual(["Vip"]);
+  expect(page.total).toBe(1);
+});
+
+test("listPage treats an empty tagIds array as no tag filter", async () => {
+  // The page always sends the array; "no filter" is an empty one, not a
+  // separate query. Reading it as "match nothing" would blank /contacts.
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  await asUser.mutation(api.contacts.create, { phone: "111", name: "Plain" });
+
+  const page = await asUser.query(api.contacts.listPage, {
+    tagIds: [], limit: 25, offset: 0,
+  });
+
+  expect(page.total).toBe(1);
+});
+
+test("listPage never returns another account's contacts via a supplied tagId", async () => {
+  // The same defense-in-depth `filterByTags` carries: a caller can pass
+  // another account's real tagId, and `contactTags.by_tag` would happily
+  // resolve that account's links.
+  const t = convexTest(schema, modules);
+  const { asUser: asAlice } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  const { asUser: asBob } = await seedAccountMember(t, {
+    name: "Bob", email: "bob@example.com", role: "supervisor",
+  });
+  const aliceContactId = await asAlice.mutation(api.contacts.create, { phone: "111" });
+  const aliceTagId = await asAlice.mutation(api.tags.create, { name: "VIP", color: "#f00" });
+  await asAlice.mutation(api.contacts.assignTag, {
+    contactId: aliceContactId, tagId: aliceTagId,
+  });
+
+  const bobsView = await asBob.query(api.contacts.listPage, {
+    tagIds: [aliceTagId], limit: 25, offset: 0,
+  });
+
+  expect(bobsView.items).toHaveLength(0);
+  expect(bobsView.total).toBe(0);
+});
+
+test("listPage is supervisor+, closing the same phone-search oracle as list", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice", email: "alice@example.com", role: "supervisor",
+  });
+  const agentId = await t.run(async (ctx) => {
+    const uid = await ctx.db.insert("users", { name: "Ag", email: "ag@example.com" });
+    await ctx.db.insert("memberships", {
+      userId: uid, accountId, role: "agent", fullName: "Ag", email: "ag@example.com",
+    });
+    return uid;
+  });
+  const asAgent = t.withIdentity({ subject: `${agentId}|s1` });
+
+  await expect(
+    asAgent.query(api.contacts.listPage, { limit: 25, offset: 0 }),
+  ).rejects.toThrow();
+});

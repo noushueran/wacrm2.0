@@ -152,9 +152,27 @@ describe("POST /api/whatsapp/webhook (thin proxy)", () => {
     );
 
     // 502 is what a reverse proxy in front of a stopped Convex returns —
-    // precisely the state during a Convex deploy.
+    // precisely the state during the VPS migration cutover.
     expect(res.status).toBe(503);
     expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it("does not forward without a valid signature, so a retry storm cannot be induced", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await POST(
+      new Request("http://localhost/api/whatsapp/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": "sha256=deadbeef" },
+        body: JSON.stringify({ entry: [] }),
+      }),
+    );
+
+    // 401 is returned BEFORE the forward, so an unsigned flood can never
+    // reach Convex nor cause us to emit 503s.
+    expect(res.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

@@ -88,7 +88,7 @@ export function IssueLine({
       <CircleAlert className={cn("mt-0.5 h-3 w-3 shrink-0", iconTone)} />
       <span className="min-w-0 flex-1">
         {issue.node_key && (
-          <code className="mr-1 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+          <code className="mr-1 rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">
             {issue.node_key}
           </code>
         )}

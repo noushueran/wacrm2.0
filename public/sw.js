@@ -1,4 +1,4 @@
-// Holidayys WA CRM service worker. Hand-rolled (no next-pwa/Serwist) to
+// Service worker. Hand-rolled (no next-pwa/Serwist) to
 // avoid coupling with the customized next.config.ts. Jobs: receive Web
 // Push, show/route notifications, hand off to a visible tab, minimal
 // offline fallback. Bump SW_VERSION on any change.
@@ -36,7 +36,7 @@ self.addEventListener("push", (event) => {
   } catch (_e) {
     payload = {};
   }
-  const title = payload.title || "Holidayys WA CRM";
+  const title = payload.title || "New message";
   const options = {
     body: payload.body || "New WhatsApp message",
     tag: payload.tag || "wa-message",

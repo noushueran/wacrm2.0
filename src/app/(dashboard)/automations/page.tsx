@@ -44,6 +44,8 @@ import {
 } from "@/components/ui/dialog"
 import { AUTOMATION_TEMPLATES, type TemplateSlug } from "@/lib/automations/templates"
 import { triggerMeta, formatRelative } from "@/lib/automations/trigger-meta"
+import { RunStatsBar } from "@/components/automations/run-stats-bar"
+import { emptyRunCounts } from "../../../../convex/lib/automations/runStats"
 import { cn } from "@/lib/utils"
 
 import { api } from "../../../../convex/_generated/api"
@@ -65,7 +67,12 @@ const TEMPLATE_ICON: Record<TemplateSlug, typeof Zap> = {
 
 export default function AutomationsPage() {
   const router = useRouter()
-  const canCreate = useCan("send-messages")
+  // Matches the server floor, which is `admin` for every function in
+  // `convex/automations.ts` — reads AND writes (see that file's WRITE
+  // FLOOR header). `send-messages` was an agent-level capability and so
+  // promised an action the backend now refuses; `/automations` is in no
+  // nav allowlist below admin either, so nothing legitimate is lost.
+  const canCreate = useCan("edit-critical-settings")
   const t = useTranslations("Automations.list")
   const [pendingDelete, setPendingDelete] = useState<Automation | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -280,17 +287,13 @@ function AutomationCard({
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span
               className={cn(
-                "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium",
+                "inline-flex items-center rounded-full border px-2 py-0.5 text-[12px] font-medium",
                 meta.pillClass,
               )}
             >
               {meta.label}
             </span>
-            <span className="tabular-nums">
-              {automation.execution_count === 1
-                ? t("runs", { count: automation.execution_count })
-                : t("runsPlural", { count: automation.execution_count })}
-            </span>
+            <RunStatsBar counts={automation.runCounts ?? emptyRunCounts()} size="sm" />
             <span aria-hidden>·</span>
             <span>{t("lastRun", { time: formatRelative(automation.last_executed_at) })}</span>
           </div>

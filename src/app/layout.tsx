@@ -5,6 +5,7 @@ import { Inter } from "next/font/google";
 import Script from "next/script";
 import { ConvexAuthNextjsServerProvider } from "@convex-dev/auth/nextjs/server";
 import "./globals.css";
+import { BRAND, PRODUCT_NAME } from "@/lib/brand";
 import { ConvexClientProvider } from "./ConvexClientProvider";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ThemedToaster } from "@/components/themed-toaster";
@@ -29,14 +30,14 @@ export const metadata: Metadata = {
   // that unfurl a shared link (e.g. the /join invite page) would receive a
   // localhost image URL. Prefers the deployment's own env var, falling back
   // to the known production origin.
-  metadataBase: new URL(
-    process.env.NEXT_PUBLIC_SITE_URL ?? "https://wa.holidayys.co"
-  ),
+  // No `??` fallback: `BRAND.siteUrl` throws when unset. A default here
+  // is how this deployment ships wearing another company's name.
+  metadataBase: new URL(BRAND.siteUrl),
   title: {
-    default: "Holidayys WA CRM",
-    template: "%s — Holidayys WA CRM",
+    default: PRODUCT_NAME,
+    template: `%s — ${PRODUCT_NAME}`,
   },
-  description: "Internal WhatsApp CRM for Holidays Tours LLC — shared inbox, contacts, pipelines, broadcasts, and automations.",
+  description: `Internal WhatsApp CRM for ${BRAND.legalName} — shared inbox, contacts, pipelines, broadcasts, and automations.`,
   robots: {
     index: false,
     follow: false,
@@ -47,7 +48,7 @@ export const metadata: Metadata = {
   },
   appleWebApp: {
     capable: true,
-    title: "Holidayys",
+    title: BRAND.name,
     statusBarStyle: "black-translucent",
   },
   formatDetection: {

@@ -1,13 +1,12 @@
 'use client';
 
-import { useMemo } from 'react';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { ArrowRight, GitBranch, Trophy } from 'lucide-react';
 
 import { useQuery } from '@/lib/convex/cached';
 import { useAuth } from '@/hooks/use-auth';
-import { groupLeadsByStage, PIPELINE_STAGE_KEYS, type PipelineStageKey } from '@/lib/leads/pipeline';
+import type { PipelineStageKey } from '@/lib/leads/pipeline';
 import { formatCurrencyShort } from '@/lib/currency';
 import { cn } from '@/lib/utils';
 import { EmptyState } from './empty-state';
@@ -16,13 +15,24 @@ import { Skeleton } from './skeleton';
 import { api } from '../../../convex/_generated/api';
 
 // ============================================================
-// LeadsPipelineCard — the dashboard's compact view of the REAL deals
-// pipeline (qualified leads over the funnel), replacing the legacy
-// pipelines/deals donut. One segmented bar + per-stage counts, win
-// rate, and won value; links through to /leads' Pipeline view. Reads
-// the same cached `leadsBoard` subscription the leads page uses, so
-// visiting both costs one query. Render-gated by the caller (viewers
-// may not call `leadsBoard`).
+// LeadsPipelineCard — a compact view of the REAL deals pipeline (qualified
+// leads over the funnel): one segmented bar, per-stage counts, win rate and
+// won value, linking through to /leads' Pipeline view.
+//
+// NOW READS AN AGGREGATE, NOT THE BOARD. It used to share the /leads page's
+// `leadsBoard` subscription, on the reasoning that visiting both pages then
+// cost one query. That reasoning was sound and the price was not: measured
+// against production data, `leadsBoard({})` is 1,668 document reads and a
+// ~2.4 MB payload — 459 fully hydrated leads, each costing a contact, a
+// conversation, an offers collect and a checklist lookup, issued
+// SEQUENTIALLY — to produce the ten numbers below. `pipelineSummary`
+// returns those ten numbers directly.
+//
+// It also no longer sits on /dashboard. A pipeline is something a manager
+// studies, not something a salesperson acts on between messages, so it
+// lives on /reports' Funnel tab beside the windowed funnel counts. The two
+// are not redundant: this is where deals stand RIGHT NOW, `funnelOverview`
+// is how many conversations reached each stage within the range.
 // ============================================================
 
 const STAGE_BG: Record<PipelineStageKey, string> = {
@@ -38,8 +48,9 @@ const STAGE_BG: Record<PipelineStageKey, string> = {
 export function LeadsPipelineCard() {
   const t = useTranslations('Dashboard.leadsPipeline');
   const tFunnel = useTranslations('Inbox.funnel');
-  // Same account-readiness gate as every dashboard query; viewers have no
-  // lead queue (`leadsBoard` would throw), so the card self-hides.
+  // Same account-readiness gate as every other query; viewers have no lead
+  // queue (`pipelineSummary` requires `agent`, so it would throw), so the
+  // card self-hides rather than relying on its caller to know that.
   const { accountId, accountRole } = useAuth();
   const canView =
     !!accountId &&
@@ -47,33 +58,7 @@ export function LeadsPipelineCard() {
       accountRole === 'supervisor' ||
       accountRole === 'admin' ||
       accountRole === 'owner');
-  const board = useQuery(api.qualification.leadsBoard, canView ? {} : 'skip');
-
-  const stats = useMemo(() => {
-    if (!board) return null;
-    const grouped = groupLeadsByStage(board.leads);
-    const stages = PIPELINE_STAGE_KEYS.map((key) => ({
-      key,
-      count: grouped[key].length,
-    }));
-    const total = stages.reduce((n, s) => n + s.count, 0);
-    const closed = grouped.purchased.length + grouped.lost.length;
-    const winRate = closed > 0 ? Math.round((grouped.purchased.length / closed) * 100) : null;
-    const wonByCurrency = new Map<string, number>();
-    for (const lead of grouped.purchased) {
-      if (lead.saleValue && lead.saleValue > 0) {
-        const cur = lead.saleCurrency ?? 'USD';
-        wonByCurrency.set(cur, (wonByCurrency.get(cur) ?? 0) + lead.saleValue);
-      }
-    }
-    return {
-      stages,
-      total,
-      winRate,
-      wonByCurrency: [...wonByCurrency.entries()],
-      inQualification: board.summary.collecting,
-    };
-  }, [board]);
+  const stats = useQuery(api.qualification.pipelineSummary, canView ? {} : 'skip');
 
   if (!canView) return null;
 
@@ -106,7 +91,7 @@ export function LeadsPipelineCard() {
                 .map((s) => (
                   <div
                     key={s.key}
-                    className={cn('h-full', STAGE_BG[s.key])}
+                    className={cn('h-full', STAGE_BG[s.key as PipelineStageKey])}
                     style={{ width: `${(s.count / stats.total) * 100}%` }}
                     title={`${tFunnel(`stage.${s.key}` as never)}: ${s.count}`}
                   />
@@ -118,7 +103,13 @@ export function LeadsPipelineCard() {
                 .filter((s) => s.count > 0 || s.key === 'qualified')
                 .map((s) => (
                   <li key={s.key} className="flex items-center gap-2.5 text-xs">
-                    <span className={cn('size-2 shrink-0 rounded-full', STAGE_BG[s.key])} aria-hidden />
+                    <span
+                      className={cn(
+                        'size-2 shrink-0 rounded-full',
+                        STAGE_BG[s.key as PipelineStageKey],
+                      )}
+                      aria-hidden
+                    />
                     <span className="flex-1 truncate text-muted-foreground">
                       {tFunnel(`stage.${s.key}` as never)}
                     </span>
@@ -128,15 +119,23 @@ export function LeadsPipelineCard() {
             </ul>
 
             <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-1 pt-4 text-xs text-muted-foreground">
-              {stats.wonByCurrency.map(([currency, value]) => (
-                <span key={currency} className="inline-flex items-center gap-1 text-emerald-500">
+              {stats.wonByCurrency.map((won) => (
+                <span
+                  key={won.currency}
+                  className="inline-flex items-center gap-1 text-emerald-500"
+                >
                   <Trophy className="h-3 w-3" />
-                  {formatCurrencyShort(value, currency)}
+                  {formatCurrencyShort(won.value, won.currency)}
                 </span>
               ))}
               {stats.winRate !== null ? <span>{t('winRate', { rate: stats.winRate })}</span> : null}
               {stats.inQualification > 0 ? (
-                <span>{t('inQualification', { count: stats.inQualification })}</span>
+                <span>
+                  {t('inQualification', { count: stats.inQualification })}
+                  {/* The backend clamps both takes at 500 and reports it
+                      rather than presenting the ceiling as exact. */}
+                  {stats.capped ? '+' : ''}
+                </span>
               ) : null}
             </div>
           </>

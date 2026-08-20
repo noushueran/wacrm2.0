@@ -2,13 +2,31 @@ import { accountMutation, accountQuery } from "./lib/auth";
 import { v, ConvexError } from "convex/values";
 import type { Doc } from "./_generated/dataModel";
 import { requireConversationAccess } from "./lib/conversationAccess";
-import { holidayysDefaultConfig } from "./lib/qualification/defaults";
+import { projectChecklist, type ChecklistProjection } from "./lib/salesChecklist";
+import { defaultQualificationConfig } from "./lib/qualification/defaults";
 import {
   validateConfigPatch,
   CONFIG_PATCH_KEYS,
   type QualificationConfigPatch,
 } from "./lib/qualification/validate";
 import { seedStageConversionEvent } from "./funnel";
+import {
+  effectivePipelineStage,
+  PIPELINE_STAGE_KEYS,
+  type PipelineStageKey,
+} from "./lib/funnel";
+
+/**
+ * Ceiling on the deals `pipelineSummary` counts, per take.
+ *
+ * Sized like `dashboard.ACTIVE_CONVERSATIONS_CAP` and for the same reason:
+ * past a few hundred a stage bar communicates "a lot" rather than a
+ * quantity, so a fixed read cost is worth more than an exact tail. Unlike
+ * `leadsBoard`'s per-status caps, this bounds a COUNT rather than a
+ * rendered list, and the `capped` flag it produces is surfaced instead of
+ * being silently clamped.
+ */
+export const QUALIFIED_PIPELINE_CAP = 500;
 
 /** The purchase verdict shape the board/chip render — one projection so
  *  the two surfaces can never drift. */
@@ -50,7 +68,7 @@ export const getConfig = accountQuery({
       .unique();
     if (row) return { ...row, isPersisted: true as const };
     return {
-      ...holidayysDefaultConfig(),
+      ...defaultQualificationConfig(),
       accountId: ctx.accountId,
       isPersisted: false as const,
     };
@@ -82,7 +100,7 @@ export const updateConfig = accountMutation({
     // a partial patch — e.g. just {enabled:true} from the settings toggle
     // — always lands on a complete, schema-valid document.
     const base = existing ?? {
-      ...holidayysDefaultConfig(),
+      ...defaultQualificationConfig(),
       accountId: ctx.accountId,
     };
     const merged = { ...base, ...patch, updatedAt: Date.now() };
@@ -132,7 +150,7 @@ export const getSessionForConversation = accountQuery({
       );
       // Same absent-row fallback as `getConfig` above: defaults apply
       // until an admin persists a config.
-      const basicFields = config?.basicFields ?? holidayysDefaultConfig().basicFields;
+      const basicFields = config?.basicFields ?? defaultQualificationConfig().basicFields;
       missingHint =
         basicFields.find((f) => f.required && !answered.has(f.key))?.label ?? null;
     }
@@ -145,6 +163,11 @@ export const getSessionForConversation = accountQuery({
       serviceName: session.serviceName ?? null,
       ready: !!session.checklistSatisfiedAt,
       missingHint,
+      // Task 6 (conversation-notes-p2): `ContactStatusHeader`'s "next
+      // follow-up" line reads straight off this session — same
+      // `s.nextFollowUpAt ?? null` projection `leadsBoard` already uses
+      // below, added here rather than a second query for one field.
+      nextFollowUpAt: session.nextFollowUpAt ?? null,
       purchase: purchaseProjection(session),
     };
   },
@@ -239,9 +262,55 @@ const LEAD_STATUSES = [
   "disqualified",
 ] as const;
 
+/** The three terminal statuses the board groups behind one "Closed" filter. */
+const CLOSED_LEAD_STATUSES = new Set(["expired", "opted_out", "disqualified"]);
+
+/**
+ * The board's free-text search, applied SERVER-SIDE so it spans every
+ * lead rather than whichever page the browser is holding. Covers the
+ * same five fields the client used to match on, in the same order.
+ */
+function matchesBoardSearch(
+  lead: {
+    contactName: string;
+    contactPhone: string;
+    serviceName: string | null;
+    assigneeName: string | null;
+    summary: string | null;
+  },
+  search: string | undefined,
+): boolean {
+  const needle = search?.trim().toLowerCase();
+  if (!needle) return true;
+  return [
+    lead.contactName,
+    lead.contactPhone,
+    lead.serviceName ?? "",
+    lead.assigneeName ?? "",
+    lead.summary ?? "",
+  ]
+    .join(" ")
+    .toLowerCase()
+    .includes(needle);
+}
+
 export const leadsBoard = accountQuery({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    // ── Server-side filter + page (both opt-in) ──────────────────
+    // All optional, all defaulting to today's behaviour: omit
+    // `pageSize` and the board returns every lead exactly as before.
+    // `dashboard/leads-pipeline-card.tsx` and the Pipeline (kanban) view
+    // both need the FULL list to group by stage, so they simply keep
+    // calling this with `{}`.
+    status: v.optional(
+      v.union(v.literal("qualified"), v.literal("collecting"), v.literal("closed")),
+    ),
+    service: v.optional(v.string()),
+    search: v.optional(v.string()),
+    page: v.optional(v.number()),
+    pageSize: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
     // v4 RBAC (owner rule): agents work ONLY their own assigned leads;
     // supervisor+ see everything (with assignee details). Viewers have
     // no lead queue.
@@ -308,27 +377,7 @@ export const leadsBoard = accountQuery({
         sentAt: number | null;
         manual: boolean;
       } | null;
-      checklist: {
-        checklistId: string;
-        source: "kb" | "default";
-        doneCount: number;
-        total: number;
-        outcome: {
-          result: "won" | "lost";
-          lossCategory: string | null;
-          lossDetail: string | null;
-          at: number;
-        } | null;
-        items: {
-          key: string;
-          title: string;
-          description: string | null;
-          done: boolean;
-          doneAt: number | null;
-          doneByName: string | null;
-          note: string | null;
-        }[];
-      } | null;
+      checklist: ChecklistProjection | null;
     }[] = [];
 
     for (const status of LEAD_STATUSES) {
@@ -410,33 +459,7 @@ export const leadsBoard = accountQuery({
           saleValue: conversation.funnel?.saleValue ?? null,
           saleCurrency: conversation.funnel?.saleCurrency ?? null,
           purchase: purchaseProjection(s),
-          checklist: checklistRow
-            ? {
-                checklistId: checklistRow._id,
-                source: checklistRow.source,
-                doneCount: checklistRow.items.filter((i) => i.done).length,
-                total: checklistRow.items.length,
-                outcome: checklistRow.outcome
-                  ? {
-                      result: checklistRow.outcome.result,
-                      lossCategory: checklistRow.outcome.lossCategory ?? null,
-                      lossDetail: checklistRow.outcome.lossDetail ?? null,
-                      at: checklistRow.outcome.at,
-                    }
-                  : null,
-                items: checklistRow.items.map((i) => ({
-                  key: i.key,
-                  title: i.title,
-                  description: i.description ?? null,
-                  done: i.done,
-                  doneAt: i.doneAt ?? null,
-                  doneByName: i.doneByUserId
-                    ? (memberName.get(i.doneByUserId) ?? null)
-                    : null,
-                  note: i.note ?? null,
-                })),
-              }
-            : null,
+          checklist: checklistRow ? projectChecklist(checklistRow, memberName) : null,
         });
       }
     }
@@ -467,6 +490,30 @@ export const leadsBoard = accountQuery({
       .map((l) => l.score as number);
     const totalTracked = LEAD_STATUSES.reduce((n, s) => n + (summary[s] ?? 0), 0);
 
+    // Every service present on the WHOLE board, so the service dropdown
+    // keeps offering all of them. Derived client-side from `board.leads`
+    // before this change, which under pagination would have quietly
+    // narrowed the dropdown to the services on the current page — and
+    // made the option you were filtering by vanish as you paged past it.
+    const services = [...new Set(leads.map((l) => l.serviceName).filter((n): n is string => !!n))].sort();
+
+    const matched = leads.filter((lead) => {
+      if (args.status === "qualified" && lead.status !== "qualified") return false;
+      if (args.status === "collecting" && lead.status !== "collecting") return false;
+      if (args.status === "closed" && !CLOSED_LEAD_STATUSES.has(lead.status)) return false;
+      if (args.service !== undefined && lead.serviceName !== args.service) return false;
+      return matchesBoardSearch(lead, args.search);
+    });
+
+    const pageSize = Math.trunc(args.pageSize ?? 0);
+    const total = matched.length;
+    const paged = pageSize > 0;
+    const pageCount = paged ? Math.max(1, Math.ceil(total / pageSize)) : 1;
+    // Clamped, not trusted — see the identical note on `leadAnalysis.board`.
+    const page = paged
+      ? Math.min(Math.max(Math.trunc(args.page ?? 0), 0), pageCount - 1)
+      : 0;
+
     return {
       summary: {
         collecting: summary.collecting ?? 0,
@@ -482,7 +529,140 @@ export const leadsBoard = accountQuery({
             ? Math.round(qualifiedScores.reduce((a, b) => a + b, 0) / qualifiedScores.length)
             : 0,
       },
-      leads,
+      leads: paged ? matched.slice(page * pageSize, page * pageSize + pageSize) : matched,
+      services,
+      // Size of the FILTERED set — what the pagination control counts.
+      // The `summary` above deliberately stays whole-board: those counts
+      // are the filter pills' own labels, so deriving them from the
+      // filtered set would make each pill report its own selection.
+      total,
+      page,
+      pageCount,
+    };
+  },
+});
+
+/**
+ * The deals pipeline as ~15 numbers: per-stage counts, win rate, won value
+ * by currency, and how many leads are still being qualified.
+ *
+ * WHY THIS EXISTS ALONGSIDE `leadsBoard`. The pipeline card used to render
+ * from `leadsBoard({})`, which is the right query for the /leads board and
+ * exactly the wrong one for a summary: measured in production at 1,668
+ * document reads and a ~2.4 MB payload — 459 fully hydrated leads, each
+ * costing a contact, a conversation, an offers collect and a checklist
+ * lookup, all issued SEQUENTIALLY — to draw a bar the reader takes ten
+ * numbers off. This reads only what a count needs, and issues the one
+ * unavoidable per-lead lookup as a single parallel wave rather than a
+ * chain: ~2 round-trips instead of ~800.
+ *
+ * Only QUALIFIED sessions are deals, so unlike `leadsBoard` this does not
+ * touch the other four statuses at all — `collecting` is reported from a
+ * bounded count, not from hydrated rows.
+ *
+ * Deliberately NOT deduped against `reports.funnelOverview`, which also
+ * reports per-stage numbers. They answer different questions: this is
+ * where deals stand RIGHT NOW (one card per conversation, current stage),
+ * that is how many conversations REACHED each stage within a window. A
+ * conversation counts once here and in every stage it passed through
+ * there.
+ */
+export const pipelineSummary = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    // Same floor as `leadsBoard`: agents work only their own leads,
+    // supervisor+ see everything, viewers have no lead queue at all.
+    ctx.requireRole("agent");
+    const ownOnly = ctx.role === "agent";
+
+    const qualified = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "qualified"),
+      )
+      .order("desc")
+      .take(QUALIFIED_PIPELINE_CAP + 1);
+    const capped = qualified.length > QUALIFIED_PIPELINE_CAP;
+    const deals = capped ? qualified.slice(0, QUALIFIED_PIPELINE_CAP) : qualified;
+
+    // The stage lives on the CONVERSATION, so one lookup per session is
+    // unavoidable — but nothing depends across sessions, so it is one wave
+    // rather than a chain. This is the whole latency difference against
+    // `leadsBoard`, which awaits four reads inside its per-lead loop.
+    const conversations = await Promise.all(
+      deals.map((s) => ctx.db.get(s.conversationId)),
+    );
+
+    // Collapse to one deal per conversation BEFORE counting, for the reason
+    // `groupLeadsByStage` gives: every session of a conversation shares its
+    // single funnel stage, so counting each qualified session would count
+    // one deal N times. Newest qualified session wins — the same
+    // "latest session" rule `funnel.setStage`'s checklist gate uses.
+    const latestByConversation = new Map<
+      string,
+      { startedAt: number; stage: PipelineStageKey; saleValue: number | null; saleCurrency: string | null }
+    >();
+    for (let i = 0; i < deals.length; i++) {
+      const session = deals[i];
+      const conversation = conversations[i];
+      if (!conversation) continue;
+      if (ownOnly && conversation.assignedToUserId !== ctx.userId) continue;
+      const stage = effectivePipelineStage({
+        status: session.status,
+        funnelStage: conversation.funnel?.stage ?? null,
+      });
+      if (stage === null) continue;
+      const key = conversation._id as string;
+      const current = latestByConversation.get(key);
+      if (current && current.startedAt >= session._creationTime) continue;
+      latestByConversation.set(key, {
+        startedAt: session._creationTime,
+        stage,
+        saleValue: conversation.funnel?.saleValue ?? null,
+        saleCurrency: conversation.funnel?.saleCurrency ?? null,
+      });
+    }
+
+    const counts = Object.fromEntries(
+      PIPELINE_STAGE_KEYS.map((k) => [k, 0]),
+    ) as Record<PipelineStageKey, number>;
+    const wonByCurrency = new Map<string, number>();
+    for (const deal of latestByConversation.values()) {
+      counts[deal.stage] += 1;
+      if (deal.stage === "purchased" && deal.saleValue && deal.saleValue > 0) {
+        const currency = deal.saleCurrency ?? "USD";
+        wonByCurrency.set(
+          currency,
+          (wonByCurrency.get(currency) ?? 0) + deal.saleValue,
+        );
+      }
+    }
+
+    // Still-being-qualified. A bounded count, not hydrated rows — every key
+    // in this range is bound by equality, so every document read is a match
+    // and the `.take()` is a genuine read bound.
+    const collectingSample = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_account_status", (q) =>
+        q.eq("accountId", ctx.accountId).eq("status", "collecting"),
+      )
+      .take(QUALIFIED_PIPELINE_CAP + 1);
+
+    const closed = counts.purchased + counts.lost;
+    return {
+      stages: PIPELINE_STAGE_KEYS.map((key) => ({ key, count: counts[key] })),
+      total: [...latestByConversation.values()].length,
+      // `null`, not 0: nothing has closed yet, which is not the same claim
+      // as "nothing that closed was won".
+      winRate: closed > 0 ? Math.round((counts.purchased / closed) * 100) : null,
+      wonByCurrency: [...wonByCurrency.entries()].map(([currency, value]) => ({
+        currency,
+        value,
+      })),
+      inQualification: Math.min(collectingSample.length, QUALIFIED_PIPELINE_CAP),
+      /** True when either take hit its ceiling, so the UI can say "500+"
+       *  rather than presenting the cap as an exact figure. */
+      capped: capped || collectingSample.length > QUALIFIED_PIPELINE_CAP,
     };
   },
 });
