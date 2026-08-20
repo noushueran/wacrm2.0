@@ -52,6 +52,25 @@ function proxySecretHeaders(): Record<string, string> {
   return { 'x-wacrm-proxy-secret': secret }
 }
 
+/** How long to wait for the Convex httpAction before giving up and asking
+ *  Meta to redeliver. Comfortably inside Meta's ~20s ack window so the
+ *  response below is ours rather than a platform timeout. */
+const FORWARD_TIMEOUT_MS = 10_000
+
+/**
+ * Decline the delivery so Meta retries it later.
+ *
+ * 503 rather than 500: this is "the downstream is unavailable, come back",
+ * which is exactly true, and it is the status least likely to be read as a
+ * permanent application fault.
+ */
+function askMetaToRedeliver() {
+  return NextResponse.json(
+    { status: 'unavailable', detail: 'backend unreachable — retry' },
+    { status: 503 },
+  )
+}
+
 // GET - Webhook verification. No signature to check (Meta's handshake
 // has none) — just relay the query string to Convex's own GET
 // httpAction and pass its response straight back to Meta.
@@ -101,11 +120,29 @@ export async function POST(request: Request) {
   // scheduling the actual flows/automations/AI-reply/webhook-delivery
   // fan-out via `ctx.scheduler.runAfter` rather than awaiting it), so
   // this await does not risk missing Meta's ~20s ack timeout the way
-  // running the full fan-out in-process used to. Any failure here is
-  // logged, not surfaced to Meta — we still ack 200 below, same
-  // fast-unconditional-ack contract the previous in-process `after()`
-  // version had (background-processing failures were never reflected
-  // in the HTTP response either).
+  // running the full fan-out in-process used to.
+  //
+  // WHAT HAPPENS WHEN THE FORWARD FAILS, AND WHY IT CHANGED. This used to
+  // log the failure and ack 200 regardless — a deliberate
+  // "fast unconditional ack" contract. The cost of that contract is total
+  // and silent: Meta treats a 200 as delivered and never redelivers, so
+  // every inbound customer message that arrives while Convex is unreachable
+  // is lost outright — no queue, no dead-letter, no error anyone sees.
+  //
+  // A 5xx tells Meta to redeliver, which turns that permanent loss into a
+  // delay. That matters routinely — any backend blip — and acutely during
+  // planned Convex deploys, where the backend is deliberately disrupted.
+  //
+  // The 4xx/5xx split is the load-bearing part. A 5xx (or an unreachable
+  // host) means Convex never got to judge the payload, so the same bytes
+  // may well succeed later. A 4xx means Convex DID receive it and rejected
+  // it — a bad payload or a wrong proxy secret — and redelivering the
+  // identical bytes just reproduces the rejection on Meta's retry
+  // schedule. Those keep acking 200, exactly as before.
+  //
+  // The trade to be aware of: sustained 5xx can make Meta throttle or
+  // disable a webhook subscription. That is a reason to keep any planned
+  // outage short, not a reason to prefer silent data loss.
   try {
     const target = `${convexSiteUrl()}/whatsapp/ingest`
     const response = await fetch(target, {
@@ -115,14 +152,22 @@ export async function POST(request: Request) {
         'content-type': 'application/json',
       },
       body: rawBody,
+      // Fail fast rather than hanging until Meta's own ack timeout. With
+      // no bound, an unreachable backend holds the connection open until
+      // the platform kills it, which burns the ack window and lands Meta
+      // on a generic gateway error instead of the deliberate 503 below.
+      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.error(
         `[webhook proxy] Convex httpAction responded ${response.status}`,
       )
+      if (response.status >= 500) return askMetaToRedeliver()
     }
   } catch (error) {
+    // Network failure, DNS failure, or the timeout above.
     console.error('[webhook proxy] forward to Convex failed:', error)
+    return askMetaToRedeliver()
   }
 
   return NextResponse.json({ status: 'received' }, { status: 200 })

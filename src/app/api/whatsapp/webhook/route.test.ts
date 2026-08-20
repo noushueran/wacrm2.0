@@ -90,7 +90,7 @@ describe("POST /api/whatsapp/webhook (thin proxy)", () => {
     );
   });
 
-  it("still acks 200 to Meta even when the Convex httpAction is unreachable (fetch throws)", async () => {
+  it("asks Meta to REDELIVER (503) when the Convex httpAction is unreachable", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal(
       "fetch",
@@ -108,11 +108,14 @@ describe("POST /api/whatsapp/webhook (thin proxy)", () => {
       }),
     );
 
-    expect(res.status).toBe(200);
+    // 200 here would tell Meta the message was delivered and it would never
+    // be sent again — silent, permanent loss of a customer message. 503
+    // converts that into a delayed delivery.
+    expect(res.status).toBe(503);
     expect(errorSpy).toHaveBeenCalled();
   });
 
-  it("still acks 200 to Meta even when Convex itself responds with an error status", async () => {
+  it("still acks 200 when Convex REJECTS the payload (4xx) — a retry would just be rejected again", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal(
       "fetch",
@@ -129,6 +132,28 @@ describe("POST /api/whatsapp/webhook (thin proxy)", () => {
     );
 
     expect(res.status).toBe(200);
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it("asks Meta to REDELIVER (503) when Convex responds 5xx", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("Bad Gateway", { status: 502 })),
+    );
+
+    const rawBody = JSON.stringify({ entry: [] });
+    const res = await POST(
+      new Request("http://localhost/api/whatsapp/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": signedHeader(rawBody) },
+        body: rawBody,
+      }),
+    );
+
+    // 502 is what a reverse proxy in front of a stopped Convex returns —
+    // precisely the state during a Convex deploy.
+    expect(res.status).toBe(503);
     expect(errorSpy).toHaveBeenCalled();
   });
 });
