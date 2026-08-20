@@ -104,12 +104,16 @@ optional, so the old code simply ignores rows the new features wrote.
   `"none"`. Confirm `aiConfigs.model` on this deployment is >= gpt-5.1
   (this repo's own notes reference `gpt-5.4-mini`, which is fine) before
   deploying.
-- **The build has not been run against this exact tree** — the machine ran
-  out of disk. The identical Amani tree builds clean in both directions
-  (all vars set -> success; one unset -> a named, loud failure), and this
-  tree differs only in files that do not affect the build path. Run
-  `npm run build` once with the section-2 variables set before deploying.
-- **CI does not run in this repository.** It is a GitHub fork, and GitHub
-  disables Actions on forks by default — `.github/workflows/ci.yml` has 0
-  runs since 2026-07-11. Verify locally (`npx vitest run`,
-  `npx tsc --noEmit`) or enable Actions in repo settings.
+- **The build IS verified — in CI, not locally.** The local run was
+  abandoned (the machine ran out of disk), but opening the sync PR
+  triggered `.github/workflows/ci.yml` and it passed: lint, typecheck,
+  test and `npm run build`, green in 3m21s. Note this corrects an earlier
+  reading that Actions never runs here because the repo is a fork; the
+  workflow had 0 runs before 2026-08-20, but it does fire on a
+  `pull_request` targeting `main`.
+- **A failing Netlify deploy preview is EXPECTED until section 2 is done.**
+  CI builds with brand variables supplied by the workflow; Netlify has
+  none set yet, so `src/lib/brand.ts` throws and the build stops. Same
+  commit, two environments, one difference. That is the design, not a
+  defect — and it is safe, because a failed build means Netlify keeps
+  serving the current version.
