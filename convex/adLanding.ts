@@ -4,8 +4,12 @@ import { internal } from "./_generated/api";
 import {
   extractLandingContent,
   isFetchableLandingUrl,
+  isLoginWallLanding,
+  isLoginWallUrl,
   landingUrlKey,
   LANDING_HTML_MAX,
+  LANDING_LOGIN_WALL_ERROR,
+  looksLikeSerializedJunk,
 } from "./lib/ai/adContext";
 
 // ============================================================
@@ -21,6 +25,11 @@ import {
 // shorter TTL) while KEEPING the last good extraction — a temporarily
 // down landing page must never blank context the assistant already had,
 // and must never cost a reply.
+//
+// "Failed" includes landing on a login/consent wall (`fetchAndExtract`,
+// `LANDING_LOGIN_WALL_ERROR`): Meta hands an unauthenticated fetcher its
+// login page for the very `fb.me`/Instagram permalinks CTWA ads point at,
+// and that page must never be cached as if it were the ad's own copy.
 // ============================================================
 
 /** A good extraction is trusted this long before a refresh. */
@@ -153,6 +162,119 @@ export const storeResult = internalMutation({
   },
 });
 
+/** Rows per `clearJunkLandingContent` transaction. Small table, no
+ *  secondary reads — the default is the same 200 the other backfills use. */
+const DEFAULT_CLEANUP_BATCH = 200;
+
+/**
+ * One-shot cleanup for the two kinds of junk written before this module
+ * learned to reject them. Measured over production's 439 rows on
+ * 2026-08-25 — and worth stating plainly, because it is the whole reason
+ * this exists: NOT ONE row held real page text.
+ *
+ *   - 253 login walls (`isLoginWallLanding`) — everything about the row is
+ *     the wall, so all three text fields go and the row takes the same
+ *     `error: "login wall"` a fetch would record today.
+ *   - 179 truncated-`<script>` JSON blobs (`looksLikeSerializedJunk`) —
+ *     only `content` is junk. `title`/`description` are the ad's own offer
+ *     copy and the best grounding in the cache, so the row stays `ok` and
+ *     keeps them; just the blob is dropped.
+ *   - 7 rows with no content at all, left alone.
+ *
+ * Neither kind heals on its own. A wall row is `status: "ok"`, so it sits
+ * trusted for the full 24h TTL, and the keep-last-good rule means even the
+ * failure that eventually replaces it leaves the text in place forever. A
+ * junk-content row does re-fetch clean once its TTL lapses, but only if
+ * that ad is clicked again — and until then any FUTURE reader of
+ * `adLandingPages.content` would have to re-derive both guards to avoid
+ * what is already stored. `loadAdContext` does exactly that today; this
+ * mutation is what lets the next reader not have to.
+ *
+ * Deliberately does NOT touch `fetchedAt`. On a cleared wall row the old
+ * timestamp is now read against the 1h error TTL rather than the 24h ok
+ * TTL, so the row is re-claimable at the next ad click and refills itself
+ * with the real post instead of staying blank. `finalUrl` is kept as the
+ * ops breadcrumb for why a row was cleared; rows are patched, not deleted,
+ * so nothing a later good fetch would not overwrite anyway is destroyed.
+ *
+ * Internal, paginated, and idempotent — an already-cleared row matches
+ * neither branch's "has something to clear" test, so `walls: 0,
+ * junkContent: 0` on a second pass is the signal the cleanup is complete.
+ * It reads no other table and patches each row in place from that row's
+ * own `_id`, so the table-wide scan carries no cross-tenant hazard and two
+ * overlapping runs cannot double-count anything. Pass `dryRun` for the
+ * counts without writing.
+ *
+ * Lives here rather than in its own `*Backfill.ts` module (the convention
+ * `inboxBackfill.ts`/`adServiceBackfill.ts` set) for one practical reason:
+ * a new `convex/` module is not in the committed `_generated/api.d.ts`
+ * until the owner runs codegen, and `generatedApi.test.ts` fails on that
+ * drift. It shares both detectors with the guards it cleans up after,
+ * which is the next-best home.
+ *
+ * DELETE THIS MUTATION once a pass reports nothing left to clear.
+ */
+export const clearJunkLandingContent = internalMutation({
+  args: {
+    cursor: v.optional(v.union(v.string(), v.null())),
+    batchSize: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    cursor: string;
+    isDone: boolean;
+    scanned: number;
+    walls: number;
+    junkContent: number;
+  }> => {
+    const page = await ctx.db.query("adLandingPages").paginate({
+      cursor: args.cursor ?? null,
+      numItems: args.batchSize ?? DEFAULT_CLEANUP_BATCH,
+    });
+
+    let walls = 0;
+    let junkContent = 0;
+    for (const row of page.page) {
+      if (isLoginWallLanding(row)) {
+        // Already cleared by an earlier pass — `isLoginWallLanding` still
+        // says yes on the `finalUrl` alone, which is exactly why the
+        // idempotence check reads the text fields instead of it.
+        if (row.title === undefined && row.description === undefined && row.content === undefined) {
+          continue;
+        }
+        walls++;
+        if (args.dryRun) continue;
+        await ctx.db.patch(row._id, {
+          status: "error",
+          title: undefined,
+          description: undefined,
+          content: undefined,
+          error: LANDING_LOGIN_WALL_ERROR,
+        });
+        continue;
+      }
+      if (looksLikeSerializedJunk(row.content)) {
+        junkContent++;
+        if (args.dryRun) continue;
+        // `content` only: this row's title/description are real ad copy,
+        // and its `status: "ok"` is honest — the fetch DID reach the page.
+        await ctx.db.patch(row._id, { content: undefined });
+      }
+    }
+
+    return {
+      cursor: page.continueCursor,
+      isDone: page.isDone,
+      scanned: page.page.length,
+      walls,
+      junkContent,
+    };
+  },
+});
+
 type FetchOutcome = {
   ok: boolean;
   title?: string;
@@ -232,8 +354,21 @@ async function fetchAndExtract(url: string): Promise<FetchOutcome> {
     if (declaredLength > MAX_CONTENT_LENGTH_BYTES) {
       return { ok: false, error: "response too large" };
     }
+    // A wall is a FAILURE, not an extraction. Storing it as `ok` is what
+    // put "Log into Facebook / Email or mobile number / Forgot password?"
+    // into the reply agent's system prompt for 53% of production's ad
+    // leads — first contact from a paid click, the one moment the
+    // grounding matters most. Failing instead keeps the last good
+    // extraction (see `storeResult`) and retries after `RETRY_ERROR_MS`,
+    // which is the right shape here: Meta's wall is transient, and the
+    // very `fb.me` links cached as walls serve the real post on a later
+    // fetch.
+    if (isLoginWallUrl(response.url)) {
+      return { ok: false, error: LANDING_LOGIN_WALL_ERROR };
+    }
     const html = (await response.text()).slice(0, LANDING_HTML_MAX);
-    const { title, description, content } = extractLandingContent(html);
+    const { title, description, content, loginWall } = extractLandingContent(html);
+    if (loginWall) return { ok: false, error: LANDING_LOGIN_WALL_ERROR };
     if (!title && !description && !content) {
       return { ok: false, error: "no extractable content" };
     }
