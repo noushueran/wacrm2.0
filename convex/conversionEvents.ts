@@ -7,6 +7,7 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { resolveEventName, backendForLane } from "./lib/funnel";
+import { hashedPhone } from "./lib/metaHash";
 import {
   applyStageTransition,
   recordConversionEventInRollup,
@@ -82,6 +83,59 @@ function networkError(err: unknown): TransientDeliveryError {
   return new TransientDeliveryError(
     `network: ${err instanceof Error ? err.message : String(err)}`,
   );
+}
+
+/**
+ * The row-identifying half of a `logDelivery` line. Split out so every
+ * call site names the same fields — and, more to the point, so no call
+ * site is free to reach for `row.phone` or `row.identifier` while
+ * assembling one.
+ */
+function logFieldsFor(row: Doc<"conversionEvents">) {
+  return {
+    eventId: row.eventId,
+    eventName: row.eventName,
+    backend: row.backend,
+    lane: row.lane,
+    stage: row.stage,
+    attempt: row.attempts + 1,
+  };
+}
+
+/**
+ * One structured line per delivery attempt, for reading the pipeline in
+ * the Convex logs rather than only in the Conversions tab (which shows
+ * current state, not the sequence that produced it).
+ *
+ * WHAT IS DELIBERATELY ABSENT is the point of this function existing at
+ * all rather than callers writing their own `console.log`: no access
+ * token, no raw phone or email, no `ctwa_clid`, and no request/response
+ * body. `eventId` is `${conversationId}:${stage}` — an internal key that
+ * identifies the row without carrying anything about the person — and
+ * `outcome`/`httpStatus`/`fbTraceId` are what an operator actually needs
+ * to correlate a row with Meta's own diagnostics. `error` is the message
+ * we already persist to `lastError`, which is sliced to 200 chars at the
+ * throw site and is Meta's own error text, never our payload.
+ *
+ * Logged at `error` level only for a genuine failure: a `dormant` retire
+ * is normal operation on an unconfigured deployment and would otherwise
+ * make every tick look broken.
+ */
+function logDelivery(entry: {
+  eventId: string;
+  eventName: string;
+  backend: string;
+  lane: string;
+  stage: string;
+  attempt: number;
+  outcome: "sent" | "unmatched" | "error" | "dormant";
+  httpStatus?: number;
+  fbTraceId?: string;
+  error?: string;
+}): void {
+  const line = `[conversionEvents] ${JSON.stringify(entry)}`;
+  if (entry.outcome === "error") console.error(line);
+  else console.log(line);
 }
 
 /**
@@ -414,6 +468,11 @@ export const deliverConversionEvent = internalAction({
           conversionEventId: args.conversionEventId,
           reason: "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
         });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "dormant",
+          error: "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
+        });
         return;
       }
       const wabaId = await ctx.runQuery(internal.conversionEvents.getWabaId, {
@@ -428,11 +487,30 @@ export const deliverConversionEvent = internalAction({
           conversionEventId: args.conversionEventId,
           reason: "no wabaId configured for account",
         });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "dormant",
+          error: "no wabaId configured for account",
+        });
         return;
       }
       try {
+        // `ph` is an ADDITIONAL match key, never a replacement for the two
+        // WhatsApp business-messaging requires (`whatsapp_business_account_id`
+        // + `ctwa_clid`, both sent unhashed — Meta's parameter reference says
+        // of `ctwa_clid` exactly "Do not hash"). It is normalized to Meta's
+        // rules and SHA-256'd by `lib/metaHash.ts`; see that module for why
+        // its normalization deliberately differs from `lib/phone.ts`'s.
+        // Omitted entirely rather than sent empty when the row carries no
+        // usable digits — an empty-string match key is a present-but-
+        // unmatchable one and drags Event Match Quality down.
+        const ph = await hashedPhone(row.phone);
         const event: Record<string, unknown> = {
           event_name: row.eventName,
+          // The MILESTONE's time, not this attempt's: `_creationTime` is when
+          // the outbox row was written, which is the moment the stage was
+          // reached. A retry days later re-sends this same value rather than
+          // stamping "now" — the event says when it happened.
           event_time: Math.floor(row._creationTime / 1000),
           action_source: "business_messaging",
           messaging_channel: "whatsapp",
@@ -440,6 +518,7 @@ export const deliverConversionEvent = internalAction({
           user_data: {
             whatsapp_business_account_id: wabaId,
             ctwa_clid: row.identifier,
+            ...(ph ? { ph: [ph] } : {}),
           },
         };
         if (row.value !== undefined) {
@@ -448,6 +527,14 @@ export const deliverConversionEvent = internalAction({
         const body: Record<string, unknown> = { data: [event] };
         const partnerAgent = process.env.META_CAPI_PARTNER_AGENT;
         if (partnerAgent) body.partner_agent = partnerAgent;
+        // Events Manager → Test Events. Set META_CAPI_TEST_EVENT_CODE and
+        // deliveries are routed to the test stream instead of counting as
+        // production conversions; UNSET IT before going live, or the whole
+        // funnel keeps landing in the test panel and optimizes nothing.
+        // Read per-delivery (not cached at module load) so flipping the env
+        // takes effect on the next retry tick rather than the next deploy.
+        const testEventCode = process.env.META_CAPI_TEST_EVENT_CODE;
+        if (testEventCode) body.test_event_code = testEventCode;
         const url = `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(
           datasetId,
         )}/events?access_token=${encodeURIComponent(token)}`;
@@ -476,10 +563,21 @@ export const deliverConversionEvent = internalAction({
           status: "sent",
           fbTraceId: data.fbtrace_id,
         });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "sent",
+          httpStatus: res.status,
+          fbTraceId: data.fbtrace_id,
+        });
       } catch (err) {
         await ctx.runMutation(internal.conversionEvents.patchStatus, {
           conversionEventId: args.conversionEventId,
           ...errorPatchFor(err),
+        });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "error",
+          error: err instanceof Error ? err.message : String(err),
         });
       }
       return;
@@ -492,6 +590,11 @@ export const deliverConversionEvent = internalAction({
       await ctx.runMutation(internal.conversionEvents.retireDormant, {
         conversionEventId: args.conversionEventId,
         reason: "LANDING_CONVERSION_URL/WA_CONVERSION_SHARED_SECRET unset",
+      });
+      logDelivery({
+        ...logFieldsFor(row),
+        outcome: "dormant",
+        error: "LANDING_CONVERSION_URL/WA_CONVERSION_SHARED_SECRET unset",
       });
       return;
     }
@@ -534,16 +637,31 @@ export const deliverConversionEvent = internalAction({
           status: "sent",
           matchResult: data.offerSlug,
         });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "sent",
+          httpStatus: res.status,
+        });
       } else {
         await ctx.runMutation(internal.conversionEvents.patchStatus, {
           conversionEventId: args.conversionEventId,
           status: "unmatched",
+        });
+        logDelivery({
+          ...logFieldsFor(row),
+          outcome: "unmatched",
+          httpStatus: res.status,
         });
       }
     } catch (err) {
       await ctx.runMutation(internal.conversionEvents.patchStatus, {
         conversionEventId: args.conversionEventId,
         ...errorPatchFor(err),
+      });
+      logDelivery({
+        ...logFieldsFor(row),
+        outcome: "error",
+        error: err instanceof Error ? err.message : String(err),
       });
     }
   },
@@ -716,6 +834,29 @@ export const retryConversionEvents = internalAction({
       backends.push("platformA");
     }
 
+    // Loud when dark. Silence here WAS the defect: the sweep asks for nothing
+    // while a backend's env is unset, so a months-long blackout and a healthy
+    // tick produced byte-identical logs. One line per unconfigured backend
+    // that is actually holding rows — a deployment that never used a backend
+    // has no dormant rows for it and stays quiet.
+    const unconfigured = DELIVERY_BACKENDS.filter(
+      (backend) => !backends.includes(backend),
+    );
+    if (unconfigured.length > 0) {
+      const holding = await ctx.runQuery(
+        internal.conversionEvents.getUnconfiguredHold,
+        { backends: [...unconfigured] },
+      );
+      for (const row of holding) {
+        console.error(
+          `[conversionEvents] ${row.backend} delivery is UNCONFIGURED and is ` +
+            "holding conversions — oldest since " +
+            `${new Date(row.oldestHeldAt).toISOString()} (${row.reason}). ` +
+            "They deliver automatically once the env is set.",
+        );
+      }
+    }
+
     const [live, dormant] = await Promise.all([
       ctx.runQuery(internal.conversionEvents.getPendingToRetry, {}),
       ctx.runQuery(internal.conversionEvents.getDormantToSweep, {
@@ -785,5 +926,136 @@ export const listRecent = accountQuery({
         };
       }),
     );
+  },
+});
+
+// ============================================================
+// Delivery health — why a backend is dark, surfaced instead of inferred.
+//
+// The failure this exists for: an unconfigured backend is not an error.
+// `deliverConversionEvent` retires its rows to `"dormant"` and returns
+// cleanly, the cron keeps ticking, and `getDormantToSweep` asks for
+// nothing while the env stays unset. That is the correct RUNTIME
+// behaviour — it is what lets a backlog self-heal the moment the env
+// lands — but it is indistinguishable from health at every observable
+// surface. Production ran this way for months: every conversion the
+// account produced was parked, and the only symptom was rows quietly
+// accumulating in a status the Conversions tab renders as one indigo
+// badge among fifty.
+//
+// So the signal is derived from what the retire path ALREADY persists
+// (`status` + `lastError`) rather than from `process.env`, which a query
+// cannot read (`getDormantToSweep`'s header). No new table, no new
+// index, and it stays true for a backend that is dark for a reason
+// OTHER than env — `"no wabaId configured for account"` is retired
+// through the same path and reads out here identically.
+// ============================================================
+
+const DELIVERY_BACKENDS = ["capi", "platformA"] as const;
+
+/**
+ * Ceiling on the dormant scan behind `deliveryHealth`. A dark backend's
+ * backlog grows without bound (production reached 2,483 on one account),
+ * and this query runs on an admin tab open in a browser — the exact shape
+ * that has taken this deployment down before. Past the cap the count is
+ * reported as capped rather than counted: "500+, oldest 94 days ago" and
+ * "2,483, oldest 94 days ago" call for the same action, so paying 2,483
+ * document reads to tell them apart buys nothing.
+ */
+export const DORMANT_HEALTH_SCAN_CAP = 500;
+
+/** Strips `retireDormant`'s `"dormant: "` prefix off a stored `lastError`. */
+function heldReason(lastError: string | undefined): string | null {
+  if (!lastError) return null;
+  return lastError.startsWith("dormant: ")
+    ? lastError.slice("dormant: ".length)
+    : lastError;
+}
+
+/**
+ * Per-backend hold state for the Settings → Conversions banner. Admin+,
+ * matching `listRecent` — this reads the same table and the same tab gates
+ * both on `CRITICAL_SECTIONS`.
+ *
+ * Scanned off `by_status_backend` (the partition `getDormantToSweep`
+ * already uses) rather than `by_account`, because there is no
+ * account+status index and ranging `by_account` would walk every event the
+ * account ever produced to find the dormant ones. The scan is therefore
+ * deployment-wide and filtered to `ctx.accountId` in memory: rows belonging
+ * to other tenants are read but never returned, and on the single-account
+ * deployments this ships to the filter is a no-op. In a genuinely busy
+ * multi-tenant deployment the count degrades to "at least this many" — the
+ * same direction `capped` already reports, and never an overcount.
+ *
+ * `oldestHeldAt` is exact even when capped: `.take()` on this index walks
+ * `_creationTime` ascending, so the oldest dormant row is always in the
+ * first page. `newest` is deliberately NOT reported for the mirror-image
+ * reason — inside a capped window it would be the newest of the OLDEST 500,
+ * which is a number that looks meaningful and is not.
+ */
+export const deliveryHealth = accountQuery({
+  args: {},
+  handler: async (ctx) => {
+    ctx.requireRole("admin");
+
+    return await Promise.all(
+      DELIVERY_BACKENDS.map(async (backend) => {
+        const scanned = await ctx.db
+          .query("conversionEvents")
+          .withIndex("by_status_backend", (q) =>
+            q.eq("status", "dormant").eq("backend", backend),
+          )
+          .take(DORMANT_HEALTH_SCAN_CAP + 1);
+
+        const capped = scanned.length > DORMANT_HEALTH_SCAN_CAP;
+        const held = scanned
+          .slice(0, DORMANT_HEALTH_SCAN_CAP)
+          .filter((row) => row.accountId === ctx.accountId);
+
+        return {
+          backend,
+          heldCount: held.length,
+          capped,
+          oldestHeldAt: held[0]?._creationTime ?? null,
+          // The most recent reason inside the window, not the oldest: if the
+          // cause CHANGED (env set, but the account has no WABA), the newer
+          // one is the one still standing between these rows and delivery.
+          reason: heldReason(held[held.length - 1]?.lastError),
+        };
+      }),
+    );
+  },
+});
+
+/**
+ * The backends that are holding conversions while unconfigured — one
+ * document read each, for `retryConversionEvents`'s log line. Takes the
+ * backends the caller found UNCONFIGURED (the action owns `process.env`,
+ * exactly as `getDormantToSweep` does) and reports which of them have a
+ * backlog, so a configured-and-empty deployment logs nothing.
+ */
+export const getUnconfiguredHold = internalQuery({
+  args: {
+    backends: v.array(v.union(v.literal("platformA"), v.literal("capi"))),
+  },
+  handler: async (ctx, args) => {
+    const found = await Promise.all(
+      args.backends.map(async (backend) => {
+        const oldest = await ctx.db
+          .query("conversionEvents")
+          .withIndex("by_status_backend", (q) =>
+            q.eq("status", "dormant").eq("backend", backend),
+          )
+          .first();
+        return oldest
+          ? {
+              backend,
+              oldestHeldAt: oldest._creationTime,
+              reason: heldReason(oldest.lastError),
+            }
+          : null;
+      }),
+    );
+    return found.filter((row): row is NonNullable<typeof row> => row !== null);
   },
 });

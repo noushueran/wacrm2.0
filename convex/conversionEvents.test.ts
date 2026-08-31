@@ -53,7 +53,7 @@ async function seedEvent(
   accountId: Id<"accounts">,
   conversationId: Id<"conversations">,
   contactId: Id<"contacts">,
-  over: Partial<{ backend: "platformA" | "capi"; lane: "code" | "ctwa"; eventName: string; identifier: string; stage: string; value: number; currency: string; status: string; attempts: number; transientAttempts: number; nextAttemptAt: number }> = {},
+  over: Partial<{ backend: "platformA" | "capi"; lane: "code" | "ctwa"; eventName: string; identifier: string; stage: string; value: number; currency: string; status: string; attempts: number; transientAttempts: number; nextAttemptAt: number; phone: string }> = {},
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("conversionEvents", {
@@ -65,7 +65,7 @@ async function seedEvent(
       identifier: over.identifier ?? "clid-1",
       value: over.value,
       currency: over.currency,
-      phone: "+15551230000",
+      phone: over.phone ?? "+15551230000",
       waMessageId: "wamid.1",
       firstMessageAt: 1_000_000,
       eventId: `${conversationId}:${over.stage ?? "new_lead"}`,
@@ -77,7 +77,7 @@ async function seedEvent(
   );
 }
 
-const env = ["META_CAPI_DATASET_ID", "META_CAPI_ACCESS_TOKEN", "LANDING_CONVERSION_URL", "WA_CONVERSION_SHARED_SECRET"];
+const env = ["META_CAPI_DATASET_ID", "META_CAPI_ACCESS_TOKEN", "LANDING_CONVERSION_URL", "WA_CONVERSION_SHARED_SECRET", "META_CAPI_TEST_EVENT_CODE"];
 const orig: Record<string, string | undefined> = {};
 for (const k of env) orig[k] = process.env[k];
 const origFetch = globalThis.fetch;
@@ -985,4 +985,322 @@ test("a malformed CONVERSION_DELIVERY_START_MS holds the backlog rather than flo
     delete process.env.META_CAPI_DATASET_ID;
     delete process.env.META_CAPI_ACCESS_TOKEN;
   }
+});
+
+// ------------------------------------------------------------
+// deliveryHealth / getUnconfiguredHold — a dark backend says so.
+// ------------------------------------------------------------
+
+test("deliveryHealth reports the hold, its reason and its age for a dark backend", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const { asOwner } = await seedOwner(t, accountId);
+
+  // Through the REAL retire path, not a hand-written dormant row: the whole
+  // point is that the banner reads back what `deliverConversionEvent`
+  // actually persisted when it gave up.
+  const id = await seedEvent(t, accountId, conversationId, contactId);
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const health = await asOwner.query(api.conversionEvents.deliveryHealth, {});
+  const capi = health.find((row) => row.backend === "capi")!;
+  expect(capi.heldCount).toBe(1);
+  expect(capi.capped).toBe(false);
+  expect(capi.reason).toBe(
+    "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
+  );
+  expect(capi.oldestHeldAt).toBeTypeOf("number");
+
+  // The backend that was never asked to do anything is not accused of
+  // being broken — a clean lane must read clean.
+  const platformA = health.find((row) => row.backend === "platformA")!;
+  expect(platformA.heldCount).toBe(0);
+  expect(platformA.oldestHeldAt).toBeNull();
+  expect(platformA.reason).toBeNull();
+});
+
+test("deliveryHealth reports the CURRENT blocker after the env lands but a WABA is still missing", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const { asOwner } = await seedOwner(t, accountId);
+  // No `seedWaba` — this is the second gate the env-var fix does not clear,
+  // and it retires through the same path with a different reason.
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+
+  const id = await seedEvent(t, accountId, conversationId, contactId);
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const health = await asOwner.query(api.conversionEvents.deliveryHealth, {});
+  const capi = health.find((row) => row.backend === "capi")!;
+  expect(capi.heldCount).toBe(1);
+  expect(capi.reason).toBe("no wabaId configured for account");
+});
+
+test("deliveryHealth counts only the caller's own account", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const { asOwner } = await seedOwner(t, accountId);
+
+  const otherAccountId = await seedAccount(t);
+  const other = await seedConversation(t, otherAccountId);
+  await seedWaba(t, otherAccountId);
+
+  for (const [acc, conv] of [
+    [accountId, { contactId, conversationId }],
+    [otherAccountId, other],
+  ] as const) {
+    const id = await seedEvent(t, acc, conv.conversationId, conv.contactId);
+    await t.action(internal.conversionEvents.deliverConversionEvent, {
+      conversionEventId: id,
+    });
+  }
+
+  const health = await asOwner.query(api.conversionEvents.deliveryHealth, {});
+  // Both tenants are dark, but an admin of one is told about one.
+  expect(health.find((row) => row.backend === "capi")!.heldCount).toBe(1);
+});
+
+test("deliveryHealth is admin-gated", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Ag", email: "ag@example.com" }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId, accountId, role: "agent", fullName: "Ag", email: "ag@example.com",
+    }),
+  );
+  const asAgent = t.withIdentity({ subject: `${userId}|s-Ag` });
+  await expect(
+    asAgent.query(api.conversionEvents.deliveryHealth, {}),
+  ).rejects.toThrow();
+});
+
+test("retryConversionEvents logs an unconfigured backend that is holding conversions", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+
+  const id = await seedEvent(t, accountId, conversationId, contactId);
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await t.action(internal.conversionEvents.retryConversionEvents, {});
+    const logged = spy.mock.calls.map((call) => String(call[0]));
+    expect(
+      logged.some(
+        (line) => line.includes("capi") && line.includes("UNCONFIGURED"),
+      ),
+    ).toBe(true);
+    // platformA has no backlog here, so it is not named — a deployment that
+    // simply does not use a lane must not be nagged about it.
+    expect(logged.some((line) => line.includes("platformA"))).toBe(false);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("retryConversionEvents stays quiet once the backend is configured", async () => {
+  delete process.env.META_CAPI_DATASET_ID;
+  delete process.env.META_CAPI_ACCESS_TOKEN;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+
+  const id = await seedEvent(t, accountId, conversationId, contactId);
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await t.action(internal.conversionEvents.retryConversionEvents, {});
+    const logged = spy.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("UNCONFIGURED"))).toBe(false);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+// ============================================================
+// CAPI payload: match keys and Test Events.
+//
+// These assert the SHAPE Meta reads, not just that a POST happened —
+// the failure mode they exist for is a payload that returns 200 and
+// matches nobody, which no status-based test can see.
+// ============================================================
+
+/** Capture the one CAPI request body a delivery sends. */
+function captureCapiBody(): { get: () => Record<string, unknown> | null } {
+  let body: Record<string, unknown> | null = null;
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    body = JSON.parse(init.body as string);
+    return new Response(JSON.stringify({ fbtrace_id: "trace-1" }), {
+      status: 200,
+    });
+  }) as typeof fetch;
+  return { get: () => body };
+}
+
+test("capi: sends ctwa_clid unhashed and phone SHA-256 hashed", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    identifier: "clid-abc",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const body = captured.get()!;
+  const event = (body.data as Array<Record<string, unknown>>)[0];
+  const userData = event.user_data as Record<string, unknown>;
+
+  // Meta's parameter reference says of ctwa_clid exactly "Do not hash".
+  expect(userData.ctwa_clid).toBe("clid-abc");
+  expect(userData.whatsapp_business_account_id).toBe("WABA1");
+  // ...and the phone must NOT go over the wire in the clear.
+  expect(userData.ph).toEqual([
+    "16b63a8b7c923e5b3252ae6a71303c8c8c38a8147c0904c68315ed3708cff965",
+  ]);
+  expect(JSON.stringify(body)).not.toContain("15551230000");
+  expect(JSON.stringify(body)).not.toContain("+15551230000");
+});
+
+test("capi: a row with no usable phone omits ph rather than hashing nothing", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    phone: "",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  const userData = event.user_data as Record<string, unknown>;
+  // Absent, not "" and not a digest of "" — an empty match key is a
+  // present-but-unmatchable one and costs Event Match Quality.
+  expect("ph" in userData).toBe(false);
+  // The required WhatsApp keys are still there, so the event still matches.
+  expect(userData.ctwa_clid).toBe("clid-1");
+});
+
+test("capi: event_time is the milestone's time, not the retry's", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    // A row that already failed twice — this delivery is a RETRY.
+    status: "error",
+    attempts: 2,
+  });
+  const createdAt = await t.run(async (ctx) => (await ctx.db.get(id))!._creationTime);
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  expect(event.event_time).toBe(Math.floor(createdAt / 1000));
+  // And the identity is reused rather than regenerated — the property
+  // that makes a retry idempotent at Meta's end too.
+  expect(event.event_id).toBe(`${conversationId}:new_lead`);
+});
+
+test("capi: test_event_code is sent only when the env is set", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  delete process.env.META_CAPI_TEST_EVENT_CODE;
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+
+  const off = captureCapiBody();
+  const id1 = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", stage: "qualified", eventName: "QualifiedLead",
+  });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id1,
+  });
+  // Production default: absent. A stray test code left set is how a whole
+  // funnel silently lands in the Test Events panel and optimizes nothing.
+  expect("test_event_code" in off.get()!).toBe(false);
+
+  process.env.META_CAPI_TEST_EVENT_CODE = "TEST12345";
+  const on = captureCapiBody();
+  const id2 = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", stage: "purchased", eventName: "Purchase", value: 500, currency: "AED",
+  });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id2,
+  });
+  expect(on.get()!.test_event_code).toBe("TEST12345");
+});
+
+test("the access token never appears in a request body", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "super-secret-token";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  expect(JSON.stringify(captured.get())).not.toContain("super-secret-token");
 });
