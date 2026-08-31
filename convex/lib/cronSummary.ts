@@ -26,7 +26,12 @@ export const CRON_REGISTRY = [
   { name: "qualification-staff-loops", intervalMinutes: 60 },
   { name: "lead-scoring", intervalMinutes: 5 },
   { name: "lead-sequence", intervalMinutes: 15 },
-  { name: "inbox-chase-assign", intervalMinutes: 30 },
+  // "inbox-chase-assign" is TEMPORARILY ABSENT — its registration in
+  // crons.ts is commented out for the first deploy of that sweep, and
+  // the invariant test pins this list to the ACTUAL registrations. The
+  // reasoning, and the restore steps, are in crons.ts. Listing a cron
+  // here that is not registered would put a row in Settings -> Cron
+  // schedules that can only ever read "never ran".
   { name: "inbox-snooze-wake", intervalMinutes: 5 },
   { name: "revival-sweep", intervalMinutes: 30 },
   { name: "kbgap-sweep", intervalMinutes: 360 },
