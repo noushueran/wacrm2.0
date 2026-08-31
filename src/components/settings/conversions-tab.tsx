@@ -4,10 +4,11 @@ import { useMemo } from 'react';
 import { useQuery } from 'convex/react';
 import { useTranslations } from 'next-intl';
 import { format } from 'date-fns';
-import { Loader2, Target } from 'lucide-react';
+import { AlertTriangle, Loader2, Target } from 'lucide-react';
 
 import { RequireRole } from '@/components/auth/require-role';
 import { useAuth } from '@/hooks/use-auth';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import {
@@ -77,6 +78,55 @@ function fmtDateTime(ms: number): string {
   return format(new Date(ms), 'MMM d, yyyy · HH:mm');
 }
 
+/**
+ * One row of `api.conversionEvents.deliveryHealth`. Declared here rather
+ * than inferred from the query so this component stays presentational and
+ * independently testable — the same split `lead-sequence-settings-view.tsx`
+ * uses, and the reason `ConversionHoldBanner` can be static-rendered with
+ * plain props while `ConversionsTab` owns the hooks.
+ */
+export type ConversionHoldView = {
+  backend: 'capi' | 'platformA';
+  heldCount: number;
+  capped: boolean;
+  oldestHeldAt: number | null;
+  reason: string | null;
+};
+
+/**
+ * The "this lane is dark" banner. Renders nothing when every backend is
+ * delivering, so a healthy account sees no change at all.
+ */
+export function ConversionHoldBanner({ holds }: { holds: ConversionHoldView[] }) {
+  const t = useTranslations('Settings.conversions');
+  if (holds.length === 0) return null;
+  return (
+    <div className="space-y-2" data-testid="conversion-holds">
+      {holds.map((hold) => (
+        <Alert
+          key={hold.backend}
+          variant="destructive"
+          data-testid={`conversion-hold-${hold.backend}`}
+        >
+          <AlertTriangle />
+          <AlertTitle>
+            {t('health.title', { backend: t(`health.backend.${hold.backend}`) })}
+          </AlertTitle>
+          <AlertDescription>
+            {t(hold.capped ? 'health.heldCapped' : 'health.held', {
+              count: hold.heldCount,
+              oldest:
+                hold.oldestHeldAt !== null ? fmtDateTime(hold.oldestHeldAt) : '—',
+            })}{' '}
+            {hold.reason ? `${t('health.reason', { reason: hold.reason })} ` : ''}
+            {t('health.resumes')}
+          </AlertDescription>
+        </Alert>
+      ))}
+    </div>
+  );
+}
+
 export function ConversionsTab() {
   const t = useTranslations('Settings.conversions');
   // Reuses the funnel stage labels the inbox stepper already carries
@@ -96,10 +146,26 @@ export function ConversionsTab() {
   const loading = rows === undefined;
   const events = useMemo(() => rows ?? [], [rows]);
 
+  // Per-backend hold state. A dark delivery lane is INVISIBLE in the table
+  // below — `dormant` renders as one badge among fifty, and the tab caps at
+  // the 50 most recent rows, so a backlog of thousands and a handful of
+  // stragglers look identical. This banner is the difference between
+  // "some rows are parked" and "this lane has never delivered anything".
+  const health = useQuery(
+    api.conversionEvents.deliveryHealth,
+    canEditCriticalSettings ? {} : 'skip',
+  );
+  const holds = useMemo(
+    () => (health ?? []).filter((row) => row.heldCount > 0),
+    [health],
+  );
+
   return (
     <RequireRole min="admin">
       <section className="animate-in fade-in-50 space-y-6 duration-200">
         <SettingsPanelHead title={t('title')} description={t('description')} />
+
+        <ConversionHoldBanner holds={holds} />
 
         {loading ? (
           <div className="flex items-center justify-center py-12">
