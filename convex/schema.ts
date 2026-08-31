@@ -1609,7 +1609,29 @@ export default defineSchema({
       v.literal("automation"),
       v.literal("offer_accept"),
     ),
-  }).index("by_conversation", ["conversationId"]),
+  })
+    .index("by_conversation", ["conversationId"])
+    // `reports.assignmentsByAgent` (the /reports Agents tab) counts, per
+    // local day, how many distinct conversations each agent picked up.
+    // That is a window over the whole ACCOUNT's handovers, which
+    // `by_conversation` cannot express at all — it would mean visiting
+    // every conversation in the account to read its trail.
+    //
+    // Convex appends `_creationTime` to every index, so this one is
+    // really `["accountId", "_creationTime"]` and
+    // `eq(accountId).gte(_creationTime, sinceMs).lt(_creationTime,
+    // untilMs)` is a genuine single range over exactly the requested
+    // window — every document read is a match, with no `.filter()` on
+    // top that could starve the take. Both edges are bound for the reason
+    // `reports.ts`'s `readHours` documents on its own: the fold pools
+    // every row it is handed with no further per-row test, so an
+    // unbounded upper read would corrupt the counts, not merely cost
+    // extra reads.
+    //
+    // These rows are never updated or deleted, so the range is
+    // append-only and a descending take always reaches the newest days
+    // first.
+    .index("by_account", ["accountId"]),
 
   // One Web Push subscription = one browser/device for one user. A user
   // may have several (phone + laptop). `by_endpoint` is the upsert/prune

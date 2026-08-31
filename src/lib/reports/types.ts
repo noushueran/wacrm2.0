@@ -20,9 +20,53 @@ export const REPORT_TABS = [
   'response',
   'funnel',
   'billing',
+  // Windowed like the five above, so it sits with them rather than beside
+  // `activity` — the range picker genuinely drives it.
+  'agents',
   'activity',
 ] as const
 export type ReportTab = (typeof REPORT_TABS)[number]
+
+/**
+ * The first local day for which assignment history exists at all.
+ *
+ * `conversationEvents` — the table behind the Agents tab — records a row
+ * only from the moment the assignment-trail code is DEPLOYED. Nothing
+ * backfilled it, and nothing can: `conversations.assignedToUserId` is a
+ * bare field with no `assignedAt` companion, so there is no record
+ * anywhere of when an earlier handover happened.
+ *
+ * Load-bearing, not trivia. On the 30- and 90-day ranges the window reaches
+ * back past this date, and the resulting run of empty bars reads as "the team
+ * assigned nothing for three weeks" — a confident, wrong story. The panel
+ * shows a note whenever `sinceMs` predates this, so the gap is attributed to
+ * missing history rather than to idle agents.
+ *
+ * PER-DEPLOYMENT, WHICH IS WHY IT IS CONFIGURATION. The date differs per
+ * company because each one deploys the trail on its own day — the Amani
+ * deployment's is 2026-08-13 (commit 7856d2e). Hardcoding one company's
+ * date into a tree that ships to several is how the note comes to claim
+ * history that this deployment never recorded, which is the exact
+ * confident-wrong-story this constant exists to prevent.
+ *
+ * Unlike `src/lib/brand.ts` a missing value FALLS BACK rather than throwing:
+ * the cost of being wrong here is a mislabelled empty range, not a CRM
+ * wearing another company's name, and a Reports tab that refuses to render
+ * is worse than one whose caveat is a few days out. `NaN` from an
+ * unparseable value would make `sinceMs < floor` always false and silently
+ * drop the note, so it is floored to 0 — no note rather than a wrong one.
+ *
+ * Parsed as local midnight (`new Date(y, m-1, d)`), matching how every other
+ * day key in this file is built — see `mondayKeyOf`.
+ */
+export const ASSIGNMENT_HISTORY_FLOOR_DAY =
+  process.env.NEXT_PUBLIC_ASSIGNMENT_HISTORY_FLOOR_DAY?.trim() || '2026-08-13'
+
+export const ASSIGNMENT_HISTORY_FLOOR_MS = (() => {
+  const [y, m, d] = ASSIGNMENT_HISTORY_FLOOR_DAY.split('-').map(Number)
+  const ms = new Date(y, (m ?? 1) - 1, d ?? 1).getTime()
+  return Number.isNaN(ms) ? 0 : ms
+})()
 
 export const RANGE_OPTIONS = [7, 30, 90] as const
 export type RangeDays = (typeof RANGE_OPTIONS)[number]

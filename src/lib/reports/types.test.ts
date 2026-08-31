@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ASSIGNMENT_HISTORY_FLOOR_DAY,
+  ASSIGNMENT_HISTORY_FLOOR_MS,
   RANGE_OPTIONS,
   REPORT_TABS,
   parseRange,
@@ -162,5 +164,29 @@ describe("reportWindow", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("ASSIGNMENT_HISTORY_FLOOR", () => {
+  // The env var is read once at module load, so this suite covers the
+  // FALLBACK branch — the one every deployment that forgets to set
+  // `NEXT_PUBLIC_ASSIGNMENT_HISTORY_FLOOR_DAY` actually takes. The
+  // override branch is exercised by setting the variable, which vitest
+  // cannot do per-test against an already-imported module.
+  it("falls back to a valid day when the env var is unset", () => {
+    expect(ASSIGNMENT_HISTORY_FLOOR_DAY).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  // The guard that matters: `NaN` would make `sinceMs < floor` always
+  // false, silently dropping the "history starts on" caveat instead of
+  // showing a wrong one. Never NaN, whatever the configured value.
+  it("never yields NaN, so the caveat comparison stays meaningful", () => {
+    expect(Number.isNaN(ASSIGNMENT_HISTORY_FLOOR_MS)).toBe(false);
+    expect(ASSIGNMENT_HISTORY_FLOOR_MS).toBeGreaterThanOrEqual(0);
+  });
+
+  it("parses the day string it reports, at local midnight", () => {
+    const [y, m, d] = ASSIGNMENT_HISTORY_FLOOR_DAY.split("-").map(Number);
+    expect(ASSIGNMENT_HISTORY_FLOOR_MS).toBe(new Date(y, m - 1, d).getTime());
   });
 });

@@ -2,8 +2,14 @@
 import { convexTest, type TestConvex } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
-import { AD_ROW_LIMIT, AWAITING_SAMPLE_CAP, STATUS_MIX_CAP } from "./reports";
+import {
+  AD_ROW_LIMIT,
+  ASSIGNMENT_ROW_LIMIT,
+  AWAITING_SAMPLE_CAP,
+  STATUS_MIX_CAP,
+} from "./reports";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute, from-project-root pattern (matches every other
@@ -1436,4 +1442,495 @@ test("funnelOverview does not drag in the hours before a LOCAL midnight window s
   const byStage = Object.fromEntries(out.funnel.map((f) => [f.stage, f.count]));
   expect(byStage.price_quoted).toBe(1);
   expect(byStage.qualified).toBe(0); // 1 with the daily bucketing — the bug
+});
+
+
+// ============================================================
+// assignmentsByAgent (Agents tab)
+//
+// Every test here seeds `conversationEvents` through `clock(...)` rather than
+// writing a `_creationTime` field: that column is derived from `Date.now()` at
+// insert time and cannot be set directly, and it is the ONLY time key this
+// query buckets on. `makeClock`'s non-decreasing guard is therefore load-
+// bearing for this suite specifically — an out-of-order seed here would
+// silently land rows on the wrong day rather than failing.
+// ============================================================
+
+type Thread = { conversationId: Id<"conversations">; contactId: Id<"contacts"> };
+
+/** One conversation to hang handovers off. Returned as a value the caller
+ *  holds onto, rather than looked up by key inside `seedAssignment`, so that
+ *  "the same thread, reassigned twice" is unambiguously the same id. */
+async function seedThread(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  key: string,
+): Promise<Thread> {
+  return await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId,
+      phone: `+9715000000${key}`,
+      phoneNormalized: `9715000000${key}`,
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId,
+      contactId,
+      status: "open",
+      unreadCount: 0,
+    });
+    return { contactId, conversationId };
+  });
+}
+
+/** One handover event at a fixed instant. */
+async function seedAssignment(
+  t: ReturnType<typeof convexTest>,
+  clock: (ms: number) => void,
+  args: {
+    accountId: Id<"accounts">;
+    atMs: number;
+    thread: Thread;
+    kind: "assigned" | "unassigned";
+    targetUserId?: Id<"users">;
+    previousUserId?: Id<"users">;
+    source?: "manual" | "takeover" | "release" | "auto_assign";
+  },
+) {
+  clock(args.atMs);
+  await t.run((ctx) =>
+    ctx.db.insert("conversationEvents", {
+      accountId: args.accountId,
+      conversationId: args.thread.conversationId,
+      contactId: args.thread.contactId,
+      kind: args.kind,
+      ...(args.targetUserId ? { targetUserId: args.targetUserId } : {}),
+      ...(args.previousUserId ? { previousUserId: args.previousUserId } : {}),
+      source: args.source ?? "manual",
+    }),
+  );
+}
+
+/** A user plus their `memberships` row, so the query can resolve a name. */
+async function seedAgent(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  name: string,
+): Promise<Id<"users">> {
+  const userId = await t.run((ctx) =>
+    ctx.db.insert("users", {
+      name,
+      email: `${name.toLowerCase()}@example.com`,
+    }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId,
+      accountId,
+      role: "agent",
+      fullName: name,
+    }),
+  );
+  return userId;
+}
+
+test("assignmentsByAgent counts distinct conversations per agent per day", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+  const threadB = await seedThread(t, accountId, "2");
+
+  // Thread A bounces to Ana three times in one day — churn, one lead.
+  for (const at of ["08:00", "11:00", "15:00"]) {
+    await seedAssignment(t, clock, {
+      accountId,
+      atMs: Date.parse(`2026-08-03T${at}:00Z`),
+      thread: threadA,
+      kind: "assigned",
+      targetUserId: ana,
+    });
+  }
+  // A second, genuinely different thread the same day.
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T16:00:00Z"),
+    thread: threadB,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  // Four events, two leads.
+  expect(out.days).toEqual([
+    { dayKey: "2026-08-03", byAgent: { [ana]: 2 }, released: 0 },
+  ]);
+  expect(out.agents).toEqual([{ userId: ana, name: "Ana", total: 2 }]);
+  expect(out.truncated).toBe(false);
+  expect(out.earliestCoveredDay).toBeNull();
+});
+
+test("assignmentsByAgent counts the same lead again on a later day", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+
+  for (const day of ["2026-08-03", "2026-08-04"]) {
+    await seedAssignment(t, clock, {
+      accountId,
+      atMs: Date.parse(`${day}T10:00:00Z`),
+      thread: threadA,
+      kind: "assigned",
+      targetUserId: ana,
+    });
+  }
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-05T00:00:00Z"),
+    dayKeys: ["2026-08-03", "2026-08-04"],
+    tzOffsetMinutes: 0,
+  });
+
+  // Deduping is PER DAY, so this is 1 + 1. The total has to equal the row it
+  // sits beside — a distinct-over-the-whole-window total would read 1 and
+  // contradict its own columns.
+  expect(out.days.map((d) => d.byAgent[ana])).toEqual([1, 1]);
+  expect(out.agents).toEqual([{ userId: ana, name: "Ana", total: 2 }]);
+});
+
+test("assignmentsByAgent credits a takeover to the receiver, not the releaser", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const bo = await seedAgent(t, accountId, "Bo");
+  const threadA = await seedThread(t, accountId, "1");
+
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T08:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+  // Bo takes the same thread later the same day. Both worked it; Ana is not
+  // debited.
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T14:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: bo,
+    previousUserId: ana,
+    source: "takeover",
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.days[0].byAgent).toEqual({ [ana]: 1, [bo]: 1 });
+  expect(out.days[0].released).toBe(0);
+});
+
+test("assignmentsByAgent puts releases in their own column, under no agent", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T08:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+  // Released, re-taken, released again — still ONE lead dropped that day.
+  for (const at of ["09:00", "10:00"]) {
+    await seedAssignment(t, clock, {
+      accountId,
+      atMs: Date.parse(`2026-08-03T${at}:00Z`),
+      thread: threadA,
+      kind: "unassigned",
+      previousUserId: ana,
+      source: "release",
+    });
+  }
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.days[0].released).toBe(1);
+  // The release does NOT debit Ana — she still picked the lead up that day.
+  expect(out.days[0].byAgent).toEqual({ [ana]: 1 });
+  // And it does not put a nameless row in the agent list either.
+  expect(out.agents).toEqual([{ userId: ana, name: "Ana", total: 1 }]);
+});
+
+test("assignmentsByAgent buckets by the CALLER's local day, not UTC", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+
+  // 21:00 UTC on the 3rd is 01:00 on the 4th in Dubai (UTC+4 ->
+  // tzOffsetMinutes -240, the `getTimezoneOffset` sign convention). Bucketing
+  // in UTC would put this on the 3rd.
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T21:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T20:00:00Z"),
+    untilMs: Date.parse("2026-08-04T20:00:00Z"),
+    dayKeys: ["2026-08-03", "2026-08-04"],
+    tzOffsetMinutes: -240,
+  });
+
+  expect(out.days).toEqual([
+    { dayKey: "2026-08-03", byAgent: {}, released: 0 },
+    { dayKey: "2026-08-04", byAgent: { [ana]: 1 }, released: 0 },
+  ]);
+});
+
+test("assignmentsByAgent excludes events outside either window edge", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const before = await seedThread(t, accountId, "1");
+  const inside = await seedThread(t, accountId, "2");
+  const after = await seedThread(t, accountId, "3");
+
+  for (const [thread, at] of [
+    [before, "2026-08-02T23:00:00Z"],
+    [inside, "2026-08-03T10:00:00Z"],
+    [after, "2026-08-04T01:00:00Z"],
+  ] as const) {
+    await seedAssignment(t, clock, {
+      accountId,
+      atMs: Date.parse(at),
+      thread,
+      kind: "assigned",
+      targetUserId: ana,
+    });
+  }
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"), // exclusive
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.days[0].byAgent).toEqual({ [ana]: 1 });
+  expect(out.agents).toEqual([{ userId: ana, name: "Ana", total: 1 }]);
+});
+
+test("assignmentsByAgent ignores another account's handovers", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const mine = await seedThread(t, accountId, "1");
+
+  const otherAccountId = await t.run(async (ctx) => {
+    const ownerUserId = await ctx.db.insert("users", {
+      name: "Other",
+      email: "other@example.com",
+    });
+    return await ctx.db.insert("accounts", {
+      name: "Other account",
+      defaultCurrency: "USD",
+      ownerUserId,
+    });
+  });
+  const theirs = await seedThread(t, otherAccountId, "9");
+
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T09:00:00Z"),
+    thread: mine,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+  await seedAssignment(t, clock, {
+    accountId: otherAccountId,
+    atMs: Date.parse("2026-08-03T10:00:00Z"),
+    thread: theirs,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.days[0].byAgent).toEqual({ [ana]: 1 });
+});
+
+test("assignmentsByAgent keeps a former member's leads, under a null name", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  // A user with NO `memberships` row for this account — someone who has since
+  // left the team. Their handovers still happened.
+  const gone = await t.run((ctx) =>
+    ctx.db.insert("users", { name: "Gone", email: "gone@example.com" }),
+  );
+  const threadA = await seedThread(t, accountId, "1");
+
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-03T10:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: gone,
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.agents).toEqual([{ userId: gone, name: null, total: 1 }]);
+  // Dropping them would make this disagree with the column beside it.
+  expect(out.days[0].byAgent).toEqual({ [gone]: 1 });
+});
+
+test("assignmentsByAgent truncates the OLDEST days and says where", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+
+  // One event on the 2nd...
+  await seedAssignment(t, clock, {
+    accountId,
+    atMs: Date.parse("2026-08-02T10:00:00Z"),
+    thread: threadA,
+    kind: "assigned",
+    targetUserId: ana,
+  });
+
+  // ...then the cap PLUS ONE on the 3rd, so the read is genuinely capped and
+  // the 2nd falls off the descending take.
+  clock(Date.parse("2026-08-03T10:00:00Z"));
+  await t.run(async (ctx) => {
+    for (let i = 0; i <= ASSIGNMENT_ROW_LIMIT; i++) {
+      await ctx.db.insert("conversationEvents", {
+        accountId,
+        conversationId: threadA.conversationId,
+        contactId: threadA.contactId,
+        kind: "assigned",
+        targetUserId: ana,
+        source: "manual",
+      });
+    }
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-02T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-02", "2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  expect(out.truncated).toBe(true);
+  // The newest day survived — an ASCENDING take would have kept the 2nd and
+  // dropped this, rendering a confident, wrong, short bar for the latest day.
+  expect(out.earliestCoveredDay).toBe("2026-08-03");
+  expect(out.days).toEqual([
+    { dayKey: "2026-08-02", byAgent: {}, released: 0 },
+    { dayKey: "2026-08-03", byAgent: { [ana]: 1 }, released: 0 },
+  ]);
+});
+
+test("assignmentsByAgent reports no truncation at exactly the cap", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const ana = await seedAgent(t, accountId, "Ana");
+  const threadA = await seedThread(t, accountId, "1");
+
+  clock(Date.parse("2026-08-03T10:00:00Z"));
+  await t.run(async (ctx) => {
+    for (let i = 0; i < ASSIGNMENT_ROW_LIMIT; i++) {
+      await ctx.db.insert("conversationEvents", {
+        accountId,
+        conversationId: threadA.conversationId,
+        contactId: threadA.contactId,
+        kind: "assigned",
+        targetUserId: ana,
+        source: "manual",
+      });
+    }
+  });
+
+  const out = await asSupervisor.query(api.reports.assignmentsByAgent, {
+    sinceMs: Date.parse("2026-08-03T00:00:00Z"),
+    untilMs: Date.parse("2026-08-04T00:00:00Z"),
+    dayKeys: ["2026-08-03"],
+    tzOffsetMinutes: 0,
+  });
+
+  // Exactly CAP rows is a COMPLETE report, not a capped one. A `take(CAP)`
+  // read cannot tell these apart and would warn on a correct report.
+  expect(out.truncated).toBe(false);
+  expect(out.earliestCoveredDay).toBeNull();
+});
+
+test("assignmentsByAgent is supervisor-gated", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asAgent } = await seedAccountWithSupervisor(t);
+
+  await expect(
+    asAgent.query(api.reports.assignmentsByAgent, {
+      sinceMs: T0,
+      untilMs: T0 + 86_400_000,
+      dayKeys: ["2026-08-01"],
+      tzOffsetMinutes: 0,
+    }),
+  ).rejects.toThrow();
 });

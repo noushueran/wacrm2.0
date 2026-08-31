@@ -22,7 +22,10 @@ import {
   emptyStageCounts,
   emptyEventStatusCounts,
   EVENT_STATUS_KEYS,
+  ASSIGNMENT_ROW_LIMIT,
+  foldAssignmentEvents,
 } from "./lib/reportStats";
+import { localDayKeyFromMs } from "./lib/dashboardDate";
 import type { Id } from "./_generated/dataModel";
 import type { DatabaseReader } from "./_generated/server";
 
@@ -876,5 +879,131 @@ export const billing = accountQuery({
     );
 
     return { series, totals };
+  },
+});
+
+// `ASSIGNMENT_ROW_LIMIT` is defined in `./lib/reportStats` (imported above),
+// not here — same database-free reasoning as `STATUS_MIX_CAP`/`AD_ROW_LIMIT`/
+// `AWAITING_SAMPLE_CAP`: the Agents panel is a `'use client'` component and
+// importing the constant from this module would ship the whole backend file
+// to the browser. Re-exported so `reports.test.ts` can keep importing every
+// cap in this file from one place.
+export { ASSIGNMENT_ROW_LIMIT };
+
+/**
+ * Leads assigned per agent, per local day — the /reports Agents tab. See
+ * docs/superpowers/specs/2026-08-21-agents-assignment-report-design.md.
+ *
+ * Reads `conversationEvents`, the handover trail written by the single
+ * `applyAssignment` in `lib/assignment.ts`. Because that one function both
+ * patches `conversations.assignedToUserId` and inserts the event, the trail
+ * cannot drift from the field, and all seven assignment entry points are
+ * covered without this query knowing about any of them.
+ *
+ * A cell counts DISTINCT CONVERSATIONS, not events — see
+ * `foldAssignmentEvents`, which owns that rule and is tested against it
+ * directly.
+ *
+ * READ BOUNDEDNESS. Both window edges are bound on `by_account`, which Convex
+ * stores as `["accountId", "_creationTime"]`, so the range covers exactly
+ * `[sinceMs, untilMs)` and every document read is a match — there is no
+ * `.filter()` layered on top that could starve the take. Unlike `volume` /
+ * `responsePerformance` / `billing`, whose cost is pinned by WINDOW length
+ * because they read an hourly rollup, this query's cost grows with handover
+ * VOLUME inside the window. That is the `adPerformance` shape, and it gets
+ * `adPerformance`'s answer: an explicit cap, `ASSIGNMENT_ROW_LIMIT`.
+ *
+ * The take is DESCENDING, and that is load-bearing rather than stylistic. An
+ * ascending take would truncate the NEWEST days — the ones anyone is actually
+ * looking at — and the panel would render a confident, wrong, short bar for
+ * today. Descending truncates the oldest instead, and `truncated` /
+ * `earliestCoveredDay` hand the panel enough to label the incomplete edge. A
+ * capped read that cannot say WHERE it was capped is how a report states a
+ * number it has not earned.
+ *
+ * `earliestCoveredDay` is the local day of the oldest row actually read, so it
+ * names the first day that may be short — not the first day that is missing.
+ * It is null when nothing was truncated.
+ *
+ * Names come from `memberships` (account-scoped, so no `users` read, and no
+ * cross-tenant reach). An assignee with no membership row — someone who has
+ * since left the team — is kept under a null `name` for the client to label,
+ * NOT dropped: their leads really happened, and dropping them would make each
+ * day's total disagree with the per-agent column beside it. Returned as
+ * aggregates only, like every query in this file, which is what makes
+ * supervisor the right floor rather than admin.
+ */
+export const assignmentsByAgent = accountQuery({
+  args: {
+    sinceMs: v.number(),
+    untilMs: v.number(),
+    dayKeys: v.array(v.string()),
+    tzOffsetMinutes: v.number(),
+  },
+  handler: async (ctx, args) => {
+    ctx.requireRole("supervisor");
+
+    // `take(CAP + 1)`, not `take(CAP)` — the `awaitingReplyAges` pattern.
+    // Reading exactly the cap cannot distinguish "capped" from "there were
+    // precisely CAP rows", and that off-by-one would put a truncation warning
+    // on a complete report.
+    const rows = await ctx.db
+      .query("conversationEvents")
+      .withIndex("by_account", (q) =>
+        q
+          .eq("accountId", ctx.accountId)
+          .gte("_creationTime", args.sinceMs)
+          .lt("_creationTime", args.untilMs),
+      )
+      .order("desc")
+      .take(ASSIGNMENT_ROW_LIMIT + 1);
+
+    const truncated = rows.length > ASSIGNMENT_ROW_LIMIT;
+    const events = truncated ? rows.slice(0, ASSIGNMENT_ROW_LIMIT) : rows;
+    // `order("desc")` means the LAST row read is the oldest one, so this is
+    // the earliest day the window actually covers in full-or-part. Only
+    // meaningful when the take hit its cap; otherwise the window's own
+    // `sinceMs` is the honest floor and there is nothing to flag.
+    const oldest = events[events.length - 1];
+    const earliestCoveredDay =
+      truncated && oldest
+        ? localDayKeyFromMs(oldest._creationTime, args.tzOffsetMinutes)
+        : null;
+
+    const { days, agentTotals } = foldAssignmentEvents(
+      events.map((event) => ({
+        conversationId: event.conversationId,
+        kind: event.kind,
+        targetUserId: event.targetUserId,
+        creationTimeMs: event._creationTime,
+      })),
+      args.dayKeys,
+      args.tzOffsetMinutes,
+    );
+
+    // The roster is read ONLY for the agents that actually appear, but it is
+    // fetched in one indexed pass rather than per-agent: a member count is
+    // small and bounded, while N point lookups would scale with how many
+    // agents were active in the window.
+    const memberships = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .collect();
+    const nameByUserId = new Map(
+      memberships.map((member) => [member.userId as string, member.fullName]),
+    );
+
+    const agents = Object.entries(agentTotals)
+      .map(([userId, total]) => ({
+        userId,
+        name: nameByUserId.get(userId) ?? null,
+        total,
+      }))
+      // Busiest first. `userId` breaks ties so the row order is stable across
+      // refetches — otherwise two agents on equal totals can swap places on
+      // every poll, which reads as the table flickering.
+      .sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId));
+
+    return { days, agents, truncated, earliestCoveredDay };
   },
 });

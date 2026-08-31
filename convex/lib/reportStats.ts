@@ -562,3 +562,135 @@ export const AD_ROW_LIMIT = 100;
  * just the Active lane's own query shape.
  */
 export const AWAITING_SAMPLE_CAP = 500;
+
+// --- Assignment fold (Agents tab) -------------------------------------------
+//
+// Behind `reports.assignmentsByAgent` — docs/superpowers/specs/
+// 2026-08-21-agents-assignment-report-design.md.
+
+/**
+ * Cap on the `conversationEvents` rows `assignmentsByAgent` reads for one
+ * window.
+ *
+ * Lives here rather than in `reports.ts` for the reason `STATUS_MIX_CAP` /
+ * `AD_ROW_LIMIT` / `AWAITING_SAMPLE_CAP` above all document: the Agents panel
+ * needs this number verbatim for its truncation copy, and importing it from
+ * `reports.ts` would ship that entire module to the browser — every query
+ * handler, every `ctx.db.query()` call and index name, the full
+ * `accountQuery`/`requireRole` machinery — to obtain one integer.
+ *
+ * `assignmentsByAgent` is window-bounded on both edges, so unlike the three
+ * caps above this one is NOT the only thing standing between the query and an
+ * unbounded table. It bounds the remaining axis: handover VOLUME inside the
+ * window, which no window length can pin. That is the `adPerformance` shape,
+ * not the `volume` shape.
+ *
+ * 12,000 covers a 90-day window at roughly four times production's current
+ * ~90 handovers/day, and sits comfortably under Convex's own per-query
+ * document read limit with the `memberships` roster read alongside it.
+ *
+ * The take that uses this is DESCENDING — see `assignmentsByAgent`. If the
+ * scan itself ever becomes the cost rather than the row count, the documented
+ * escape hatch is a per-(account, day, agent) rollup, the same shape as
+ * `messageHourlyStats`.
+ */
+export const ASSIGNMENT_ROW_LIMIT = 12_000;
+
+/** One `conversationEvents` row, narrowed to the fields this fold reads.
+ *  Structural rather than `Doc<"conversationEvents">` so the fold stays a
+ *  total function over plain data, testable with object literals and with no
+ *  dependency on generated code. */
+export type AssignmentEventRow = {
+  conversationId: string;
+  kind: "assigned" | "unassigned";
+  targetUserId?: string;
+  creationTimeMs: number;
+};
+
+/** One day's column of the Agents grid. `byAgent` is keyed by user id; agents
+ *  with nothing that day are ABSENT rather than zero, so the caller decides
+ *  how a gap renders. */
+export type AssignmentDay = {
+  dayKey: string;
+  byAgent: Record<string, number>;
+  released: number;
+};
+
+/**
+ * Groups raw handover events into the per-(local day, agent) counts the Agents
+ * tab renders.
+ *
+ * DISTINCT CONVERSATIONS, not events. A thread that bounces to the same agent
+ * three times in one day counts once for them — the grid answers "how many
+ * leads did they work", and counting raw events would let reassignment churn
+ * inflate exactly the number a supervisor is reading. The dedupe key is
+ * `(dayKey, agent, conversationId)`, so the same thread landing with two
+ * different agents on one day correctly counts once for each: both of them
+ * genuinely picked it up.
+ *
+ * `kind: "unassigned"` rows feed `released` and NO agent's count. A release
+ * has a `previousUserId` but no `targetUserId`, and debiting the agent who let
+ * go of a thread would mix two different questions into one column — see the
+ * design doc's "Semantics".
+ *
+ * `dayKeys` makes the output DENSE: every requested day appears, in the given
+ * order, even with no activity. The chart needs a bar per day (a sparse series
+ * would silently close the gaps and misdraw the shape), and it doubles as the
+ * `keys`-style guard the other folds in this file carry — a row whose local day
+ * falls outside the requested set is discarded rather than inventing a column.
+ *
+ * `agentTotals` is the COLUMN SUM of what is displayed, so a thread assigned to
+ * the same agent on two different days contributes 2. That is deliberate: the
+ * totals column must equal the row it sits beside, and a distinct-over-the-
+ * whole-window total would not.
+ */
+export function foldAssignmentEvents(
+  rows: AssignmentEventRow[],
+  dayKeys: string[],
+  tzOffsetMinutes: number,
+): { days: AssignmentDay[]; agentTotals: Record<string, number> } {
+  const wanted = new Set(dayKeys);
+  // dayKey -> agentId -> set of conversation ids seen for that agent that day.
+  const assigned = new Map<string, Map<string, Set<string>>>();
+  // dayKey -> set of conversation ids released that day.
+  const released = new Map<string, Set<string>>();
+
+  for (const row of rows) {
+    const dayKey = localDayKeyFromMs(row.creationTimeMs, tzOffsetMinutes);
+    if (!wanted.has(dayKey)) continue;
+
+    if (row.kind === "unassigned") {
+      let day = released.get(dayKey);
+      if (!day) released.set(dayKey, (day = new Set()));
+      day.add(row.conversationId);
+      continue;
+    }
+
+    // An "assigned" row without a `targetUserId` is not representable —
+    // `applyAssignment` writes the field whenever `kind` is "assigned" — but
+    // skipping rather than bucketing under a placeholder keeps the fold total.
+    if (!row.targetUserId) continue;
+
+    let day = assigned.get(dayKey);
+    if (!day) assigned.set(dayKey, (day = new Map()));
+    let forAgent = day.get(row.targetUserId);
+    if (!forAgent) day.set(row.targetUserId, (forAgent = new Set()));
+    forAgent.add(row.conversationId);
+  }
+
+  const agentTotals: Record<string, number> = {};
+  const days = dayKeys.map((dayKey) => {
+    const byAgent: Record<string, number> = {};
+    for (const [agentId, conversations] of assigned.get(dayKey) ?? []) {
+      byAgent[agentId] = conversations.size;
+      agentTotals[agentId] = (agentTotals[agentId] ?? 0) + conversations.size;
+    }
+    return {
+      dayKey,
+      byAgent,
+      released: released.get(dayKey)?.size ?? 0,
+    };
+  });
+
+  return { days, agentTotals };
+}

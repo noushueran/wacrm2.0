@@ -1323,7 +1323,7 @@
   },
   "Reports": {
     "title": "Reports",
-    "subtitle": "Conversation volume, ad performance, response times, funnel and Meta billing.",
+    "subtitle": "Conversation volume, ad performance, response times, funnel, Meta billing and agent workload.",
     "range": "{days} days",
     "exportCsv": "Export CSV",
     "tabs": {
@@ -1332,7 +1332,8 @@
       "response": "Response",
       "funnel": "Funnel",
       "billing": "Billing",
-      "activity": "Activity"
+      "activity": "Activity",
+      "agents": "Agents"
     },
     "conversations": {
       "started": "New conversations",
@@ -1448,6 +1449,21 @@
         "free": "Free",
         "other": "Other"
       }
+    },
+    "agents": {
+      "chartTitle": "Leads assigned per agent",
+      "chartSubtitle": "One bar per day, split by the agent who picked the lead up.",
+      "tableTitle": "Day by day",
+      "agent": "Agent",
+      "total": "Total",
+      "released": "Released to pool",
+      "formerMember": "Former member",
+      "otherAgents": "{count, plural, =1 {1 other agent} other {# other agents}}",
+      "emptyTitle": "No leads were assigned in this range",
+      "emptyHint": "Assign a conversation to a teammate from the Inbox and it will show up here.",
+      "caveat": "A lead counts once per agent per day, however many times it changed hands. A takeover counts for the agent who received it.",
+      "historyFloor": "Assignment history starts on {date} — nothing was recorded before then, so earlier days are blank rather than empty.",
+      "truncated": "More than {limit} handovers in this range, so only the most recent are counted. Days from {date} backwards may be incomplete — narrow the range for exact figures."
     }
   },
   "Automations": {
@@ -2641,6 +2657,17 @@
         "error": "Error",
         "abandoned": "Abandoned",
         "dormant": "Dormant"
+      },
+      "health": {
+        "title": "{backend} delivery is not configured",
+        "held": "{count, number} conversion {count, plural, one {event is} other {events are}} being held, the oldest since {oldest}.",
+        "heldCapped": "At least {count, number} conversion events are being held, the oldest since {oldest}.",
+        "reason": "Reason: {reason}.",
+        "resumes": "Nothing is lost — held events deliver automatically once this is configured, subject to the provider's event age limit.",
+        "backend": {
+          "capi": "Meta CAPI",
+          "platformA": "Platform A pixel"
+        }
       }
     },
     "deals": {

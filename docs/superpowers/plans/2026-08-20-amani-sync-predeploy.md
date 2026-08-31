@@ -117,3 +117,86 @@ optional, so the old code simply ignores rows the new features wrote.
   commit, two environments, one difference. That is the design, not a
   defect — and it is safe, because a failed build means Netlify keeps
   serving the current version.
+
+---
+
+## 7. Refresh — Amani `main` @ e3f75e7 (2026-08-31)
+
+The sync above was cut from Amani on 2026-08-20. This section covers only
+what landed on Amani afterwards and has now been brought across. It is
+additive to sections 1–6, which all still apply unchanged.
+
+### What came over
+
+- **Reports → Agents tab** (`reports.assignmentsByAgent`,
+  `lib/reportStats.foldAssignmentEvents`, `components/reports/agents-panel.tsx`).
+  Leads picked up per agent per local day, counting DISTINCT
+  CONVERSATIONS rather than events so reassignment churn cannot inflate
+  the figure a supervisor reads. Role floor: `supervisor`.
+- **Conversion delivery health** (`conversionEvents.deliveryHealth` +
+  `getUnconfiguredHold`, the banner in `settings/conversions-tab.tsx`).
+  An unconfigured backend parks conversions in `dormant` and returns
+  cleanly — correct at runtime, but until now indistinguishable from
+  health at every observable surface. Amani ran that way for months. Now
+  it logs one `console.error` per holding backend and shows a banner.
+- **Public API docs** caught up with behaviour this tree already had:
+  do-not-contact rejects a single send with `bad_request`, and broadcasts
+  report a `skipped` count.
+- **65 design docs / plans** for features the 2026-08-20 sync brought over
+  but whose specs it left behind.
+
+### Schema
+
+One new index, nothing else:
+
+    conversationEvents.index("by_account", ["accountId"])
+
+Convex builds it on deploy. Still 100% additive — no field added, removed
+or narrowed by this refresh, so section 5's rollback story is unchanged.
+
+### New environment variable — optional, but read section 6 first
+
+    NEXT_PUBLIC_ASSIGNMENT_HISTORY_FLOOR_DAY=YYYY-MM-DD
+
+The Agents tab shows "assignment history starts on <date>" whenever the
+selected range reaches back past the day `conversationEvents` began
+recording. Amani hardcoded its own date, `2026-08-13`.
+
+**That date is wrong for this deployment and it is not a cosmetic
+difference.** `conversationEvents` does not exist in this deployment's
+Convex at all until the sync is deployed, so assignment history here
+begins on the DEPLOY DAY, not on 2026-08-13. Left at the Amani default,
+the 30- and 90-day ranges render weeks of empty bars under a caveat that
+says the history was recorded and the team assigned nothing — a
+confident, wrong story, which is precisely what the caveat exists to
+prevent.
+
+`src/lib/reports/types.ts` therefore reads it from the environment,
+falling back to the Amani date. Set it in Netlify to the day you deploy
+Convex. It falls back rather than throwing (unlike `src/lib/brand.ts`)
+because a caveat a few days out is a smaller harm than a Reports tab that
+refuses to render.
+
+### Verification — all green on this machine, 2026-08-31
+
+Unlike section 6's note, the local run completed this time (1.3 TB free):
+
+- `npm run typecheck` — clean
+- `npm test` — **4,577 tests, 280 files, all passing**
+- `npm run lint` — 0 errors, 1 warning (a stale `eslint-disable` in
+  `src/app/api/media/download/route.ts`, pre-existing and unrelated)
+- `npm run build` — compiled successfully, 34 static pages, `/reports`
+  among the rendered routes
+
+### Deliberately NOT copied
+
+Two Amani paths are company data, not product code, and porting them
+would have moved another company's business content and real customer
+recordings into this repo:
+
+- `amani-ai-agent/` — Amani's sales SOP, knowledge base and UAE visa flow
+- `scripts/voice-eval/samples/` — real customer voice notes (`.ogg`) from
+  Amani production, plus their manifest
+
+If the voice-transcription eval is wanted here, it needs samples drawn
+from this deployment's own media.
