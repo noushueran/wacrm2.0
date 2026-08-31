@@ -197,15 +197,25 @@ async function runWrappedMutation(
   });
 }
 
-export const runSweepChaseAssign = internalAction({
-  args: {},
-  handler: (ctx): Promise<void> =>
-    runWrappedMutation(
-      ctx,
-      "inbox-chase-assign",
-      internal.inboxChaseAssign.sweepChaseAssign,
-    ),
-});
+// TEMPORARILY DARK alongside its cron and its CRON_REGISTRY entry — the
+// three move together, which is exactly what the type system enforces:
+// `runWrappedMutation` takes a `CronName`, and that union is derived
+// from CRON_REGISTRY, so leaving this wrapper live while the registry
+// entry is gone is a compile error rather than a silent orphan. The
+// reasoning and the restore steps are in crons.ts.
+//
+// `internal.inboxChaseAssign.sweepChaseAssign` itself is untouched and
+// still deploys — only its scheduling is withdrawn.
+//
+// export const runSweepChaseAssign = internalAction({
+//   args: {},
+//   handler: (ctx): Promise<void> =>
+//     runWrappedMutation(
+//       ctx,
+//       "inbox-chase-assign",
+//       internal.inboxChaseAssign.sweepChaseAssign,
+//     ),
+// });
 
 export const runSweepSnoozeWake = internalAction({
   args: {},

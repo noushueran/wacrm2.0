@@ -94,12 +94,34 @@ crons.interval(
 // design — `inboxChaseAssign.test.ts` pins it, because flipping it to a
 // truthy test would silently disable both this sweep and the lead
 // offers that share the flag.
-crons.interval(
-  "inbox-chase-assign",
-  { minutes: 30 },
-  internal.cronSchedules.runSweepChaseAssign,
-  {},
-);
+// TEMPORARILY DARK FOR THE FIRST DEPLOY OF THIS SWEEP — restore below.
+//
+// `autoAssignEnabled` is ALREADY `true` on this deployment's only
+// `qualificationConfigs` row (seeded by `defaults.ts`, never chosen by
+// anyone), and `enabled` is true too, so both gates above are open. The
+// sweep has never run here — `inboxChaseAssign` is not in the deployed
+// function list — so the first tick would meet an entire history of
+// unowned Chasing threads and assign them 50 at a time, every 30
+// minutes, notifying a person each time. Nothing reaches customers; the
+// harm is staff arriving to months of dormant threads dealt out
+// overnight.
+//
+// It cannot be disarmed BEFORE this deploy: `qualification.updateConfig`
+// is an `accountMutation` behind `requireRole("admin")`, so the CLI
+// (which carries no user identity) cannot call it, and the Settings
+// toggle that would flip it ships in this very deploy.
+//
+// So the order is: deploy with this dark -> turn `autoAssignEnabled` off
+// in Settings once the frontend is up -> restore this entry and deploy
+// again -> turn it back on deliberately, watching the first sweep.
+// Deleting these lines and the comment is the whole of the restore.
+//
+// crons.interval(
+//   "inbox-chase-assign",
+//   { minutes: 30 },
+//   internal.cronSchedules.runSweepChaseAssign,
+//   {},
+// );
 
 // Wake snoozed conversations whose time has come (spec
 // 2026-07-28-inbox-manual-overrides §Waking). Clearing the field is what
