@@ -2,20 +2,22 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react"
 import { useRouter } from "next/navigation"
-import { useMutation, useQuery } from "convex/react"
+import { useConvex, useMutation } from "convex/react"
+import { useQuery } from "@/lib/convex/cached"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
   ArrowLeft,
   ChevronDown,
-  Plus,
   Trash2,
   GripVertical,
   MessageSquare,
@@ -35,18 +37,16 @@ import {
   ArrowUp,
   MousePointerClick,
   List,
+  Paperclip,
+  Upload,
+  X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import type {
   AutomationStepType,
   AutomationTriggerType,
@@ -55,14 +55,20 @@ import type {
   KeywordMatchTriggerConfig,
   MessageTemplate,
   Profile,
+  SendMessageStepConfig,
+  SendTemplateStepConfig,
   Tag as TagRecord,
 } from "@/types"
 import {
-  InteractiveBuilder,
   blankButtonsPayload,
   blankListPayload,
 } from "@/components/interactive/interactive-builder"
+import { SendComposer } from "./send-composer"
+import { TemplatePreview } from "./message-preview"
+import { ActionPicker } from "./action-picker"
+import { StepIssues, useStepIssues, type ValidationIssue } from "./step-issues"
 import { interactivePayloadPreviewText } from "@/lib/whatsapp/interactive"
+import { uploadAccountMedia, MEDIA_MAX_BYTES } from "@/lib/storage/upload-media"
 import {
   convexErrorMessage,
   toUiCustomField,
@@ -76,14 +82,35 @@ import { cn } from "@/lib/utils"
 
 import { api } from "../../../convex/_generated/api"
 import type { Id } from "../../../convex/_generated/dataModel"
+import { extractTemplateVariables } from "../../../convex/lib/automations/templateVars"
 
 // ------------------------------------------------------------
 // Types (builder-local — mirror the flattened rows we POST)
 // ------------------------------------------------------------
 
 export interface BuilderStep {
-  /** Client id; the API assigns real UUIDs server-side. */
+  /** Client-local id (list keys, expand/collapse state). Also the
+   *  fallback source `toApiSteps` sends as `id` for a step that has never
+   *  been saved — see `step_key`. */
   cid: string
+  /** The server's stable per-step key (`automationSteps.stepKey`), once
+   *  this step has been saved at least once — populated by
+   *  `fromServerSteps` from the tree `automations.get` returns. Undefined
+   *  for a step added in this editing session that has never been saved,
+   *  in which case `toApiSteps` falls back to `cid`. */
+  step_key?: string
+  /** `stepKey ?? _id` — `stepsTree.ts`'s `BuilderStepNode.effectiveStepKey`,
+   *  round-tripped by `fromServerSteps`. USE THIS for looking a step up in
+   *  `stepStats` (Task 8's canvas chips): a step saved before Task 10's
+   *  stepKey migration has `step_key === undefined` but still has
+   *  accumulated stats, filed under its row's `_id` (see
+   *  `automationsEngine.ts`'s own `step.stepKey ?? step._id` at write
+   *  time) — `effective_step_key` is what actually matches those rows.
+   *  Undefined for a step added this session that has never been saved,
+   *  same as `step_key`. Deliberately NOT read by `toApiSteps` — see
+   *  `effectiveStepKey`'s own comment in `stepsTree.ts` for why the save
+   *  path must keep using `step_key` alone. */
+  effective_step_key?: string
   step_type: AutomationStepType
   step_config: Record<string, unknown>
   branches?: { yes: BuilderStep[]; no: BuilderStep[] }
@@ -97,6 +124,10 @@ export interface BuilderInitial {
   trigger_config: Record<string, unknown>
   is_active: boolean
   steps: BuilderStep[]
+  /** See `convex/schema.ts`'s comment on `automations.stopOnReply`.
+   *  Defaults to `false` for a brand-new draft and for any automation
+   *  saved before this field existed (see `toUiAutomation`). */
+  stop_on_reply: boolean
 }
 
 // ------------------------------------------------------------
@@ -110,7 +141,12 @@ interface StepMeta {
   border: string
 }
 
-const STEP_META: Record<AutomationStepType, StepMeta> = {
+// Exported for action-picker.tsx — the single source of truth for each
+// step's icon/label, including send_buttons/send_list, which never
+// appear in the add-step picker (see action-catalog.ts) but must still
+// render correctly wherever an already-stored step of one of those two
+// types shows up on the canvas.
+export const STEP_META: Record<AutomationStepType, StepMeta> = {
   send_message: { label: "send_message", icon: MessageSquare, border: "border-l-primary" },
   send_buttons: { label: "send_buttons", icon: MousePointerClick, border: "border-l-primary" },
   send_list: { label: "send_list", icon: List, border: "border-l-primary" },
@@ -125,22 +161,6 @@ const STEP_META: Record<AutomationStepType, StepMeta> = {
   send_webhook: { label: "send_webhook", icon: Webhook, border: "border-l-primary" },
   close_conversation: { label: "close_conversation", icon: CircleSlash, border: "border-l-primary" },
 }
-
-const ADDABLE_STEPS: AutomationStepType[] = [
-  "send_message",
-  "send_buttons",
-  "send_list",
-  "send_template",
-  "add_tag",
-  "remove_tag",
-  "assign_conversation",
-  "update_contact_field",
-  "create_deal",
-  "wait",
-  "condition",
-  "send_webhook",
-  "close_conversation",
-]
 
 const TRIGGER_OPTIONS: { value: AutomationTriggerType }[] = [
   { value: "new_message_received" },
@@ -172,6 +192,24 @@ function toStepConfig(p: InteractiveMessagePayload): Record<string, unknown> {
 }
 function asInteractive(cfg: Record<string, unknown>): InteractiveMessagePayload {
   return cfg as unknown as InteractiveMessagePayload
+}
+
+// Same cast-seam pattern as toStepConfig/asInteractive above, for
+// send_message's SendComposer shape instead of the raw interactive payload.
+function toSendConfig(cfg: SendMessageStepConfig): Record<string, unknown> {
+  return cfg as unknown as Record<string, unknown>
+}
+function asSendConfig(cfg: Record<string, unknown>): SendMessageStepConfig {
+  return cfg as unknown as SendMessageStepConfig
+}
+
+// Same cast-seam pattern again, for SendTemplateFields' whole-config
+// contract (template_name/language/variables/header).
+function toSendTemplateConfig(cfg: SendTemplateStepConfig): Record<string, unknown> {
+  return cfg as unknown as Record<string, unknown>
+}
+function asSendTemplateConfig(cfg: Record<string, unknown>): SendTemplateStepConfig {
+  return cfg as unknown as SendTemplateStepConfig
 }
 
 function blankConfig(type: AutomationStepType): Record<string, unknown> {
@@ -237,7 +275,11 @@ interface PipelineStageOption {
   position: number
 }
 
-const ResourcesContext = createContext<AutomationResources>({
+/** The "no provider above me" sentinel. Compared by IDENTITY in
+ *  `ResourcesProvider` below, so it must stay a single frozen module-level
+ *  object — a fresh `{tags: [], ...}` literal would compare unequal and
+ *  defeat the check. */
+const EMPTY_RESOURCES: AutomationResources = Object.freeze({
   tags: [],
   members: [],
   templates: [],
@@ -246,11 +288,67 @@ const ResourcesContext = createContext<AutomationResources>({
   stages: [],
 })
 
-function useResources(): AutomationResources {
+const ResourcesContext = createContext<AutomationResources>(EMPTY_RESOURCES)
+
+/** Exported so `send-composer.tsx` (the SendComposer's fallback-template
+ *  picker) can read the same account resources without a second query. */
+export function useResources(): AutomationResources {
   return useContext(ResourcesContext)
 }
 
-function ResourcesProvider({ children }: { children: ReactNode }) {
+// ------------------------------------------------------------
+// Per-step run stats (Task 8) — `api.automations.stepStats`, keyed on
+// `stepKey` (NOT `stepId`/`_id`; see convex/automations.ts's own comment
+// on why `automationSteps._id` churns on every save). Queried once at
+// the builder root and handed down via context, sibling to
+// `ResourcesContext` above, so every collapsed step card can look up its
+// own row by `step.step_key` without each one running its own query.
+// Deliberately a SEPARATE context rather than folded into
+// `AutomationResources`: resources are account-wide and load in every
+// mode, while this is per-automation and explicitly skipped in "new
+// automation" mode (no id yet to query against).
+// ------------------------------------------------------------
+
+export interface StepStatsEntry {
+  reached: number
+  sent: number
+  failed: number
+  waiting: number
+}
+
+const StepStatsContext = createContext<Map<string, StepStatsEntry>>(new Map())
+
+function useStepStats(): Map<string, StepStatsEntry> {
+  return useContext(StepStatsContext)
+}
+
+/**
+ * Mounts the account-resource queries — unless an ancestor already did.
+ *
+ * Exported so a route can hoist it ABOVE its own loading gate. On
+ * `/automations/[id]/edit` the builder does not mount until
+ * `automations.get` resolves, and these five queries only started when
+ * the builder mounted — so the page paid two SEQUENTIAL round trips
+ * (~200ms each against the self-hosted backend) before rendering
+ * anything. Wrapping the route in this provider starts all six queries
+ * in the same tick instead.
+ *
+ * The identity check makes the hoist safe rather than duplicative:
+ * `AutomationBuilder` still renders its own `<ResourcesProvider>` (so
+ * `/automations/new`, which has no gate to hoist past, keeps working
+ * untouched), and when a route has already provided resources the inner
+ * one degrades to a pass-through instead of opening a second set of
+ * subscriptions. The branch is stable across a mount — the querying
+ * provider never publishes `EMPTY_RESOURCES` — so this never swaps
+ * component types mid-life and never remounts the builder subtree.
+ */
+export function ResourcesProvider({ children }: { children: ReactNode }) {
+  const inherited = useContext(ResourcesContext)
+  if (inherited !== EMPTY_RESOURCES) return <>{children}</>
+  return <ResourcesQueryProvider>{children}</ResourcesQueryProvider>
+}
+
+function ResourcesQueryProvider({ children }: { children: ReactNode }) {
   // Tags, templates and custom fields come straight from Convex —
   // `accountQuery` scopes them to the caller's account. Only APPROVED
   // templates can actually be sent (anything else 400s at send time,
@@ -292,10 +390,16 @@ function ResourcesProvider({ children }: { children: ReactNode }) {
     [membersResult],
   )
 
+  // Memoized: this was a fresh object literal on every render, so every
+  // `useResources()` consumer in the step tree re-rendered whenever the
+  // builder did, no matter that the resources themselves were unchanged.
+  const value = useMemo(
+    () => ({ tags, members, templates, customFields, pipelines, stages }),
+    [tags, members, templates, customFields, pipelines, stages],
+  )
+
   return (
-    <ResourcesContext.Provider
-      value={{ tags, members, templates, customFields, pipelines, stages }}
-    >
+    <ResourcesContext.Provider value={value}>
       {children}
     </ResourcesContext.Provider>
   )
@@ -537,21 +641,125 @@ function DealPipelineFields({
   )
 }
 
+type TemplateHeaderType = NonNullable<SendTemplateStepConfig["header"]>["type"]
+
+/** Mirrors `send-composer.tsx`'s `isMediaHeaderType` — kept as a separate
+ *  copy rather than imported, since send-composer.tsx already imports
+ *  `useResources` from this file; importing back would close a circular
+ *  dependency between the two. */
+function isTemplateHeaderMediaType(
+  headerType: MessageTemplate["header_type"],
+): headerType is TemplateHeaderType {
+  return headerType === "image" || headerType === "video" || headerType === "document"
+}
+
+// Mirrors send-composer.tsx's MEDIA_ACCEPT for the same three kinds —
+// WhatsApp template headers support image/video/document, never audio.
+const TEMPLATE_HEADER_ACCEPT: Record<TemplateHeaderType, string> = {
+  image: "image/png,image/jpeg,image/webp",
+  video: "video/mp4,video/3gpp",
+  document:
+    "application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain",
+}
+
+// Encode name + language in a select option value so two templates that
+// share a name across languages stay distinct. Module-level (rather than
+// defined inside SendTemplateFields, as it used to be) so handleHeaderFile's
+// useCallback below can depend on a referentially-stable function instead
+// of a fresh closure every render.
+function toTemplateValue(name: string, lang: string): string {
+  return `${name}::${lang}`
+}
+
 /** Template dropdown showing approved templates by name + language,
- *  storing both template_name and language. Falls back to manual name +
- *  language inputs when no approved templates are synced yet. */
+ *  storing template_name/language/variables/header. Falls back to manual
+ *  name + language inputs when no approved templates are synced yet. */
 function SendTemplateFields({
-  templateName,
-  language,
+  cfg,
   onChange,
   t,
 }: {
-  templateName: string
-  language: string
-  onChange: (patch: { template_name: string; language: string }) => void
+  cfg: SendTemplateStepConfig
+  onChange: (next: SendTemplateStepConfig) => void
   t: ReturnType<typeof useTranslations>
 }) {
   const { templates } = useResources()
+  const convex = useConvex()
+  const startUpload = useMutation(api.files.startUpload)
+  const [headerUploading, setHeaderUploading] = useState(false)
+  const headerInputRef = useRef<HTMLInputElement>(null)
+
+  // Stale-closure guard for the async upload below — same pattern, and
+  // same reason, as send-composer.tsx's handleHeaderFile: assigned in the
+  // render body (not an effect) so the upload's await continuation reads
+  // whatever the user has done SINCE the upload started, not the cfg this
+  // callback closed over.
+  const cfgRef = useRef(cfg)
+  cfgRef.current = cfg
+  const onChangeRef = useRef(onChange)
+  onChangeRef.current = onChange
+
+  const templateName = cfg.template_name ?? ""
+  const language = cfg.language ?? ""
+  const current = templateName ? toTemplateValue(templateName, language) : ""
+  const selectedTemplate = templates.find(
+    (tmpl) => toTemplateValue(tmpl.name, tmpl.language ?? "en_US") === current,
+  )
+  const hasMatch = !!selectedTemplate
+  const variableNumbers = selectedTemplate ? extractTemplateVariables(selectedTemplate.body_text) : []
+  const needsHeader = isTemplateHeaderMediaType(selectedTemplate?.header_type)
+
+  const handleHeaderFile = useCallback(
+    async (file: File) => {
+      if (!selectedTemplate || !isTemplateHeaderMediaType(selectedTemplate.header_type)) return
+      if (file.size > MEDIA_MAX_BYTES) {
+        toast.error(t("composer.fileTooLarge", { size: (file.size / 1024 / 1024).toFixed(1) }))
+        return
+      }
+      // Captured before the await — pinned to the template that was
+      // actually selected when THIS upload started, regardless of what
+      // the picker shows by the time it resolves (same reasoning as
+      // send-composer.tsx's `headerType`/`templateIdentity`).
+      const headerType = selectedTemplate.header_type as TemplateHeaderType
+      const templateIdentity = toTemplateValue(selectedTemplate.name, selectedTemplate.language ?? "en_US")
+      setHeaderUploading(true)
+      try {
+        const { key } = await uploadAccountMedia(convex, startUpload, file, "automation")
+        const latest = cfgRef.current
+        const latestIdentity = latest.template_name
+          ? toTemplateValue(latest.template_name, latest.language ?? "")
+          : ""
+        if (latestIdentity !== templateIdentity) {
+          // The template selection changed (or was cleared) while this
+          // upload was in flight — attaching it now would land on the
+          // wrong (or no) template, so it's dropped instead, loudly.
+          toast.error(t("composer.uploadDiscardedStale"))
+          return
+        }
+        // Merge into the LATEST config (not the cfg this closure was
+        // created with), so an edit made while this upload was in flight
+        // survives.
+        onChangeRef.current({ ...latest, header: { type: headerType, key } })
+        toast.success(t("composer.uploadSuccess"))
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : t("composer.uploadFailed"))
+      } finally {
+        setHeaderUploading(false)
+      }
+    },
+    [convex, startUpload, selectedTemplate, t],
+  )
+
+  function selectTemplate(name: string, lang: string) {
+    // A new template rarely means the same thing by the same {{n}}, and
+    // may not even declare the header the old one did — so switching
+    // drops stale variables/header rather than carrying them forward.
+    onChange({ template_name: name, language: lang, variables: {} })
+  }
+
+  function setVariable(n: number, v: string) {
+    onChange({ ...cfg, variables: { ...cfg.variables, [String(n)]: v } })
+  }
 
   if (templates.length === 0) {
     return (
@@ -559,18 +767,14 @@ function SendTemplateFields({
         <FieldBlock label={t("templates.templateNameLabel")}>
           <Input
             value={templateName}
-            onChange={(e) =>
-              onChange({ template_name: e.target.value, language })
-            }
+            onChange={(e) => onChange({ ...cfg, template_name: e.target.value })}
             className="bg-muted text-foreground"
           />
         </FieldBlock>
         <FieldBlock label={t("templates.languageLabel")}>
           <Input
             value={language}
-            onChange={(e) =>
-              onChange({ template_name: templateName, language: e.target.value })
-            }
+            onChange={(e) => onChange({ ...cfg, language: e.target.value })}
             className="bg-muted text-foreground"
           />
         </FieldBlock>
@@ -578,40 +782,139 @@ function SendTemplateFields({
     )
   }
 
-  // Encode name + language in the option value so two templates that
-  // share a name across languages stay distinct.
-  const toValue = (name: string, lang: string) => `${name}::${lang}`
-  const current = templateName ? toValue(templateName, language) : ""
-  const hasMatch = templates.some(
-    (t) => toValue(t.name, t.language ?? "en_US") === current,
-  )
+  const headerDisplayName =
+    cfg.header?.key?.split("/").pop() || cfg.header?.url?.split("/").pop() || ""
 
   return (
-    <FieldBlock label={t("templates.templateLabel")}>
-      <select
-        value={current}
-        onChange={(e) => {
-          const [name, lang] = e.target.value.split("::")
-          onChange({ template_name: name ?? "", language: lang ?? "" })
-        }}
-        className={SELECT_CLASS}
-      >
-        <option value="">{t("templates.select")}</option>
-        {templates.map((tmpl) => {
-          const lang = tmpl.language ?? "en_US"
-          return (
-            <option key={tmpl.id} value={toValue(tmpl.name, lang)}>
-              {tmpl.name} ({lang})
+    <>
+      <FieldBlock label={t("templates.templateLabel")}>
+        <select
+          value={current}
+          onChange={(e) => {
+            const [name, lang] = e.target.value.split("::")
+            selectTemplate(name ?? "", lang ?? "")
+          }}
+          className={SELECT_CLASS}
+        >
+          <option value="">{t("templates.select")}</option>
+          {templates.map((tmpl) => {
+            const lang = tmpl.language ?? "en_US"
+            return (
+              <option key={tmpl.id} value={toTemplateValue(tmpl.name, lang)}>
+                {tmpl.name} ({lang})
+              </option>
+            )
+          })}
+          {current && !hasMatch && (
+            <option value={current}>
+              {t("templates.unknown", { name: templateName, lang: language || t("templates.unknownLang") })}
             </option>
-          )
-        })}
-        {current && !hasMatch && (
-          <option value={current}>
-            {t("templates.unknown", { name: templateName, lang: language || t("templates.unknownLang") })}
-          </option>
-        )}
-      </select>
-    </FieldBlock>
+          )}
+        </select>
+      </FieldBlock>
+
+      {variableNumbers.length > 0 && (
+        <>
+          {variableNumbers.map((n) => (
+            <FieldBlock key={n} label={t("templates.variableLabel", { n })}>
+              <Input
+                value={cfg.variables?.[String(n)] ?? ""}
+                onChange={(e) => setVariable(n, e.target.value)}
+                className="bg-muted text-foreground"
+              />
+            </FieldBlock>
+          ))}
+          <p className="mb-2 text-[12px] text-muted-foreground">{t("composer.fallbackVariablesHelp")}</p>
+        </>
+      )}
+
+      {needsHeader && (
+        <FieldBlock label={t("templates.headerLabel")}>
+          {cfg.header?.key || cfg.header?.url ? (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-xs">
+              <Paperclip className="h-3.5 w-3.5 shrink-0 text-cyan-400" aria-hidden />
+              <span className="min-w-0 flex-1 truncate text-foreground">{headerDisplayName}</span>
+              <button
+                type="button"
+                onClick={() => onChange({ ...cfg, header: undefined })}
+                className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
+                aria-label={t("composer.removeFile")}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => headerInputRef.current?.click()}
+              disabled={headerUploading}
+              className="flex w-full items-center justify-center gap-2 rounded-md border border-dashed border-border bg-card px-3 py-4 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {headerUploading ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {t("composer.uploading")}
+                </>
+              ) : (
+                <>
+                  <Upload className="h-3.5 w-3.5" />
+                  {t("composer.clickToUpload")}
+                </>
+              )}
+            </button>
+          )}
+          {/* The Convex validator only sees step_config, not the
+              template's own header_type, so it can't refuse activation
+              over a missing header — this client-side warning is the
+              only guard. Without it, activation passes, and at send time
+              `cfg.header` is undefined so only the body component reaches
+              Meta, which 400s with the opaque error 132000 this branch
+              exists to eliminate. */}
+          {!cfg.header?.key && !cfg.header?.url && (
+            <p className="mt-1 text-xs text-amber-500">{t("composer.headerRequiredWarning")}</p>
+          )}
+          <input
+            ref={headerInputRef}
+            type="file"
+            accept={
+              isTemplateHeaderMediaType(selectedTemplate?.header_type)
+                ? TEMPLATE_HEADER_ACCEPT[selectedTemplate!.header_type as TemplateHeaderType]
+                : undefined
+            }
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) void handleHeaderFile(f)
+              e.target.value = ""
+            }}
+          />
+        </FieldBlock>
+      )}
+
+      <div className="mt-3 border-t border-border pt-3">
+        {/* I-4 fix: `selectedTemplate` is `undefined` both for "nothing
+            chosen yet" (`current === ""`) and for "template_name is set but
+            no longer in the resolved approved list" (deleted/unapproved
+            since this step was configured) — the latter still passes
+            `validateStepsForActivation` and the engine WILL attempt the
+            send, so it must not read as "Nothing to send yet.". Reuses the
+            EXACT same t("templates.unknown", ...) call the <select>'s own
+            fallback <option> above uses, so the two can never disagree
+            about what "not found" means or looks like. Only reachable once
+            `templates.length > 0` (this whole branch is gated on that), so
+            `templatesLoading` can never be true here — see
+            resolveTemplatePreview's own comment for the loading case. */}
+        <TemplatePreview
+          body={selectedTemplate?.body_text ?? ""}
+          notFoundLabel={
+            current && !hasMatch
+              ? t("templates.unknown", { name: templateName, lang: language || t("templates.unknownLang") })
+              : undefined
+          }
+          variables={cfg.variables}
+        />
+      </div>
+    </>
   )
 }
 
@@ -629,6 +932,89 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
 
   const createAutomation = useMutation(api.automations.create)
   const updateAutomation = useMutation(api.automations.update)
+
+  // Task 8 — per-step chips. Skipped in "new automation" mode: there is
+  // no automationId yet, and a step's `step_key` (see `BuilderStep`'s own
+  // comment) is only ever populated by the server round-trip anyway, so a
+  // brand-new draft's steps could never match a stats row regardless.
+  const stepStatsResult = useQuery(
+    api.automations.stepStats,
+    initial.id ? { automationId: initial.id as Id<"automations"> } : "skip",
+  )
+  const stepStatsMap = useMemo(() => {
+    const map = new Map<string, StepStatsEntry>()
+    for (const row of stepStatsResult ?? []) {
+      map.set(row.stepKey, {
+        reached: row.reached,
+        sent: row.sent,
+        failed: row.failed,
+        waiting: row.waiting,
+      })
+    }
+    return map
+  }, [stepStatsResult])
+
+  // Task 4 (Phase 3 builder-ux) — inline validation. Runs the exact
+  // function the server gates activation on
+  // (`convex/automations.ts`'s `assertActivatable`), so this and the
+  // server's VALIDATION_FAILED refusal can never disagree about what
+  // counts as broken. `state.steps` (`BuilderStep[]`) satisfies
+  // `useStepIssues`'s structural `StepTreeNode` requirement with no cast
+  // — see step-issues.tsx's own comment on why.
+  const {
+    issues: stepIssuesList,
+    byPath: stepIssuesByPath,
+    unattached: unattachedStepIssues,
+  } = useStepIssues(state.steps)
+  const hasStepIssues = stepIssuesList.length > 0
+  // Only blocks turning it ON. `convex/automations.ts`'s own
+  // `assertActivatable` comment is explicit that "draft saves and
+  // deactivations are never validated" — an automation that's already
+  // active and gets edited into a broken (unsaved) state must still be
+  // switchable back OFF without first fixing the field, matching that
+  // server-side invariant.
+  const activeToggleDisabled = hasStepIssues && !state.is_active
+  // Fix round (code review) — `save()` always sends `isActive:
+  // state.is_active` explicitly (see `save()` below, and its call sites'
+  // `isActive: state.is_active`), so it mirrors `convex/automations.ts`'s
+  // `update`'s own `willBeActive = rest.isActive !== undefined ?
+  // rest.isActive : existing.isActive` exactly — there is no "field
+  // omitted, fall back to whatever's stored" branch to reproduce here,
+  // because this client never omits it. The server validates whenever a
+  // write would LEAVE the automation active, not only when a request
+  // flips it on: an already-active automation edited into a broken state
+  // and saved with the switch untouched still sends `isActive: true`
+  // unchanged, so `willBeActive` is true and the server's
+  // `assertActivatable` rejects with `VALIDATION_FAILED` — after a round
+  // trip, which is exactly the failure this task exists to move earlier.
+  // `activeToggleDisabled` above only gated the switch itself, leaving
+  // this path — the single most ordinary one, editing a live automation
+  // and hitting Save — ungated. Blocking Save only when it would leave
+  // the automation active matches the switch's own reasoning: a save
+  // that deactivates a broken automation, or a draft save on one that's
+  // already inactive, must still go through untouched (same server
+  // invariant `assertActivatable`'s comment states).
+  const saveBlocked = state.is_active && hasStepIssues
+  // `bucketIssuesByStepPath` inserts keys in the order issues are
+  // encountered, which is validate.ts's own walk order — so the first key
+  // here is the first-offending step, exactly what "scroll to the first
+  // offending card" means. `undefined` when every issue is unattachable
+  // (e.g. the zero-steps case has no card at all to point at).
+  const firstOffendingPath: string | undefined = Array.from(stepIssuesByPath.keys())[0]
+
+  function scrollToFirstIssue() {
+    if (!firstOffendingPath) return
+    const targetCid = findCidForStepPath(state.steps, firstOffendingPath)
+    if (targetCid) setExpandedId(targetCid)
+    // Defer to the next frame so a card that was just expanded has
+    // actually laid out — scrolling in the same tick would still target
+    // its collapsed height/position.
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`automation-step-${firstOffendingPath}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" })
+    })
+  }
 
   function patchTop<K extends keyof BuilderInitial>(key: K, value: BuilderInitial[K]) {
     setState((s) => ({ ...s, [key]: value }))
@@ -674,6 +1060,7 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
           triggerConfig: state.trigger_config,
           isActive: state.is_active,
           steps,
+          stopOnReply: state.stop_on_reply,
         })
         toast.success(t("toasts.saved"))
       } else {
@@ -684,21 +1071,56 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
           triggerConfig: state.trigger_config,
           isActive: state.is_active,
           steps,
+          stopOnReply: state.stop_on_reply,
         })
         toast.success(t("toasts.created"))
         router.replace(`/automations/${newId}/edit`)
       }
     } catch (err) {
-      // The activation-validation gate the old REST routes ran (400
-      // with an `issues` array) was deliberately not ported to
-      // `convex/automations.ts` (see that file's header comment) — a
-      // save can only fail here on a genuine error, surfaced via
-      // `convexErrorMessage`.
+      // `convex/automations.ts`'s `update`/`create` DO run the same
+      // `VALIDATION_FAILED` activation gate `saveBlocked` pre-empts below
+      // (see that file's `assertActivatable`) — this stale comment used to
+      // claim otherwise, from before that gate existed. `saveBlocked`
+      // covers the step-level issues `useStepIssues` computes, but not
+      // `validateTriggerForActivation`'s trigger-config checks (out of
+      // this task's scope — see step-issues.tsx), so a trigger-only
+      // failure can still reach here; `convexErrorMessage` surfaces it as
+      // a readable toast rather than a raw Convex error.
       toast.error(convexErrorMessage(err) || t("toasts.saveFailed"))
     } finally {
       setSaving(false)
     }
   }
+
+  // Same reasoning as `saveButtonEl` below: factored out so the
+  // tooltip-wrapped (I-3 fix, unattached issues) and bare branches in the
+  // header render the identical button rather than two copies to keep in
+  // sync by hand.
+  const issuesBadgeEl = (
+    <button
+      type="button"
+      onClick={scrollToFirstIssue}
+      className="shrink-0 rounded-full bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-500/25 dark:text-amber-400"
+    >
+      {stepIssuesList.length === 1
+        ? t("issues.one")
+        : t("issues.other", { count: stepIssuesList.length })}
+    </button>
+  )
+
+  // Factored out so the tooltip-wrapped and bare branches in the header
+  // below render the identical element rather than two hand-kept-in-sync
+  // copies of the same button.
+  const saveButtonEl = (
+    <Button
+      onClick={save}
+      disabled={saving || saveBlocked}
+      className="bg-primary text-primary-foreground hover:bg-primary/90"
+    >
+      {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+      {isEditing ? t("save") : t("saveDraft")}
+    </Button>
+  )
 
   return (
     // `pt-safe`: full-screen `fixed` overlay outside the shell, so it does not
@@ -724,22 +1146,66 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
           placeholder={t("untitled")}
           className="min-w-0 flex-1 rounded-md bg-transparent px-2 py-1 text-sm font-semibold text-foreground placeholder:text-muted-foreground focus:bg-muted focus:outline-none sm:text-base"
         />
+        {hasStepIssues && (
+          unattachedStepIssues.length > 0 ? (
+            // I-3 fix: `firstOffendingPath` is undefined whenever every
+            // issue is unattached (the zero-steps case — see
+            // `unattachedIssues`'s own comment), so `scrollToFirstIssue`
+            // is a silent no-op and there is otherwise no card, tooltip,
+            // or badge that shows WHY. Surface the validator's own
+            // message(s) verbatim in a tooltip rather than paraphrasing —
+            // matches the `activeToggleDisabled`/`saveBlocked` tooltip
+            // pattern already used lower in this header.
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger render={<span tabIndex={0} className="inline-flex shrink-0" />}>
+                  {issuesBadgeEl}
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  {unattachedStepIssues.map((issue) => issue.message).join(" ")}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            issuesBadgeEl
+          )
+        )}
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span className="hidden sm:inline">{t("active")}</span>
-          <Switch
-            checked={state.is_active}
-            onCheckedChange={(v) => patchTop("is_active", !!v)}
-            aria-label={t("activeAria")}
-          />
+          {activeToggleDisabled ? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger render={<span tabIndex={0} className="inline-flex" />}>
+                  <Switch
+                    checked={state.is_active}
+                    onCheckedChange={(v) => patchTop("is_active", !!v)}
+                    aria-label={t("activeAria")}
+                    disabled
+                  />
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{t("issues.cannotActivate")}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            <Switch
+              checked={state.is_active}
+              onCheckedChange={(v) => patchTop("is_active", !!v)}
+              aria-label={t("activeAria")}
+            />
+          )}
         </div>
-        <Button
-          onClick={save}
-          disabled={saving}
-          className="bg-primary text-primary-foreground hover:bg-primary/90"
-        >
-          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-          {isEditing ? t("save") : t("saveDraft")}
-        </Button>
+        {saveBlocked ? (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger render={<span tabIndex={0} className="inline-flex" />}>
+                {saveButtonEl}
+              </TooltipTrigger>
+              <TooltipContent side="bottom">{t("issues.cannotActivate")}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          saveButtonEl
+        )}
       </header>
 
       {/* Canvas */}
@@ -747,24 +1213,85 @@ export function AutomationBuilder({ initial }: { initial: BuilderInitial }) {
         <div className="absolute inset-0 bg-[radial-gradient(circle,var(--border)_1px,transparent_1px)] [background-size:20px_20px] pointer-events-none" />
         <div className="relative mx-auto flex max-w-2xl flex-col items-center gap-0 px-4 py-10">
           <ResourcesProvider>
-            <TriggerCard
-              type={state.trigger_type}
-              config={state.trigger_config}
-              onTypeChange={(tVal) => patchTop("trigger_type", tVal)}
-              onConfigChange={(c) => patchTop("trigger_config", c)}
-              t={t}
-            />
-            <StepList
-              steps={state.steps}
-              parentPath={[]}
-              expandedId={expandedId}
-              setExpandedId={setExpandedId}
-              updateStep={updateStep}
-              addStepAt={addStepAt}
-              deleteStepAt={deleteStepAt}
-              moveStepAt={moveStepAt}
-            />
+            <StepStatsContext.Provider value={stepStatsMap}>
+              {/* Automation-level settings — deliberately NOT wired into
+                  the trigger→step connector chain below (no dashed line
+                  in/out of it): it describes the automation as a whole,
+                  not a point in its flow, so `mb-6` just separates it
+                  from where that flow visually begins. */}
+              <SettingsCard
+                stopOnReply={state.stop_on_reply}
+                onChange={(v) => patchTop("stop_on_reply", v)}
+                t={t}
+              />
+              <TriggerCard
+                type={state.trigger_type}
+                config={state.trigger_config}
+                onTypeChange={(tVal) => patchTop("trigger_type", tVal)}
+                onConfigChange={(c) => patchTop("trigger_config", c)}
+                t={t}
+              />
+              <StepList
+                steps={state.steps}
+                parentPath={[]}
+                stepPathPrefix=""
+                issuesByPath={stepIssuesByPath}
+                expandedId={expandedId}
+                setExpandedId={setExpandedId}
+                updateStep={updateStep}
+                addStepAt={addStepAt}
+                deleteStepAt={deleteStepAt}
+                moveStepAt={moveStepAt}
+              />
+            </StepStatsContext.Provider>
           </ResourcesProvider>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ------------------------------------------------------------
+// Settings card (Task 8) — automation-level toggles that apply to the
+// whole automation rather than to any one step or the trigger. Styled
+// like `TriggerCard`/a step card (same rounded-lg/border/shadow shell)
+// so it reads as part of the same card language, but rendered without a
+// connector line above or below it: unlike the trigger and steps, it
+// isn't a point in the automation's flow, so a dashed connector into it
+// would imply an execution order that doesn't apply here.
+// ------------------------------------------------------------
+
+function SettingsCard({
+  stopOnReply,
+  onChange,
+  t,
+}: {
+  stopOnReply: boolean
+  onChange: (v: boolean) => void
+  t: ReturnType<typeof useTranslations>
+}) {
+  return (
+    <div className="z-10 mb-6 w-full max-w-[320px] sm:w-80">
+      <div className="rounded-lg border border-border bg-card shadow-lg">
+        <div className="px-4 py-3">
+          <div className="text-[12px] uppercase tracking-wide text-muted-foreground">
+            {t("settings.title")}
+          </div>
+          <div className="mt-2 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-foreground">
+                {t("settings.stopOnReply")}
+              </div>
+              <p className="mt-1 text-[12px] text-muted-foreground">
+                {t("settings.stopOnReplyHelp")}
+              </p>
+            </div>
+            <Switch
+              checked={stopOnReply}
+              onCheckedChange={(v) => onChange(!!v)}
+              aria-label={t("settings.stopOnReply")}
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -803,7 +1330,7 @@ function TriggerCard({
             <Zap className="h-4 w-4" />
           </div>
           <div className="min-w-0 flex-1">
-            <div className="text-[11px] uppercase tracking-wide text-blue-300">{t("trigger")}</div>
+            <div className="text-[12px] uppercase tracking-wide text-blue-300">{t("trigger")}</div>
             <div className="truncate text-sm font-medium text-foreground">
               {t(`triggers.${type}.label`)}
             </div>
@@ -829,7 +1356,7 @@ function TriggerCard({
                   </option>
                 ))}
               </select>
-              <p className="mt-1 text-[11px] text-muted-foreground">
+              <p className="mt-1 text-[12px] text-muted-foreground">
                 {t(`triggers.${type}.hint`)}
               </p>
             </div>
@@ -856,21 +1383,42 @@ function TriggerCard({
               </div>
             )}
             {type === "time_based" && (
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  {t("schedule")}
-                </label>
-                <Input
-                  placeholder="Cron expression or HH:mm"
-                  value={(config.schedule as string) ?? ""}
-                  onChange={(e) =>
-                    onConfigChange({ ...config, schedule: e.target.value })
-                  }
-                  className="bg-muted text-foreground"
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  {t("scheduleHint")}
-                </p>
+              <div className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    {t("schedule")}
+                  </label>
+                  {/* A native time input, not free text: the engine
+                      accepts a daily 24-hour "HH:mm" only, and the old
+                      "Cron expression or HH:mm" placeholder invited
+                      values that activated cleanly and never fired. */}
+                  <Input
+                    type="time"
+                    value={(config.schedule as string) ?? ""}
+                    onChange={(e) =>
+                      onConfigChange({ ...config, schedule: e.target.value })
+                    }
+                    className="bg-muted text-foreground"
+                  />
+                  <p className="mt-1 text-[12px] text-muted-foreground">
+                    Runs once a day at this time, in your account&apos;s local
+                    time.
+                  </p>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Send to contacts tagged
+                  </label>
+                  <TagSelect
+                    value={(config.tag_id as string) ?? ""}
+                    onChange={(v) => onConfigChange({ ...config, tag_id: v })}
+                    t={t}
+                  />
+                  <p className="mt-1 text-[12px] text-muted-foreground">
+                    A time-based automation has no triggering contact, so it
+                    runs once per contact holding this tag.
+                  </p>
+                </div>
               </div>
             )}
           </div>
@@ -997,7 +1545,7 @@ function InteractiveReplyConfig({
         placeholder={t("replyIdsHint")}
         className="bg-muted font-mono text-foreground"
       />
-      <p className="mt-1 text-[11px] text-muted-foreground">{t("replyIdsHelp")}</p>
+      <p className="mt-1 text-[12px] text-muted-foreground">{t("replyIdsHelp")}</p>
     </div>
   )
 }
@@ -1018,6 +1566,16 @@ type StepPath = (
 interface StepListProps {
   steps: BuilderStep[]
   parentPath: StepPath
+  /** Dot-path prefix for items in THIS list — `""` at the root,
+   *  `"steps[0].yes."` / `"steps[0].no."` inside a condition's branches.
+   *  Mirrors `convex/lib/automations/validate.ts`'s own `walk()` prefix
+   *  exactly (see step-issues.tsx's header comment), so a step's computed
+   *  path always matches the `path` on any `ValidationIssue` it produced. */
+  stepPathPrefix: string
+  /** Every step's validation issues, keyed by its own dot-path — computed
+   *  once at the builder root by `useStepIssues` and threaded down
+   *  unchanged, same pattern as `updateStep`/`deleteStepAt` below. */
+  issuesByPath: Map<string, ValidationIssue[]>
   expandedId: string | null
   setExpandedId: (id: string | null) => void
   updateStep: (path: StepPath, updater: (s: BuilderStep) => BuilderStep) => void
@@ -1027,7 +1585,7 @@ interface StepListProps {
 }
 
 function StepList(props: StepListProps) {
-  const { steps, parentPath, ...rest } = props
+  const { steps, parentPath, stepPathPrefix, ...rest } = props
   const parentScope: ParentScope =
     parentPath.length === 0
       ? { kind: "root" }
@@ -1048,6 +1606,7 @@ function StepList(props: StepListProps) {
           total={steps.length}
           parentScope={parentScope}
           parentPath={parentPath}
+          stepPath={`${stepPathPrefix}steps[${idx}]`}
           {...rest}
         />
       ))}
@@ -1061,6 +1620,7 @@ function StepRenderer({
   total,
   parentScope,
   parentPath,
+  stepPath,
   ...props
 }: {
   step: BuilderStep
@@ -1068,7 +1628,12 @@ function StepRenderer({
   total: number
   parentScope: ParentScope
   parentPath: StepPath
-} & Omit<StepListProps, "steps" | "parentPath">) {
+  /** This step's own dot-path, e.g. `steps[0]` or `steps[0].yes.steps[1]`
+   *  — computed by `StepList` from `stepPathPrefix` + its index in the
+   *  array. Used to look this step's own issues up in `issuesByPath`, and
+   *  to key its DOM node for "scroll to first offending card". */
+  stepPath: string
+} & Omit<StepListProps, "steps" | "parentPath" | "stepPathPrefix">) {
   const t = useTranslations("Automations.builder")
   const path: StepPath = [
     ...parentPath,
@@ -1080,16 +1645,30 @@ function StepRenderer({
   const Icon = meta.icon
   const expanded = props.expandedId === step.cid
   const isCondition = step.step_type === "condition"
+  const stepIssues = props.issuesByPath.get(stepPath) ?? []
+  // Task 8 — a step added this session and never yet saved has no
+  // `effective_step_key` (see `BuilderStep`'s own comment), so it can
+  // never match a row here; that's correct, not a bug — there is nothing
+  // to report yet.
+  const stepStats = useStepStats()
+  const statsEntry = resolveStepStats(step.effective_step_key, stepStats)
   // Card widths on mobile fill the full canvas column (max-w-2xl px-4
   // still keeps them reasonable). On sm+ the original fixed widths
   // come back so the flow visual stays recognisable.
-  const width = isCondition
-    ? "w-full max-w-[400px] sm:w-[400px]"
-    : "w-full max-w-[320px] sm:w-80"
+  //
+  // Collapsed cards keep the narrow flow-diagram look. An EXPANDED card
+  // widens because the config forms inside it — the interactive payload
+  // builder above all — need real horizontal room; at 320px the button
+  // editor collapsed to one character per line.
+  const width = expanded
+    ? "w-full max-w-[560px] sm:w-[560px]"
+    : isCondition
+      ? "w-full max-w-[400px] sm:w-[400px]"
+      : "w-full max-w-[320px] sm:w-80"
 
   return (
     <>
-      <div className={cn("z-10 flex flex-col", width)}>
+      <div id={`automation-step-${stepPath}`} className={cn("z-10 flex flex-col", width)}>
         <div
           className={cn(
             "rounded-lg border border-border border-l-4 bg-card shadow-lg",
@@ -1102,15 +1681,31 @@ function StepRenderer({
             className="flex w-full items-center gap-3 px-4 py-3 text-left"
           >
             <GripVertical className="h-4 w-4 flex-shrink-0 text-muted-foreground" aria-hidden />
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-muted-foreground">
+            <div className="relative flex h-8 w-8 items-center justify-center rounded-md bg-muted text-muted-foreground">
               <Icon className="h-4 w-4" />
+              {/* Presence-only signal (no count) so a problem deep in a
+                  long automation is visible without expanding every card —
+                  the amber strip inside the expanded card has the detail.
+                  The dot itself is aria-hidden (decorative), paired with an
+                  sr-only line so a screen-reader user gets the same signal
+                  a sighted one gets from the visual dot. */}
+              {stepIssues.length > 0 && (
+                <>
+                  <span
+                    className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full bg-amber-500 ring-2 ring-card"
+                    aria-hidden
+                  />
+                  <span className="sr-only">{t("issues.stepHasIssues")}</span>
+                </>
+              )}
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+              <div className="text-[12px] uppercase tracking-wide text-muted-foreground">
                 {isCondition ? "Condition" : step.step_type === "wait" ? "Wait" : "Action"}
               </div>
               <div className="truncate text-sm font-medium text-foreground">{t(`steps.${meta.label}`)}</div>
-              <div className="truncate text-[11px] text-muted-foreground">{previewFor(step)}</div>
+              <div className="truncate text-[12px] text-muted-foreground">{previewFor(step)}</div>
+              {statsEntry && <StepStatsChips entry={statsEntry} t={t} />}
             </div>
             <ChevronDown
               className={cn("h-4 w-4 text-muted-foreground transition-transform", expanded && "rotate-180")}
@@ -1122,6 +1717,7 @@ function StepRenderer({
                 step={step}
                 onChange={(next) => props.updateStep(path, () => next)}
               />
+              <StepIssues issues={stepIssues} />
               <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
                 <div className="flex gap-1">
                   <Button
@@ -1157,7 +1753,7 @@ function StepRenderer({
         </div>
 
         {isCondition && (
-          <ConditionBranches step={step} parentPath={path} {...props} />
+          <ConditionBranches step={step} parentPath={path} stepPath={stepPath} {...props} />
         )}
       </div>
 
@@ -1173,14 +1769,105 @@ function StepRenderer({
   )
 }
 
+/**
+ * Looks a step up in the per-automation stats map by its EFFECTIVE key
+ * (`stepKey ?? _id` — see `BuilderStep.effective_step_key`'s own
+ * comment), not its raw `step_key`. Pulled out of `StepRenderer` as a
+ * plain function so this join — the exact mechanism this task's fix
+ * round exists for — is unit-testable in isolation: a step saved before
+ * Task 10's stepKey migration has `step_key === undefined` but a real,
+ * non-empty `effective_step_key` (its row's own `_id`), and its
+ * accumulated stats are filed under that same value by
+ * `automationsEngine.ts`'s own `step.stepKey ?? step._id` at write time.
+ * Using `step_key` here instead would make every pre-migration step's
+ * chip render nothing, forever, regardless of how much real traffic it
+ * has seen.
+ */
+export function resolveStepStats(
+  effectiveStepKey: string | undefined,
+  stats: Map<string, StepStatsEntry>,
+): StepStatsEntry | undefined {
+  return effectiveStepKey ? stats.get(effectiveStepKey) : undefined
+}
+
+/**
+ * Which of a step's stats to show, in display order, omitting anything
+ * at zero — pulled out of `StepStatsChips` as a plain function so the
+ * "omit zero-valued figures... rather than three zeroes" rule (this
+ * task's brief, Step 3) is unit-testable without rendering the 2000-line
+ * builder tree it lives in.
+ *
+ * `sent` is deliberately never surfaced here even though `stepStats`
+ * returns it: the automation-level `RunStatsBar` already uses "Sent" for
+ * a *run* completing end-to-end (`RunCounts.completed`), a different
+ * count than "this one step executed without error" — showing a
+ * same-named figure with a different meaning right below it would read
+ * as one number, not two. `reached`/`waiting`/`failed` don't collide
+ * with anything else on this page.
+ */
+export function stepStatsChipParts(
+  entry: StepStatsEntry,
+): Array<{ kind: "reached" | "waiting" | "failed"; count: number }> {
+  const parts: Array<{ kind: "reached" | "waiting" | "failed"; count: number }> = []
+  if (entry.reached > 0) parts.push({ kind: "reached", count: entry.reached })
+  if (entry.waiting > 0) parts.push({ kind: "waiting", count: entry.waiting })
+  if (entry.failed > 0) parts.push({ kind: "failed", count: entry.failed })
+  return parts
+}
+
+/** The `142 reached · 18 waiting · 3 failed` chip row under a step's
+ *  preview text. Waiting gets an amber pulsing dot on top of its colour
+ *  — the brief's "style it so it reads as live" — reusing the exact
+ *  ping-dot markup `automations/page.tsx` already uses for an active
+ *  automation, so "something is happening right now" reads the same way
+ *  in both places. */
+function StepStatsChips({
+  entry,
+  t,
+}: {
+  entry: StepStatsEntry
+  t: ReturnType<typeof useTranslations>
+}) {
+  const parts = stepStatsChipParts(entry)
+  if (parts.length === 0) return null
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground">
+      {parts.map((p, i) => (
+        <span key={p.kind} className="inline-flex items-center gap-1">
+          {i > 0 && <span aria-hidden>·</span>}
+          {p.kind === "waiting" && (
+            <span className="relative flex h-1.5 w-1.5" aria-hidden>
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-500 opacity-75" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-500" />
+            </span>
+          )}
+          <span
+            className={cn(
+              p.kind === "waiting" && "font-medium text-amber-500",
+              p.kind === "failed" && "text-destructive",
+            )}
+          >
+            {t(`stepStats.${p.kind}`, { count: p.count })}
+          </span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function ConditionBranches({
   step,
   parentPath,
+  stepPath,
   ...props
 }: {
   step: BuilderStep
   parentPath: StepPath
-} & Omit<StepListProps, "steps" | "parentPath">) {
+  /** This condition step's own dot-path (see `StepRenderer`'s comment) —
+   *  the base that `.yes.` / `.no.` extend for its children, exactly
+   *  matching how `validate.ts`'s `walk()` recurses into `branches`. */
+  stepPath: string
+} & Omit<StepListProps, "steps" | "parentPath" | "stepPathPrefix">) {
   const t = useTranslations("Automations.builder")
   const yes = step.branches?.yes ?? []
   const no = step.branches?.no ?? []
@@ -1201,10 +1888,10 @@ function ConditionBranches({
     // cards. Two-column grid returns on sm+.
     <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
       <BranchColumn label={t("branches.yes")} color="text-primary">
-        <StepList {...props} steps={yes} parentPath={yesPath} />
+        <StepList {...props} steps={yes} parentPath={yesPath} stepPathPrefix={`${stepPath}.yes.`} />
       </BranchColumn>
       <BranchColumn label={t("branches.no")} color="text-rose-400">
-        <StepList {...props} steps={no} parentPath={noPath} />
+        <StepList {...props} steps={no} parentPath={noPath} stepPathPrefix={`${stepPath}.no.`} />
       </BranchColumn>
     </div>
   )
@@ -1221,39 +1908,17 @@ function BranchColumn({
 }) {
   return (
     <div className="flex flex-col items-center">
-      <div className={cn("mb-2 text-[11px] font-semibold uppercase", color)}>{label}</div>
+      <div className={cn("mb-2 text-[12px] font-semibold uppercase", color)}>{label}</div>
       {children}
     </div>
   )
 }
 
 function AddButton({ onPick }: { onPick: (t: AutomationStepType) => void }) {
-  const t = useTranslations("Automations.builder")
   return (
     <div className="relative flex flex-col items-center">
       <div className="h-4 w-[2px] bg-border" aria-hidden />
-      <DropdownMenu>
-        <DropdownMenuTrigger
-          className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-dashed border-border bg-background text-muted-foreground transition-colors hover:border-primary hover:bg-primary/10 hover:text-primary data-[popup-open]:border-primary data-[popup-open]:bg-primary/20 data-[popup-open]:text-primary"
-          aria-label={t("addStep")}
-        >
-          <Plus className="h-4 w-4" />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="max-h-80 min-w-56 overflow-y-auto border-border bg-popover"
-        >
-          {ADDABLE_STEPS.map((tp) => {
-            const Icon = STEP_META[tp].icon
-            return (
-              <DropdownMenuItem key={tp} onClick={() => onPick(tp)}>
-                <Icon className="h-4 w-4" />
-                {t(`steps.${STEP_META[tp].label}`)}
-              </DropdownMenuItem>
-            )
-          })}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <ActionPicker onPick={onPick} />
       <div className="h-4 w-[2px] bg-border" aria-hidden />
     </div>
   )
@@ -1278,33 +1943,30 @@ function StepEditor({
   switch (step.step_type) {
     case "send_message":
       return (
-        <FieldBlock label={t("config.messageText")}>
-          <Textarea
-            value={(cfg.text as string) ?? ""}
-            onChange={(e) => set({ text: e.target.value })}
-            placeholder={t("config.placeholderMessageText")}
-            className="min-h-24 bg-muted text-foreground"
-          />
-        </FieldBlock>
+        <SendComposer
+          value={asSendConfig(cfg)}
+          onChange={(next) => onChange({ ...step, step_config: toSendConfig(next) })}
+        />
       )
     case "send_buttons":
     case "send_list":
-      // The whole step_config IS the interactive payload; the shared
-      // builder edits it in place (and enforces Meta's limits + preview).
+      // Legacy step types: the whole step_config IS the interactive
+      // payload. Upgrade on open — seed the composer with just that
+      // payload, and any edit rewrites this ONE step to send_message.
+      // Steps the user never opens are left exactly as stored.
       return (
-        <InteractiveBuilder
-          value={asInteractive(cfg)}
-          onChange={(payload) =>
-            onChange({ ...step, step_config: toStepConfig(payload) })
+        <SendComposer
+          value={{ interactive: asInteractive(cfg) }}
+          onChange={(next) =>
+            onChange({ ...step, step_type: "send_message", step_config: toSendConfig(next) })
           }
         />
       )
     case "send_template":
       return (
         <SendTemplateFields
-          templateName={(cfg.template_name as string) ?? ""}
-          language={(cfg.language as string) ?? ""}
-          onChange={(patch) => set(patch)}
+          cfg={asSendTemplateConfig(cfg)}
+          onChange={(next) => onChange({ ...step, step_config: toSendTemplateConfig(next) })}
           t={t}
         />
       )
@@ -1420,30 +2082,54 @@ function StepEditor({
           <FieldBlock label={t("config.subjectLabel")}>
             <select
               value={(cfg.subject as string) ?? "tag_presence"}
-              onChange={(e) => set({ subject: e.target.value })}
+              onChange={(e) => {
+                const subject = e.target.value
+                // session_window's operand is a fixed open/closed choice,
+                // not free text — write the same "open" default the
+                // operand <select> below already displays, so activation
+                // validation (which requires a non-empty operand) never
+                // disagrees with what the dropdown appears to show.
+                if (subject === "session_window" && cfg.operand !== "open" && cfg.operand !== "closed") {
+                  set({ subject, operand: "open" })
+                } else {
+                  set({ subject })
+                }
+              }}
               className="w-full rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-foreground"
             >
               <option value="tag_presence">{t("config.subjects.tag_presence")}</option>
               <option value="contact_field">{t("config.subjects.contact_field")}</option>
               <option value="message_content">{t("config.subjects.message_content")}</option>
               <option value="time_of_day">{t("config.subjects.time_of_day")}</option>
+              <option value="session_window">{t("config.subjects.session_window")}</option>
             </select>
           </FieldBlock>
           <FieldBlock label={t("config.operandLabel")}>
-            <Input
-              placeholder={
-                cfg.subject === "time_of_day"
-                  ? t("config.placeholderTime")
-                  : cfg.subject === "contact_field"
-                  ? t("config.placeholderContact")
-                  : cfg.subject === "tag_presence"
-                  ? t("config.placeholderTag")
-                  : ""
-              }
-              value={(cfg.operand as string) ?? ""}
-              onChange={(e) => set({ operand: e.target.value })}
-              className="bg-muted text-foreground"
-            />
+            {cfg.subject === "session_window" ? (
+              <select
+                value={(cfg.operand as string) === "closed" ? "closed" : "open"}
+                onChange={(e) => set({ operand: e.target.value })}
+                className="w-full rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-foreground"
+              >
+                <option value="open">{t("config.windowStates.open")}</option>
+                <option value="closed">{t("config.windowStates.closed")}</option>
+              </select>
+            ) : (
+              <Input
+                placeholder={
+                  cfg.subject === "time_of_day"
+                    ? t("config.placeholderTime")
+                    : cfg.subject === "contact_field"
+                    ? t("config.placeholderContact")
+                    : cfg.subject === "tag_presence"
+                    ? t("config.placeholderTag")
+                    : ""
+                }
+                value={(cfg.operand as string) ?? ""}
+                onChange={(e) => set({ operand: e.target.value })}
+                className="bg-muted text-foreground"
+              />
+            )}
           </FieldBlock>
           {(cfg.subject === "contact_field" || cfg.subject === "message_content") && (
             <FieldBlock label="Value">
@@ -1503,8 +2189,12 @@ function FieldBlock({
 
 function previewFor(step: BuilderStep): string {
   switch (step.step_type) {
-    case "send_message":
-      return (step.step_config.text as string) || "no text yet"
+    case "send_message": {
+      const cfg = asSendConfig(step.step_config)
+      if (cfg.media) return `📎 ${cfg.media.type}`
+      if (cfg.interactive) return interactivePayloadPreviewText(cfg.interactive) || "no body yet"
+      return cfg.text || "no text yet"
+    }
     case "send_buttons":
     case "send_list":
       return interactivePayloadPreviewText(asInteractive(step.step_config)) || "no body yet"
@@ -1688,11 +2378,41 @@ function moveInBranches(
   return { ...branches, [head.branch]: next }
 }
 
+/**
+ * Finds the `cid` of the step at a given dot-path (validate.ts's scheme,
+ * e.g. `steps[0].yes.steps[1]` — see step-issues.tsx's `collectStepPaths`,
+ * which this mirrors) — the bridge from `useStepIssues`'s string paths
+ * back to the `cid`-keyed `expandedId` state, so "scroll to the first
+ * offending card" can also expand it. Kept here rather than in
+ * step-issues.tsx because it's specific to this file's `BuilderStep`
+ * shape (it reads `cid`, which the deliberately-minimal `StepTreeNode`
+ * that file's pure functions operate on does not have).
+ */
+export function findCidForStepPath(
+  steps: BuilderStep[],
+  targetPath: string,
+  prefix = "",
+): string | undefined {
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]
+    const path = `${prefix}steps[${i}]`
+    if (path === targetPath) return step.cid
+    if (step.step_type === "condition" && step.branches) {
+      const yesMatch = findCidForStepPath(step.branches.yes, targetPath, `${path}.yes.`)
+      if (yesMatch) return yesMatch
+      const noMatch = findCidForStepPath(step.branches.no, targetPath, `${path}.no.`)
+      if (noMatch) return noMatch
+    }
+  }
+  return undefined
+}
+
 // ------------------------------------------------------------
 // Serialize builder tree → API payload (flattened shape)
 // ------------------------------------------------------------
 
 interface ApiStep {
+  id?: string
   step_type: string
   step_config: Record<string, unknown>
   branches?: { yes?: ApiStep[]; no?: ApiStep[] }
@@ -1700,6 +2420,10 @@ interface ApiStep {
 
 export function toApiSteps(steps: BuilderStep[]): ApiStep[] {
   return steps.map((s) => ({
+    // Round-trips the server's stable key so a save preserves per-step
+    // stats. `s.cid` is the client-local fallback for a step added in this
+    // editing session that has never been saved.
+    id: s.step_key ?? s.cid,
     step_type: s.step_type,
     step_config: s.step_config,
     branches: s.branches
@@ -1714,6 +2438,17 @@ export function toApiSteps(steps: BuilderStep[]): ApiStep[] {
  */
 export interface ServerStepNode {
   id: string
+  /** `automationSteps.stepKey`, round-tripped by `fromServerSteps` below
+   *  into `BuilderStep.step_key`. Always populated by `automations.get`,
+   *  which resolves the schema's `stepKey ?? _id` fallback in `toStepRow`
+   *  for a row saved before the field existed — so a step that came from
+   *  the server always has a key that matches whatever the engine recorded
+   *  its stats under. Optional only because the tree shape is shared. */
+  stepKey?: string
+  /** `stepsTree.ts`'s `BuilderStepNode.effectiveStepKey` (`stepKey ?? id`)
+   *  — round-tripped below into `BuilderStep.effective_step_key`. See
+   *  that field's own comment for why it's separate from `stepKey`. */
+  effectiveStepKey: string
   step_type: string
   step_config: Record<string, unknown>
   branches: { yes: ServerStepNode[]; no: ServerStepNode[] }
@@ -1722,6 +2457,8 @@ export interface ServerStepNode {
 export function fromServerSteps(nodes: ServerStepNode[]): BuilderStep[] {
   return nodes.map((n) => ({
     cid: cid(),
+    step_key: n.stepKey,
+    effective_step_key: n.effectiveStepKey,
     step_type: n.step_type as AutomationStepType,
     step_config: n.step_config ?? {},
     branches:

@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest, type TestConvex } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import { ACTIVE_CONVERSATIONS_CAP } from "./dashboard";
 import { hourStartMs } from "./lib/messageStats";
@@ -104,6 +104,35 @@ async function seedAccountMember(
   return { userId, accountId, asUser };
 }
 
+/** A further member of an ALREADY-SEEDED account. `seedAccountMember`
+ *  creates a fresh account per call, which is right for isolation tests and
+ *  wrong for role tests — those need several roles looking at ONE snapshot
+ *  row. */
+async function seedAccountMemberIn(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  opts: { name: string; email: string; role: AccountRole },
+) {
+  const userId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("users", {
+      name: opts.name,
+      email: opts.email,
+    });
+    await ctx.db.insert("memberships", {
+      userId: id,
+      accountId,
+      role: opts.role,
+      fullName: opts.name,
+      email: opts.email,
+    });
+    return id;
+  });
+  return {
+    userId,
+    asUser: t.withIdentity({ subject: `${userId}|session-${opts.name}` }),
+  };
+}
+
 async function seedContact(
   t: ReturnType<typeof convexTest>,
   opts: { accountId: Id<"accounts">; phone: string; name?: string },
@@ -190,6 +219,49 @@ async function seedMessage(
         incoming: inbound ? 1 : 0,
         outgoing: inbound ? 0 : 1,
       });
+    }
+
+    // `responseTime` likewise reads the rollup rather than pairing raw
+    // messages on the fly, so a seeded message has to run the same pairing
+    // production runs at its `insert("messages")` choke point
+    // (`insertMessageAndUpdateConversation`) — otherwise these tests would
+    // assert against a chart with no data behind it. Same reasoning, and the
+    // same `_creationTime`-not-`Date.now()` bucketing, as the counts above.
+    const conversation = (await ctx.db.get(opts.conversationId))!;
+    const pendingAtMs = conversation.pendingCustomerAtMs;
+    if (inbound) {
+      if (pendingAtMs === undefined) {
+        await ctx.db.patch(opts.conversationId, {
+          pendingCustomerAtMs: row._creationTime,
+        });
+      }
+    } else if (pendingAtMs !== undefined) {
+      await ctx.db.patch(opts.conversationId, {
+        pendingCustomerAtMs: undefined,
+      });
+      const elapsedMs = row._creationTime - pendingAtMs;
+      const replyBucketStart = hourStartMs(pendingAtMs);
+      const replyBucket = await ctx.db
+        .query("messageHourlyStats")
+        .withIndex("by_account_hour", (q) =>
+          q.eq("accountId", opts.accountId).eq("hourStartMs", replyBucketStart),
+        )
+        .unique();
+      if (replyBucket) {
+        await ctx.db.patch(replyBucket._id, {
+          responseCount: (replyBucket.responseCount ?? 0) + 1,
+          responseTotalMs: (replyBucket.responseTotalMs ?? 0) + elapsedMs,
+        });
+      } else {
+        await ctx.db.insert("messageHourlyStats", {
+          accountId: opts.accountId,
+          hourStartMs: replyBucketStart,
+          incoming: 0,
+          outgoing: 0,
+          responseCount: 1,
+          responseTotalMs: elapsedMs,
+        });
+      }
     }
 
     return messageId;
@@ -309,10 +381,33 @@ async function seedAutomationLog(
 }
 
 // ============================================================
-// metrics
+// The KPI tiles are no longer a live aggregation — `dashboard.snapshot`
+// reads one row that the `dashboard-snapshot` cron builds via
+// `refreshSnapshots`. Every tile assertion therefore has to run the
+// refresher first; `readSnapshot` keeps that a single call so a test that
+// forgets it fails on a null row rather than silently asserting against a
+// stale one.
+//
+// `refreshSnapshots` stamps `computedAtMs` and its 72-hour window from
+// `Date.now()`, which these tests fake — so it must be called with the
+// clock at "now", after all seeding, exactly as the cron would run it.
+// ============================================================
+async function readSnapshot(
+  t: TestConvex<typeof schema>,
+  asUser: { query: TestConvex<typeof schema>["query"] },
+  args: { todayStartMs: number; yesterdayStartMs: number },
+) {
+  await t.mutation(internal.dashboard.refreshSnapshots, {});
+  const row = await asUser.query(api.dashboard.snapshot, args);
+  if (row === null) throw new Error("refreshSnapshots wrote no snapshot row");
+  return row;
+}
+
+// ============================================================
+// snapshot (the KPI tiles)
 // ============================================================
 
-test("metrics reports active/new conversations, contacts, open deals, and agent messages scoped to the caller's account", async () => {
+test("snapshot reports active/new conversations, contacts, open deals, and agent messages scoped to the caller's account", async () => {
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
@@ -398,7 +493,7 @@ test("metrics reports active/new conversations, contacts, open deals, and agent 
   const bobConv = await seedConversation(t, { accountId: bobId, contactId: bobContact, status: "open" });
   await seedMessage(t, { accountId: bobId, conversationId: bobConv, senderType: "agent" });
 
-  const aliceResult = await asAlice.query(api.dashboard.metrics, {
+  const aliceResult = await readSnapshot(t, asAlice, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
@@ -410,12 +505,18 @@ test("metrics reports active/new conversations, contacts, open deals, and agent 
   expect(aliceResult.newContactsToday).toEqual({ current: 3, previous: 2 });
   expect(aliceResult.openDealsValue).toBe(350);
   expect(aliceResult.openDealsCount).toBe(2);
-  expect(aliceResult.messagesSentToday).toEqual({ current: 4, previous: 3 });
+  // `messagesSentToday` is deliberately absent. No component ever rendered
+  // it, and deriving it meant collecting every message in a two-day window
+  // — measured at ~1,300 documents, the bulk of this query's old 1,882-read
+  // cost, and the reason the dashboard's first read touched `messages` at
+  // all. Asserted rather than merely deleted so re-adding it is a conscious
+  // act with a visible price.
+  expect("messagesSentToday" in aliceResult).toBe(false);
 
   // Symmetric check: Bob sees his own (much larger) numbers, proving
   // isolation holds in both directions rather than Alice's exact-match
   // assertions above merely happening not to be polluted.
-  const bobResult = await asBob.query(api.dashboard.metrics, {
+  const bobResult = await readSnapshot(t, asBob, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
@@ -423,7 +524,7 @@ test("metrics reports active/new conversations, contacts, open deals, and agent 
   expect(bobResult.openDealsCount).toBe(1);
 });
 
-test("metrics splits new leads by acquisition source (ad vs direct), today and yesterday", async () => {
+test("snapshot splits new leads by acquisition source (ad vs direct), today and yesterday", async () => {
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
@@ -452,7 +553,7 @@ test("metrics splits new leads by acquisition source (ad vs direct), today and y
   await seedLead("3004", true); // ad, today
   await seedLead("3005", false); // direct, today
 
-  const res = await asUser.query(api.dashboard.metrics, {
+  const res = await readSnapshot(t, asUser, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
@@ -465,6 +566,129 @@ test("metrics splits new leads by acquisition source (ad vs direct), today and y
     adYesterday: 1,
     directYesterday: 1,
   });
+});
+
+// ============================================================
+// snapshot: the three behaviours the snapshot introduced that the old
+// live `metrics` query had no equivalent for.
+// ============================================================
+
+test("snapshot returns null before the cron has ever run", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(NOW);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Dana",
+    email: "dana@example.com",
+    role: "owner",
+  });
+
+  // Deliberately NOT an error and NOT zeros. A freshly deployed backend
+  // (or an account created since the last tick) has no row yet; the page
+  // renders "preparing" for it, where zeros would read as "no work today".
+  await expect(
+    asUser.query(api.dashboard.snapshot, {
+      todayStartMs: TODAY_START,
+      yesterdayStartMs: YESTERDAY_START,
+    }),
+  ).resolves.toBeNull();
+});
+
+test("snapshot scopes waitingOnReply to the caller's role, from one shared row", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  // One account, three roles. The snapshot row is account-wide and shared,
+  // so this is the test that the PRE-SPLIT counts in it are resolved per
+  // caller rather than handing everyone the account total — the property
+  // `conversations.unreadTotal` gave for free by scoping at read time.
+  const { asUser: asOwner, accountId } = await seedAccountMember(t, {
+    name: "Olive",
+    email: "olive@example.com",
+    role: "owner",
+  });
+  const agent = await seedAccountMemberIn(t, accountId, {
+    name: "Aggie",
+    email: "aggie@example.com",
+    role: "agent",
+  });
+  const other = await seedAccountMemberIn(t, accountId, {
+    name: "Otto",
+    email: "otto@example.com",
+    role: "agent",
+  });
+  const viewer = await seedAccountMemberIn(t, accountId, {
+    name: "Vera",
+    email: "vera@example.com",
+    role: "viewer",
+  });
+
+  clock(NOW);
+  const contactId = await seedContact(t, { accountId, phone: "+15550000200" });
+  const withUnread = async (assignedToUserId?: Id<"users">) => {
+    const id = await seedConversation(t, { accountId, contactId });
+    await t.run((ctx) =>
+      ctx.db.patch(id, {
+        unreadCount: 1,
+        ...(assignedToUserId ? { assignedToUserId } : {}),
+      }),
+    );
+  };
+  await withUnread();                 // pool
+  await withUnread();                 // pool
+  await withUnread(agent.userId);     // Aggie's
+  await withUnread(other.userId);     // Otto's
+  await withUnread(other.userId);     // Otto's
+  // A read thread must not count for anyone.
+  await seedConversation(t, { accountId, contactId });
+
+  const args = { todayStartMs: TODAY_START, yesterdayStartMs: YESTERDAY_START };
+  // Supervisor+ — everything.
+  expect((await readSnapshot(t, asOwner, args)).waitingOnReply).toBe(5);
+  // Agent — own plus the pool, never a colleague's.
+  expect((await readSnapshot(t, agent.asUser, args)).waitingOnReply).toBe(3);
+  expect((await readSnapshot(t, other.asUser, args)).waitingOnReply).toBe(4);
+  // Viewer — the pool alone.
+  expect((await readSnapshot(t, viewer.asUser, args)).waitingOnReply).toBe(2);
+});
+
+test("snapshot folds its UTC hours into the CALLER's local day, not the cron's", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Tara",
+    email: "tara@example.com",
+    role: "owner",
+  });
+
+  // Two contacts either side of a UTC midnight: one an hour before, one an
+  // hour after. The refresher buckets both by UTC hour and stores them
+  // unfolded, which is the whole point — whether they land in the same
+  // local day depends entirely on who is asking.
+  // TODAY_START is already a UTC midnight, and sits after T0 — which the
+  // clock guard requires, since `seedAccountMember` above ran at T0.
+  const utcMidnight = TODAY_START;
+  clock(utcMidnight - 3_600_000);
+  await seedContact(t, { accountId, phone: "+15550000301" }); // 23:00 UTC Jan 14
+  clock(utcMidnight + 3_600_000);
+  await seedContact(t, { accountId, phone: "+15550000302" }); // 01:00 UTC Jan 15
+  clock(utcMidnight + 7_200_000);
+
+  // A viewer in UTC: the two contacts fall on different local days.
+  const utcView = await readSnapshot(t, asUser, {
+    todayStartMs: utcMidnight,
+    yesterdayStartMs: utcMidnight - 86_400_000,
+  });
+  expect(utcView.newContactsToday).toEqual({ current: 1, previous: 1 });
+
+  // The SAME stored row, read by someone at UTC-05:00, whose local day
+  // began at 05:00 UTC — both contacts now sit before it, in yesterday.
+  const westView = await readSnapshot(t, asUser, {
+    todayStartMs: utcMidnight + 5 * 3_600_000,
+    yesterdayStartMs: utcMidnight - 19 * 3_600_000,
+  });
+  expect(westView.newContactsToday).toEqual({ current: 0, previous: 2 });
 });
 
 // ============================================================
@@ -563,6 +787,75 @@ test("conversationsSeries buckets a message into its LOCAL day, not its UTC day,
 // ============================================================
 // responseTime
 // ============================================================
+
+// Reproduces the production failure this query was rewritten to fix:
+// `[CONVEX Q(dashboard:responseTime)] Your request timed out performing too
+// many system operations`, which crashed the whole `/dashboard` route (the
+// page has no Error Boundary, so a throwing `useQuery` takes the tree down).
+//
+// The old handler `.collect()`ed every message in the window. A window bounds
+// the SPAN, not the ROW COUNT, so the read grew with traffic until it blew
+// Convex's per-transaction ceiling — the identical mistake `conversationsSeries`
+// had made, and was fixed by rolling counts up on write.
+//
+// `documentsRead: 1000` is the whole point of the test. The 14-day window is
+// 336 hourly buckets and everything else the query reads is fixed (the
+// caller's membership + user row), so a window-bounded handler lands far
+// under 1000 no matter how busy the account is, while a volume-bounded one
+// needs one read per message and cannot fit. The `toEqual`s below are what
+// stop that budget from being satisfied the cheap way, by returning nothing:
+// a handler that reads no rows also reports no samples.
+test("responseTime's read cost is bounded by the window, not by message volume", async () => {
+  const t = convexTest({
+    schema,
+    modules,
+    transactionLimits: { documentsRead: 1000 },
+  });
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+
+  // Seeded at T0, before the window: `makeClock` only moves forward, and the
+  // message loop below starts at `WINDOW_START`.
+  const contact = await seedContact(t, { accountId, phone: "1" });
+  const conversation = await seedConversation(t, { accountId, contactId: contact });
+
+  // 600 customer/reply pairs — 1200 messages, comfortably past the 1000-doc
+  // budget — spread one pair every 30 minutes so they span most of the
+  // window (300 hours, ending before `NOW`) and fall across many distinct
+  // hourly buckets rather than piling into one.
+  const PAIRS = 600;
+  const PAIR_SPACING_MIN = 30;
+  const REPLY_DELAY_MIN = 10;
+  const WINDOW_START = Date.parse("2026-06-26T00:00:00.000Z");
+  for (let i = 0; i < PAIRS; i++) {
+    const askedAt = WINDOW_START + i * PAIR_SPACING_MIN * 60_000;
+    clock(askedAt);
+    await seedMessage(t, { accountId, conversationId: conversation, senderType: "customer" });
+    clock(askedAt + REPLY_DELAY_MIN * 60_000);
+    await seedMessage(t, { accountId, conversationId: conversation, senderType: "agent" });
+  }
+
+  clock(NOW);
+  const result = await asUser.query(api.dashboard.responseTime, {
+    sinceMs: WINDOW_START,
+    tzOffsetMinutes: 0,
+  });
+
+  // Every pair was replied to in exactly 10 minutes, so each populated
+  // bucket must average 10 and the sample counts must add up to all 600 —
+  // proof the query stayed both correct and complete under the budget.
+  const totalSamples = result.buckets.reduce((sum, b) => sum + b.samples, 0);
+  expect(totalSamples).toBe(PAIRS);
+  for (const bucket of result.buckets) {
+    if (bucket.samples === 0) continue;
+    expect(bucket.avgMinutes).toBeCloseTo(REPLY_DELAY_MIN, 10);
+  }
+});
 
 test("responseTime pairs customer messages with the next reply, dedupes repeated customer messages, buckets by local day-of-week, and computes this/last week averages", async () => {
   const t = convexTest(schema, modules);
@@ -912,10 +1205,10 @@ test("activity surfaces only customer messages (not bot/agent) via by_account_se
 // cross-cutting denial — every dashboard query requires an identity
 // ============================================================
 
-test("metrics throws UNAUTHENTICATED when there is no identity", async () => {
+test("snapshot throws UNAUTHENTICATED when there is no identity", async () => {
   const t = convexTest(schema, modules);
   await expect(
-    t.query(api.dashboard.metrics, { todayStartMs: 0, yesterdayStartMs: 0 }),
+    t.query(api.dashboard.snapshot, { todayStartMs: 0, yesterdayStartMs: 0 }),
   ).rejects.toMatchObject({ data: { code: "UNAUTHENTICATED" } });
 });
 
@@ -1003,7 +1296,7 @@ test("activity allows a supervisor and rejects an agent with FORBIDDEN", async (
 // distinguishes "exactly CAP" from "more than CAP".
 // ============================================================
 
-test("metrics returns an exact open-conversation count below the cap", async () => {
+test("snapshot returns an exact open-conversation count below the cap", async () => {
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
@@ -1018,7 +1311,7 @@ test("metrics returns an exact open-conversation count below the cap", async () 
     await seedConversation(t, { accountId, contactId });
   }
 
-  const result = await asUser.query(api.dashboard.metrics, {
+  const result = await readSnapshot(t, asUser, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
@@ -1026,7 +1319,7 @@ test("metrics returns an exact open-conversation count below the cap", async () 
   expect(result.activeConversations.capped).toBe(false);
 });
 
-test("metrics caps the open-conversation count rather than collecting the table", async () => {
+test("snapshot caps the open-conversation count rather than collecting the table", async () => {
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
@@ -1041,7 +1334,7 @@ test("metrics caps the open-conversation count rather than collecting the table"
     await seedConversation(t, { accountId, contactId });
   }
 
-  const result = await asUser.query(api.dashboard.metrics, {
+  const result = await readSnapshot(t, asUser, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
@@ -1050,7 +1343,7 @@ test("metrics caps the open-conversation count rather than collecting the table"
   expect(result.activeConversations.capped).toBe(true);
 }, 60_000);
 
-test("metrics still derives today-vs-yesterday from a bounded window when capped", async () => {
+test("snapshot still derives today-vs-yesterday from a bounded window when capped", async () => {
   const t = convexTest(schema, modules);
   const clock = makeClock(T0);
   clock(T0);
@@ -1070,11 +1363,140 @@ test("metrics still derives today-vs-yesterday from a bounded window when capped
   clock(TODAY_START);
   for (let i = 0; i < 3; i++) await seedConversation(t, { accountId, contactId });
 
-  const result = await asUser.query(api.dashboard.metrics, {
+  const result = await readSnapshot(t, asUser, {
     todayStartMs: TODAY_START,
     yesterdayStartMs: YESTERDAY_START,
   });
   expect(result.activeConversations.current).toBe(8);
   expect(result.activeConversations.capped).toBe(false);
   expect(result.activeConversations.previous).toBe(2); // 3 today - 1 yesterday
+});
+
+// ============================================================
+// metrics: archived conversations are not open work (Lead Analysis P2,
+// Task 6). `openConversations`/`newOpenToday` don't exist on the return
+// value — the real shape is `activeConversations: { current, previous,
+// capped }` (see the tests above) — so these assert on that shape.
+// ============================================================
+
+test("snapshot does not count an archived conversation as open", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "owner",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000101" });
+  clock(NOW);
+  await seedConversation(t, { accountId, contactId, status: "open" }); // stays open
+  const archivedId = await seedConversation(t, { accountId, contactId, status: "open" });
+  await t.run((ctx) => ctx.db.patch(archivedId, { archivedAt: Date.now() }));
+
+  const result = await readSnapshot(t, asUser, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  expect(result.activeConversations.current).toBe(1);
+});
+
+test("restoring a conversation returns it to the open count", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "owner",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000102" });
+  clock(NOW);
+  const lead = await seedConversation(t, { accountId, contactId, status: "open" });
+  await asUser.mutation(api.leadAnalysis.archive, { conversationId: lead });
+  await asUser.mutation(api.leadAnalysis.restore, { conversationId: lead });
+
+  const result = await readSnapshot(t, asUser, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  expect(result.activeConversations.current).toBe(1);
+});
+
+test("a conversation archived today is not counted as new-open today", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "owner",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000103" });
+  clock(NOW);
+  const archivedId = await seedConversation(t, { accountId, contactId, status: "open" });
+  await t.run((ctx) => ctx.db.patch(archivedId, { archivedAt: Date.now() }));
+
+  const result = await readSnapshot(t, asUser, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+  expect(result.activeConversations.current).toBe(0);
+  // Would be 1 (today's delta counting the archived-today thread as
+  // new-open) without the archive check in the JS-filtered predicate.
+  expect(result.activeConversations.previous).toBe(0);
+});
+
+test("archiving drops the thread out of the unread badge", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "owner",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000104" });
+  clock(NOW);
+  const lead = await seedConversation(t, { accountId, contactId, status: "open" });
+  await t.run((ctx) => ctx.db.patch(lead, { unreadCount: 3 }));
+  expect(await asUser.query(api.conversations.unreadTotal, {})).toBe(1);
+
+  await asUser.mutation(api.leadAnalysis.archive, { conversationId: lead });
+
+  // Load-bearing: `archive` zeroes `unreadCount`, so archived rows leave
+  // the `by_account_unread` range without `unreadTotal` needing to know
+  // anything about archiving.
+  expect(await asUser.query(api.conversations.unreadTotal, {})).toBe(0);
+});
+
+test("the deprecated metrics shim still answers, for clients deployed before snapshot", async () => {
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Legacy", email: "legacy@example.com", role: "owner",
+  });
+  const contactId = await seedContact(t, { accountId, phone: "+15550000400" });
+  clock(NOW);
+  await seedConversation(t, { accountId, contactId, status: "open" });
+  await seedContact(t, { accountId, phone: "+15550000401" });
+
+  // Deliberately WITHOUT running `refreshSnapshots`. The shim exists for the
+  // deploy window in which the backend is new and the client is old, and in
+  // that window the cron may not have written a snapshot row yet — so it has
+  // to stand alone, which is exactly why it kept the original live
+  // implementation instead of re-deriving from `dashboardSnapshots`.
+  const res = await asUser.query(api.dashboard.metrics, {
+    todayStartMs: TODAY_START,
+    yesterdayStartMs: YESTERDAY_START,
+  });
+
+  expect(res.activeConversations.current).toBe(1);
+  expect(res.newContactsToday.current).toBe(1);
+  // The old shape, in full — an old client destructures all of it.
+  expect(res).toHaveProperty("openDealsValue");
+  expect(res).toHaveProperty("openDealsCount");
+  expect(res).toHaveProperty("messagesSentToday");
+  expect(res).toHaveProperty("newLeadsBySource");
 });

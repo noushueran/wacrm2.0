@@ -7,7 +7,11 @@ import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { resolveEventName, backendForLane } from "./lib/funnel";
-import { applyStageTransition } from "./funnel";
+import {
+  applyStageTransition,
+  recordConversionEventInRollup,
+  moveConversionEventStatusInRollup,
+} from "./funnel";
 import { accountQuery } from "./lib/auth";
 
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
@@ -195,6 +199,13 @@ export const seedNewLead = internalMutation({
       status: "pending",
       attempts: 0,
     });
+    // Rollup: born `pending` in today's bucket; every later status change
+    // moves it inside that same bucket rather than into another day's.
+    await recordConversionEventInRollup(ctx, {
+      accountId,
+      atMs: Date.now(),
+      status: "pending",
+    });
 
     // Funnel visibility (Task B3). Re-read so `applyStageTransition` sees
     // the attribution patch just above (if this call is what set it); its
@@ -278,6 +289,16 @@ export const patchStatus = internalMutation({
       }
     }
     await ctx.db.patch(args.conversionEventId, patch);
+    // Keep the Funnel tab's status counts exact across a MUTABLE field:
+    // decrement whatever this row was counted as, increment what it now is,
+    // both in its CREATION day's bucket. A no-op when the status is
+    // unchanged (a patch that only rewrites `fbTraceId`, say).
+    await moveConversionEventStatusInRollup(ctx, {
+      accountId: row.accountId,
+      createdAtMs: row._creationTime,
+      from: row.status,
+      to: status,
+    });
   },
 });
 
@@ -308,6 +329,12 @@ export const retireDormant = internalMutation({
     await ctx.db.patch(args.conversionEventId, {
       status: "dormant",
       lastError: `dormant: ${args.reason}`,
+    });
+    await moveConversionEventStatusInRollup(ctx, {
+      accountId: row.accountId,
+      createdAtMs: row._creationTime,
+      from: row.status,
+      to: "dormant",
     });
   },
 });
@@ -344,6 +371,12 @@ export const migrateDormantOutOfAbandoned = internalMutation({
     for (const row of page) {
       if (row.attempts < MAX_DELIVER_ATTEMPTS) {
         await ctx.db.patch(row._id, { status: "dormant" });
+        await moveConversionEventStatusInRollup(ctx, {
+          accountId: row.accountId,
+          createdAtMs: row._creationTime,
+          from: row.status,
+          to: "dormant",
+        });
       }
     }
 
@@ -590,22 +623,77 @@ export const getPendingToRetry = internalQuery({
 export const getDormantToSweep = internalQuery({
   args: {
     backends: v.array(v.union(v.literal("platformA"), v.literal("capi"))),
+    /**
+     * Earliest `_creationTime` eligible to be swept, from
+     * `CONVERSION_DELIVERY_START_MS`. Omitted means "sweep the whole
+     * backlog", which is the behaviour every caller had before this existed.
+     *
+     * Why it exists: configuring a backend for the first time makes every
+     * dormant row eligible at once, and `deliverConversionEvent` derives
+     * `event_time` from `_creationTime`. So switching CAPI on with a backlog
+     * present fires months of backdated conversions at the dataset in one
+     * sweep. The cutoff makes "from now on" expressible without deleting or
+     * rewriting the backlog — those rows stay dormant and inert, and remain
+     * available if the decision is reversed.
+     */
+    cutoffMs: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<Doc<"conversionEvents">[]> => {
     if (args.backends.length === 0) return [];
+    const { cutoffMs } = args;
     const perBackend = await Promise.all(
       args.backends.map((backend) =>
         ctx.db
           .query("conversionEvents")
-          .withIndex("by_status_backend", (q) =>
-            q.eq("status", "dormant").eq("backend", backend),
-          )
+          .withIndex("by_status_backend", (q) => {
+            const partition = q.eq("status", "dormant").eq("backend", backend);
+            // Bound on the INDEX, never a post-index `.filter()`. Convex
+            // indexes end implicitly with `_creationTime` (`by_account`
+            // already relies on that), so this is a genuine range: the walk
+            // starts AT the cutoff. A filter would instead read every older
+            // row and discard it on each 15-minute tick — the same
+            // scan-that-grows this function was restructured to escape, and
+            // worse here, because `.take(100)` oldest-first means a backlog
+            // of 100+ would fill the window and starve new rows outright.
+            return cutoffMs === undefined
+              ? partition
+              : partition.gte("_creationTime", cutoffMs);
+          })
           .take(100),
       ),
     );
     return perBackend.flat().slice(0, 100);
   },
 });
+
+/**
+ * `CONVERSION_DELIVERY_START_MS` — the earliest `_creationTime` the dormant
+ * sweep will deliver, as epoch milliseconds. Unset means "deliver the whole
+ * backlog", which is what every deployment did before this existed.
+ *
+ * Set it to roughly "now" when turning a backend on for the first time, and
+ * the rows that accumulated while it was unconfigured stay dormant instead of
+ * arriving at the provider stamped with months-old `event_time` values. It
+ * only gates the DORMANT sweep: live `pending` rows retry regardless, so a
+ * cutoff can never strand a conversion that is actively being delivered.
+ *
+ * A malformed value fails CLOSED — it skips the backlog rather than
+ * delivering it. The asymmetry is deliberate: failing open here means an
+ * irreversible burst of backdated events at a third party, while failing
+ * closed leaves rows exactly where they already are, and says so in the log.
+ */
+function deliveryCutoffMs(): number | undefined {
+  const raw = process.env.CONVERSION_DELIVERY_START_MS;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed)) return parsed;
+  console.error(
+    `[conversionEvents] CONVERSION_DELIVERY_START_MS is ${JSON.stringify(raw)}, ` +
+      "which is not a number. Holding the dormant backlog rather than delivering " +
+      "it; correct the value to resume sweeping.",
+  );
+  return Number.MAX_SAFE_INTEGER;
+}
 
 /**
  * Cron entry point (`convex/crons.ts`, every 15 minutes): pulls the live retry
@@ -630,7 +718,10 @@ export const retryConversionEvents = internalAction({
 
     const [live, dormant] = await Promise.all([
       ctx.runQuery(internal.conversionEvents.getPendingToRetry, {}),
-      ctx.runQuery(internal.conversionEvents.getDormantToSweep, { backends }),
+      ctx.runQuery(internal.conversionEvents.getDormantToSweep, {
+        backends,
+        cutoffMs: deliveryCutoffMs(),
+      }),
     ]);
 
     // Live rows first: a dormant backlog must never crowd them out of the

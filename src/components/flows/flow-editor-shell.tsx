@@ -126,7 +126,7 @@ export function FlowEditorShell({ initialFlow, initialNodes }: Props) {
               {LEGEND_TYPES.map((t_type) => (
                 <span
                   key={t_type}
-                  className="inline-flex items-center gap-1.5 text-[11.5px] text-muted-foreground"
+                  className="inline-flex items-center gap-1.5 text-[12.5px] text-muted-foreground"
                 >
                   <span
                     className="h-2.5 w-2.5 rounded-full"
@@ -198,7 +198,7 @@ function SegButton({
       onClick={onClick}
       aria-pressed={active}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12.5px] font-medium transition-colors",
+        "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors",
         active
           ? "bg-card text-foreground shadow-sm"
           : "text-muted-foreground hover:text-foreground",

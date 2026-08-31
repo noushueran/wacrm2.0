@@ -152,11 +152,11 @@ describe('buildSendComponents — header', () => {
   it('prefers header_media_key over header_media_url, resolved to a public R2 URL', () => {
     // Task 5 of the R2 migration: dual-read. `NEXT_PUBLIC_R2_PUBLIC_HOST`
     // is the client resolver's config source (`src/lib/storage/media-url.ts`).
-    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.holidayys.co';
+    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.amaniworld.com';
     const components = buildSendComponents(
       row({
         header_type: 'image',
-        header_media_url: 'https://convex-api.holidayys.co/api/storage/old',
+        header_media_url: 'https://convex-api.amaniworld.com/api/storage/old',
         header_media_key: 'acc1/templates/sample.jpg',
       }),
     );
@@ -165,7 +165,7 @@ describe('buildSendComponents — header', () => {
       parameters: [
         {
           type: 'image',
-          image: { link: 'https://objs.holidayys.co/acc1/templates/sample.jpg' },
+          image: { link: 'https://objs.amaniworld.com/acc1/templates/sample.jpg' },
         },
       ],
     });

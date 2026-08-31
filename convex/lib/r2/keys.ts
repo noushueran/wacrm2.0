@@ -15,8 +15,16 @@ export const MEDIA_KINDS = [
   "outbound",
   "template",
   "flow",
+  // Media attached to an automation's send step. Separate from "flow" so
+  // AUTOMATION_SENDABLE_MEDIA_KINDS can gate exactly this kind — see
+  // `automationsEngine.ts`.
+  "automation",
   "avatar",
   "ad",
+  // Note attachments. Unlike every kind above, a `note` object is never
+  // sent to Meta — it is internal-only evidence (a passport scan, a
+  // signed quote), so Meta's per-type size caps do not apply to it.
+  "note",
 ] as const;
 
 export type MediaKind = (typeof MEDIA_KINDS)[number];

@@ -50,6 +50,18 @@ import type { Doc, Id } from "./_generated/dataModel";
 //     runtime reason, not just a rebinding-timing one. `redirect:
 //     'manual'` is kept, so a public URL still can't 3xx-bounce to an
 //     internal one.
+//
+//     The literal-IP half is checked by PARSING, not by matching the
+//     textual form: `isPrivateOrReservedIpv6` expands the address into
+//     its eight groups first. An earlier version prefix-matched strings
+//     and carried a `::ffff:<dotted-quad>` regex, which never fired —
+//     `new URL()` normalizes `[::ffff:127.0.0.1]` to the hex form
+//     `[::ffff:7f00:1]`, so loopback and cloud-metadata addresses passed
+//     the guard. All three IPv4-embedding forms (IPv4-mapped,
+//     IPv4-compatible, NAT64) now resolve to their embedded IPv4 and are
+//     judged by the IPv4 rules, independent of spelling; an IPv6-shaped
+//     host that will not parse fails CLOSED. See the `BLOCKED_URLS`
+//     regression table in webhookDelivery.test.ts.
 // ============================================================
 
 /** Per-endpoint HTTP timeout. Mirrors `deliver.ts`'s own constant. */
@@ -84,38 +96,129 @@ function randomUuidV4(): string {
 }
 
 /**
- * True for a literal loopback/private/link-local/reserved IPv4 or IPv6
- * address — ported verbatim from `ssrf.ts`'s `isPrivateOrReservedIp`
- * (pure string/number logic, no I/O, fully portable).
+ * True for a literal loopback/private/link-local/reserved IPv4 address.
+ * Pure string/number logic, no I/O.
  */
-function isPrivateOrReservedIp(ip: string): boolean {
+function isPrivateOrReservedIpv4(ip: string): boolean {
   const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (a === 0) return true; // "this" network
-    if (a === 10) return true; // private
-    if (a === 127) return true; // loopback
-    if (a === 169 && b === 254) return true; // link-local + cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // private
-    if (a === 192 && b === 168) return true; // private
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    return false;
+  if (!v4) return false;
+  const a = Number(v4[1]);
+  const b = Number(v4[2]);
+  if (a === 0) return true; // "this" network
+  if (a === 10) return true; // private
+  if (a === 127) return true; // loopback
+  if (a === 169 && b === 254) return true; // link-local + cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // private
+  if (a === 192 && b === 168) return true; // private
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+/**
+ * Expand a (possibly `::`-compressed) IPv6 literal into its eight
+ * 16-bit groups, or `null` if `ip` is not syntactically valid IPv6.
+ *
+ * Exists because the previous prefix-matching approach (`startsWith`
+ * on the textual form, plus a `::ffff:<dotted-quad>` regex) could not
+ * see an IPv4-mapped address in the form the platform actually hands
+ * us. `new URL("http://[::ffff:127.0.0.1]/").hostname` normalizes to
+ * `[::ffff:7f00:1]` — the HEX form — so the dotted-quad regex never
+ * matched and loopback/metadata addresses sailed through the guard.
+ * Parsing into groups makes the embedded-IPv4 check independent of
+ * which textual spelling arrived.
+ *
+ * A trailing dotted-quad (`::ffff:1.2.3.4`) is folded into the final
+ * two groups, per RFC 4291 §2.2.
+ */
+function expandIpv6(ip: string): number[] | null {
+  let text = ip.toLowerCase().replace(/^\[|\]$/g, "");
+  if (text.includes("%")) text = text.slice(0, text.indexOf("%")); // zone id
+
+  // Fold a trailing dotted-quad into two 16-bit groups.
+  const tail = text.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (tail) {
+    const octets = tail[1]!.split(".").map(Number);
+    if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return null;
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    text = text.slice(0, tail.index) + `${hi}:${lo}`;
   }
 
-  const v6 = ip.toLowerCase().replace(/^\[|\]$/g, "");
-  if (v6 === "::1" || v6 === "::") return true; // loopback / unspecified
-  if (
-    v6.startsWith("fe8") ||
-    v6.startsWith("fe9") ||
-    v6.startsWith("fea") ||
-    v6.startsWith("feb")
-  )
-    return true; // fe80::/10 link-local
-  if (v6.startsWith("fc") || v6.startsWith("fd")) return true; // fc00::/7 ULA
-  const mapped = v6.match(/::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (mapped) return isPrivateOrReservedIp(mapped[1]!); // IPv4-mapped
+  const halves = text.split("::");
+  if (halves.length > 2) return null; // at most one `::`
+
+  const parseGroups = (part: string): number[] | null => {
+    if (part === "") return [];
+    const out: number[] = [];
+    for (const g of part.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+      out.push(Number.parseInt(g, 16));
+    }
+    return out;
+  };
+
+  const head = parseGroups(halves[0]!);
+  if (!head) return null;
+
+  if (halves.length === 1) return head.length === 8 ? head : null;
+
+  const rest = parseGroups(halves[1]!);
+  if (!rest) return null;
+  const fill = 8 - head.length - rest.length;
+  if (fill < 1) return null; // `::` must stand for at least one group
+  return [...head, ...Array<number>(fill).fill(0), ...rest];
+}
+
+/**
+ * True for a literal loopback/private/link-local/reserved IPv6 address,
+ * INCLUDING the IPv4-embedding forms that carry a private IPv4 payload
+ * (IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible `::a.b.c.d`, and NAT64
+ * `64:ff9b::/96`) — each of which reaches the embedded IPv4 target on a
+ * dual-stack host.
+ *
+ * Fails CLOSED: a colon-bearing host that will not parse as IPv6 is
+ * treated as reserved rather than waved through, since we cannot reason
+ * about where it would actually connect.
+ */
+function isPrivateOrReservedIpv6(ip: string): boolean {
+  const g = expandIpv6(ip);
+  if (!g) return true; // unparseable → fail closed
+
+  const embeddedV4 = (): string =>
+    `${g[6]! >> 8}.${g[6]! & 0xff}.${g[7]! >> 8}.${g[7]! & 0xff}`;
+
+  const allZero = (upTo: number) => g.slice(0, upTo).every((x) => x === 0);
+  const zeroBetween = (from: number, to: number) =>
+    g.slice(from, to).every((x) => x === 0);
+
+  // ::/128 unspecified and ::1/128 loopback.
+  if (allZero(7) && (g[7] === 0 || g[7] === 1)) return true;
+  // fe80::/10 link-local.
+  if ((g[0]! & 0xffc0) === 0xfe80) return true;
+  // fc00::/7 unique-local.
+  if ((g[0]! & 0xfe00) === 0xfc00) return true;
+  // ::ffff:a.b.c.d — IPv4-mapped.
+  if (allZero(5) && g[5] === 0xffff) return isPrivateOrReservedIpv4(embeddedV4());
+  // ::a.b.c.d — deprecated IPv4-compatible (the all-zero prefix cases
+  // above already returned, so anything left here embeds a real IPv4).
+  if (allZero(6)) return isPrivateOrReservedIpv4(embeddedV4());
+  // 64:ff9b::/96 — NAT64 well-known prefix.
+  if (g[0] === 0x64 && g[1] === 0xff9b && zeroBetween(2, 6)) {
+    return isPrivateOrReservedIpv4(embeddedV4());
+  }
   return false;
+}
+
+/**
+ * True for a literal loopback/private/link-local/reserved IPv4 or IPv6
+ * address. Pure string/number logic, no I/O, fully portable.
+ */
+function isPrivateOrReservedIp(ip: string): boolean {
+  const bare = ip.replace(/^\[|\]$/g, "");
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) {
+    return isPrivateOrReservedIpv4(bare);
+  }
+  return isPrivateOrReservedIpv6(bare);
 }
 
 /** True if `host` is a literal IPv4 or IPv6 address (not a hostname). */

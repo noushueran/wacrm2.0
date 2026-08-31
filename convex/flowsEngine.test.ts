@@ -143,6 +143,30 @@ async function eventsFor(t: ReturnType<typeof convexTest>, flowRunId: Id<"flowRu
   );
 }
 
+/**
+ * Flags a contact do-not-contact the same way the real feature does —
+ * `contacts.doNotContact` is a denormalized `{ at, noteId }` object
+ * (schema.ts), not a bare boolean, sourced from a `contactNotes` row
+ * whose `outcome` is `"do_not_contact"`. Mirrors `broadcasts.test.ts`'s
+ * own inline pattern for the identical setup.
+ */
+async function markDoNotContact(
+  t: ReturnType<typeof convexTest>,
+  accountId: Id<"accounts">,
+  contactId: Id<"contacts">,
+) {
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+}
+
 // ============================================================
 // Pure-helper tests — ported from `src/lib/flows/engine.test.ts`
 // (byte-faithful: same function signatures, same assertions).
@@ -453,11 +477,11 @@ test("a condition node (tag presence) branches to the correct child", async () =
 
 test("a send_media node resolves config.media_key to a public R2 URL for Meta", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
@@ -476,7 +500,15 @@ test("a send_media node resolves config.media_key to a public R2 URL for Meta", 
     // a key minted for a DIFFERENT account here would end the run
     // failed instead of resolving. This is also, therefore, the
     // regression test for "a flow's OWN media_key still succeeds."
-    config: { media_type: "image", media_key: `${accountId}/outbound/brochure.png`, next_node_key: "end1" },
+    //
+    // Kind is `"flow"`, not e.g. `"outbound"` — `node-config-form.tsx`'s
+    // `SendMediaForm` is the only place that ever writes a flow node's
+    // `media_key`, and it unconditionally mints its upload as kind
+    // `"flow"` (`uploadAccountMedia(..., "flow")`). This is also,
+    // therefore, the regression test for `FLOW_SENDABLE_MEDIA_KINDS`
+    // not rejecting the one kind a flow legitimately sends — see the
+    // `note`-kind rejection test below for the other half.
+    config: { media_type: "image", media_key: `${accountId}/flow/brochure.png`, next_node_key: "end1" },
   });
   await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
 
@@ -494,13 +526,13 @@ test("a send_media node resolves config.media_key to a public R2 URL for Meta", 
   expect(messages).toHaveLength(1);
   expect(messages[0]!.contentType).toBe("image");
   expect(messages[0]!.mediaUrl).toBe(
-    `https://objs.holidayys.co/${accountId}/outbound/brochure.png`,
+    `https://objs.amaniworld.com/${accountId}/flow/brochure.png`,
   );
   // Final-review fix "outbound media never persists a key": the node's
   // `media_key` is threaded through to `metaSend.sendMedia` and
   // persisted alongside the resolved `mediaUrl`, not discarded after
   // resolution.
-  expect(messages[0]!.mediaKey).toBe(`${accountId}/outbound/brochure.png`);
+  expect(messages[0]!.mediaKey).toBe(`${accountId}/flow/brochure.png`);
 
   const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
   expect(run!.status).toBe("completed");
@@ -526,11 +558,11 @@ test("a send_media node whose media_key belongs to a DIFFERENT account ends the 
   // SUCCEED, persisting the foreign key's URL; that's the actual
   // vulnerability, and it only surfaces when R2 is configured.
   process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const accountId = await seedAccount(t, "Acme");
   const otherAccountId = await seedAccount(t, "Globex");
@@ -559,6 +591,73 @@ test("a send_media node whose media_key belongs to a DIFFERENT account ends the 
 
   // Nothing was persisted — proof the send pipeline (which would have
   // resolved the foreign key to a real URL and called Meta) was never
+  // reached.
+  const messages = await messagesFor(t, conversationId);
+  expect(messages).toHaveLength(0);
+
+  const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
+  expect(run!.status).toBe("failed");
+  expect(run!.endReason).toBe("send_media_failed");
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("a send_media node whose media_key is a same-account NOTE key ends the run failed (send_media_failed), not resolved", async () => {
+  // This branch closes the gap a review found in the fix above: the
+  // account-ownership check alone (previous test) is NOT sufficient
+  // once a `note`-kind R2 object exists — a `note` is internal-only
+  // evidence (a passport scan) attached via `contactNotes.add`/`update`
+  // and must NEVER reach a customer over WhatsApp, even when the key
+  // legitimately belongs to THIS account. `send_media` bypasses
+  // `send.ts` entirely (it calls `internal.metaSend.sendMedia`
+  // directly), so `send.ts`'s own `SENDABLE_MEDIA_KINDS` guard never
+  // runs on this path — `FLOW_SENDABLE_MEDIA_KINDS` in
+  // `convex/flowsEngine.ts` is what has to catch it here. R2 is
+  // deliberately left CONFIGURED (not omitted) — with no kind check,
+  // this send would otherwise SUCCEED, persisting the note attachment's
+  // URL onto a customer-facing message; that's the actual
+  // vulnerability, and it only surfaces when R2 is configured.
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-amani";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15551234567");
+
+  const flowId = await seedFlow(t, { accountId, triggerType: "keyword", triggerConfig: { keywords: ["photo"] }, entryNodeId: "start" });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "send_photo" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "send_photo",
+    nodeType: "send_media",
+    // Same-account key (so this isolates the KIND check from the
+    // ownership check above), but kind `"note"` — the one kind that
+    // must never be forwarded to a customer.
+    config: { media_type: "document", media_key: `${accountId}/note/passport-scan.pdf`, next_node_key: "end1" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const result = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "photo", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+
+  expect(result.consumed).toBe(true);
+  expect(result.outcome).toBe("completed");
+
+  // Nothing was persisted — proof the send pipeline (which would have
+  // resolved the note key to a real URL and called Meta) was never
   // reached.
   const messages = await messagesFor(t, conversationId);
   expect(messages).toHaveLength(0);
@@ -883,4 +982,245 @@ test("account isolation: account B's inbound never advances account A's run; dis
   expect(runA!.currentNodeKey).toBe("menu");
   const eventsAfter = await eventsFor(t, resultA.flowRunId!);
   expect(eventsAfter).toHaveLength(eventsBefore.length);
+});
+
+// ============================================================
+// 7. do-not-contact gate (final review, CRITICAL 1) — neither
+// dispatchInbound (starting a new run OR advancing an in-flight reply)
+// nor timeout (a scheduled fallback callback) may ever send to a
+// contact flagged `doNotContact`. Two independent checks, because a
+// suspended run's fallback window is exactly when the flag can get set
+// AFTER dispatch already ran.
+// ============================================================
+
+test("dispatchInbound never starts a new run (and never sends) for a doNotContact contact; a non-blocked contact still does", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["hi"], match_type: "contains" },
+    entryNodeId: "start",
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "greet" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "greet",
+    nodeType: "send_message",
+    config: { text: "Hello!", next_node_key: "end1" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const { contactId: blockedContactId, conversationId: blockedConversationId } = await seedContactAndConversation(
+    t,
+    accountId,
+    "15550001111",
+  );
+  await markDoNotContact(t, accountId, blockedContactId);
+
+  const blockedResult = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId: blockedContactId,
+    message: { kind: "text", text: "hi there", metaMessageId: "wamid-blocked" },
+    isFirstInboundMessage: false,
+  });
+  expect(blockedResult.consumed).toBe(false);
+  expect(blockedResult.flowRunId).toBeUndefined();
+  expect(await messagesFor(t, blockedConversationId)).toHaveLength(0);
+  const blockedRuns = await t.run((ctx) =>
+    ctx.db.query("flowRuns").filter((q) => q.eq(q.field("contactId"), blockedContactId)).collect(),
+  );
+  expect(blockedRuns).toHaveLength(0);
+
+  const { contactId: okContactId, conversationId: okConversationId } = await seedContactAndConversation(
+    t,
+    accountId,
+    "15550002222",
+  );
+  const okResult = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId: okContactId,
+    message: { kind: "text", text: "hi there", metaMessageId: "wamid-ok" },
+    isFirstInboundMessage: false,
+  });
+  expect(okResult.consumed).toBe(true);
+  // This flow has no suspending node (send_message runs straight into
+  // `end`), so it completes synchronously in one dispatch — "completed",
+  // not "started". The point of this assertion is simply that the
+  // non-blocked contact's run actually ran (see the message-count check
+  // below), not the specific outcome literal.
+  expect(okResult.outcome).toBe("completed");
+  expect(await messagesFor(t, okConversationId)).toHaveLength(1);
+});
+
+test("dispatchInbound bails without advancing when a reply arrives after the contact was flagged doNotContact mid-run", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15550003333");
+
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["hi"] },
+    entryNodeId: "start",
+    fallbackPolicy: { on_unknown_reply: "reprompt", max_reprompts: 2, on_timeout_hours: 24, on_exhaust: "handoff" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "menu" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "menu",
+    nodeType: "send_buttons",
+    config: { text: "Pick one", buttons: [{ reply_id: "a", title: "A", next_node_key: "end1" }] },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const started = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "hi", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+  expect(started.outcome).toBe("started");
+  expect(await messagesFor(t, conversationId)).toHaveLength(1);
+
+  // An agent flags this contact do-not-contact WHILE the run sits
+  // suspended waiting on the button tap.
+  await markDoNotContact(t, accountId, contactId);
+
+  const replied = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "interactive_reply", replyId: "a", replyTitle: "A", metaMessageId: "wamid-2" },
+    isFirstInboundMessage: false,
+  });
+  expect(replied.consumed).toBe(false);
+  expect(replied.outcome).toBe("no_match");
+
+  // Nothing further was ever sent, and the run never advanced past "menu".
+  expect(await messagesFor(t, conversationId)).toHaveLength(1);
+  const run = await t.run((ctx) => ctx.db.get(started.flowRunId!));
+  expect(run!.status).toBe("active");
+  expect(run!.currentNodeKey).toBe("menu");
+
+  const events = await eventsFor(t, started.flowRunId!);
+  expect(
+    events.some(
+      (e) => e.eventType === "error" && (e.payload as Record<string, unknown> | undefined)?.reason === "blocked_do_not_contact",
+    ),
+  ).toBe(true);
+});
+
+test("timeout ends the run without sending when the contact was flagged doNotContact during the wait window", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15550004444");
+
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["hi"] },
+    entryNodeId: "start",
+    fallbackPolicy: { on_unknown_reply: "reprompt", max_reprompts: 0, on_timeout_hours: 1, on_exhaust: "end" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "menu" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "menu",
+    nodeType: "send_buttons",
+    config: { text: "Pick one", buttons: [{ reply_id: "a", title: "A", next_node_key: "end1" }] },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const result = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "hi", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+  expect(result.outcome).toBe("started");
+  expect(await messagesFor(t, conversationId)).toHaveLength(1);
+
+  // Flag the contact do-not-contact BEFORE the scheduled fallback fires
+  // — this is precisely the delayed-send window `dispatchInbound`'s own
+  // gate cannot cover (it already ran, an hour before this).
+  await markDoNotContact(t, accountId, contactId);
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  // No reprompt was ever sent — still just the one "Pick one" message —
+  // and the run was ended, not left stuck active forever.
+  expect(await messagesFor(t, conversationId)).toHaveLength(1);
+  const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
+  expect(run!.status).toBe("failed");
+  expect(run!.endReason).toBe("blocked_do_not_contact");
+
+  const events = await eventsFor(t, result.flowRunId!);
+  expect(
+    events.some(
+      (e) => e.eventType === "error" && (e.payload as Record<string, unknown> | undefined)?.reason === "blocked_do_not_contact",
+    ),
+  ).toBe(true);
+
+  vi.useRealTimers();
+});
+
+test("timeout still resends the current node's prompt for a non-blocked contact (control)", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t, "Acme");
+  const { contactId, conversationId } = await seedContactAndConversation(t, accountId, "15550005555");
+
+  const flowId = await seedFlow(t, {
+    accountId,
+    triggerType: "keyword",
+    triggerConfig: { keywords: ["hi"] },
+    entryNodeId: "start",
+    fallbackPolicy: { on_unknown_reply: "reprompt", max_reprompts: 3, on_timeout_hours: 1, on_exhaust: "end" },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "start", nodeType: "start", config: { next_node_key: "menu" } });
+  await seedNode(t, {
+    accountId,
+    flowId,
+    nodeKey: "menu",
+    nodeType: "send_buttons",
+    config: { text: "Pick one", buttons: [{ reply_id: "a", title: "A", next_node_key: "end1" }] },
+  });
+  await seedNode(t, { accountId, flowId, nodeKey: "end1", nodeType: "end", config: {} });
+
+  const result = await t.action(internal.flowsEngine.dispatchInbound, {
+    accountId,
+    contactId,
+    message: { kind: "text", text: "hi", metaMessageId: "wamid-1" },
+    isFirstInboundMessage: false,
+  });
+  expect(await messagesFor(t, conversationId)).toHaveLength(1);
+
+  // Fire ONLY the one currently-pending timeout — NOT
+  // `t.finishAllScheduledFunctions(vi.runAllTimers)`, which would also
+  // drain the FRESH timeout this reprompt itself reschedules (and the
+  // one after that, ...), repeating the reprompt cycle all the way to
+  // `max_reprompts` in a single call. Mirrors
+  // `qualificationEngine.test.ts`'s own documented use of this exact
+  // pair for the identical "run one scheduled step, not the whole
+  // chain" reason.
+  vi.runOnlyPendingTimers();
+  await t.finishInProgressScheduledFunctions();
+
+  // Reprompted: the same "Pick one" prompt was sent a second time, and
+  // the run is still active waiting on the button tap.
+  expect(await messagesFor(t, conversationId)).toHaveLength(2);
+  const run = await t.run((ctx) => ctx.db.get(result.flowRunId!));
+  expect(run!.status).toBe("active");
+  expect(run!.repromptCount).toBe(1);
+
+  vi.useRealTimers();
 });

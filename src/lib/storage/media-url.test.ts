@@ -3,7 +3,7 @@ import { expect, test, vi, beforeEach, afterEach } from "vitest";
 const ORIGINAL = process.env.NEXT_PUBLIC_R2_PUBLIC_HOST;
 
 beforeEach(() => {
-  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   vi.resetModules();
 });
 
@@ -14,23 +14,23 @@ afterEach(() => {
 test("mediaUrlFromKey builds a public URL", async () => {
   const { mediaUrlFromKey } = await import("./media-url");
   expect(mediaUrlFromKey("acc1/outbound/abc.png")).toBe(
-    "https://objs.holidayys.co/acc1/outbound/abc.png",
+    "https://objs.amaniworld.com/acc1/outbound/abc.png",
   );
 });
 
 test("mediaUrlFromKey normalizes a trailing slash on the public host", async () => {
-  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.holidayys.co/";
+  process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = "https://objs.amaniworld.com/";
   vi.resetModules();
   const { mediaUrlFromKey } = await import("./media-url");
   expect(mediaUrlFromKey("acc1/outbound/abc.png")).toBe(
-    "https://objs.holidayys.co/acc1/outbound/abc.png",
+    "https://objs.amaniworld.com/acc1/outbound/abc.png",
   );
 });
 
 test("resolveMediaUrl prefers key, falls back to legacy url, else null", async () => {
   const { resolveMediaUrl } = await import("./media-url");
   expect(resolveMediaUrl({ key: "acc1/outbound/a.png", url: "legacy" })).toBe(
-    "https://objs.holidayys.co/acc1/outbound/a.png",
+    "https://objs.amaniworld.com/acc1/outbound/a.png",
   );
   expect(resolveMediaUrl({ url: "legacy" })).toBe("legacy");
   expect(resolveMediaUrl({})).toBeNull();

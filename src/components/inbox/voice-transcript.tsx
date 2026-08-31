@@ -65,7 +65,7 @@ export function VoiceTranscript({
   return (
     <div className="mt-1.5 border-t border-current/10 pt-1.5">
       <span
-        className="inline-flex items-center gap-0.5 text-[9px] font-semibold uppercase leading-none tracking-wide opacity-70"
+        className="inline-flex items-center gap-0.5 text-[10px] font-semibold uppercase leading-none tracking-wide opacity-70"
         title={labelTitle}
       >
         <Sparkles className="h-2.5 w-2.5" />
@@ -91,7 +91,7 @@ export function VoiceTranscript({
           type="button"
           onClick={() => setExpanded((v) => !v)}
           aria-expanded={expanded}
-          className="mt-0.5 text-[10px] underline opacity-70 hover:opacity-100"
+          className="mt-0.5 text-[11px] underline opacity-70 hover:opacity-100"
         >
           {expanded ? lessLabel : moreLabel}
         </button>

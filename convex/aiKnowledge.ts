@@ -10,6 +10,7 @@ import { v, ConvexError } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { chunkText } from "./lib/ai/chunk";
 import { embedTexts, EMBEDDING_DIMENSIONS } from "./lib/ai/embeddings";
+import { aiKnowledgeTopK } from "./lib/ai/defaults";
 
 // ============================================================
 // AI knowledge base (RAG) — `convex/schema.ts`'s `aiKnowledgeDocuments`
@@ -500,7 +501,11 @@ export const retrieve = internalAction({
     audience: v.optional(v.literal("customer")),
   },
   handler: async (ctx, args): Promise<string[]> => {
-    const k = args.k ?? 5;
+    // Explicit caller arg wins; otherwise the deployment default (still
+    // 5) via `AI_KNOWLEDGE_TOP_K`, so retrieval depth can be tuned from
+    // the environment once the new usage telemetry shows how much of a
+    // prompt the excerpts actually account for — no deploy required.
+    const k = args.k ?? aiKnowledgeTopK();
     const query = args.queryText.trim();
     if (!query || k <= 0) return [];
 
@@ -588,6 +593,10 @@ export const retrieve = internalAction({
     // lexical arms carry the whole retrieval, exactly as they already
     // do for a lexical-only account.
     let queryEmbedding: number[] | null = null;
+    // Collected inside the try, logged after it: the whole point of the
+    // catch below is that retrieval degrades rather than fails, and a
+    // usage-log write must not be the thing that trips it.
+    let embedSpend: { model: string; promptTokens: number; totalTokens: number } | null = null;
     try {
       const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
@@ -597,7 +606,11 @@ export const retrieve = internalAction({
       if (embeddingsApiKey) {
         const embedded = isDryRun()
           ? syntheticEmbedding(query)
-          : (await embedTexts(embeddingsApiKey, [query]))[0];
+          : (
+              await embedTexts(embeddingsApiKey, [query], (u) => {
+                embedSpend = u;
+              })
+            )[0];
         if (embedded) queryEmbedding = embedded;
       }
     } catch {
@@ -605,6 +618,29 @@ export const retrieve = internalAction({
       // response — degrade to the lexical arms instead of failing the
       // caller.
       queryEmbedding = null;
+    }
+
+    // Embedding spend. Cheap per call (`text-embedding-3-small`) but it
+    // runs on EVERY inbound, and up to three times on a fully-enabled
+    // one (auto-reply, qualification analysis, purchase judge) — it was
+    // simply never recorded before the 2026-07-27 audit. Best-effort,
+    // same contract as every other usage write.
+    if (embedSpend) {
+      const spend: { model: string; promptTokens: number; totalTokens: number } = embedSpend;
+      try {
+        await ctx.runMutation(internal.aiUsage.log, {
+          accountId: args.accountId,
+          mode: "embed",
+          provider: "openai",
+          model: spend.model,
+          promptTokens: spend.promptTokens,
+          // No completion side on the embeddings endpoint.
+          completionTokens: 0,
+          totalTokens: spend.totalTokens,
+        });
+      } catch (err) {
+        console.warn("[ai knowledge] embedding usage log failed:", err);
+      }
     }
 
     // --- Compiled pool (`kbChunks`), semantic arm -------------------

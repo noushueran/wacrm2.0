@@ -32,7 +32,7 @@ export function QualificationChip({
     return (
       <Badge
         variant="outline"
-        className="ml-1 hidden gap-1 border-emerald-500/40 text-[10px] text-emerald-500 sm:inline-flex"
+        className="inline-flex gap-1 border-emerald-500/40 text-[11px] text-emerald-500"
       >
         <BadgeCheck className="h-3 w-3" />
         {t("qualifiedBadge")}
@@ -46,7 +46,7 @@ export function QualificationChip({
   return (
     <Badge
       variant="outline"
-      className="ml-1 hidden gap-1 border-primary/40 text-[10px] text-primary sm:inline-flex"
+      className="inline-flex gap-1 border-primary/40 text-[11px] text-primary"
       title={
         session.missingHint
           ? t("progressTitle", { hint: session.missingHint })

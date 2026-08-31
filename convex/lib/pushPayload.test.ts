@@ -34,7 +34,7 @@ describe("buildInboundPayload", () => {
       conversationId: "c1",
       hidePreview: true,
     });
-    expect(p.title).toBe("Holidayys WA CRM");
+    expect(p.title).toBe("Testco WA CRM");
     expect(p.body).toBe("New WhatsApp message");
     expect(p.url).toBe("/inbox?c=c1"); // routing still works
   });

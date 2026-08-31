@@ -14,12 +14,12 @@ import { buildSystemPrompt } from "./defaults";
 
 describe("isFetchableLandingUrl", () => {
   test("accepts ordinary http(s) landing URLs", () => {
-    expect(isFetchableLandingUrl("https://holidayys.co/packages/georgia-summer")).toBe(true);
+    expect(isFetchableLandingUrl("https://amaniworld.com/packages/georgia-summer")).toBe(true);
     expect(isFetchableLandingUrl("http://fb.me/2AbCdEfG")).toBe(true);
   });
 
   test("rejects non-http protocols and unparseable input", () => {
-    expect(isFetchableLandingUrl("ftp://holidayys.co/x")).toBe(false);
+    expect(isFetchableLandingUrl("ftp://amaniworld.com/x")).toBe(false);
     expect(isFetchableLandingUrl("javascript:alert(1)")).toBe(false);
     expect(isFetchableLandingUrl("not a url")).toBe(false);
     expect(isFetchableLandingUrl("")).toBe(false);
@@ -40,16 +40,16 @@ describe("landingUrlKey", () => {
   test("strips fragments and click-tracking params, keeps real ones", () => {
     expect(
       landingUrlKey(
-        "https://holidayys.co/packages/georgia?fbclid=AbC123&utm_source=fb&utm_campaign=summer&nights=5#gallery",
+        "https://amaniworld.com/packages/georgia?fbclid=AbC123&utm_source=fb&utm_campaign=summer&nights=5#gallery",
       ),
-    ).toBe("https://holidayys.co/packages/georgia?nights=5");
+    ).toBe("https://amaniworld.com/packages/georgia?nights=5");
   });
 
   test("every click on one ad maps to one cache key", () => {
-    const a = landingUrlKey("https://Holidayys.co/packages/georgia?fbclid=click-1");
-    const b = landingUrlKey("https://holidayys.co/packages/georgia?fbclid=click-2#x");
+    const a = landingUrlKey("https://amaniworld.com/packages/georgia?fbclid=click-1");
+    const b = landingUrlKey("https://amaniworld.com/packages/georgia?fbclid=click-2#x");
     expect(a).toBe(b);
-    expect(a).toBe("https://holidayys.co/packages/georgia");
+    expect(a).toBe("https://amaniworld.com/packages/georgia");
   });
 
   test("returns null for unparseable input", () => {
@@ -60,7 +60,7 @@ describe("landingUrlKey", () => {
 describe("extractLandingContent", () => {
   const PAGE = `<!doctype html>
 <html><head>
-  <title>Holidayys &mdash; fallback title</title>
+  <title>Amani &mdash; fallback title</title>
   <meta name="description" content="Fallback meta description">
   <meta property="og:title" content="Georgia Summer Package &amp; City Tour" />
   <meta content="5 nights Tbilisi &#43; Batumi from AED 1299" property="og:description"/>
@@ -128,8 +128,8 @@ describe("buildSystemPrompt adContext section", () => {
   const AD = {
     headline: "Georgia Summer Package",
     body: "5 nights from AED 1299 — visa included!",
-    sourceUrl: "https://holidayys.co/packages/georgia-summer",
-    landingTitle: "Georgia Summer Package | Holidayys",
+    sourceUrl: "https://amaniworld.com/packages/georgia-summer",
+    landingTitle: "Georgia Summer Package | Amani",
     landingDescription: "Tbilisi, Gudauri and Batumi in one trip.",
     landingContent: "Day 1: arrival in Tbilisi…",
   };
@@ -139,8 +139,8 @@ describe("buildSystemPrompt adContext section", () => {
     expect(prompt).toContain("Lead source");
     expect(prompt).toContain("Ad headline: Georgia Summer Package");
     expect(prompt).toContain("Ad text: 5 nights from AED 1299 — visa included!");
-    expect(prompt).toContain("Ad link: https://holidayys.co/packages/georgia-summer");
-    expect(prompt).toContain("Linked page title: Georgia Summer Package | Holidayys");
+    expect(prompt).toContain("Ad link: https://amaniworld.com/packages/georgia-summer");
+    expect(prompt).toContain("Linked page title: Georgia Summer Package | Amani");
     expect(prompt).toContain("Linked page description: Tbilisi, Gudauri and Batumi in one trip.");
     expect(prompt).toContain("Day 1: arrival in Tbilisi…");
     expect(prompt).toContain("acknowledge the specific offer/destination");

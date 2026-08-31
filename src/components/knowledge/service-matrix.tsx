@@ -118,7 +118,7 @@ function VerdictBadge({
   t: ReturnType<typeof useTranslations>;
 }) {
   return (
-    <Badge variant="outline" className={cn('shrink-0 text-[10px]', softBadge(VERDICT_TONE[verdict]))}>
+    <Badge variant="outline" className={cn('shrink-0 text-[11px]', softBadge(VERDICT_TONE[verdict]))}>
       {t(`verdict.${verdict}`)}
     </Badge>
   );

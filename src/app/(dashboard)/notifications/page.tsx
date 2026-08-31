@@ -171,7 +171,7 @@ export default function NotificationsPage() {
                         {n.body}
                       </p>
                     )}
-                    <p className="mt-1 text-[11px] text-muted-foreground/70">
+                    <p className="mt-1 text-[12px] text-muted-foreground/70">
                       {formatDistanceToNow(new Date(n.created_at), {
                         addSuffix: true,
                       })}

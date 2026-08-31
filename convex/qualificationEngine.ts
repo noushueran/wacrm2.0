@@ -18,8 +18,11 @@ import {
   type AnalysisResult,
 } from "./lib/qualification/analyze";
 import {
-  ANALYSIS_MAX_OUTPUT_TOKENS,
   aiContextMessageLimit,
+  aiJudgeModel,
+  aiJudgeReasoningEffort,
+  aiReplyReasoningEffort,
+  promptCacheKey,
   buildSystemPrompt,
 } from "./lib/ai/defaults";
 import { latestUserMessage } from "./lib/ai/query";
@@ -42,13 +45,19 @@ import {
   pickFollowUpText,
 } from "./lib/qualification/schedule";
 import { mapFieldsToContact } from "./lib/qualification/contactFields";
+import { dispatchTagAdded, dispatchConversationAssigned } from "./lib/automations/triggers";
+import { resolveRouting, type FallbackCause } from "./lib/qualification/routing";
 import { insertNotification } from "./notifications";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
+import { applyAssignment } from "./lib/assignment";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import type { AccountRole } from "./lib/roles";
 import { normalizePhone } from "./lib/phone";
 import { parseStaffReply } from "./lib/qualification/staffReply";
+import { blockedReason } from "./lib/notes/gate";
+import { resolveWindowState } from "./lib/whatsapp/messagingWindow";
 import { allocateContactCode } from "./contacts";
+import { insertConversation } from "./conversations";
 import type { Doc, Id } from "./_generated/dataModel";
 
 // ============================================================
@@ -146,6 +155,21 @@ function isAiDryRun(): boolean {
   return !!process.env.CONVEX_AI_DRY_RUN;
 }
 
+/** Dry-run question pool, in priority order — the stub proposes the
+ *  first one the same pass did NOT extract an answer for. */
+const SYNTHETIC_ASKABLE = [
+  {
+    key: "travel_dates",
+    text: "When are you planning to travel?",
+    alternates: ["Rough month works too — when are you thinking?"],
+  },
+  {
+    key: "email",
+    text: "What's the best email to send your quote to?",
+    alternates: ["Which email should we send the details to?"],
+  },
+] as const;
+
 /**
  * DRY-RUN stand-in for the analysis LLM call — deterministic JSON
  * derived from markers in the latest customer message, so tests steer
@@ -181,13 +205,16 @@ export function syntheticAnalysisRaw(latestText: string): string {
     })),
     checklistSatisfied,
     expectedCount: 4,
+    // Never propose a question this same pass just answered — the real
+    // analyst is instructed not to, and `applyAnalysis` drops it anyway
+    // (see its pendingQuestion block), so a stub that always asked for
+    // `travel_dates` while extracting `travel_dates` would exercise a
+    // path production can no longer reach.
     nextQuestion: checklistSatisfied
       ? null
-      : {
-          key: "travel_dates",
-          text: "When are you planning to travel?",
-          alternates: ["Rough month works too — when are you thinking?"],
-        },
+      : (SYNTHETIC_ASKABLE.find(
+          (q) => !fields.some((f) => f.key === q.key),
+        ) ?? null),
     intent,
     summary: "dry-run analysis",
   });
@@ -215,6 +242,13 @@ export const loadAnalysisContext = internalQuery({
       carried: { key: string; value: string }[];
       completedAt: number;
     };
+    /** Watermark: newest customer message this session has been analysed
+     *  through. Undefined for a session that predates the field. */
+    analyzedThroughMs?: number;
+    /** Creation time of the newest customer message in the thread, or
+     *  null when there is none. Compared against the watermark to decide
+     *  whether an extraction would learn anything new. */
+    newestCustomerMs: number | null;
   } | null> => {
     const config = await loadEnabledConfig(ctx, args.accountId);
     if (!config) return null;
@@ -234,6 +268,18 @@ export const loadAnalysisContext = internalQuery({
     // v3 multi-lead: the LATEST session is the live one; older terminal
     // rows are history. A terminal latest no longer bails — the analysis
     // decides whether this message starts a NEW inquiry.
+    // Newest CUSTOMER message — the thing an extraction would read. Taken
+    // off the same `by_conversation` index the transcript uses; senders
+    // other than the customer cannot carry new answers, so an agent or
+    // bot message must not invalidate the watermark.
+    const newestCustomer = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .filter((q) => q.eq(q.field("senderType"), "customer"))
+      .first();
+    const newestCustomerMs = newestCustomer?._creationTime ?? null;
+
     const session = await ctx.db
       .query("qualificationSessions")
       .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
@@ -258,6 +304,8 @@ export const loadAnalysisContext = internalQuery({
             session.lastCustomerMessageAt ??
             session._creationTime,
         },
+        analyzedThroughMs: session.analyzedThroughMs,
+        newestCustomerMs,
       };
     }
     return {
@@ -265,6 +313,8 @@ export const loadAnalysisContext = internalQuery({
       knownFields: (session?.fields ?? []).map((f) => ({ key: f.key, value: f.value })),
       basicFields: config.basicFields,
       previousInquiry: undefined,
+      analyzedThroughMs: session?.analyzedThroughMs,
+      newestCustomerMs,
     };
   },
 });
@@ -321,6 +371,9 @@ export const applyAnalysis = internalMutation({
     conversationId: v.id("conversations"),
     contactId: v.id("contacts"),
     analysis: analysisValidator,
+    /** Newest customer message the caller actually analysed — see the
+     *  `analyzedThroughMs` note in the patch below. */
+    analyzedThroughMs: v.optional(v.number()),
   },
   handler: async (
     ctx,
@@ -416,14 +469,49 @@ export const applyAnalysis = internalMutation({
       expectedCount,
       score: analysis.score,
       scoreBreakdown: analysis.scoreBreakdown,
+      // Watermark for the freshness guard in `analyzeInbound`. Stamped
+      // with the caller's OWN view of the newest customer message, not
+      // `Date.now()`: a message that arrived while this extraction was
+      // in flight was NOT analysed, and stamping now would silently skip
+      // it forever.
+      ...(args.analyzedThroughMs !== undefined
+        ? { analyzedThroughMs: args.analyzedThroughMs }
+        : {}),
     };
     if (analysis.serviceName) patch.serviceName = analysis.serviceName;
     if (analysis.summary) patch.summary = analysis.summary;
+    // The pending question must be RE-EARNED on every analysis pass, not
+    // inherited. It is the only thing the follow-up cron sends (verbatim,
+    // hours later, with no LLM call of its own — `pickFollowUpText`), so
+    // a question that outlives the turn it was computed on is a question
+    // the customer gets asked again after they already answered it. That
+    // is exactly what happened on conversation nn7afrjd… : the analyst
+    // proposed "inside or outside the UAE?", the customer replied "I am
+    // already Dubai" 2 minutes later, the next pass returned
+    // nextQuestion: null, the old branch here KEPT the question, and the
+    // 4-hour nudge asked it again word for word.
+    //
+    // `analysis` only exists when `parseAnalysis` succeeded, i.e. the
+    // analyst DID see the current transcript — so a null nextQuestion is
+    // a considered "nothing to ask", not an absence of information, and
+    // clearing is the honest reading. With nothing pending, the cron
+    // falls back to its field-driven phrasings, which are derived from
+    // what is actually still missing and therefore self-correcting.
     if (analysis.nextQuestion) {
-      patch.pendingQuestion = analysis.nextQuestion;
-    } else if (analysis.checklistSatisfied) {
-      patch.pendingQuestion = undefined; // nothing left to ask
-    } // null + unsatisfied → keep the prior question for follow-ups
+      patch.pendingQuestion = { ...analysis.nextQuestion, askedAt: now };
+    } else {
+      patch.pendingQuestion = undefined;
+    }
+    // Belt-and-braces: even a re-proposed question is dropped once the
+    // merged fields show its key answered at medium+ confidence. The
+    // model proposing a question it just extracted an answer for is the
+    // single failure that must never reach the customer.
+    const pending = patch.pendingQuestion as
+      | { key: string; text: string; alternates: string[]; askedAt: number }
+      | undefined;
+    if (pending && merged.some((f) => f.key === pending.key && f.confidence !== "low")) {
+      patch.pendingQuestion = undefined;
+    }
     if (ready && !session.checklistSatisfiedAt) patch.checklistSatisfiedAt = now;
 
     if (analysis.intent === "opt_out") {
@@ -441,6 +529,39 @@ export const applyAnalysis = internalMutation({
     }
 
     await ctx.db.patch(sessionId, patch);
+    // The lead's sales checklist used to wait for `completeQualification`,
+    // which most sessions never reach — 188 checklists against 1,802
+    // conversations — so the Inbox panel was empty for nine leads in ten.
+    // It is scheduled here instead, on any pass where the session HAS a
+    // service — the one just named or one it was already carrying.
+    //
+    // Deliberately not the "unknown → known" transition. `serviceName` is
+    // only ever set, never cleared, so a transition-only guard would reach
+    // exactly the sessions that had never named a service and skip every
+    // lead already carrying one — which is most of the active ones, and
+    // precisely the chats whose empty panel prompted this. Firing on the
+    // steady state instead makes the trigger self-healing: an existing
+    // `collecting` lead picks up its checklist on the next inbound message.
+    //
+    // The repetition is free. `generateForSession` early-returns on
+    // `info.hasChecklist`, so a lead that already has one costs a scheduled
+    // action and one internal query — no LLM call, and the agent's ticked
+    // items are never overwritten. `serviceName` still gates it because
+    // that is what the KB retrieval and the prompt key on: generating
+    // before a service is known (at `ensureSession`, which sets none) would
+    // produce a GENERIC checklist and then permanently block the tailored
+    // one, since generation early-returns once any row exists.
+    //
+    // `completeQualification` keeps its own call as the safety net for a
+    // lead that qualifies without a service ever being named. Whichever
+    // fires first wins; the others no-op on `info.hasChecklist`.
+    if (patch.serviceName || session.serviceName) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.salesChecklists.generateForSession,
+        { accountId: args.accountId, sessionId },
+      );
+    }
     // A terminal intent (opt-out / disqualified) always wins over
     // readiness — the customer told us to stop. `wants_human` readiness
     // still completes: completion's own handoff covers the human ask.
@@ -462,14 +583,57 @@ export const analyzeInbound = internalAction({
     accountId: v.id("accounts"),
     conversationId: v.id("conversations"),
     contactId: v.id("contacts"),
+    // Debounce token — the row id of the inbound that booked this run.
+    // At fire time only the run whose trigger is still the NEWEST
+    // customer message proceeds, so a burst of quick fragments costs ONE
+    // extraction instead of one per fragment. Exactly the token
+    // `aiReply.dispatchInbound` already uses for the reply itself.
+    //
+    // Optional: `dispatchInbound` deliberately calls WITHOUT one, because
+    // it is not racing a newer message — it is the reply that must not
+    // build its prompt on stale objectives, so it wants the analysis run
+    // unconditionally (the freshness guard below still makes that free
+    // when the scheduled run already did the work).
+    triggerMessageId: v.optional(v.id("messages")),
+    // Bypass the freshness watermark below. Exactly one caller needs it:
+    // the media pass, after a transcript lands. A transcript attaches new
+    // CONTENT to a message that already existed, so the newest-customer
+    // -message timestamp does not move and the watermark would otherwise
+    // read as "already analysed" and skip the very data that just became
+    // readable.
+    force: v.optional(v.boolean()),
   },
   handler: async (ctx, args): Promise<void> => {
     try {
+      // Burst gate. A newer customer message means ITS scheduled run
+      // owns the extraction for the whole burst; this one stands down
+      // without spending a provider call.
+      if (args.triggerMessageId) {
+        const latestInbound = await ctx.runQuery(
+          internal.aiReply.latestInboundMessageId,
+          { accountId: args.accountId, conversationId: args.conversationId },
+        );
+        if (latestInbound && latestInbound !== args.triggerMessageId) return;
+      }
+
       const context = await ctx.runQuery(
         internal.qualificationEngine.loadAnalysisContext,
         { accountId: args.accountId, conversationId: args.conversationId },
       );
       if (!context) return;
+      // Freshness guard: the session has already been analysed through
+      // the newest customer message, so there is nothing new to extract.
+      // This is what makes the analysis safe to invoke twice — once from
+      // the debounced schedule, once inline from `dispatchInbound` — and
+      // charge for it once.
+      if (
+        !args.force &&
+        context.analyzedThroughMs !== undefined &&
+        context.newestCustomerMs !== null &&
+        context.analyzedThroughMs >= context.newestCustomerMs
+      ) {
+        return;
+      }
 
       const aiCfg = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
         accountId: args.accountId,
@@ -512,7 +676,12 @@ export const analyzeInbound = internalAction({
         });
       }
 
+      const qualifyInstructions = await ctx.runQuery(
+        internal.agentInstructions.forAgent,
+        { accountId: args.accountId, agentKey: "qualify" },
+      );
       const systemPrompt = buildAnalysisPrompt({
+        extraInstructions: qualifyInstructions,
         checklistExcerpts,
         basicFields: context.basicFields,
         knownFields: context.knownFields,
@@ -523,17 +692,18 @@ export const analyzeInbound = internalAction({
       if (isAiDryRun()) {
         raw = syntheticAnalysisRaw(latest);
       } else {
+        // Extraction emits a fixed JSON schema straight into
+        // `parseAnalysis` — no customer ever reads it — so it runs on the
+        // cheap judge tier with reasoning off. See `aiJudgeModel`.
+        const model = aiJudgeModel(aiCfg.provider, aiCfg.model);
         const gen = await generateReply({
           provider: aiCfg.provider,
-          model: aiCfg.model,
+          model,
           apiKey: aiCfg.apiKey,
           systemPrompt,
           messages,
-          // Structured output, not a WhatsApp reply. At the default 320
-          // the JSON came back cut mid-object (`finish_reason: "length"`)
-          // and `parseAnalysis` discarded the entire analysis — measured
-          // at 404 completion tokens for a real 7-turn conversation.
-          maxTokens: ANALYSIS_MAX_OUTPUT_TOKENS,
+          reasoningEffort: aiJudgeReasoningEffort(),
+          promptCacheKey: promptCacheKey(args.accountId, "qualify"),
         });
         raw = gen.text;
         try {
@@ -542,10 +712,15 @@ export const analyzeInbound = internalAction({
             conversationId: args.conversationId,
             mode: "qualify",
             provider: aiCfg.provider,
-            model: aiCfg.model,
+            // The model actually called, not the account's configured
+            // one — otherwise the usage page's by-model breakdown would
+            // attribute judge spend to the reply model.
+            model,
             promptTokens: gen.usage?.promptTokens ?? 0,
             completionTokens: gen.usage?.completionTokens ?? 0,
             totalTokens: gen.usage?.totalTokens ?? 0,
+            cachedPromptTokens: gen.usage?.cachedPromptTokens,
+            reasoningTokens: gen.usage?.reasoningTokens,
           });
         } catch (err) {
           console.warn("[qualification analysis] usage log failed:", err);
@@ -562,6 +737,11 @@ export const analyzeInbound = internalAction({
           conversationId: args.conversationId,
           contactId: args.contactId,
           analysis,
+          // The snapshot this run actually read, captured BEFORE the
+          // provider call — never a fresh `Date.now()`.
+          ...(context.newestCustomerMs !== null
+            ? { analyzedThroughMs: context.newestCustomerMs }
+            : {}),
         },
       );
 
@@ -610,6 +790,7 @@ export const getObjectives = internalQuery({
     args,
   ): Promise<{
     collected: { label: string; value: string }[];
+    unconfirmed: { label: string; value: string }[];
     nextQuestion: string | null;
     suppressReply?: boolean;
   } | null> => {
@@ -630,25 +811,70 @@ export const getObjectives = internalQuery({
       session.qualifiedAt &&
       Date.now() - session.qualifiedAt < 90_000
     ) {
-      return { collected: [], nextQuestion: null, suppressReply: true };
+      return {
+        collected: [],
+        unconfirmed: [],
+        nextQuestion: null,
+        suppressReply: true,
+      };
     }
+
+    const label = (f: (typeof session.fields)[number]) =>
+      (f.label ?? f.key) +
+      (f.carried ? " (from a previous inquiry — reconfirm casually once)" : "");
 
     const collected = session.fields
       .filter((f) => f.confidence !== "low")
-      .map((f) => ({
-        label:
-          (f.label ?? f.key) +
-          (f.carried ? " (from a previous inquiry — reconfirm casually once)" : ""),
-        value: f.value,
-      }));
+      .map((f) => ({ label: label(f), value: f.value }));
+
+    // Low-confidence rows used to be invisible to the reply prompt
+    // entirely, which is a repetition source of its own: the customer
+    // DID answer, the analyst just wasn't sure it parsed the answer
+    // right, and the assistant — told only about the confident fields —
+    // asked from scratch. Surfaced separately so the model confirms
+    // ("just to confirm, 30 days?") instead of re-asking blind. Safe to
+    // show now that placeholder values ("Not provided") can no longer
+    // land in this bucket — see `isNonAnswer`.
+    const unconfirmed = session.fields
+      .filter((f) => f.confidence === "low")
+      .map((f) => ({ label: label(f), value: f.value }));
 
     // Only a live (collecting) session still has something to ask; a
     // finished one contributes its collected list ONLY (v4: so the
     // assistant never re-asks answered details after completion).
     let nextQuestion: string | null = null;
     if (session.status === "collecting") {
-      nextQuestion = session.pendingQuestion?.text ?? null;
-      if (!nextQuestion) {
+      // Same freshness rule the follow-up cron applies (see
+      // `pickFollowUpText`): a question computed BEFORE the customer's
+      // latest message may be the one that message answered. Normally
+      // `askedAt` wins this comparison — `ingest.ts` awaits the analysis
+      // before scheduling the reply — so this only bites when the
+      // analysis was skipped (media-only inbound) or raced, which is
+      // precisely when the stored question is least trustworthy.
+      const pending = session.pendingQuestion;
+      const fresh =
+        pending !== undefined &&
+        pending.askedAt !== undefined &&
+        pending.askedAt >= (session.lastCustomerMessageAt ?? 0);
+      if (fresh) {
+        nextQuestion = pending.text;
+      } else if (!pending && !(session.serviceName ?? "").trim()) {
+        // No question has ever been proposed (first turn): steer from
+        // the first unanswered required basic field. A STALE question is
+        // deliberately NOT replaced by this fallback — the basic fields
+        // are the generic off-topic set, and pushing "how many
+        // travellers?" at a visa applicant is worse than letting the
+        // model read the transcript and choose for itself this turn.
+        //
+        // `serviceName` gates it for the same reason (fix 2026-07-30).
+        // "No question has ever been proposed" is not only the first
+        // turn: `applyAnalysis` CLEARS `pendingQuestion` whenever the
+        // analyst names nothing to ask, so a mature service thread lands
+        // here too — and then no basicFields key can ever look answered,
+        // because everything known about it is keyed in the CHECKLIST
+        // namespace. That steered the reply model to ask a visa applicant
+        // what they were looking for. Same root cause and same gate as
+        // `pickFollowUpText`; see its comment for the full reasoning.
         const answered = new Set(
           session.fields.filter((f) => f.confidence !== "low").map((f) => f.key),
         );
@@ -659,7 +885,7 @@ export const getObjectives = internalQuery({
       }
     }
 
-    return { collected, nextQuestion };
+    return { collected, unconfirmed, nextQuestion };
   },
 });
 
@@ -1154,12 +1380,17 @@ export const evaluatePurchase = internalAction({
       if (isAiDryRun()) {
         raw = syntheticPurchaseRaw(latest);
       } else {
+        // Same reasoning as the analysis pass above: the verdict is
+        // parsed by `parsePurchaseVerdict`, never shown to anyone.
+        const model = aiJudgeModel(aiCfg.provider, aiCfg.model);
         const gen = await generateReply({
           provider: aiCfg.provider,
-          model: aiCfg.model,
+          model,
           apiKey: aiCfg.apiKey,
           systemPrompt,
           messages,
+          reasoningEffort: aiJudgeReasoningEffort(),
+          promptCacheKey: promptCacheKey(args.accountId, "purchase"),
         });
         raw = gen.text;
         try {
@@ -1168,10 +1399,12 @@ export const evaluatePurchase = internalAction({
             conversationId: args.conversationId,
             mode: "qualify",
             provider: aiCfg.provider,
-            model: aiCfg.model,
+            model,
             promptTokens: gen.usage?.promptTokens ?? 0,
             completionTokens: gen.usage?.completionTokens ?? 0,
             totalTokens: gen.usage?.totalTokens ?? 0,
+            cachedPromptTokens: gen.usage?.cachedPromptTokens,
+            reasoningTokens: gen.usage?.reasoningTokens,
           });
         } catch (err) {
           console.warn("[purchase signal] usage log failed:", err);
@@ -1215,6 +1448,13 @@ export const closingContext = internalQuery({
     if (!conversation || conversation.accountId !== args.accountId) return null;
     const contact = await ctx.db.get(conversation.contactId);
     if (!contact) return null;
+    // An agent recorded that this customer asked not to be contacted.
+    // `sendClosingMessage` is a one-shot fire scheduled once when the
+    // session completes (see its own caller) — nothing re-tries it, so
+    // returning null here just means the closing text never goes out;
+    // there's no session/row left waiting on it, unlike `followUpContext`
+    // above.
+    if (blockedReason(contact) !== null) return null;
     return { to: contact.phone, text: config.closingMessage };
   },
 });
@@ -1312,11 +1552,13 @@ export const ensureAdminConversation = internalMutation({
       }
       return { conversationId: existing._id, to: contact.phone };
     }
-    const conversationId = await ctx.db.insert("conversations", {
+    // Through `insertConversation` (not a bare `ctx.db.insert`) so this
+    // thread gets `awaitingReply: true` like every other newly created
+    // conversation — see that helper's comment for why an omitted
+    // `awaitingReply` makes the row invisible in every Inbox lane.
+    const conversationId = await insertConversation(ctx, {
       accountId: args.accountId,
       contactId: contact._id,
-      status: "open",
-      unreadCount: 0,
       aiAutoreplyDisabled: true,
     });
     return { conversationId, to: contact.phone };
@@ -1417,6 +1659,7 @@ export const sweepFollowUps = internalAction({
 type FollowUpVerdict =
   | { kind: "skip" }
   | { kind: "clear" }
+  | { kind: "optOut" }
   | { kind: "expire"; reason: string }
   | { kind: "reschedule"; at: number }
   | { kind: "sendText"; to: string; text: string; nextCursor: number }
@@ -1428,6 +1671,22 @@ type FollowUpVerdict =
       params: string[];
       contentText: string;
     };
+
+/**
+ * How long a thread yields after a human touches it (assignment, or a
+ * manual agent reply) before scheduled nudges resume. Deliberately
+ * SHORTER than a day: the anchor is the human's own last activity, so a
+ * 24h period would push every resumed nudge past WhatsApp's 24h service
+ * window by construction, making the whole feature depend on an approved
+ * re-engagement template. At 4h the common case ("agent answered this
+ * morning, customer never replied") still sends a plain text message.
+ *
+ * 4h mirrors `REMINDER_FIRST_MS` below — the interval this codebase
+ * already treats as "a human has had a fair chance to act". Working
+ * hours are applied on top, so an evening touch resumes next morning,
+ * never overnight.
+ */
+const HUMAN_QUIET_MS = 4 * 3_600_000;
 
 /**
  * The guard chain (spec §8), evaluated at SEND time — arming happened
@@ -1451,6 +1710,42 @@ export const followUpContext = internalQuery({
     // future lever). Defensive: arming only happens on inbound.
     if (!session.lastCustomerMessageAt) return { kind: "clear" };
 
+    // Loaded here (rather than only where it's finally used, below) so
+    // the do-not-contact gate can run before EVERY branch from this
+    // point on that can send or reschedule — isSessionExpired, the
+    // conversation checks, aiAutoreplyDisabled, snoozedUntil,
+    // humanOwned, maxFollowUps, and the working-hours clamp all follow
+    // this line. The two guards above (not "collecting", not yet due)
+    // stay first on purpose: they're hit on every sweep and must not
+    // pay for a contact read.
+    const contact = await ctx.db.get(session.contactId);
+    if (!contact) return { kind: "clear" };
+    // An agent recorded that this customer asked not to be contacted.
+    // "optOut", not "clear" and not "skip":
+    //   - "skip" leaves nextFollowUpAt in the past, so the session would
+    //     stay in getDueSessions' 100-row due range and get re-offered
+    //     to the sweep on every pass, forever (the livelock this gate
+    //     exists to prevent).
+    //   - "clear" fixes the livelock but leaves status "collecting" with
+    //     no closedReason — the session then sits in the leadsBoard's
+    //     "collecting" bucket forever, displayed to sales as an active
+    //     lead to work, which is the opposite of the truth.
+    //   - "optOut" reuses the SAME terminal status applyAnalysis already
+    //     sets when the LLM classifies an inbound message's intent as
+    //     "opt_out" (see the `intent === "opt_out"` branch above): status
+    //     "opted_out", closedReason "opted_out". leadsBoard already
+    //     buckets/caps/ranks "opted_out" as a closed status, and
+    //     leads-board-view.tsx already has a `closedReason.opted_out`
+    //     ("Asked to stop") i18n label — no board changes needed.
+    // Placed ahead of isSessionExpired/conversation-closed on purpose:
+    // "the customer asked us to stop" is a more accurate and more
+    // specific closedReason than "no_response" or "conversation_closed"
+    // for a session that would also independently qualify for those, so
+    // do-not-contact takes precedence.
+    if (blockedReason(contact) !== null) {
+      return { kind: "optOut" as const };
+    }
+
     if (isSessionExpired(session.lastCustomerMessageAt, now, config.sessionWindowHours)) {
       return { kind: "expire", reason: "no_response" };
     }
@@ -1464,25 +1759,52 @@ export const followUpContext = internalQuery({
     // One more visit right after expiry so the sweep can close the file.
     const expiryRevisit =
       session.lastCustomerMessageAt + config.sessionWindowHours * 3_600_000 + 60_000;
+    // An EXPLICIT pause ("Take over" / Resume AI) is never auto-undone:
+    // someone deliberately silenced the bot on this thread, so the
+    // session just waits out its expiry clock. This is the one yield
+    // that stays permanent — the two below are not.
     if (conversation.aiAutoreplyDisabled) return { kind: "reschedule", at: expiryRevisit };
-    // Assignment IS the takeover signal (owner strategy 2026-07-18):
-    // once a human owns the thread, scheduled nudges yield exactly like
-    // a pause — the human decides the cadence now.
-    if (conversation.assignedToUserId) return { kind: "reschedule", at: expiryRevisit };
-    if (
-      session.humanTouchedAt &&
-      session.humanTouchedAt > session.lastCustomerMessageAt
-    ) {
+    // A snooze is a deliberate park by a human. Same class of signal as
+    // an explicit Take over, so it yields the same way — waiting out the
+    // expiry clock rather than cancelling the session, since the snooze
+    // will lift on its own.
+    if (conversation.snoozedUntil !== undefined) {
       return { kind: "reschedule", at: expiryRevisit };
+    }
+    // Human activity DEFERS the nudge; it does not kill it (fix
+    // 2026-07-26). Assignment and a manual reply are INCIDENTAL signals,
+    // not instructions to stop: an agent answering a question is the
+    // normal shape of a working thread, not a request for silence.
+    //
+    // Previously both rescheduled to `expiryRevisit`, so the session sat
+    // untouched until the 72h clock killed it and NOT ONE nudge was ever
+    // sent — silently, in exactly the case the engine exists for ("we
+    // answered, the customer went quiet"). Now they yield for a bounded
+    // quiet period measured from the human's own last activity, then
+    // rejoin the ladder. Clamped to `expiryRevisit` so a long quiet
+    // period can never strand a session past its own window.
+    const humanOwned =
+      !!conversation.assignedToUserId ||
+      (session.humanTouchedAt !== undefined &&
+        session.humanTouchedAt > session.lastCustomerMessageAt);
+    if (humanOwned) {
+      const anchor = Math.max(
+        session.humanTouchedAt ?? 0,
+        session.lastCustomerMessageAt,
+      );
+      const resumeAt = anchor + HUMAN_QUIET_MS;
+      if (now < resumeAt) {
+        return {
+          kind: "reschedule",
+          at: Math.min(clampToWorkingHours(resumeAt, config), expiryRevisit),
+        };
+      }
     }
     if (session.followUpsSent >= config.maxFollowUps) {
       return { kind: "reschedule", at: expiryRevisit };
     }
     const clamped = clampToWorkingHours(now, config);
     if (clamped > now) return { kind: "reschedule", at: clamped };
-
-    const contact = await ctx.db.get(session.contactId);
-    if (!contact) return { kind: "clear" };
 
     if (withinServiceWindow(session.lastCustomerMessageAt, now)) {
       const picked = pickFollowUpText(session, config);
@@ -1520,6 +1842,41 @@ export const markSessionExpired = internalMutation({
     await ctx.db.patch(args.sessionId, {
       status: "expired",
       closedReason: args.reason,
+      nextFollowUpAt: undefined,
+    });
+  },
+});
+
+/**
+ * Same terminal SESSION shape `applyAnalysis` already writes when the
+ * LLM classifies an inbound message's intent as "opt_out" — status
+ * "opted_out", closedReason "opted_out". Reused here for the
+ * do-not-contact gate in `followUpContext` so both paths land the
+ * session in the exact same leadsBoard bucket with the exact same
+ * label, regardless of which mechanism (an agent's note vs. the
+ * customer's own words) triggered it.
+ *
+ * Deliberately DOES NOT also patch `conversation.aiAutoreplyDisabled =
+ * true` the way `applyAnalysis`'s own opt_out branch does (~line
+ * 519-522). That field is a standing, supervisor-visible pause a human
+ * has to lift explicitly — right for "the customer told us to stop" in
+ * their own words, but wrong here: this path fires from an AGENT's
+ * do-not-contact note, and auto-reply is already correctly gated on the
+ * live `doNotContact` flag via `blockedReason` at every send site. If
+ * this also set `aiAutoreplyDisabled`, clearing the note later (the flag
+ * flips back off) would NOT resume auto-reply — the conversation would
+ * stay silently dead until a supervisor separately noticed and cleared
+ * this second, unrelated field too. Leaving it untouched keeps the one
+ * flag (`doNotContact`) the single source of truth for this path.
+ */
+export const markSessionOptedOut = internalMutation({
+  args: { sessionId: v.id("qualificationSessions") },
+  handler: async (ctx, args): Promise<void> => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.status !== "collecting") return;
+    await ctx.db.patch(args.sessionId, {
+      status: "opted_out",
+      closedReason: "opted_out",
       nextFollowUpAt: undefined,
     });
   },
@@ -1594,6 +1951,9 @@ export const sendFollowUp = internalAction({
             ...session,
             at: null,
           });
+          return;
+        case "optOut":
+          await ctx.runMutation(internal.qualificationEngine.markSessionOptedOut, session);
           return;
         case "expire":
           await ctx.runMutation(internal.qualificationEngine.markSessionExpired, {
@@ -2001,7 +2361,10 @@ export const onAdminInbound = internalMutation({
 
 /** Shared cores so the router (a mutation) can act without runMutation. */
 async function acceptOfferCore(
-  ctx: { db: import("./_generated/server").MutationCtx["db"] },
+  ctx: {
+    db: import("./_generated/server").MutationCtx["db"];
+    scheduler: import("./_generated/server").MutationCtx["scheduler"];
+  },
   offerId: Id<"leadOffers">,
 ): Promise<{ ok: boolean; alreadyAssigned?: boolean }> {
   const offer = await ctx.db.get(offerId);
@@ -2014,11 +2377,25 @@ async function acceptOfferCore(
   }
   const now = Date.now();
   await ctx.db.patch(offerId, { status: "accepted", respondedAt: now });
-  await ctx.db.patch(offer.conversationId, {
-    assignedToUserId: offer.agentUserId,
-    updatedAt: now,
+  // The agent accepted the offer themselves, so they are both actor and
+  // target. Guarded above: this branch is only reached when the
+  // conversation was still unassigned.
+  await applyAssignment(ctx, {
+    conversation,
+    nextAssignee: offer.agentUserId,
+    actorUserId: offer.agentUserId,
+    source: "offer_accept",
   });
   await chargeLeadIfAgent(ctx, offer.accountId, offer.agentUserId, offer.conversationId);
+  // Guarded above: this branch is only reached when the conversation was
+  // still unassigned (an already-assigned one cancels the offer), so the
+  // assignee genuinely changed.
+  await dispatchConversationAssigned(ctx, {
+    accountId: offer.accountId,
+    conversationId: offer.conversationId,
+    contactId: conversation.contactId,
+    agentId: offer.agentUserId,
+  });
   await insertNotification(ctx, {
     accountId: offer.accountId,
     userId: offer.agentUserId,
@@ -2042,15 +2419,83 @@ async function markOfferClosedCore(
   return { sessionId: offer.sessionId };
 }
 
-/** Tiny helper action: plain text to a staff phone. */
+/**
+ * Tiny helper action: plain text to a staff phone.
+ *
+ * Meta ACCEPTS a free-form send outside the recipient's 24h customer
+ * service window, hands back a wamid, then reports `failed`
+ * asynchronously (code 131047, "more than 24 hours have passed since
+ * the customer last replied to this number") — a failure this action's
+ * own try/catch below can never see, because it already returned by the
+ * time Meta's status callback lands.
+ *
+ * `skipWhenWindowClosed` (default `false`, i.e. always attempt — the
+ * original behavior) makes that check-before-send opt-in PER CALLER,
+ * because whether skipping is safe depends entirely on whether the
+ * caller has a fallback channel:
+ *
+ * - `ingest.ts`'s SLA alert opts in (`skipWhenWindowClosed: true`). It
+ *   writes an in-app `sla_alert` notification in the same mutation
+ *   before this ever runs, so a skip loses nothing — and production
+ *   confirms this send NEEDED gating: 442 of 856 (51.6%) silently
+ *   failed the invisible way described above.
+ * - `alertRoutingFailure`'s routing "exhausted"/"unroutable"/
+ *   "misconfigured" admin alerts (`:2884`-ish, below) stay on the
+ *   default. They have NO in-app fallback — nothing else ever tells an
+ *   admin "this lead is stranded" or "routing is broken" — and,
+ *   measured against live production data, they are NOT the failing
+ *   case: 61 of 61 delivered (0% failure), against the SLA alert's
+ *   51.6%. Gating this caller would trade a channel that already works
+ *   for a silent, unrecoverable loss (self-hosted Convex keeps no log
+ *   history; the existing `deliveryError` capture on the `messages` row
+ *   only fires on an attempted-and-failed send, never on a skip). A
+ *   rare failure here stays visible exactly the way it does today: a
+ *   persisted `messages` row with `status: "failed"` and a captured
+ *   `deliveryError`.
+ * - The two staff replies-to-a-reply in `onAdminInbound` ("someone
+ *   already took that lead", "no problem, next agent") also stay on the
+ *   default — moot either way, since they fire as an immediate reply to
+ *   an agent who just texted the bot, so their own window is open by
+ *   construction and the check would never trip.
+ *
+ * When `skipWhenWindowClosed` IS set, reuses
+ * `automationsEngine.resolveWindowQuery` — the same authoritative lookup
+ * over the shared pure `resolveWindowState` resolver that the
+ * automations send step already gates on — rather than a second,
+ * qualificationEngine-local copy of the conversation lookup.
+ */
 export const notifyStaffText = internalAction({
-  args: { accountId: v.id("accounts"), phone: v.string(), text: v.string() },
+  args: {
+    accountId: v.id("accounts"),
+    phone: v.string(),
+    text: v.string(),
+    skipWhenWindowClosed: v.optional(v.boolean()),
+  },
   handler: async (ctx, args): Promise<void> => {
     try {
       const target = await ctx.runMutation(
         internal.qualificationEngine.ensureAdminConversation,
         { accountId: args.accountId, phone: args.phone },
       );
+      if (args.skipWhenWindowClosed) {
+        const window = await ctx.runQuery(internal.automationsEngine.resolveWindowQuery, {
+          accountId: args.accountId,
+          conversationId: target.conversationId,
+        });
+        if (!window.canSendFreeForm) {
+          // Deliberately skipped, not failed — kept at a different log
+          // level than the catch below purely so a live tail can tell
+          // the two apart; self-hosted Convex keeps no execution
+          // history here, so this is NOT a durable audit trail (that's
+          // `deliveryError` on the `messages` row, for callers that
+          // don't skip and hit an actual send failure instead).
+          console.warn(
+            "[qualification] notifyStaffText skipped: recipient's window is closed",
+            { accountId: args.accountId, conversationId: target.conversationId },
+          );
+          return;
+        }
+      }
       await ctx.runAction(internal.metaSend.sendText, {
         accountId: args.accountId,
         conversationId: target.conversationId,
@@ -2073,6 +2518,17 @@ export const answerContext = internalQuery({
     if (!conversation || conversation.accountId !== inquiry.accountId) return null;
     const contact = await ctx.db.get(inquiry.contactId);
     if (!contact) return null;
+    // An agent recorded that this customer asked not to be contacted.
+    // Returning null here leaves `inquiry.status` at "answered" — the
+    // SAME terminal-looking state every other `aiEligible: false` skip
+    // (human-owned thread, paused auto-reply) already leaves it in, per
+    // this query's own `aiEligible` comment: nothing re-sweeps this row,
+    // and the answer would only ever reach the customer through the
+    // `pendingAnswers` injection on their next AI reply — which is
+    // itself gated by `blockedReason` (`aiReply.ts`'s `loadDispatchContext`),
+    // so a blocked contact can't receive it that way either. No separate
+    // terminal state to force here.
+    if (blockedReason(contact) !== null) return null;
     return {
       accountId: inquiry.accountId,
       conversationId: inquiry.conversationId,
@@ -2129,10 +2585,15 @@ export const relayAnswerToCustomer = internalAction({
         });
         const gen = await generateReply({
           provider: aiCfg.provider,
+          // Deliberately the account's own model, NOT the judge tier:
+          // this text is sent to the customer verbatim, so it is reply
+          // prose and belongs on the reply model and reply effort.
           model: aiCfg.model,
           apiKey: aiCfg.apiKey,
           systemPrompt,
           messages,
+          reasoningEffort: aiReplyReasoningEffort(),
+          promptCacheKey: promptCacheKey(context.accountId, "reply"),
         });
         text = gen.text || `Update on your question: ${context.answer}`;
       }
@@ -2187,17 +2648,28 @@ export const relayAnswerToCustomer = internalAction({
  * Tags the CONTACT with the qualified lead's service (v4, owner rule:
  * "tagging is mandatory when qualifying"). The tag is found by
  * case-insensitive name (created flat/ungrouped if missing) and linked
- * with `source: "ai"`, deduped via `by_contact_tag`. Multiple leads on
- * one conversation therefore stack multiple service tags. Kept
- * best-effort by the caller — a tagging hiccup must never fail
- * completion.
+ * with the caller's `source` (see below), deduped via `by_contact_tag`.
+ * Multiple leads on one conversation therefore stack multiple service
+ * tags. Kept best-effort by the caller — a tagging hiccup must never
+ * fail completion.
+ *
+ * `source` is a parameter defaulting to `"ai"` — the qualification path
+ * that has always owned this helper. `convex/adServiceTagging.ts` passes
+ * `"ad"` when it tags a contact from a click-to-WhatsApp referral before
+ * qualification runs.
  */
 export async function tagContactForService(
-  ctx: { db: import("./_generated/server").MutationCtx["db"] },
+  ctx: {
+    db: import("./_generated/server").MutationCtx["db"];
+    scheduler: import("./_generated/server").MutationCtx["scheduler"];
+  },
   args: {
     accountId: Id<"accounts">;
     contactId: Id<"contacts">;
     serviceName: string;
+    /** Provenance for the `contactTags` link. Defaults to "ai" — the
+     *  qualification path that has always owned this helper. */
+    source?: "ai" | "ad";
   },
 ): Promise<void> {
   const name = args.serviceName.trim();
@@ -2226,7 +2698,15 @@ export async function tagContactForService(
     accountId: args.accountId,
     contactId: args.contactId,
     tagId: tag._id,
-    source: "ai",
+    source: args.source ?? "ai",
+  });
+  // Service tagging attaches a real tag, so it fires `tag_added` too —
+  // this is the path that makes "when the <service> tag lands, follow
+  // up" automations work off qualification.
+  await dispatchTagAdded(ctx, {
+    accountId: args.accountId,
+    contactId: args.contactId,
+    tagId: tag._id,
   });
 }
 
@@ -2286,30 +2766,11 @@ export const cleanupDuplicateLeads = internalMutation({
 
 type OfferCandidate = { userId: Id<"users">; phone: string; name: string; recent: number };
 
-/**
- * Why a lead had to be offered to the whole team instead of the agents
- * linked to its service tag.
- *
- * A plain `usedFallback: boolean` used to stand on the `offer` variant,
- * which collapsed four genuinely different misconfigurations into a
- * single admin message ("no agent is linked to that tag") that is only
- * accurate for one of them. Each cause has a different remedy, and
- * naming the wrong one costs an admin a pointless hunt — so each
- * carries its own text. Listing them in one place also means a new
- * fallback path cannot be added without choosing what to tell the admin.
- */
-export type FallbackCause =
-  /** Qualified without the AI naming a service, so there was never a tag
-   *  to route by. Not a routing misconfiguration at all. */
-  | "no_service_name"
-  /** No `tags` row matches the service name. Remedy: create the tag. */
-  | "tag_missing"
-  /** The tag exists with zero `memberTags` links. Remedy: link agents. */
-  | "tag_unlinked"
-  /** Links exist, but no linked member can take a lead — each is missing
-   *  a phone or holds an `admin`/`viewer` role. Remedy: a phone number
-   *  or a role change, NOT another link. */
-  | "links_ineligible";
+// The routing rule itself now lives in `lib/qualification/routing.ts`,
+// shared with the Chasing auto-assign sweep. `FallbackCause` is
+// re-exported from its new home so every existing importer of it from
+// this module keeps resolving unchanged.
+export type { FallbackCause };
 
 /**
  * What the engine decided to do about a session's lead offer.
@@ -2385,7 +2846,8 @@ export const offerContext = internalQuery({
     // `sweepLeadOffers` (which finds work on `by_status_offered`) could
     // never retry it either. It has, by definition, no routing intent that
     // COULD have been expressed, which is the same condition that licenses
-    // widening below, so it takes the fallback path under its own cause.
+    // widening inside `resolveRouting`, so it takes the fallback path
+    // under its own cause.
     const serviceName = session.serviceName ?? null;
     // Same placeholder convention as the handoff/notification/board copy
     // above (`?? "New lead"` / `?? "Qualified lead"` / `?? "New inquiry"`),
@@ -2394,62 +2856,10 @@ export const offerContext = internalQuery({
     const contact = await ctx.db.get(session.contactId);
     const customerName = contact?.name?.trim() || contact?.phone || "a customer";
 
-    const memberships = await ctx.db
-      .query("memberships")
-      .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
-      .collect();
-    // Everyone who could take a lead at all: right role, reachable.
-    const eligibleById = new Map<Id<"users">, { phone: string; name: string }>();
-    for (const m of memberships) {
-      if (!m.phone) continue;
-      if (m.role !== "agent" && m.role !== "supervisor") continue;
-      eligibleById.set(m.userId, {
-        phone: m.phone,
-        name: m.fullName ?? m.email ?? "Team member",
-      });
-    }
-
-    // Who the service tag routes to, computed BEFORE subtracting anyone
-    // already tried — an empty set here means no routing intent was ever
-    // expressed, which is what licenses the whole-team fallback. This is
-    // deliberately NOT the "linked people exist but have all passed"
-    // case: there the intent WAS expressed and honoured, so we fall
-    // through to `exhausted` and let a human decide instead of silently
-    // overriding a deliberate configuration.
-    let poolIds: Id<"users">[] = [];
-    let fallback: FallbackCause | null = null;
-    if (!serviceName) {
-      fallback = "no_service_name";
-    } else {
-      // the service tag (auto-created at completion)
-      const tags = await ctx.db
-        .query("tags")
-        .withIndex("by_account", (q) => q.eq("accountId", session.accountId))
-        .collect();
-      const serviceTag = tags.find(
-        (t) => t.name.trim().toLowerCase() === serviceName.trim().toLowerCase(),
-      );
-      if (!serviceTag) {
-        // Reachable: `tagContactForService` runs best-effort inside a
-        // try/catch at completion, so the row can simply never exist.
-        fallback = "tag_missing";
-      } else {
-        const links = await ctx.db
-          .query("memberTags")
-          .withIndex("by_account_tag", (q) =>
-            q.eq("accountId", session.accountId).eq("tagId", serviceTag._id),
-          )
-          .collect();
-        poolIds = links.map((l) => l.userId).filter((id) => eligibleById.has(id));
-        // Someone linked but unreachable is a different problem, and a
-        // different remedy, from nobody linked at all.
-        if (poolIds.length === 0) {
-          fallback = links.length === 0 ? "tag_unlinked" : "links_ineligible";
-        }
-      }
-    }
-    // Widen to the whole team rather than lose the lead.
-    if (fallback) poolIds = Array.from(eligibleById.keys());
+    const { eligibleById, poolIds, fallback } = await resolveRouting(ctx, {
+      accountId: session.accountId,
+      serviceName,
+    });
 
     // Both no-candidate exits below answer the same question; building it
     // once is what keeps them from drifting apart.
@@ -2748,27 +3158,34 @@ export const announceAssignment = internalAction({
         offerId: args.offerId,
       });
       if (!data) return;
-      await ctx.runAction(internal.metaSend.sendText, {
-        accountId: data.accountId,
-        conversationId: data.customerConversationId,
-        to: data.customerPhone,
-        text:
-          `Great news — ${data.agentName} from our team will contact you shortly to take this forward! 🎉\n` +
-          "Meanwhile, here's their contact — feel free to save it in case you'd like to call.",
-      });
-      await ctx.runAction(internal.metaSend.sendContactCard, {
-        accountId: data.accountId,
-        conversationId: data.customerConversationId,
-        to: data.customerPhone,
-        cardName: data.agentName,
-        cardPhone: data.agentPhone,
-        jobTitle: data.agentJobTitle,
-        company: data.company,
-        email: data.companyEmail,
-        website: data.companyWebsite,
-        companyPhone: data.companyPhone,
-        address: data.companyAddress,
-      });
+      // Customer-facing half only — gated. The agent still needs to know
+      // precisely that this lead is theirs (so they see the do-not-contact
+      // banner on the thread and don't chase), so that send below runs
+      // unconditionally; only the intro text + contact card TO THE
+      // CUSTOMER are skipped.
+      if (!data.customerBlocked) {
+        await ctx.runAction(internal.metaSend.sendText, {
+          accountId: data.accountId,
+          conversationId: data.customerConversationId,
+          to: data.customerPhone,
+          text:
+            `Great news — ${data.agentName} from our team will contact you shortly to take this forward! 🎉\n` +
+            "Meanwhile, here's their contact — feel free to save it in case you'd like to call.",
+        });
+        await ctx.runAction(internal.metaSend.sendContactCard, {
+          accountId: data.accountId,
+          conversationId: data.customerConversationId,
+          to: data.customerPhone,
+          cardName: data.agentName,
+          cardPhone: data.agentPhone,
+          jobTitle: data.agentJobTitle,
+          company: data.company,
+          email: data.companyEmail,
+          website: data.companyWebsite,
+          companyPhone: data.companyPhone,
+          address: data.companyAddress,
+        });
+      }
       const staff = await ctx.runMutation(
         internal.qualificationEngine.ensureAdminConversation,
         { accountId: data.accountId, phone: data.agentPhone },
@@ -2823,6 +3240,14 @@ export const announceContext = internalQuery({
       customerConversationId: offer.conversationId,
       customerPhone: contact.phone,
       customerName: contact.name?.trim() || contact.phone,
+      // An agent recorded that this customer asked not to be contacted.
+      // Read here (not filtered by returning null) because this row also
+      // carries the AGENT half of the announcement — `announceAssignment`
+      // below uses this flag to skip ONLY the two customer-facing sends
+      // (the intro text + contact card) while still telling the agent
+      // they own the lead, same as `blockedReason`'s own doc comment:
+      // "Machines are stopped; people are informed."
+      customerBlocked: blockedReason(contact) !== null,
       agentName: membership.fullName ?? membership.email ?? "our travel expert",
       agentPhone: offer.agentPhone,
       agentJobTitle: membership.jobTitle,
@@ -3048,7 +3473,14 @@ export const staffCheckinsDue = internalQuery({
           accountId: config.accountId,
           phone,
           phoneNormalized,
-          windowOpen: now - lastInbound < 24 * 3_600_000 && lastInbound > 0,
+          windowOpen: resolveWindowState({
+            now,
+            // `lastInbound` is 0 when the conversation has no customer
+            // message yet. The resolver takes `undefined` for that case
+            // and reports the window closed either way, which preserves
+            // the `lastInbound > 0` guard this replaces.
+            lastInboundAt: lastInbound > 0 ? lastInbound : undefined,
+          }).csw.open,
           templateName: config.staffCheckinTemplateName ?? null,
           templateLanguage: config.staffCheckinTemplateLanguage ?? null,
         });

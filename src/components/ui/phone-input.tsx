@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import type { CountryCode } from 'libphonenumber-js';
 import { Input } from '@/components/ui/input';
 import {
@@ -8,6 +8,7 @@ import {
   composeE164,
   formatAsYouType,
   listCountryOptions,
+  nextPickerState,
   splitE164,
 } from '@/lib/whatsapp/phone-input-logic';
 
@@ -29,17 +30,29 @@ export function PhoneInput({ value, onChange, id, placeholder }: PhoneInputProps
 
   // Re-seed when the incoming value changes to a different number (e.g. the
   // form switches from "add" to "edit", or resets on open).
-  useEffect(() => {
-    const parts = splitE164(value);
-    if (parts) {
-      setCountry(parts.country);
-      setNational(parts.national);
-    } else if (!value) {
-      setNational('');
-      setCountry(DEFAULT_COUNTRY);
+  //
+  // Done DURING RENDER, guarded by the previous value, which is React's
+  // documented way to adjust state when a prop changes — not in an
+  // effect. An effect here re-seeded after the browser had already
+  // painted the stale number, so the control rendered twice on every
+  // external change, and it round-trips its own keystrokes through the
+  // parent so "every external change" means every keystroke. React
+  // re-runs this component before committing instead, and nothing
+  // downstream ever sees the intermediate state.
+  //
+  // The decision itself lives in `nextPickerState`, where it is unit
+  // tested; the important half is that it returns null for a non-empty
+  // value it cannot parse, so a half-typed number does not reset the
+  // country the user just picked.
+  const [lastValue, setLastValue] = useState(value);
+  if (value !== lastValue) {
+    setLastValue(value);
+    const next = nextPickerState(value);
+    if (next) {
+      setCountry(next.country);
+      setNational(next.national);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-seed only on external value change
-  }, [value]);
+  }
 
   function emit(nextCountry: CountryCode, nextNational: string) {
     onChange(composeE164(nextCountry, nextNational));

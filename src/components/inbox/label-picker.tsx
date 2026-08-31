@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery } from 'convex/react';
-import { Check, Plus } from 'lucide-react';
+import { Check, Megaphone, Plus } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { toUiTag, toUiTagGroup } from '@/lib/convex/adapters';
@@ -56,17 +56,24 @@ export function LabelPicker({
           key={tag.id}
           type="button"
           onClick={() => toggle(tag)}
-          className="rounded-full px-2 py-0.5 text-[10px] font-medium"
+          className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium"
           style={{ backgroundColor: `${tag.color}20`, color: tag.color }}
           title={tag.name}
         >
+          {tag.source === 'ad' && (
+            <Megaphone
+              className="mr-1 h-2.5 w-2.5 shrink-0"
+              role="img"
+              aria-label={t('fromAd')}
+            />
+          )}
           {tag.name} ×
         </button>
       ))}
 
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger
-          className="inline-flex items-center gap-0.5 rounded-full border border-dashed border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+          className="inline-flex items-center gap-0.5 rounded-full border border-dashed border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
         >
           <Plus className="size-3" /> {t('add')}
         </PopoverTrigger>
@@ -74,7 +81,7 @@ export function LabelPicker({
           <div className="max-h-72 space-y-3 overflow-y-auto">
             {dimensions.map(({ group, tags: groupTagsList }) => (
               <div key={group?.id ?? 'ungrouped'}>
-                <p className="mb-1 px-1 text-[10px] uppercase text-muted-foreground">
+                <p className="mb-1 px-1 text-[11px] uppercase text-muted-foreground">
                   {group ? group.name : t('ungrouped')}
                 </p>
                 <div className="flex flex-col">

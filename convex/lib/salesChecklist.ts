@@ -1,3 +1,4 @@
+import { withExtraInstructions } from "./agentRegistry";
 // Pure helpers for the post-qualification sales checklist — no Convex
 // imports so everything here is directly unit-testable. The checklist a
 // lead actually gets is KB-driven (the `SALES CHECKLIST` section of the
@@ -24,7 +25,7 @@ export const DEFAULT_SALES_CHECKLIST: ChecklistItemSeed[] = [
     key: "pitch",
     title: "Give a proper pitch",
     description:
-      "Present the right package for their needs: what's included and why Holidayys.",
+      "Present the right package for their needs: what's included and why us.",
   },
   {
     key: "price",
@@ -150,19 +151,84 @@ export function allItemsDone(items: { done: boolean }[]): boolean {
 export function buildChecklistPrompt(args: {
   excerpts: string[];
   serviceName: string | null;
+  extraInstructions?: string | null;
 }): string {
   const excerpts = args.excerpts
     .map((c, i) => `[${i + 1}] ${c}`)
     .join("\n\n---\n\n");
-  return [
+  const head = [
     "You turn a travel company's sales-process documentation into the working checklist a salesperson must complete for one newly qualified lead.",
     args.serviceName ? `The lead's service: ${args.serviceName}.` : "",
     "Documentation excerpts (SALES CHECKLIST section):",
     excerpts,
-    "",
-    'Reply with ONLY a JSON array of tasks, ordered: [{"title": "…", "description": "…"}]',
-    "Rules: 3–12 tasks; imperative titles under 120 characters; description is one concrete sentence; no markdown, no commentary outside the JSON.",
   ]
     .filter(Boolean)
     .join("\n");
+
+  return withExtraInstructions(
+    head,
+    [
+      'Reply with ONLY a JSON array of tasks, ordered: [{"title": "…", "description": "…"}]',
+      "Rules: 3–12 tasks; imperative titles under 120 characters; description is one concrete sentence; no markdown, no commentary outside the JSON.",
+    ].join("\n"),
+    args.extraInstructions,
+  );
+}
+
+import type { Doc, Id } from "../_generated/dataModel";
+
+/** Exactly the payload `LeadChecklist` renders — one shape shared by the
+ *  Leads board and the Inbox panel, so adding an item field can never
+ *  reach one surface and miss the other. */
+export interface ChecklistProjection {
+  checklistId: string;
+  source: "kb" | "default";
+  doneCount: number;
+  total: number;
+  outcome: {
+    result: "won" | "lost";
+    lossCategory: string | null;
+    lossDetail: string | null;
+    at: number;
+  } | null;
+  items: Array<{
+    key: string;
+    title: string;
+    description: string | null;
+    done: boolean;
+    doneAt: number | null;
+    doneByName: string | null;
+    note: string | null;
+  }>;
+}
+
+/** `memberName` is the caller's already-loaded userId → display name map;
+ *  a miss yields null rather than an email (staff PII below admin). */
+export function projectChecklist(
+  row: Doc<"salesChecklists">,
+  memberName: Map<Id<"users">, string>,
+): ChecklistProjection {
+  return {
+    checklistId: row._id,
+    source: row.source,
+    doneCount: row.items.filter((i) => i.done).length,
+    total: row.items.length,
+    outcome: row.outcome
+      ? {
+          result: row.outcome.result,
+          lossCategory: row.outcome.lossCategory ?? null,
+          lossDetail: row.outcome.lossDetail ?? null,
+          at: row.outcome.at,
+        }
+      : null,
+    items: row.items.map((i) => ({
+      key: i.key,
+      title: i.title,
+      description: i.description ?? null,
+      done: i.done,
+      doneAt: i.doneAt ?? null,
+      doneByName: i.doneByUserId ? (memberName.get(i.doneByUserId) ?? null) : null,
+      note: i.note ?? null,
+    })),
+  };
 }

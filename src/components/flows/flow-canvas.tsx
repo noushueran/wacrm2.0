@@ -78,7 +78,6 @@ import {
 } from '@/lib/flows/edges';
 import { autoLayout, shouldAutoLayout } from '@/lib/flows/layout';
 import {
-  NODE_META,
   NodeIconChip,
   groupNodeTypesByCategory,
   nodeColors,
@@ -136,7 +135,6 @@ function slotColor(nodeType: NodeType, slotId: string, fallback: string) {
 function FlowNodeCard({ data, selected }: NodeProps) {
   const t = useTranslations('Flows.builder');
   const { node, isEntry, isFlashed } = data as NodeData;
-  const meta = NODE_META[node.node_type];
   const c = nodeColors(node.node_type);
   const tSummary = useTranslations('Flows.summary');
   const summary = summarizeNode(node, tSummary);
@@ -192,18 +190,18 @@ function FlowNodeCard({ data, selected }: NodeProps) {
           className="rounded-md"
         />
         <span
-          className="truncate text-[10.5px] font-semibold tracking-wider uppercase"
+          className="truncate text-[11.5px] font-semibold tracking-wider uppercase"
           style={{ color: c.text }}
         >
           {t(`nodes.${node.node_type}.label`)}
         </span>
         {isEntry && (
-          <span className="border-border text-muted-foreground ml-auto rounded border px-1.5 py-0.5 text-[8.5px] font-bold tracking-[0.1em] uppercase">
+          <span className="border-border text-muted-foreground ml-auto rounded border px-1.5 py-0.5 text-[9.5px] font-bold tracking-[0.1em] uppercase">
             {t('badgeEntry')}
           </span>
         )}
       </div>
-      <div className="text-muted-foreground mt-2 truncate font-mono text-[11px]">
+      <div className="text-muted-foreground mt-2 truncate font-mono text-[12px]">
         {node.node_key}
       </div>
       {summary && (
@@ -217,7 +215,7 @@ function FlowNodeCard({ data, selected }: NodeProps) {
           {slots.map((slot) => (
             <div
               key={slot.id}
-              className="text-muted-foreground relative flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[11px]"
+              className="text-muted-foreground relative flex items-center justify-between gap-2 rounded px-1 py-0.5 text-[12px]"
             >
               <span className="truncate" title={slot.label}>
                 {slot.label}
@@ -624,7 +622,6 @@ function NodeEditSheet({
       </Sheet>
     );
   }
-  const meta = NODE_META[node.node_type];
   const c = nodeColors(node.node_type);
   return (
     <Sheet open={open} onOpenChange={(v) => !v && onClose()}>
@@ -635,10 +632,10 @@ function NodeEditSheet({
         <SheetHeader className="border-border flex-row items-center gap-3 space-y-0 border-b px-5 py-4">
           <NodeIconChip type={node.node_type} size={36} iconSize={18} />
           <div className="min-w-0 flex-1">
-            <SheetTitle className="flex items-center gap-2 text-[11px] font-semibold tracking-wider uppercase">
+            <SheetTitle className="flex items-center gap-2 text-[12px] font-semibold tracking-wider uppercase">
               <span style={{ color: c.text }}>{t(`nodes.${node.node_type}.label`)}</span>
               {isEntry && (
-                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-semibold tracking-wider text-emerald-300 uppercase">
+                <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wider text-emerald-300 uppercase">
                   {t('badgeEntry')}
                 </span>
               )}
@@ -647,7 +644,7 @@ function NodeEditSheet({
               {t(`nodes.${node.node_type}.blurb`)}
             </SheetDescription>
           </div>
-          <code className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px]">
+          <code className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]">
             {node.node_key}
           </code>
         </SheetHeader>
@@ -735,7 +732,7 @@ function CanvasAddNodeButton({ t }: { t: ReturnType<typeof useTranslations> }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        className="bg-primary text-primary-foreground hover:bg-primary-hover inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-[13px] font-medium shadow-[0_6px_20px_-8px_rgba(0,0,0,0.5)] transition-colors"
+        className="bg-primary text-primary-foreground hover:bg-primary-hover inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-[14px] font-medium shadow-[0_6px_20px_-8px_rgba(0,0,0,0.5)] transition-colors"
         aria-label={t('addNode')}
       >
         <Plus className="h-4 w-4" />
@@ -753,11 +750,10 @@ function CanvasAddNodeButton({ t }: { t: ReturnType<typeof useTranslations> }) {
           <Fragment key={group.id}>
             {i > 0 && <DropdownMenuSeparator />}
             <DropdownMenuGroup>
-              <DropdownMenuLabel className="text-muted-foreground px-2 py-1.5 text-[11px] font-semibold tracking-wider uppercase">
+              <DropdownMenuLabel className="text-muted-foreground px-2 py-1.5 text-[12px] font-semibold tracking-wider uppercase">
                 {t(`categories.${group.id}`)}
               </DropdownMenuLabel>
               {group.types.map((t_type) => {
-                const meta = NODE_META[t_type];
                 return (
                   <DropdownMenuItem
                     key={t_type}
@@ -771,10 +767,10 @@ function CanvasAddNodeButton({ t }: { t: ReturnType<typeof useTranslations> }) {
                       className="rounded-md"
                     />
                     <span className="flex flex-col">
-                      <span className="text-popover-foreground text-[13px] font-semibold">
+                      <span className="text-popover-foreground text-[14px] font-semibold">
                         {t(`nodes.${t_type}.label`)}
                       </span>
-                      <span className="text-muted-foreground text-[11.5px]">
+                      <span className="text-muted-foreground text-[12.5px]">
                         {t(`nodes.${t_type}.blurb`)}
                       </span>
                     </span>

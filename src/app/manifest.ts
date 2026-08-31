@@ -1,11 +1,12 @@
 import type { MetadataRoute } from "next";
+import { BRAND, PRODUCT_NAME } from "@/lib/brand";
 
 // Web app manifest — makes the CRM installable. `start_url` opens the
 // inbox (the daily driver); the app boots dark to match the shell.
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "Holidayys WA CRM",
-    short_name: "Holidayys",
+    name: PRODUCT_NAME,
+    short_name: BRAND.name,
     id: "/",
     start_url: "/inbox",
     scope: "/",

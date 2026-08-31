@@ -149,7 +149,7 @@ test("create seeds one broadcastRecipients row per contact, all counts zeroed, s
   });
   const contactIds = await seedContacts(asUser, 3);
 
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -187,7 +187,7 @@ test("create accepts an explicit status, templateVariables, and audienceFilter",
   });
   const contactIds = await seedContacts(asUser, 1);
 
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
     status: "draft",
@@ -231,7 +231,7 @@ test("create throws NOT_FOUND when Bob supplies Alice's contactId, and creates n
   ).toHaveLength(0);
 
   // Positive control — Bob's own contacts work fine.
-  const broadcastId = await asBob.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asBob.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: bobContactIds,
   });
@@ -259,6 +259,161 @@ test("create throws FORBIDDEN for a caller below the agent role", async () => {
 });
 
 // ============================================================
+// create — Gate 4: drop do-not-contact recipients, don't reject
+// ============================================================
+
+test("create drops do-not-contact contacts and reports how many", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const keep = await asUser.mutation(api.contacts.create, { phone: "1" });
+  const drop = await asUser.mutation(api.contacts.create, { phone: "2" });
+
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId: drop,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(drop, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const result = await asUser.mutation(api.broadcasts.create, {
+    name: "August offer",
+    templateName: "promo",
+    templateLanguage: "en",
+    contactIds: [keep, drop],
+  });
+
+  expect(result.skipped).toBe(1);
+
+  const recipients = await t.run((ctx) =>
+    ctx.db
+      .query("broadcastRecipients")
+      .withIndex("by_broadcast", (q) => q.eq("broadcastId", result.broadcastId))
+      .collect(),
+  );
+  expect(recipients.map((r) => r.contactId)).toEqual([keep]);
+
+  const broadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
+  // The count must reflect who will ACTUALLY be messaged, or every
+  // progress percentage downstream is wrong.
+  expect(broadcast!.totalRecipients).toBe(1);
+});
+
+test("create still rejects a foreign contactId outright", async () => {
+  const t = convexTest(schema, modules);
+  const alice = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const bob = await seedAccountMember(t, {
+    name: "Bob",
+    email: "bob@example.com",
+    role: "agent",
+  });
+  const mine = await alice.asUser.mutation(api.contacts.create, { phone: "1" });
+  const theirs = await bob.asUser.mutation(api.contacts.create, { phone: "2" });
+
+  // Dropping is for a customer who opted out. A cross-tenant id is an
+  // error, and must stay one.
+  await expect(
+    alice.asUser.mutation(api.broadcasts.create, {
+      name: "x",
+      templateName: "promo",
+      templateLanguage: "en",
+      contactIds: [mine, theirs],
+    }),
+  ).rejects.toThrow(/NOT_FOUND/);
+});
+
+test("a broadcast to only do-not-contact contacts creates nothing sendable", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const drop = await asUser.mutation(api.contacts.create, { phone: "1" });
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId: drop,
+      noteText: "Stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(drop, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const result = await asUser.mutation(api.broadcasts.create, {
+    name: "x",
+    templateName: "promo",
+    templateLanguage: "en",
+    contactIds: [drop],
+  });
+  expect(result.skipped).toBe(1);
+  const broadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
+  expect(broadcast!.totalRecipients).toBe(0);
+});
+
+test("createInternal's sendable/skipped partition accounts for every contactId, and its returned totalRecipients matches sendable.length exactly", async () => {
+  // Guards the invariant `apiV1.ts`'s `createBroadcast` now relies on:
+  // it reports `createInternal`'s `totalRecipients` back to the public
+  // API caller VERBATIM rather than re-deriving it. That's only safe
+  // because this loop is a strict partition — every id lands in exactly
+  // one of `sendable`/`skipped`. If a future second filter here (a
+  // suppression list, a per-broadcast dedupe, a rate cap) shrinks
+  // `sendable` without incrementing `skipped`, this test fails loudly
+  // at the source instead of the two counts silently drifting apart at
+  // the public API edge.
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const keep1 = await asUser.mutation(api.contacts.create, { phone: "1" });
+  const drop = await asUser.mutation(api.contacts.create, { phone: "2" });
+  const keep2 = await asUser.mutation(api.contacts.create, { phone: "3" });
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId: drop,
+      noteText: "Stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(drop, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const contactIds = [keep1, drop, keep2];
+  const result = await t.mutation(internal.broadcasts.createInternal, {
+    accountId,
+    name: "x",
+    templateName: "promo",
+    templateLanguage: "en",
+    contactIds,
+  });
+
+  // The partition itself: every id is accounted for exactly once.
+  expect(result.totalRecipients + result.skipped).toBe(contactIds.length);
+
+  // The returned count matches what was actually persisted — not just
+  // arithmetically, but the SAME value read back from the row.
+  const broadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
+  expect(broadcast!.totalRecipients).toBe(result.totalRecipients);
+  expect(result.totalRecipients).toBe(2);
+  expect(result.skipped).toBe(1);
+});
+
+// ============================================================
 // setRecipientStatus — count aggregation (the payoff of this task)
 // ============================================================
 
@@ -270,7 +425,7 @@ test("setRecipientStatus advances counts one column at a time through pending ->
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -341,7 +496,7 @@ test("setRecipientStatus on a separate recipient -> failed bumps only failedCoun
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -379,7 +534,7 @@ test("setRecipientStatus is a total no-op when the status is unchanged — count
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -422,7 +577,7 @@ test("setRecipientStatus throws NOT_FOUND for a recipient belonging to a differe
     role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: aliceContactIds,
   });
@@ -468,12 +623,12 @@ test("list never returns another account's broadcasts, newest first", async () =
     role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
-  const first = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId: first } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     name: "First",
     contactIds,
   });
-  const second = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId: second } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     name: "Second",
     contactIds,
@@ -498,7 +653,7 @@ test("get throws NOT_FOUND for a broadcast belonging to a different account", as
     role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -520,7 +675,7 @@ test("listRecipients returns the broadcast's recipients, scoped to the caller's 
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -549,7 +704,7 @@ test("listRecipients throws NOT_FOUND for a broadcast belonging to a different a
     role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -578,7 +733,7 @@ test("setStatus patches status and bumps updatedAt", async () => {
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -607,7 +762,7 @@ test("setStatus throws NOT_FOUND for a broadcast belonging to a different accoun
     role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 1);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -640,7 +795,7 @@ test("remove cascades: deletes the broadcast's recipients along with it", async 
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -676,7 +831,7 @@ test("remove throws NOT_FOUND for a broadcast belonging to a different account, 
     role: "supervisor",
   });
   const contactIds = await seedContacts(asAlice, 2);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -737,7 +892,7 @@ test("recordRecipientStatusByWamid finds the recipient by wamid, advances its st
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -781,7 +936,7 @@ test("recordRecipientStatusByWamid refuses an out-of-order regression: 'sent' ar
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -822,7 +977,7 @@ test("recordRecipientStatusByWamid records an errorMessage on 'failed' and bumps
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -861,7 +1016,7 @@ test("recordRecipientStatusByWamid targets exactly the matching recipient: a dif
     role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
-  const aliceBroadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId: aliceBroadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: aliceContactIds,
   });
@@ -873,7 +1028,7 @@ test("recordRecipientStatusByWamid targets exactly the matching recipient: a dif
   });
 
   const bobContactIds = await seedContacts(asBob, 1);
-  const bobBroadcastId = await asBob.mutation(api.broadcasts.create, {
+  const { broadcastId: bobBroadcastId } = await asBob.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: bobContactIds,
   });
@@ -923,7 +1078,7 @@ test("send schedules one deliverOne per pending recipient and flips the broadcas
   // Created as "draft" so the assertion below actually demonstrates
   // `send` performing the flip, rather than merely leaving `create`'s
   // own default ("sending") untouched.
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
     status: "draft",
@@ -962,7 +1117,7 @@ test("deliverOne in DRY-RUN sends the template, stamps the recipient 'sent', rec
     role: "supervisor",
   });
   const [contactId] = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: [contactId!],
   });
@@ -1024,7 +1179,7 @@ test("a per-recipient failure (its contact deleted before delivery) stamps 'fail
     role: "supervisor",
   });
   const [okContactId, goneContactId] = await seedContacts(asUser, 2);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: [okContactId!, goneContactId!],
   });
@@ -1063,7 +1218,7 @@ test("finalizes 'failed' when every recipient fails", async () => {
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 2);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -1081,6 +1236,76 @@ test("finalizes 'failed' when every recipient fails", async () => {
   expect(broadcast!.status).toBe("failed");
   expect(broadcast!.sentCount).toBe(0);
   expect(broadcast!.failedCount).toBe(2);
+});
+
+// ============================================================
+// do-not-contact gate at SEND time (final review, CRITICAL 2) — `create`
+// only snapshots do-not-contact ONCE, at broadcast-creation time
+// (`blockedReason` check further up this file). A broadcast fans out
+// over minutes via `DELIVER_STAGGER_MS`, so a recipient flagged AFTER
+// `create` but BEFORE its own `deliverOne` fires must still never be
+// messaged — this is the live, per-send re-check `deliverOne` itself
+// must perform.
+// ============================================================
+
+test("a recipient flagged do-not-contact AFTER create but BEFORE deliverOne runs is never messaged, and the broadcast still finalizes", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const [okContactId, laterBlockedContactId] = await seedContacts(asUser, 2);
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: [okContactId!, laterBlockedContactId!],
+  });
+
+  // Both recipients are still "pending" — `deliverOne` hasn't scheduled/
+  // run yet. An agent flags the second contact do-not-contact right now,
+  // exactly the mid-run window `create`'s own one-time snapshot check
+  // can't see.
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId: (await ctx.db.get(laterBlockedContactId!))!.accountId,
+      contactId: laterBlockedContactId!,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(laterBlockedContactId!, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  await asUser.action(api.broadcasts.send, { broadcastId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  const ok = recipients.find((r) => r.contactId === okContactId);
+  const blocked = recipients.find((r) => r.contactId === laterBlockedContactId);
+  expect(ok!.status).toBe("sent");
+  expect(ok!.whatsappMessageId).toMatch(/^dry-run-[0-9a-f]{16}$/);
+  // Reuses the SAME terminal status an undeliverable recipient already
+  // gets (never a new one) — see this function's own comment.
+  expect(blocked!.status).toBe("failed");
+  expect(blocked!.errorMessage).toMatch(/do_not_contact/);
+
+  // No message was ever written for the blocked contact.
+  const blockedConversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", laterBlockedContactId!))
+      .first(),
+  );
+  expect(blockedConversation).toBeNull();
+
+  // The broadcast still reaches a terminal state — a partial send (one
+  // succeeded) is "sent", not stuck "sending" forever.
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.status).toBe("sent");
+  expect(broadcast!.sentCount).toBe(1);
+  expect(broadcast!.failedCount).toBe(1);
 });
 
 test("send with zero pending recipients finalizes immediately rather than staying stuck at 'sending'", async () => {
@@ -1130,7 +1355,7 @@ test("send throws NOT_FOUND for a broadcast belonging to a different account, an
     role: "supervisor",
   });
   const aliceContactIds = await seedContacts(asAlice, 1);
-  const broadcastId = await asAlice.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asAlice.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds: aliceContactIds,
   });
@@ -1153,7 +1378,7 @@ test("send throws UNAUTHENTICATED when there is no identity", async () => {
     role: "supervisor",
   });
   const contactIds = await seedContacts(asUser, 1);
-  const broadcastId = await asUser.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -1249,7 +1474,7 @@ test("broadcasts.get and listRecipients throw FORBIDDEN below supervisor", async
     role: "owner",
   });
   const contactIds = await seedContacts(asOwner, 1);
-  const broadcastId = await asOwner.mutation(api.broadcasts.create, {
+  const { broadcastId } = await asOwner.mutation(api.broadcasts.create, {
     ...baseBroadcast,
     contactIds,
   });
@@ -1261,4 +1486,91 @@ test("broadcasts.get and listRecipients throw FORBIDDEN below supervisor", async
   await expect(
     asAgent.query(api.broadcasts.listRecipients, { broadcastId, ...onePage }),
   ).rejects.toMatchObject({ data: { code: "FORBIDDEN", min: "supervisor" } });
+});
+
+// ============================================================
+// Opt-out told to the BOT (spec 2026-08-09). `contacts.doNotContact` is
+// only ever set by a human note; when a customer tells the assistant to
+// stop, the qualification engine records it on the SESSION instead. A
+// gate that checks one and not the other messages exactly the people who
+// asked it not to.
+// ============================================================
+
+async function optOutOfBot(
+  t: ReturnType<typeof convexTest>,
+  accountId: string,
+  contactId: string,
+) {
+  await t.run(async (ctx) => {
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId: accountId as never,
+      contactId: contactId as never,
+      status: "open",
+      unreadCount: 0,
+    });
+    await ctx.db.insert("qualificationSessions", {
+      accountId: accountId as never,
+      conversationId,
+      contactId: contactId as never,
+      status: "opted_out",
+      origin: "inbound",
+      fields: [],
+      expectedCount: 0,
+      answeredCount: 0,
+      followUpsSent: 0,
+      phrasingCursor: 0,
+      sendAttemptErrors: 0,
+    });
+  });
+}
+
+test("create drops a contact who told the bot to stop, and reports it as skipped", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const contactIds = await seedContacts(asUser, 3);
+  await optOutOfBot(t, accountId, contactIds[0]!);
+
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.totalRecipients).toBe(2);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  expect(recipients).toHaveLength(2);
+  // No row at all for the opted-out contact — not a failed one.
+  expect(recipients.map((r) => r.contactId)).not.toContain(contactIds[0]);
+});
+
+test("an opt-out that lands after create still stops the send", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser, accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const contactIds = await seedContacts(asUser, 1);
+
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds,
+  });
+  // A broadcast fans out over minutes; the wish can arrive mid-run.
+  await optOutOfBot(t, accountId, contactIds[0]!);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  await t.action(internal.broadcasts.deliverOne, {
+    accountId: accountId as never,
+    recipientId: recipients[0]!._id as never,
+  });
+
+  const after = await recipientsOf(asUser, broadcastId);
+  expect(after[0]!.status).toBe("failed");
+  expect(after[0]!.errorMessage).toContain("opted_out");
 });

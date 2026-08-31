@@ -2,7 +2,7 @@ import type { R2Config } from "./config";
 
 // ============================================================
 // Key → public URL. Objects are served from the R2 custom domain
-// (`objs.holidayys.co`), NOT the S3 API endpoint and NOT `r2.dev`
+// (the deployment's own media host), NOT the S3 API endpoint and NOT `r2.dev`
 // (Cloudflare rate-limits `r2.dev` and documents it as development-only;
 // Meta and OpenAI both fetch these URLs server-side).
 //

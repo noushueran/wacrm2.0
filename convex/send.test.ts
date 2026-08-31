@@ -522,7 +522,7 @@ test("send routes a media messageType (image) to metaSend.sendMedia", async () =
 test("send resolves a message's mediaKey to a public R2 URL for Meta, and persists BOTH the key and the resolved URL", async () => {
   // Arrange an outbound media send whose staged object is identified by
   // key, not by legacy URL, and assert the `link` handed to Meta is the
-  // objs.holidayys.co URL rather than a Convex storage URL.
+  // objs.amaniworld.com URL rather than a Convex storage URL.
   //
   // Same arrangement as "send routes a media messageType (image) to
   // metaSend.sendMedia" above (DRY-RUN + account/conversation seeding).
@@ -543,11 +543,11 @@ test("send resolves a message's mediaKey to a public R2 URL for Meta, and persis
   // composer-attachment / voice-note write path durably stores a key
   // instead of discarding it after resolution.
   process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
@@ -585,7 +585,7 @@ test("send resolves a message's mediaKey to a public R2 URL for Meta, and persis
   expect(messages).toHaveLength(1);
   const capturedLink = messages[0]!.mediaUrl;
   expect(capturedLink).toBe(
-    `https://objs.holidayys.co/${accountId}/outbound/photo.png`,
+    `https://objs.amaniworld.com/${accountId}/outbound/photo.png`,
   );
   expect(messages[0]!.mediaKey).toBe(`${accountId}/outbound/photo.png`);
 
@@ -614,15 +614,15 @@ test("send resolves a message's mediaKey to a public R2 URL for Meta, and persis
 
 test("send rejects a mediaKey belonging to a different account (cross-tenant), and nothing is persisted", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   // R2 is deliberately left CONFIGURED (not omitted) for this test: with
   // no ownership check, `resolveMediaUrlLazy` would successfully resolve
-  // Bob's key to a real `objs.holidayys.co` URL and the send would
+  // Bob's key to a real `objs.amaniworld.com` URL and the send would
   // SUCCEED (persisting Bob's URL into Alice's message) — that failure
   // mode is the actual vulnerability, and it only surfaces when R2 is
   // configured. Leaving R2 unconfigured would instead make an unfixed
@@ -676,11 +676,11 @@ test("send rejects a mediaKey belonging to a different account (cross-tenant), a
 
 test("send rejects a malformed mediaKey with the SAME NOT_FOUND shape as a foreign key", async () => {
   process.env.CONVEX_META_DRY_RUN = "1";
-  process.env.R2_BUCKET = "wa-holidayys";
+  process.env.R2_BUCKET = "wa-amani";
   process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
   process.env.R2_ACCESS_KEY_ID = "ak";
   process.env.R2_SECRET_ACCESS_KEY = "sk";
-  process.env.R2_PUBLIC_HOST = "https://objs.holidayys.co";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
   const t = convexTest(schema, modules);
   const { asUser, accountId, userId } = await seedAccountMember(t, {
     name: "Alice",
@@ -704,6 +704,57 @@ test("send rejects a malformed mediaKey with the SAME NOT_FOUND shape as a forei
       // known `kind` — this has neither, so it must be rejected without
       // ever attempting to resolve it, identically to a foreign key.
       mediaKey: "not-a-real-key",
+    }),
+  ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
+
+  const messages = await t.run((ctx) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(messages).toHaveLength(0);
+
+  delete process.env.CONVEX_META_DRY_RUN;
+  delete process.env.R2_BUCKET;
+  delete process.env.R2_ENDPOINT;
+  delete process.env.R2_ACCESS_KEY_ID;
+  delete process.env.R2_SECRET_ACCESS_KEY;
+  delete process.env.R2_PUBLIC_HOST;
+});
+
+test("send rejects a same-account mediaKey whose kind is \"note\" — note attachments must never reach a customer", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  process.env.R2_BUCKET = "wa-amani";
+  process.env.R2_ENDPOINT = "https://acct.r2.cloudflarestorage.com";
+  process.env.R2_ACCESS_KEY_ID = "ak";
+  process.env.R2_SECRET_ACCESS_KEY = "sk";
+  process.env.R2_PUBLIC_HOST = "https://objs.amaniworld.com";
+  const t = convexTest(schema, modules);
+  const { asUser, accountId, userId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const contactId = await asUser.mutation(api.contacts.create, {
+    phone: "15551234567",
+  });
+  const conversationId = await seedConversation(t, {
+    accountId,
+    contactId,
+    assignedToUserId: userId,
+  });
+
+  await expect(
+    asUser.action(api.send.send, {
+      conversationId,
+      messageType: "document",
+      // Owned by the caller's own account and otherwise well-formed —
+      // only the `kind` segment is wrong. A pre-`SENDABLE_MEDIA_KINDS`
+      // build would have resolved this to a real, fetchable URL and
+      // sent a customer's internal note attachment (e.g. a passport
+      // scan) straight to WhatsApp.
+      mediaKey: `${accountId}/note/passport-scan.pdf`,
     }),
   ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "file" } });
 

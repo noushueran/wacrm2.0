@@ -21,8 +21,12 @@
 //
 //   `useMutation` is intentionally NOT re-exported — mutations aren't
 //   cacheable; keep importing it from `convex/react`.
-export {
-  useQuery,
-  usePaginatedQuery,
-  useQueries,
-} from "convex-helpers/react/cache/hooks";
+//
+//   `usePaginatedQuery` comes from `./paginated` rather than from
+//   `convex-helpers` directly: the helpers' cached version cannot
+//   recover from an `InvalidCursor` and spins until React aborts the
+//   render (#301), which took the whole Inbox route down. That file is
+//   a near-verbatim fork of it with the recovery path fixed; see its
+//   header for the full explanation.
+export { useQuery, useQueries } from "convex-helpers/react/cache/hooks";
+export { usePaginatedQuery } from "./paginated";

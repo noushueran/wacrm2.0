@@ -1,4 +1,6 @@
 import { validateInteractivePayload } from "../whatsapp/interactive";
+import { planSend, type SendMessageStepConfig } from "./sendPlan";
+import { parseDailyTime } from "./schedule";
 
 // ------------------------------------------------------------
 // Pre-flight config validation for automations about to be activated.
@@ -79,11 +81,36 @@ function walk(steps: StepLike[], prefix: string, issues: ValidationIssue[]): voi
 function validateOne(step: StepLike, path: string, issues: ValidationIssue[]): void {
   const c = step.step_config ?? {};
   switch (step.step_type) {
-    case "send_message":
-      if (!nonEmpty(c.text)) {
-        issues.push({ path: `${path}.text`, message: "message text is required" });
+    case "send_message": {
+      const cfg = c as SendMessageStepConfig;
+      if (cfg.media && cfg.interactive) {
+        issues.push({
+          path: `${path}.media`,
+          message:
+            "a send step cannot carry both media and buttons — WhatsApp has no message type for that combination",
+        });
+        break;
+      }
+      if (planSend(cfg).kind === "empty") {
+        issues.push({
+          path: `${path}.text`,
+          message: "a send step needs text, media or buttons",
+        });
+      }
+      if (cfg.interactive) {
+        const result = validateInteractivePayload(cfg.interactive);
+        if (!result.ok) {
+          issues.push({ path: `${path}.interactive`, message: result.error });
+        }
+      }
+      if (cfg.fallback && !nonEmpty(cfg.fallback.template_name)) {
+        issues.push({
+          path: `${path}.fallback.template_name`,
+          message: "fallback template name is required",
+        });
       }
       break;
+    }
     case "send_buttons":
     case "send_list": {
       // The whole step_config IS the interactive payload; validate it
@@ -203,8 +230,21 @@ export function validateTriggerForActivation(
       });
     }
   } else if (triggerType === "time_based") {
+    // Both halves are required for the cron sweep to do anything: the
+    // schedule says WHEN, the tag says WHO. Before the sweep existed
+    // this only checked that `schedule` was a non-empty string, so
+    // "every morning" or a cron expression activated cleanly and then
+    // never fired.
     if (!nonEmpty(cfg.schedule)) {
       issues.push({ path: "trigger.schedule", message: "schedule is required" });
+    } else if (parseDailyTime(cfg.schedule as string) === null) {
+      issues.push({
+        path: "trigger.schedule",
+        message: 'schedule must be a daily time in 24-hour "HH:mm" form, e.g. "09:00"',
+      });
+    }
+    if (!nonEmpty(cfg.tag_id)) {
+      issues.push({ path: "trigger.tag_id", message: "tag is required" });
     }
   } else if (triggerType === "tag_added") {
     if (!nonEmpty(cfg.tag_id)) {

@@ -253,3 +253,208 @@ test("backfill creates default checklists only for qualified sessions missing on
   expect(existing!.items).toHaveLength(2); // untouched
   expect(await checklistForSession(t, c.sessionId)).toBeNull();
 });
+
+// ------------------------------------------------------ forConversation
+
+test("forConversation returns the checklist in the board's shape", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId, checklistId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: true,
+  });
+
+  const projection = await asUser.query(api.salesChecklists.forConversation, {
+    conversationId,
+  });
+
+  expect(projection).not.toBeNull();
+  expect(projection!.checklistId).toBe(checklistId);
+  expect(projection!.source).toBe("default");
+  expect(projection!.total).toBe(2);
+  expect(projection!.doneCount).toBe(1);
+  expect(projection!.outcome).toBeNull();
+  expect(projection!.items[0]).toMatchObject({
+    key: "call", title: "Call the lead",
+    done: false, doneAt: null, doneByName: null, note: null, description: null,
+  });
+  // Seeded as done but with no `doneByUserId` — the name must be null,
+  // never a stray empty string.
+  expect(projection!.items[1]).toMatchObject({
+    key: "pitch", done: true, doneByName: null, note: "done earlier",
+  });
+});
+
+test("forConversation is null when the conversation has no session", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const conversationId = await t.run(async (ctx) => {
+    const contactId = await ctx.db.insert("contacts", {
+      accountId, phone: "+971509998877", phoneNormalized: "971509998877",
+    });
+    return await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+      assignedToUserId: userId,
+    });
+  });
+
+  expect(
+    await asUser.query(api.salesChecklists.forConversation, { conversationId }),
+  ).toBeNull();
+});
+
+test("forConversation is null when a session has no checklist yet", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: false,
+  });
+
+  expect(
+    await asUser.query(api.salesChecklists.forConversation, { conversationId }),
+  ).toBeNull();
+});
+
+// The returning customer. `qualificationEngine` opens a FRESH session on
+// the same conversation for a new inquiry, and that session has no
+// checklist until it qualifies — reading only the newest one would blank
+// the panel and send the salesperson back to the Leads board (which still
+// shows the earlier session's ticks) for exactly the case this feature
+// exists to prevent.
+test("forConversation keeps showing an older session's checklist when a newer session has none", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId, contactId, checklistId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: true,
+  });
+
+  // Inserted inline rather than via `seedLead`, which mints a whole new
+  // contact + conversation per call; the second session must land on the
+  // SAME conversation. Field set mirrors `seedLead`'s own.
+  await t.run((ctx) =>
+    ctx.db.insert("qualificationSessions", {
+      accountId, conversationId, contactId,
+      status: "collecting", origin: "inbound", fields: [],
+      expectedCount: 5, answeredCount: 1, followUpsSent: 0, phrasingCursor: 0,
+      sendAttemptErrors: 0, serviceName: "Maldives Packages",
+    }),
+  );
+
+  const projection = await asUser.query(api.salesChecklists.forConversation, {
+    conversationId,
+  });
+  expect(projection?.checklistId).toBe(checklistId);
+  expect(projection?.doneCount).toBe(1);
+});
+
+test("forConversation refuses a conversation the caller cannot reach", async () => {
+  const t = convexTest(schema, modules);
+  const mine = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const other = await seedAccountMember(t, {
+    name: "Bea", email: "bea@x.com", role: "admin",
+  });
+  const { conversationId } = await seedLead(t, {
+    accountId: mine.accountId, assignedToUserId: mine.userId, withChecklist: true,
+  });
+
+  await expect(
+    other.asUser.query(api.salesChecklists.forConversation, { conversationId }),
+  ).rejects.toThrow();
+});
+
+// `qualificationEngine.applyAnalysis` now schedules generation as soon as
+// the service is identified, not just at qualification — so the panel
+// must show a checklist for a lead still `collecting`, the case that
+// used to show nothing.
+test("forConversation returns a checklist for a lead still being collected", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  // status "collecting", NOT qualified — the case that showed nothing before.
+  const { conversationId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, status: "collecting", withChecklist: true,
+  });
+
+  const projection = await asUser.query(api.salesChecklists.forConversation, {
+    conversationId,
+  });
+  expect(projection).not.toBeNull();
+  expect(projection!.total).toBe(2);
+});
+
+test("a completed item reports who did it by name", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId, checklistId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: true,
+  });
+
+  await asUser.mutation(api.salesChecklists.setItemDone, {
+    checklistId: checklistId!, itemKey: "call", note: "Called, going ahead",
+  });
+
+  const projection = await asUser.query(api.salesChecklists.forConversation, {
+    conversationId,
+  });
+  expect(projection!.doneCount).toBe(2);
+  expect(projection!.items[0]).toMatchObject({
+    key: "call", done: true, doneByName: "Ann", note: "Called, going ahead",
+  });
+});
+
+test("completing an item files its note against the conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId, checklistId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: true,
+  });
+
+  await asUser.mutation(api.salesChecklists.setItemDone, {
+    checklistId: checklistId!, itemKey: "call", note: "Called, going ahead",
+  });
+
+  // The thread reads notes by conversation — an unstamped note appears in
+  // no thread at all, which is what this fixes.
+  const inThread = await asUser.query(api.contactNotes.listForConversation, {
+    conversationId,
+  });
+  expect(inThread).toHaveLength(1);
+  expect(inThread[0].noteText).toContain("Called, going ahead");
+});
+
+test("reopening an item also files its note against the conversation", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedAccountMember(t, {
+    name: "Ann", email: "ann@x.com", role: "agent",
+  });
+  const { conversationId, checklistId } = await seedLead(t, {
+    accountId, assignedToUserId: userId, withChecklist: true,
+  });
+
+  await asUser.mutation(api.salesChecklists.setItemDone, {
+    checklistId: checklistId!, itemKey: "call", note: "Called, going ahead",
+  });
+  await asUser.mutation(api.salesChecklists.reopenItem, {
+    checklistId: checklistId!, itemKey: "call",
+  });
+
+  const inThread = await asUser.query(api.contactNotes.listForConversation, {
+    conversationId,
+  });
+  expect(inThread).toHaveLength(2);
+  expect(inThread[1].noteText).toContain("reopened");
+});

@@ -1,9 +1,9 @@
-import { internalAction } from "./_generated/server";
-import { internal } from "./_generated/api";
-import { v } from "convex/values";
-import type { ActionCtx } from "./_generated/server";
-import type { Id } from "./_generated/dataModel";
-import { decrypt } from "./lib/whatsappEncryption";
+import { internalAction } from './_generated/server';
+import { internal } from './_generated/api';
+import { v } from 'convex/values';
+import type { ActionCtx } from './_generated/server';
+import type { Id } from './_generated/dataModel';
+import { decrypt } from './lib/whatsappEncryption';
 import {
   sendTextMessage,
   sendContactsMessage,
@@ -15,11 +15,11 @@ import {
   sendInteractiveList,
   sendReactionMessage,
   markMessageRead,
-} from "./lib/whatsapp/metaApi";
+} from './lib/whatsapp/metaApi';
 import {
   validateInteractivePayload,
   type InteractiveMessagePayload,
-} from "./lib/whatsapp/interactive";
+} from './lib/whatsapp/interactive';
 
 // ============================================================
 // Meta-send actions — the engine's one and only door to the outside
@@ -83,8 +83,8 @@ function isDryRun(): boolean {
 function dryRunWamid(): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
   return `dry-run-${hex}`;
 }
 
@@ -96,13 +96,13 @@ function dryRunWamid(): string {
  */
 async function loadDecryptedConfig(
   ctx: ActionCtx,
-  accountId: Id<"accounts">,
+  accountId: Id<'accounts'>
 ): Promise<{ phoneNumberId: string; accessToken: string }> {
   const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
     accountId,
   });
   if (!config) {
-    throw new Error("WhatsApp not configured for this account");
+    throw new Error('WhatsApp not configured for this account');
   }
   return {
     phoneNumberId: config.phoneNumberId,
@@ -112,19 +112,19 @@ async function loadDecryptedConfig(
 
 export const sendText = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     to: v.string(),
     text: v.string(),
     contextMessageId: v.optional(v.string()),
     // Defaults to "bot" (automations/flows engines); dashboard-initiated
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
-    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    senderType: v.optional(v.union(v.literal('agent'), v.literal('bot'))),
     // Internal id of the message being replied to (WhatsApp quoted reply).
     // Persisted on the outbound row so the inbox renders the quote — Meta
     // itself is told via `contextMessageId` (the wamid), resolved upstream.
-    replyToMessageId: v.optional(v.id("messages")),
+    replyToMessageId: v.optional(v.id('messages')),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -133,7 +133,7 @@ export const sendText = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
       const result = await sendTextMessage({
         phoneNumberId,
@@ -148,9 +148,9 @@ export const sendText = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: args.senderType ?? "bot",
+      senderType: args.senderType ?? 'bot',
       replyToMessageId: args.replyToMessageId,
-      contentType: "text",
+      contentType: 'text',
       contentText: args.text,
       messageId: whatsappMessageId,
     });
@@ -161,12 +161,22 @@ export const sendText = internalAction({
 
 export const sendTemplate = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     to: v.string(),
     templateName: v.string(),
     language: v.optional(v.string()),
     params: v.optional(v.array(v.string())),
+    header: v.optional(
+      v.object({
+        type: v.union(
+          v.literal('image'),
+          v.literal('video'),
+          v.literal('document')
+        ),
+        link: v.string(),
+      })
+    ),
     // The template body already rendered with `params` substituted in, for
     // local display only. Meta itself receives the structured
     // name+params payload (see `sendTemplateMessage`), never this string —
@@ -179,11 +189,11 @@ export const sendTemplate = internalAction({
     // Defaults to "bot" (automations/flows engines); dashboard-initiated
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
-    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    senderType: v.optional(v.union(v.literal('agent'), v.literal('bot'))),
     // Internal id of the message being replied to (WhatsApp quoted reply).
     // Persisted on the outbound row so the inbox renders the quote — Meta
     // itself is told via `contextMessageId` (the wamid), resolved upstream.
-    replyToMessageId: v.optional(v.id("messages")),
+    replyToMessageId: v.optional(v.id('messages')),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -192,7 +202,7 @@ export const sendTemplate = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
       const result = await sendTemplateMessage({
         phoneNumberId,
@@ -201,6 +211,7 @@ export const sendTemplate = internalAction({
         templateName: args.templateName,
         language: args.language,
         params: args.params,
+        header: args.header,
         contextMessageId: args.contextMessageId,
       });
       whatsappMessageId = result.messageId;
@@ -209,9 +220,9 @@ export const sendTemplate = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: args.senderType ?? "bot",
+      senderType: args.senderType ?? 'bot',
       replyToMessageId: args.replyToMessageId,
-      contentType: "template",
+      contentType: 'template',
       contentText: args.contentText,
       templateName: args.templateName,
       messageId: whatsappMessageId,
@@ -223,19 +234,19 @@ export const sendTemplate = internalAction({
 
 export const sendInteractive = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     to: v.string(),
     payload: v.any(),
     contextMessageId: v.optional(v.string()),
     // Defaults to "bot" (automations/flows engines); dashboard-initiated
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
-    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    senderType: v.optional(v.union(v.literal('agent'), v.literal('bot'))),
     // Internal id of the message being replied to (WhatsApp quoted reply).
     // Persisted on the outbound row so the inbox renders the quote — Meta
     // itself is told via `contextMessageId` (the wamid), resolved upstream.
-    replyToMessageId: v.optional(v.id("messages")),
+    replyToMessageId: v.optional(v.id('messages')),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     // Validate before send (dry-run or not) so a misconfigured
@@ -254,9 +265,9 @@ export const sendInteractive = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
-      if (payload.kind === "buttons") {
+      if (payload.kind === 'buttons') {
         const result = await sendInteractiveButtons({
           phoneNumberId,
           accessToken,
@@ -287,9 +298,9 @@ export const sendInteractive = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: args.senderType ?? "bot",
+      senderType: args.senderType ?? 'bot',
       replyToMessageId: args.replyToMessageId,
-      contentType: "interactive",
+      contentType: 'interactive',
       contentText: payload.body,
       interactivePayload: payload,
       messageId: whatsappMessageId,
@@ -301,14 +312,14 @@ export const sendInteractive = internalAction({
 
 export const sendMedia = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     to: v.string(),
     kind: v.union(
-      v.literal("image"),
-      v.literal("video"),
-      v.literal("document"),
-      v.literal("audio"),
+      v.literal('image'),
+      v.literal('video'),
+      v.literal('document'),
+      v.literal('audio')
     ),
     link: v.string(),
     // R2 object key the caller already resolved `link` from (Task 5's
@@ -325,11 +336,11 @@ export const sendMedia = internalAction({
     // Defaults to "bot" (automations/flows engines); dashboard-initiated
     // sends (`convex/send.ts`) pass "agent" so the message persists as a
     // human send rather than an automation's.
-    senderType: v.optional(v.union(v.literal("agent"), v.literal("bot"))),
+    senderType: v.optional(v.union(v.literal('agent'), v.literal('bot'))),
     // Internal id of the message being replied to (WhatsApp quoted reply).
     // Persisted on the outbound row so the inbox renders the quote — Meta
     // itself is told via `contextMessageId` (the wamid), resolved upstream.
-    replyToMessageId: v.optional(v.id("messages")),
+    replyToMessageId: v.optional(v.id('messages')),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     let whatsappMessageId: string;
@@ -338,7 +349,7 @@ export const sendMedia = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
       const result = await sendMediaMessage({
         phoneNumberId,
@@ -356,7 +367,7 @@ export const sendMedia = internalAction({
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: args.senderType ?? "bot",
+      senderType: args.senderType ?? 'bot',
       replyToMessageId: args.replyToMessageId,
       // `MediaKind` ("image"/"video"/"document"/"audio") is a strict
       // subset of `messages.contentType` — every value maps straight
@@ -399,15 +410,15 @@ export const sendMedia = internalAction({
  */
 export const sendReaction = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     targetWhatsappMessageId: v.string(),
     emoji: v.string(),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
     const { to } = await ctx.runQuery(
       internal.conversations.resolveSendTarget,
-      { accountId: args.accountId, conversationId: args.conversationId },
+      { accountId: args.accountId, conversationId: args.conversationId }
     );
 
     let whatsappMessageId: string;
@@ -416,7 +427,7 @@ export const sendReaction = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
       const result = await sendReactionMessage({
         phoneNumberId,
@@ -442,7 +453,7 @@ export const sendReaction = internalAction({
  */
 export const markRead = internalAction({
   args: {
-    accountId: v.id("accounts"),
+    accountId: v.id('accounts'),
     whatsappMessageId: v.string(),
     typingIndicator: v.optional(v.boolean()),
   },
@@ -450,7 +461,7 @@ export const markRead = internalAction({
     if (isDryRun()) return;
     const { phoneNumberId, accessToken } = await loadDecryptedConfig(
       ctx,
-      args.accountId,
+      args.accountId
     );
     await markMessageRead({
       phoneNumberId,
@@ -472,8 +483,8 @@ export const markRead = internalAction({
  */
 export const sendContactCard = internalAction({
   args: {
-    accountId: v.id("accounts"),
-    conversationId: v.id("conversations"),
+    accountId: v.id('accounts'),
+    conversationId: v.id('conversations'),
     to: v.string(),
     cardName: v.string(),
     cardPhone: v.string(),
@@ -490,7 +501,7 @@ export const sendContactCard = internalAction({
         zip: v.optional(v.string()),
         country: v.optional(v.string()),
         countryCode: v.optional(v.string()),
-      }),
+      })
     ),
   },
   handler: async (ctx, args): Promise<{ whatsappMessageId: string }> => {
@@ -510,7 +521,7 @@ export const sendContactCard = internalAction({
     } else {
       const { phoneNumberId, accessToken } = await loadDecryptedConfig(
         ctx,
-        args.accountId,
+        args.accountId
       );
       const result = await sendContactsMessage({
         phoneNumberId,
@@ -523,15 +534,15 @@ export const sendContactCard = internalAction({
     const titleLine = [args.jobTitle, args.company]
       .map((s) => s?.trim())
       .filter(Boolean)
-      .join(" · ");
+      .join(' · ');
     await ctx.runMutation(internal.messages.appendInternal, {
       accountId: args.accountId,
       conversationId: args.conversationId,
-      senderType: "bot",
-      contentType: "contacts",
+      senderType: 'bot',
+      contentType: 'contacts',
       contentText:
         `📇 ${args.cardName}` +
-        (titleLine ? `\n${titleLine}` : "") +
+        (titleLine ? `\n${titleLine}` : '') +
         `\n${args.cardPhone}`,
       contactsPayload: [buildContactsPayload(card)],
       messageId: whatsappMessageId,

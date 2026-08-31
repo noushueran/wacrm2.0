@@ -4,18 +4,23 @@ import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
-import type { QueryCtx } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { conversationScope, canAccessConversation, canSeeContactPhone, canAssignToOthers } from "./lib/roles";
 import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { maskPhone } from "./lib/phone";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
+import { applyAssignment } from "./lib/assignment";
+import { dispatchConversationAssigned } from "./lib/automations/triggers";
+import { recipientsForInbound } from "./lib/pushRecipients";
+import { chasingCutoffMs, graceCutoffMs } from "./lib/inbox/lanes";
+import { bumpConversationStartedStat } from "./messages";
 
 // ============================================================
 // Conversations — the Inbox list/thread read (`list`/`get`/
 // `getByContact`/`unreadTotal`) plus the mutations that drive its write
 // side: `findOrCreateForContact`, `assign`, `unassign`, `setStatus`,
-// `markRead`. Every function here is built on `accountQuery`/
+// `markRead`/`markUnread`. Every function here is built on `accountQuery`/
 // `accountMutation` (never the raw `query`/`mutation`), mirroring the
 // account-isolation pattern `contacts.ts` establishes: `ctx.accountId`
 // always comes from the caller's own `memberships` row, never a
@@ -37,8 +42,18 @@ async function embedTags(ctx: QueryCtx, contact: Doc<"contacts">) {
     .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
     .collect();
   const tags = (
-    await Promise.all(links.map((link) => ctx.db.get(link.tagId)))
-  ).filter((tag): tag is Doc<"tags"> => tag !== null);
+    await Promise.all(
+      links.map(async (link) => {
+        const tag = await ctx.db.get(link.tagId);
+        // Provenance rides along with the tag so the UI can mark an
+        // ad-derived label without a second round trip.
+        return tag ? { ...tag, source: link.source } : null;
+      }),
+    )
+  ).filter(
+    (tag): tag is Doc<"tags"> & { source: "ai" | "manual" | "ad" | undefined } =>
+      tag !== null,
+  );
   return { ...contact, tags };
 }
 
@@ -95,10 +110,22 @@ export const list = accountQuery({
     assignment: v.optional(
       v.union(v.literal("mine"), v.literal("unassigned")),
     ),
+    // Absent/false = the active Inbox. True = the Archived tab.
+    archived: v.optional(v.boolean()),
+    // Which lane tab. Absent = today's unlaned behaviour, so every
+    // existing caller is untouched.
+    lane: v.optional(
+      v.union(
+        v.literal("active"),
+        v.literal("waiting"),
+        v.literal("chasing"),
+        v.literal("snoozed"),
+      ),
+    ),
     paginationOpts: paginationOptsValidator,
   },
   handler: async (ctx, args) => {
-    const { status, assignment, paginationOpts } = args;
+    const { status, assignment, archived, lane, paginationOpts } = args;
     const scope = conversationScope(ctx.role);
 
     // Collapse the role scope and the Mine/Unassigned tab into ONE
@@ -141,45 +168,166 @@ export const list = accountQuery({
       return { page: [], isDone: true, continueCursor: "" };
     }
 
+    // Lanes are unavailable on the Archived tab: there `archivedAt` is
+    // RANGED (`gt(0)`), and Convex leaves index keys after a range key
+    // unordered, so `awaitingReply`/`lastMessageAt` cannot be bound.
+    // Reject rather than silently dropping the argument, so a UI bug
+    // surfaces as a failure instead of a quietly wrong list.
+    if (lane && archived) {
+      throw new ConvexError({
+        code: "BAD_REQUEST",
+        reason: "lane_unavailable_on_archived",
+      });
+    }
+
+    // The Waiting/Chasing boundary. Read from `qualificationConfigs`
+    // (NOT `loadEnabledConfig` — the lane must work whether or not that
+    // feature is enabled) and computed by `lib/inbox/lanes.ts`, never
+    // inline. Absent row → fall back to the 72h default so the lane
+    // still works on an account that has never opened those settings.
+    const nowMs = Date.now();
+    let cutoff = 0;
+    if (lane === "waiting" || lane === "chasing") {
+      const qualConfig = await ctx.db
+        .query("qualificationConfigs")
+        .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+        .unique();
+      cutoff = chasingCutoffMs(nowMs, {
+        chasingAfterDays: qualConfig?.chasingAfterDays,
+        sessionWindowHours: qualConfig?.sessionWindowHours ?? 72,
+      });
+    }
+
+    // The grace boundary (owner report 2026-07-28): a thread WE spoke on
+    // last stays in Active for a few minutes, so a live back-and-forth
+    // does not throw the row across the Active/Waiting line on every
+    // message. Waiting simply gains an upper bound — still one range —
+    // and Active gains the small complementary set, handled below.
+    const grace = graceCutoffMs(nowMs);
+
     // `status` stays a filter in every branch. That is safe alongside an
     // indexed assignment: it is a coarse predicate (almost everything is
     // "open", since nothing auto-closes — see `dashboard.metrics`), so it
     // matches early and often rather than starving the scan.
     const result = await (async () => {
       if (plan.kind === "eq") {
-        // Single assignee → a genuine index range. This is the fix: the
-        // Mine and Unassigned tabs, for every role, now read only their own
-        // slice instead of scanning the whole account.
-        const q = ctx.db
-          .query("conversations")
-          .withIndex("by_account_assigned_last_message", (ix) =>
-            ix
-              .eq("accountId", ctx.accountId)
-              .eq("assignedToUserId", plan.assignee),
-          )
-          .order("desc");
+        // Single assignee → a genuine index range, now over the
+        // archive-partitioned four-key index. `archivedAt` is optional and
+        // Convex sorts a missing field before every present value, so
+        // `eq("archivedAt", undefined)` is exactly the active set and
+        // `gt("archivedAt", 0)` is exactly the archived set — both real
+        // ranges, not post-scan filters, which matters because archived
+        // rows only ever accumulate (see schema.ts's index comment).
+        //
+        // Careful: in the archived branch `assignedToUserId` CANNOT also
+        // be bound as an index key. `archivedAt` is being ranged (`gt`)
+        // rather than equated there, and index keys after a range key are
+        // unordered, so the assignee is bound as a `.filter()` in that
+        // branch only. That is acceptable here — and nowhere else in this
+        // function — because the archived set is small relative to the
+        // active set and is not the hot path, unlike the active side,
+        // where a filter is exactly the failure this whole design avoids.
+        const q = lane
+          ? ctx.db
+              .query("conversations")
+              .withIndex("by_account_assigned_lane_last_message", (ix) => {
+                const scoped = ix
+                  .eq("accountId", ctx.accountId)
+                  .eq("archivedAt", undefined)
+                  .eq("assignedToUserId", plan.assignee);
+                // Snoozed is the complement: the one lane where
+                // `snoozedUntil` is RANGED rather than equated, which is
+                // why it cannot also bind the keys after it — same
+                // constraint the Archived tab hits with `archivedAt`.
+                if (lane === "snoozed") return scoped.gt("snoozedUntil", 0);
+
+                const notOverridden = scoped
+                  .eq("snoozedUntil", undefined)
+                  .eq("chasingForcedAt", undefined)
+                  .eq("awaitingReply", lane === "active");
+                // Bounded on both sides: newer than the chasing cutoff,
+                // older than the grace window (still-live work stays in
+                // Active). One range, so the plan is unchanged.
+                if (lane === "waiting") {
+                  return notOverridden.gt("lastMessageAt", cutoff).lte("lastMessageAt", grace);
+                }
+                // `gt(0)` excludes message-less rows — see the index comment.
+                if (lane === "chasing") {
+                  return notOverridden.gt("lastMessageAt", 0).lte("lastMessageAt", cutoff);
+                }
+                return notOverridden; // active: no range on lastMessageAt
+              })
+              // Chasing and Snoozed are neglect/wake queues, not message
+              // lists — both sort ascending (oldest neglect / soonest
+              // wake first).
+              .order(lane === "chasing" || lane === "snoozed" ? "asc" : "desc")
+          : ctx.db
+              .query("conversations")
+              .withIndex("by_account_archived_assigned_last_message", (ix) => {
+                const scoped = ix.eq("accountId", ctx.accountId);
+                return archived
+                  ? scoped.gt("archivedAt", 0)
+                  : scoped.eq("archivedAt", undefined).eq("assignedToUserId", plan.assignee);
+              })
+              .order("desc");
+        const filtered = archived
+          ? q.filter((f) => f.eq(f.field("assignedToUserId"), plan.assignee))
+          : q;
         return status
-          ? await q
+          ? await filtered
               .filter((f) => f.eq(f.field("status"), status))
               .paginate(paginationOpts)
-          : await q.paginate(paginationOpts);
+          : await filtered.paginate(paginationOpts);
       }
 
-      // `any` and `meOrPool` keep the recency index. `any` needs no
-      // assignment predicate at all. `meOrPool` is an OR across two
-      // disjoint index ranges, which a single `.paginate()` cursor cannot
-      // express; it stays a filter deliberately, and is the benign case —
-      // for an agent, "mine or unassigned" matches a large share of the
-      // rows near the front, so it terminates quickly. Splitting it into
-      // two paginated streams merged under a composite cursor is a
-      // separate change, worth doing only if an account ever accumulates
-      // enough OTHER agents' threads to starve it.
-      const q = ctx.db
-        .query("conversations")
-        .withIndex("by_account_last_message", (ix) =>
-          ix.eq("accountId", ctx.accountId),
-        )
-        .order("desc");
+      // `any` and `meOrPool` both move onto `by_account_archived_last_message`
+      // — the archive partition becomes an indexed range for both plans,
+      // the same `eq(undefined)`/`gt(0)` trick as above. `any` needs no
+      // further assignment predicate at all. `meOrPool` is an OR across two
+      // disjoint assignment ranges, which a single `.paginate()` cursor
+      // cannot express; that piece stays a filter deliberately, and is the
+      // benign case — for an agent, "mine or unassigned" matches a large
+      // share of the rows near the front, so it terminates quickly. This is
+      // a strict improvement over the old plain `by_account_last_message`
+      // scan: the archive partition is now indexed, and only the
+      // assignment predicate remains a filter. Splitting that OR into two
+      // paginated streams merged under a composite cursor is a separate
+      // change, worth doing only if an account ever accumulates enough
+      // OTHER agents' threads to starve it.
+      const q = lane
+        ? ctx.db
+            .query("conversations")
+            .withIndex("by_account_lane_last_message", (ix) => {
+              const scoped = ix.eq("accountId", ctx.accountId).eq("archivedAt", undefined);
+              // See the identical comment in the assigned-index branch
+              // above — Snoozed ranges `snoozedUntil` and so cannot bind
+              // anything after it.
+              if (lane === "snoozed") return scoped.gt("snoozedUntil", 0);
+
+              const notOverridden = scoped
+                .eq("snoozedUntil", undefined)
+                .eq("chasingForcedAt", undefined)
+                .eq("awaitingReply", lane === "active");
+              // Waiting is now bounded on BOTH sides: older than the
+              // grace window (else it is still live work, and belongs in
+              // Active) and newer than the chasing cutoff. Still a single
+              // range, so the index plan is unchanged.
+              if (lane === "waiting") {
+                return notOverridden.gt("lastMessageAt", cutoff).lte("lastMessageAt", grace);
+              }
+              if (lane === "chasing") {
+                return notOverridden.gt("lastMessageAt", 0).lte("lastMessageAt", cutoff);
+              }
+              return notOverridden;
+            })
+            .order(lane === "chasing" || lane === "snoozed" ? "asc" : "desc")
+        : ctx.db
+            .query("conversations")
+            .withIndex("by_account_archived_last_message", (ix) => {
+              const scoped = ix.eq("accountId", ctx.accountId);
+              return archived ? scoped.gt("archivedAt", 0) : scoped.eq("archivedAt", undefined);
+            })
+            .order("desc");
 
       if (!status && plan.kind === "any") return await q.paginate(paginationOpts);
 
@@ -200,8 +348,207 @@ export const list = accountQuery({
         .paginate(paginationOpts);
     })();
 
+    // The Active lane's grace set (owner report 2026-07-28). Active is
+    // `awaitingReply === true` UNION "we spoke last, but only just" —
+    // two index ranges, which one `.paginate()` cursor cannot express.
+    //
+    // It does not need to. The grace set is bounded by construction: it
+    // is only threads this account replied to within the last few
+    // minutes, so it is small, and because those rows carry the newest
+    // `lastMessageAt` in the whole lane they belong at the very top of a
+    // recency-ordered list. So it is read once with a hard `.take()` cap
+    // and prepended to PAGE ONE only; later pages come from the main
+    // range untouched, and the cursor keeps working because it never saw
+    // these rows. Deliberately NOT a `.filter()` over the main range —
+    // that is the unbounded-scan trap this file documents throughout.
+    //
+    // The cap is a real ceiling, not a guess at a maximum: an account
+    // that somehow replied to more than this many threads inside the
+    // window shows the most recent of them, which is the right
+    // truncation for a recency list.
+    const GRACE_CAP = 60;
+    let graceRows: Doc<"conversations">[] = [];
+    if (lane === "active" && paginationOpts.cursor === null) {
+      const graceQuery = ctx.db
+        .query("conversations")
+        .withIndex(
+          plan.kind === "eq"
+            ? "by_account_assigned_lane_last_message"
+            : "by_account_lane_last_message",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the two index builders have different key tuples; the branch above picks the matching one
+          (ix: any) => {
+            // Same `eq(undefined)` pair as the main range above, in both
+            // branches — load-bearing now that overrides are live: it is
+            // what keeps a snoozed or forced-chasing row out of the grace
+            // set, the same exclusion the main Active range enforces.
+            // Without it a thread the owner just snoozed (or force-parked
+            // into Chasing) could still surface at the top of Active
+            // because we happened to reply moments before marking it.
+            const scoped =
+              plan.kind === "eq"
+                ? ix
+                    .eq("accountId", ctx.accountId)
+                    .eq("archivedAt", undefined)
+                    .eq("assignedToUserId", plan.assignee)
+                    .eq("snoozedUntil", undefined)
+                    .eq("chasingForcedAt", undefined)
+                    .eq("awaitingReply", false)
+                : ix
+                    .eq("accountId", ctx.accountId)
+                    .eq("archivedAt", undefined)
+                    .eq("snoozedUntil", undefined)
+                    .eq("chasingForcedAt", undefined)
+                    .eq("awaitingReply", false);
+            return scoped.gt("lastMessageAt", grace);
+          },
+        )
+        .order("desc");
+      const raw = await graceQuery.take(GRACE_CAP);
+      graceRows = raw.filter((c) => {
+        if (status && c.status !== status) return false;
+        // `meOrPool` binds assignment as a filter in the main query too —
+        // same predicate, applied here by hand for the same reason.
+        if (plan.kind === "meOrPool") {
+          return c.assignedToUserId === ctx.userId || c.assignedToUserId === undefined;
+        }
+        return true;
+      });
+    }
+
+    // The Chasing lane's forced set (spec §Force-to-Chasing). Chasing is
+    // (derived) UNION (forced), and like the grace set the second half is
+    // bounded by construction — only threads a human has explicitly
+    // marked — so it is one capped read merged into page one rather than
+    // a filter over the main range.
+    //
+    // Merged into page one only, for the same reason: the cursor belongs
+    // to the main range and never saw these rows.
+    //
+    // ORDERED ASCENDING BY `chasingForcedAt`, and that direction is a
+    // correctness property, not a preference. Unlike the grace set — whose
+    // truncation self-heals within minutes because its rows age out of the
+    // window on their own — a force NEVER expires, so a forced row that
+    // falls past this cap is gone from every lane (the derived Chasing
+    // range binds `eq("chasingForcedAt", undefined)` and excludes it, and
+    // so do Active, Waiting and Snoozed) until somebody un-forces it.
+    // Reading oldest-forced first means the rows that survive truncation
+    // are the ones that have been forced longest — the most neglected,
+    // which is exactly what a neglect queue must not drop — and the rows
+    // dropped are the just-forced, which the agent who forced them is
+    // still looking at.
+    //
+    // The truncation is also SIGNALLED rather than silent: the read takes
+    // one more than the cap purely to detect overflow. There is no cheap
+    // way to make this set never truncate — merging two disjoint index
+    // ranges under a single `.paginate()` cursor needs a composite cursor
+    // (the same change `by_account_archived_last_message`'s `meOrPool`
+    // branch defers), and an uncapped `.collect()` over the forced range
+    // is exactly the unbounded read this file refuses everywhere else.
+    // Note the `status`/`meOrPool` post-filter below shrinks the set
+    // further, after the cap, so a filtered view can lose forced rows
+    // before this warning fires.
+    const FORCED_CAP = 60;
+    let forcedRows: Doc<"conversations">[] = [];
+    if (lane === "chasing" && paginationOpts.cursor === null) {
+      const forcedQuery = ctx.db
+        .query("conversations")
+        .withIndex(
+          plan.kind === "eq"
+            ? "by_account_assigned_lane_last_message"
+            : "by_account_lane_last_message",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the two builders have different key tuples; the branch above picks the matching one
+          (ix: any) => {
+            const scoped =
+              plan.kind === "eq"
+                ? ix
+                    .eq("accountId", ctx.accountId)
+                    .eq("archivedAt", undefined)
+                    .eq("assignedToUserId", plan.assignee)
+                    .eq("snoozedUntil", undefined)
+                : ix
+                    .eq("accountId", ctx.accountId)
+                    .eq("archivedAt", undefined)
+                    .eq("snoozedUntil", undefined);
+            return scoped.gt("chasingForcedAt", 0);
+          },
+        )
+        // Oldest-forced first — see the cap comment above.
+        .order("asc");
+      const probed = await forcedQuery.take(FORCED_CAP + 1);
+      if (probed.length > FORCED_CAP) {
+        console.warn(
+          `[inbox-chasing-forced] account=${ctx.accountId} forced set exceeds cap=${FORCED_CAP}; the most recently forced threads are not shown in Chasing until earlier forces are cleared`,
+        );
+      }
+      const raw = probed.slice(0, FORCED_CAP);
+      forcedRows = raw.filter((c) => {
+        if (status && c.status !== status) return false;
+        if (plan.kind === "meOrPool") {
+          return c.assignedToUserId === ctx.userId || c.assignedToUserId === undefined;
+        }
+        return true;
+      });
+    }
+
+    // Each extra set is merged in its own lane's ordering, matching the
+    // main range: grace merges newest-first (a customer who replied 30
+    // seconds ago should still outrank a thread we answered 10 minutes
+    // ago), forced merges oldest-first (Chasing is a neglect queue, so
+    // the longest-ignored forced thread should still outrank a
+    // just-forced one). The two sets are disjoint by construction
+    // (`awaitingReply` true vs false plus the `chasingForcedAt`
+    // binding), so no dedupe is needed — only which comparator to sort
+    // with.
+    //
+    // `graceRows` and `forcedRows` can never both be non-empty — one is
+    // gated on `lane === "active"` and the other on `lane === "chasing"`
+    // — so the branches below are exclusive by construction. Chasing
+    // sorts ascending by neglect (opposite of the grace merge), so it
+    // needs its own comparator.
+    const mergedPage = forcedRows.length
+      ? [...forcedRows, ...result.page].sort(
+          (a, b) => (a.lastMessageAt ?? 0) - (b.lastMessageAt ?? 0),
+        )
+      : graceRows.length
+        ? [...graceRows, ...result.page].sort(
+            (a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0),
+          )
+        : result.page;
+
     const page = await Promise.all(
-      result.page.map((conversation) => embedContact(ctx, conversation)),
+      mergedPage.map(async (conversation) => {
+        const withContact = await embedContact(ctx, conversation);
+
+        // Sequence detail for the Chasing rows. Per PAGE, so it is
+        // bounded by `numItems` — the same shape as this function's
+        // existing contact join. Gated on the lane so no other tab pays
+        // for it. Read-only: `leadAnalyses` stays the system of record
+        // and nothing here mirrors it onto `conversations` (see the
+        // spec's §Why time-derived and not sequence-derived).
+        const analysis =
+          lane === "chasing"
+            ? await ctx.db
+                .query("leadAnalyses")
+                .withIndex("by_conversation", (q) =>
+                  q.eq("conversationId", conversation._id),
+                )
+                .unique()
+            : null;
+
+        return {
+          ...withContact,
+          followUpsSent: analysis?.followUpsSent,
+          sequenceStatus: analysis?.sequenceStatus,
+          // Manual lane overrides (Task 7) — already on `conversation`
+          // itself (no extra read, unlike the `leadAnalyses` join just
+          // above), so `...withContact` already carries them; spelled out
+          // here anyway so the row's shape is self-documenting at the
+          // call site rather than relying on the spread to smuggle them
+          // through.
+          snoozedUntil: conversation.snoozedUntil,
+          chasingForcedAt: conversation.chasingForcedAt,
+        };
+      }),
     );
     return { ...result, page };
   },
@@ -283,6 +630,8 @@ export const unreadTotal = accountQuery({
   args: {},
   handler: async (ctx) => {
     const scope = conversationScope(ctx.role);
+    // No archive predicate needed: `leadAnalysis.archive` zeroes
+    // `unreadCount`, so an archived thread leaves this range on its own.
     const unread = await ctx.db
       .query("conversations")
       .withIndex("by_account_unread", (q) =>
@@ -297,6 +646,65 @@ export const unreadTotal = accountQuery({
     }).length;
   },
 });
+
+/**
+ * The ONE place a `conversations` row is created — `notifications.ts`'s
+ * `insertNotification` precedent, and for the same reason: four separate
+ * `insert("conversations")` call sites had drifted, three of them
+ * omitting `awaitingReply` entirely. Every path now routes through here:
+ * `findOrCreateForContact` and `findOrCreateForContactInternal` below,
+ * `ingest.ts`'s inbound upsert, and `qualificationEngine.ts`'s
+ * `ensureAdminConversation`. A fifth site cannot repeat the omission
+ * without deliberately bypassing this function.
+ *
+ * `awaitingReply: true` is not a convenience default — it is the
+ * schema's documented semantics for a message-less thread (see
+ * `schema.ts`'s own comment on the field): whoever opened the thread
+ * owes it its first message, so Active is the honest lane, and it also
+ * preserves the row's existing sort position (Active applies no range to
+ * `lastMessageAt`, which is absent, and Convex sorts missing first, so it
+ * lands last under `.order("desc")`).
+ *
+ * Leaving it `undefined` was NOT benign: Active binds
+ * `eq("awaitingReply", true)` and Waiting/Chasing bind `eq(..., false)`,
+ * and the Inbox always sends a lane, so an `undefined` row matched no tab
+ * at all. `broadcasts.ts` reaches this with no human in the loop (the
+ * conversation is created in one mutation, the Meta send is a separate
+ * action), so every failed broadcast recipient left a permanently
+ * invisible row.
+ *
+ * Takes a bare `{ db }` rather than a full `MutationCtx` so it is
+ * callable from any mutation's ctx, exactly like `insertNotification`.
+ */
+export async function insertConversation(
+  ctx: { db: MutationCtx["db"] },
+  fields: {
+    accountId: Id<"accounts">;
+    contactId: Id<"contacts">;
+    /** Only `ensureAdminConversation` sets this — the assistant must
+     *  never talk to its own staff-alert channel. */
+    aiAutoreplyDisabled?: boolean;
+  },
+): Promise<Id<"conversations">> {
+  const conversationId = await ctx.db.insert("conversations", {
+    ...fields,
+    status: "open",
+    unreadCount: 0,
+    awaitingReply: true,
+  });
+  // The reports rollup's conversations-started series (docs/superpowers/
+  // specs/2026-08-05-reports-section-design.md). This is the single choke
+  // point every creation path already routes through (see this function's
+  // own doc comment above), so counting here cannot be bypassed the way
+  // the four drifted `insert` call sites this function replaced were.
+  await bumpConversationStartedStat(
+    ctx,
+    fields.accountId,
+    Date.now(),
+    "conversationsStarted",
+  );
+  return conversationId;
+}
 
 // ============================================================
 // Conversation mutations (Phase 2, Task 3) — creating a thread for a
@@ -334,11 +742,9 @@ export const findOrCreateForContact = accountMutation({
       .first();
     if (existing) return existing._id;
 
-    return await ctx.db.insert("conversations", {
+    return await insertConversation(ctx, {
       accountId: ctx.accountId,
       contactId: args.contactId,
-      status: "open",
-      unreadCount: 0,
     });
   },
 });
@@ -409,11 +815,9 @@ export const findOrCreateForContactInternal = internalMutation({
       throw new ConvexError({ code: "NOT_FOUND", entity: "conversation" });
     }
 
-    return await ctx.db.insert("conversations", {
+    return await insertConversation(ctx, {
       accountId: args.accountId,
       contactId: args.contactId,
-      status: "open",
-      unreadCount: 0,
     });
   },
 });
@@ -501,13 +905,29 @@ export const assign = accountMutation({
       throw new ConvexError({ code: "NOT_FOUND", entity: "member" });
     }
 
-    await ctx.db.patch(args.conversationId, {
-      assignedToUserId: args.userId,
-      status: "pending",
-      updatedAt: Date.now(),
+    // `applyAssignment` owns the field + the timeline row and reports
+    // whether this was a real change of hands — the guard that used to
+    // be a local `previousAssignee !== args.userId` here. `status` stays
+    // this mutation's own business: assigning IS the start of someone
+    // working the thread, which `setAutoreplyPaused` deliberately is not.
+    const changed = await applyAssignment(ctx, {
+      conversation,
+      nextAssignee: args.userId,
+      actorUserId: ctx.userId,
+      source: "manual",
     });
+    await ctx.db.patch(args.conversationId, { status: "pending" });
 
     await chargeLeadIfAgent(ctx, ctx.accountId, args.userId, args.conversationId);
+
+    if (changed) {
+      await dispatchConversationAssigned(ctx, {
+        accountId: ctx.accountId,
+        conversationId: args.conversationId,
+        contactId: conversation.contactId,
+        agentId: args.userId,
+      });
+    }
 
     if (args.userId !== ctx.userId) {
       const [contact, actorMembership] = await Promise.all([
@@ -566,12 +986,83 @@ export const unassign = accountMutation({
   args: { conversationId: v.id("conversations") },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireConversationAccess(ctx, args.conversationId, "own");
-    await ctx.db.patch(args.conversationId, {
-      assignedToUserId: undefined,
-      updatedAt: Date.now(),
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "own",
+    );
+    await applyAssignment(ctx, {
+      conversation,
+      nextAssignee: undefined,
+      actorUserId: ctx.userId,
+      source: "manual",
     });
     return args.conversationId;
+  },
+});
+
+/**
+ * One conversation's ownership history, OLDEST first — the thread renders
+ * these inline beside messages and notes, the same chronological order
+ * `contactNotes.listForConversation` uses.
+ *
+ * Names are resolved here rather than client-side so the thread doesn't
+ * need a second membership subscription. `fullName ?? "Member"` mirrors
+ * `leadsBoard`: `members.list` nulls email below admin as staff PII, so
+ * an email is never an acceptable fallback. A null name means the member
+ * left the account; the UI has its own wording for that.
+ *
+ * `.collect()` is safe for the same reason it is on notes: rows here are
+ * bounded by human handovers, not by message volume.
+ */
+export const listEvents = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    await requireConversationAccess(ctx, args.conversationId, "view");
+
+    const events = await ctx.db
+      .query("conversationEvents")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("asc")
+      .collect();
+    if (events.length === 0) return [];
+
+    const cache = new Map<Id<"users">, string | null>();
+    const nameOf = async (userId: Id<"users"> | undefined) => {
+      if (!userId) return null;
+      const hit = cache.get(userId);
+      if (hit !== undefined) return hit;
+      // Binds both fields on `by_user_account` — a `by_user` scan can
+      // surface a different account's membership row for a user who
+      // belongs to several. Same idiom as `contactNotes`' `withAuthors`.
+      const membership = await ctx.db
+        .query("memberships")
+        .withIndex("by_user_account", (q) =>
+          q.eq("userId", userId).eq("accountId", ctx.accountId),
+        )
+        .first();
+      const value = membership ? (membership.fullName ?? "Member") : null;
+      cache.set(userId, value);
+      return value;
+    };
+
+    const out = [];
+    for (const e of events) {
+      out.push({
+        _id: e._id,
+        _creationTime: e._creationTime,
+        kind: e.kind,
+        source: e.source,
+        actorUserId: e.actorUserId ?? null,
+        targetUserId: e.targetUserId ?? null,
+        actorName: await nameOf(e.actorUserId),
+        targetName: await nameOf(e.targetUserId),
+        previousName: await nameOf(e.previousUserId),
+      });
+    }
+    return out;
   },
 });
 
@@ -606,25 +1097,52 @@ export const setAutoreplyPaused = accountMutation({
   },
   handler: async (ctx, args) => {
     ctx.requireRole("agent");
-    await requireConversationAccess(ctx, args.conversationId, "view");
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "view",
+    );
 
     if (args.paused) {
       await ctx.db.patch(args.conversationId, {
         aiAutoreplyDisabled: true,
         updatedAt: Date.now(),
-        ...(args.assignToMe ? { assignedToUserId: ctx.userId } : {}),
       });
 
       if (args.assignToMe) {
+        // Taking over a thread IS an assignment, even though it's a
+        // self-assignment the notification path deliberately skips.
+        const changed = await applyAssignment(ctx, {
+          conversation,
+          nextAssignee: ctx.userId,
+          actorUserId: ctx.userId,
+          source: "takeover",
+        });
         await chargeLeadIfAgent(ctx, ctx.accountId, ctx.userId, args.conversationId);
+        if (changed) {
+          await dispatchConversationAssigned(ctx, {
+            accountId: ctx.accountId,
+            conversationId: args.conversationId,
+            contactId: conversation.contactId,
+            agentId: ctx.userId,
+          });
+        }
       }
     } else {
       await ctx.db.patch(args.conversationId, {
         aiAutoreplyDisabled: false,
-        assignedToUserId: undefined,
         aiReplyCount: 0,
         aiHandoffSummary: undefined,
         updatedAt: Date.now(),
+      });
+      // Resume AI releases ANY assignment, not just the caller's own —
+      // a stale assignee keeps the "human owns this" gate tripped. No
+      // actor: the AI resuming is what released it, not a person
+      // handing the thread to someone.
+      await applyAssignment(ctx, {
+        conversation,
+        nextAssignee: undefined,
+        source: "release",
       });
     }
 
@@ -665,6 +1183,72 @@ export const markRead = accountMutation({
     ctx.requireRole("agent");
     await requireConversationAccess(ctx, args.conversationId, "view");
     await ctx.db.patch(args.conversationId, { unreadCount: 0 });
+    return args.conversationId;
+  },
+});
+
+/**
+ * Ceiling on the badge `markUnread` restores, and on the messages it
+ * reads to compute one. A run longer than this is already "lots of
+ * unread" as far as the inbox badge communicates anything, and the cap
+ * is what keeps this mutation's read set fixed rather than growing with
+ * a thread the customer has been talking into for months.
+ */
+const MAX_RESTORED_UNREAD = 50;
+
+/**
+ * The inverse of `markRead`, for the misclick. Opening a thread zeroes
+ * `unreadCount` the moment it renders (the Inbox's select handler, the
+ * `?c=` deep-link, and `message-thread.tsx`'s own effect all call
+ * `markRead`), so an agent who clicked the wrong row had no way back to
+ * "still waiting on us" short of asking the customer to write again.
+ *
+ * Restores a COUNT, not a flag, because the badge renders a number —
+ * and the original count is gone by the time this runs, so it's
+ * recomputed as the trailing run of customer-authored messages: every
+ * inbound message since the account itself last said anything. That's
+ * the same set `markRead` would have cleared on a thread nobody had
+ * opened yet. The walk is newest-first and stops at the first
+ * non-customer message, so it reads that run and nothing more, capped
+ * at `MAX_RESTORED_UNREAD`. A thread with no inbound messages at all
+ * still comes back as 1: the agent explicitly asked for it to look
+ * unread, and 0 would silently do nothing.
+ *
+ * No-ops when the conversation is already unread, so a double-click
+ * can't stack the badge higher. No `updatedAt` bump, matching
+ * `markRead`: read state isn't a change to the conversation itself, and
+ * bumping it would shuffle the inbox order as a side effect of undoing
+ * a click.
+ */
+export const markUnread = accountMutation({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    ctx.requireRole("agent");
+    const conversation = await requireConversationAccess(
+      ctx,
+      args.conversationId,
+      "view",
+    );
+
+    if (conversation.unreadCount > 0) return args.conversationId;
+
+    const recent = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .take(MAX_RESTORED_UNREAD);
+
+    let trailingInbound = 0;
+    for (const message of recent) {
+      if (message.senderType !== "customer") break;
+      trailingInbound++;
+    }
+
+    await ctx.db.patch(args.conversationId, {
+      unreadCount: Math.max(trailingInbound, 1),
+    });
     return args.conversationId;
   },
 });
@@ -726,5 +1310,114 @@ export const resolveSendTarget = internalQuery({
     }
 
     return { to: contact.phone, contextMessageId };
+  },
+});
+
+/**
+ * A customer replied — bring the thread back (spec 2026-07-26
+ * §"Stopping and returning").
+ *
+ * GATED ON NOTHING, deliberately. This deliberately does NOT live in
+ * `leadAnalysisEngine.onInbound`, which returns early when
+ * `leadAnalysisConfigs.enabled` is false: putting it there would mean
+ * that switching Lead Analysis off strands every already-archived
+ * conversation out of the Inbox permanently, with no way back. Archive
+ * is a Lead Analysis feature; UN-archive is a safety property of the
+ * Inbox itself.
+ *
+ * No-ops on a conversation that is not archived, so it is free to call
+ * on every single inbound.
+ */
+/**
+ * The un-archive itself, callable inside another mutation's transaction.
+ *
+ * Extracted 2026-07-28 so `messages.ts`'s
+ * `insertMessageAndUpdateConversation` can run it in the SAME
+ * transaction as the message insert. It previously only ran from
+ * `ingest.ts`'s best-effort fan-out, which swallows failures by design —
+ * so a swallowed failure left an archived customer invisible in every
+ * lane while they were actively writing in, and nothing ever retried.
+ * P2's own spec called for the transactional placement; the shipped code
+ * did not do it.
+ *
+ * The old reasoning was "restoring a thread must never fail message
+ * ingestion". That weighs the wrong risk: the alternative to a failed
+ * ingest is not nothing, it is a stored message whose sender the
+ * business cannot see. A rolled-back transaction means Meta retries the
+ * webhook, which is recoverable; an invisible customer is not.
+ *
+ * No-ops on a conversation that is not archived, so it is free to call
+ * on every single inbound.
+ */
+export async function unarchiveOnInboundCore(
+  ctx: { db: MutationCtx["db"] },
+  args: {
+    accountId: Id<"accounts">;
+    conversationId: Id<"conversations">;
+    contactId: Id<"contacts">;
+  },
+): Promise<void> {
+  {
+    const conversation = await ctx.db.get(args.conversationId);
+    if (!conversation || conversation.accountId !== args.accountId) return;
+    if (conversation.archivedAt === undefined) return;
+
+    await ctx.db.patch(args.conversationId, {
+      archivedAt: undefined,
+      archivedReason: undefined,
+      archivedNote: undefined,
+      archivedByUserId: undefined,
+      returnedAt: Date.now(),
+    });
+
+    const analysis = await ctx.db
+      .query("leadAnalyses")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .unique();
+    // CLEARED, not `false` — see the representation note in schema.ts.
+    if (analysis) await ctx.db.patch(analysis._id, { archived: undefined });
+
+    // Same recipient rule as an inbound on an unassigned thread: the
+    // assigned agent if there is one, else everyone who works the whole
+    // pool (supervisor+).
+    const members = await ctx.db
+      .query("memberships")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .collect();
+    const contact = await ctx.db.get(args.contactId);
+    const who = contact?.name?.trim() || contact?.phone || "A contact";
+
+    for (const userId of recipientsForInbound({
+      assignedToUserId: conversation.assignedToUserId ?? null,
+      members,
+    })) {
+      await insertNotification(ctx, {
+        accountId: args.accountId,
+        userId,
+        type: "lead_returned",
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        title: `${who} replied`,
+        body: "An archived lead came back.",
+      });
+    }
+  }
+}
+
+/**
+ * Thin wrapper kept so existing tests and any future caller keep
+ * working. The behaviour lives in `unarchiveOnInboundCore` above, which
+ * `messages.ts` calls inside the message transaction — the placement
+ * that actually guarantees an archived customer becomes visible the
+ * moment they write. `ingest.ts` no longer calls this.
+ */
+export const unarchiveOnInbound = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+  },
+  handler: async (ctx, args) => {
+    await unarchiveOnInboundCore(ctx, args);
   },
 });

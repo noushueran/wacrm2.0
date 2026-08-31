@@ -61,3 +61,37 @@ export function formatRelative(iso: string | null | undefined): string {
   if (diffSec < 2_592_000) return `${Math.floor(diffSec / 86400)}d ago`
   return new Date(iso).toLocaleDateString()
 }
+
+export type CountdownUnit = 'due' | 'minutes' | 'hours' | 'days'
+
+export interface Countdown {
+  unit: CountdownUnit
+  /** Meaningless (always 0) when `unit` is `"due"`. */
+  count: number
+}
+
+/**
+ * Time remaining until a future timestamp (ms epoch) — the waiting
+ * queue's countdown to `automationRuns.resumeAt`.
+ *
+ * Deliberately NOT built on `formatRelative` above, even though both are
+ * "how far from now" helpers: that one's `Date.now() - then` math (and
+ * "X ago" wording) only makes sense for a PAST `then`. Feed it a future
+ * timestamp and the diff goes negative — and since any negative number
+ * is `< 60`, `diffSec < 60` is true for literally every future
+ * `resumeAt`, however far off, so it would print "just now" for a wait
+ * that resolves in 10 minutes and one that resolves in 10 days alike.
+ * This mirrors the direction instead (`then - now`) and returns
+ * structured value+unit rather than a rendered string — unlike
+ * `formatRelative`'s hardcoded English, this is new code, so it goes
+ * through next-intl at the call site instead of inheriting that
+ * shortcut.
+ */
+export function countdownTo(targetMs: number | null | undefined): Countdown {
+  if (targetMs == null || Number.isNaN(targetMs)) return { unit: 'due', count: 0 }
+  const diffSec = Math.round((targetMs - Date.now()) / 1000)
+  if (diffSec <= 0) return { unit: 'due', count: 0 }
+  if (diffSec < 3600) return { unit: 'minutes', count: Math.max(1, Math.floor(diffSec / 60)) }
+  if (diffSec < 86400) return { unit: 'hours', count: Math.floor(diffSec / 3600) }
+  return { unit: 'days', count: Math.floor(diffSec / 86400) }
+}

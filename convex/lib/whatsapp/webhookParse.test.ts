@@ -3,9 +3,12 @@ import {
   flattenInboundMessage,
   isRecipientStatus,
   isTemplateWebhookField,
+  parseStatusError,
+  parseStatusPricing,
   parseTemplateStatusUpdate,
   resolveContactName,
   type MetaWebhookMessage,
+  type MetaWebhookStatus,
 } from "./webhookParse";
 
 // ------------------------------------------------------------
@@ -473,14 +476,14 @@ test("flattenInboundMessage: an unrecognized referral source_type is dropped, NO
         ctwa_clid: "clid-story",
         source_id: "120299",
         source_type: "story_mention",
-        headline: "Georgia Holiday",
-      } as MetaWebhookMessage["referral"],
+        headline: "Dubai City Tour",
+      },
     }),
   );
   // The message and its creative survive; only the unknown enum is gone.
   expect(result?.ctwaClid).toBe("clid-story");
   expect(result?.referral?.sourceType).toBeUndefined();
-  expect(result?.referral?.headline).toBe("Georgia Holiday");
+  expect(result?.referral?.headline).toBe("Dubai City Tour");
   expect(result?.referral?.sourceId).toBe("120299");
 });
 
@@ -494,16 +497,17 @@ test("flattenInboundMessage: an unrecognized referral media_type is dropped but 
         ctwa_clid: "clid-carousel",
         source_type: "ad",
         media_type: "carousel",
-        headline: "Multi-city Europe",
+        headline: "Desert Safari",
         image_url: "https://scontent.example/c.jpg",
-      } as MetaWebhookMessage["referral"],
+      },
     }),
   );
   expect(result?.referral?.mediaType).toBeUndefined();
   // `sourceType: "ad"` must still survive — `adReferrals` gates campaign
-  // resolution on exactly that value.
+  // resolution on exactly that value, as do `messages.ts`'s ad-started
+  // counter and `reports.ts`'s `conversationsStartedAd` rollup.
   expect(result?.referral?.sourceType).toBe("ad");
-  expect(result?.referral?.headline).toBe("Multi-city Europe");
+  expect(result?.referral?.headline).toBe("Desert Safari");
 });
 
 test("flattenInboundMessage: referral enum casing is folded to the stored literal", () => {
@@ -516,7 +520,7 @@ test("flattenInboundMessage: referral enum casing is folded to the stored litera
         source_type: "AD",
         media_type: "VIDEO",
         headline: "Cased",
-      } as MetaWebhookMessage["referral"],
+      },
     }),
   );
   expect(result?.referral?.sourceType).toBe("ad");
@@ -595,4 +599,258 @@ test("does not emit the unsupported-type placeholder for buttons", () => {
     button: { text: "Show me" },
   } as never);
   expect(result?.text).not.toContain("Unsupported message type");
+});
+
+// ------------------------------------------------------------
+// parseStatusPricing
+// ------------------------------------------------------------
+
+test("parseStatusPricing: CBP shape — referral_conversion origin marks a free entry point", () => {
+  const status: MetaWebhookStatus = {
+    id: "wamid.X",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: {
+      id: "CONV1",
+      expiration_timestamp: "1753560000",
+      origin: { type: "referral_conversion" },
+    },
+    pricing: {
+      billable: false,
+      pricing_model: "CBP",
+      category: "referral_conversion",
+    },
+  };
+  expect(
+    parseStatusPricing(status),
+  ).toEqual({
+    conversationMetaId: "CONV1",
+    expiresAt: 1753560000000,
+    originType: "referral_conversion",
+    pricingModel: "CBP",
+    pricingCategory: "referral_conversion",
+    pricingType: undefined,
+    billable: false,
+    isFreeEntryPoint: true,
+  });
+});
+
+test("parseStatusPricing: PMP shape — pricing.type free_entry_point marks a free entry point", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.Y",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: { id: "CONV2", expiration_timestamp: "1753560000" },
+    pricing: {
+      billable: false,
+      pricing_model: "PMP",
+      category: "service",
+      type: "free_entry_point",
+    },
+  });
+  expect(parsed?.isFreeEntryPoint).toBe(true);
+  expect(parsed?.pricingModel).toBe("PMP");
+  expect(parsed?.pricingType).toBe("free_entry_point");
+});
+
+test("parseStatusPricing: an ordinary billed message is not a free entry point", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.Z",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: {
+      id: "CONV3",
+      expiration_timestamp: "1753386400",
+      origin: { type: "marketing" },
+    },
+    pricing: {
+      billable: true,
+      pricing_model: "PMP",
+      category: "marketing",
+      type: "regular",
+    },
+  });
+  expect(parsed?.isFreeEntryPoint).toBe(false);
+  expect(parsed?.billable).toBe(true);
+});
+
+test("parseStatusPricing: returns null when neither pricing nor conversation is present", () => {
+  expect(
+    parseStatusPricing({
+      id: "wamid.NONE",
+      status: "delivered",
+      timestamp: "1753300000",
+      recipient_id: "971500000000",
+    }),
+  ).toBeNull();
+});
+
+test("parseStatusPricing: tolerates a missing pricing object", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.A",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: { id: "CONV4", origin: { type: "user_initiated" } },
+  });
+  expect(parsed).not.toBeNull();
+  expect(parsed?.expiresAt).toBeUndefined();
+  expect(parsed?.billable).toBeUndefined();
+  expect(parsed?.isFreeEntryPoint).toBe(false);
+});
+
+test("parseStatusPricing: tolerates a missing conversation object", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.A2",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    pricing: { billable: true, pricing_model: "PMP", category: "marketing", type: "regular" },
+  });
+  expect(parsed).not.toBeNull();
+  expect(parsed?.conversationMetaId).toBeUndefined();
+  expect(parsed?.expiresAt).toBeUndefined();
+  expect(parsed?.billable).toBe(true);
+  expect(parsed?.isFreeEntryPoint).toBe(false);
+});
+
+test("parseStatusPricing: unknown enum values normalize instead of throwing", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.B",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: { id: "CONV5", origin: { type: "some_future_origin" } },
+    pricing: { pricing_model: "XYZ", category: "brand_new", type: "unheard_of" },
+  });
+  expect(parsed?.originType).toBe("some_future_origin");
+  expect(parsed?.pricingType).toBe("unheard_of");
+  expect(parsed?.isFreeEntryPoint).toBe(false);
+});
+
+test("parseStatusPricing: a non-numeric expiration_timestamp yields undefined, not NaN", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.C",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: { id: "CONV6", expiration_timestamp: "not-a-number" },
+  });
+  expect(parsed?.expiresAt).toBeUndefined();
+});
+
+test("parseStatusPricing: CBP pricing.category alone marks a free entry point", () => {
+  const parsed = parseStatusPricing({
+    id: "wamid.CAT",
+    status: "sent",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    conversation: { id: "CONV9", expiration_timestamp: "1753560000" },
+    pricing: { billable: false, pricing_model: "CBP", category: "referral_conversion" },
+  });
+  expect(parsed?.isFreeEntryPoint).toBe(true);
+});
+
+// ------------------------------------------------------------
+// parseStatusError
+// ------------------------------------------------------------
+
+test("parseStatusError: a real 131049-shaped payload captures code/title/message/details", () => {
+  const status: MetaWebhookStatus = {
+    id: "wamid.FAIL1",
+    status: "failed",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    errors: [
+      {
+        code: 131049,
+        title:
+          "This message was not delivered to maintain healthy ecosystem engagement.",
+        message: "Message failed to send because of an error.",
+        error_data: { details: "Meta rate limit engagement heuristic" },
+      },
+    ],
+  };
+  expect(parseStatusError(status)).toEqual({
+    code: 131049,
+    title:
+      "This message was not delivered to maintain healthy ecosystem engagement.",
+    message: "Message failed to send because of an error.",
+    details: "Meta rate limit engagement heuristic",
+  });
+});
+
+test("parseStatusError: returns null when there is no errors key", () => {
+  expect(
+    parseStatusError({
+      id: "wamid.NONE",
+      status: "failed",
+      timestamp: "1753300000",
+      recipient_id: "971500000000",
+    }),
+  ).toBeNull();
+});
+
+test("parseStatusError: returns null for an empty errors array", () => {
+  expect(
+    parseStatusError({
+      id: "wamid.EMPTY",
+      status: "failed",
+      timestamp: "1753300000",
+      recipient_id: "971500000000",
+      errors: [],
+    }),
+  ).toBeNull();
+});
+
+test("parseStatusError: tolerates an entry missing title/message/error_data, keeping just the code", () => {
+  const parsed = parseStatusError({
+    id: "wamid.CODEONLY",
+    status: "failed",
+    timestamp: "1753300000",
+    recipient_id: "971500000000",
+    errors: [{ code: 131049 }],
+  });
+  expect(parsed).toEqual({
+    code: 131049,
+    title: undefined,
+    message: undefined,
+    details: undefined,
+  });
+});
+
+test("parseStatusError: an entry with no usable fields at all returns null", () => {
+  expect(
+    parseStatusError({
+      id: "wamid.BLANK",
+      status: "failed",
+      timestamp: "1753300000",
+      recipient_id: "971500000000",
+      errors: [{}],
+    }),
+  ).toBeNull();
+});
+
+test("parseStatusError: a non-failed status carrying a genuine error is still captured (deliberately no status gate)", () => {
+  // Meta's docs say `errors` is failure-only, but this parser does not rely
+  // on that: `deliveryError` has no readers yet, so a stray capture here is
+  // inert, while wrongly dropping a real one is unrecoverable (no log
+  // history). See parseStatusError's own comment for the full rationale.
+  expect(
+    parseStatusError({
+      id: "wamid.SENT",
+      status: "sent",
+      timestamp: "1753300000",
+      recipient_id: "971500000000",
+      errors: [{ code: 131049, title: "reason given on a non-failed status" }],
+    }),
+  ).toEqual({
+    code: 131049,
+    title: "reason given on a non-failed status",
+    message: undefined,
+    details: undefined,
+  });
 });

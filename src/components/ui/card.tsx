@@ -20,6 +20,12 @@ function Card({
   )
 }
 
+// `@container/card-header` below is the only named container in the app.
+// Declaring it here is fine; querying it from a `className` passed INTO
+// CardHeader is not — that lands the query on the same element that
+// declares the container, where it silently never matches. Put
+// `@sm/card-header:` variants on a child instead. See the container-query
+// note in `src/app/globals.css`.
 function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div

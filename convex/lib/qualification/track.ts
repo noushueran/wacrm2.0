@@ -161,14 +161,21 @@ export async function recordOutboundSend(
  * (a staff chat must never become a lead), and the offer/keepalive
  * machinery messages exactly these numbers. One indexed collect over the
  * account's memberships (small) per call.
+ *
+ * `config` is `| null` for callers outside the qualification engine
+ * itself (e.g. `leadAnalysisEngine.onInbound`) whose account may never
+ * have set up qualification at all — a missing `qualificationConfigs`
+ * row just means no admin-alert phones to add, NOT that membership
+ * phones stop counting as staff. A team member's own WhatsApp number is
+ * staff regardless of whether qualification is configured or enabled.
  */
 export async function loadStaffPhoneSet(
   ctx: DbReadCtx,
   accountId: Id<"accounts">,
-  config: Doc<"qualificationConfigs">,
+  config: Doc<"qualificationConfigs"> | null,
 ): Promise<Set<string>> {
   const set = new Set<string>(
-    config.adminAlertPhones.map((p) => normalizePhone(p)).filter(Boolean),
+    (config?.adminAlertPhones ?? []).map((p) => normalizePhone(p)).filter(Boolean),
   );
   const members = await ctx.db
     .query("memberships")

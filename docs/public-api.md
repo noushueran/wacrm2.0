@@ -170,6 +170,13 @@ Domain error codes beyond the table above: `whatsapp_not_configured`
 (400), `meta_error` (502 — the request reached Meta and it rejected the
 send), `template_malformed` (500).
 
+If the contact has been marked **do-not-contact** (an agent recorded
+that they asked not to be contacted), the send is rejected outright
+with `bad_request` (400) rather than silently no-op'ing — a single-
+message request that appears to succeed but never sends is worse than
+an explicit error. Message them manually from the inbox instead; this
+endpoint will not.
+
 ### `GET /api/v1/contacts`
 
 List contacts, newest first. Scope: `contacts:read`. Paginated (see
@@ -250,8 +257,13 @@ curl -X POST https://wa.holidayys.co/api/v1/broadcasts \
 ```
 
 Recipients are capped at **1000 per request** — split larger sends.
-Invalid phone numbers are dropped and counted as `rejected`. Response
-(202):
+Invalid phone numbers are dropped and counted as `rejected`. A resolved
+contact who has previously asked not to be contacted is also dropped —
+never messaged — and counted as `skipped`. `total_recipients` and
+`accepted` always report the count that will actually be messaged (they
+match `GET /api/v1/broadcasts/{id}`'s `total_recipients`), so they can
+be lower than `recipients.length` even when every phone number was
+valid. Response (202):
 
 ```json
 {
@@ -260,7 +272,8 @@ Invalid phone numbers are dropped and counted as `rejected`. Response
     "status": "sending",
     "total_recipients": 2,
     "accepted": 2,
-    "rejected": 0
+    "rejected": 0,
+    "skipped": 0
   }
 }
 ```

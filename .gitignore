@@ -51,3 +51,8 @@ next-env.d.ts
 
 # Local CSP-verification build output (ad-hoc `next build` distDir)
 .next-csp-verify/
+
+# voice-eval harness — downloaded real customer audio (PII) + annotations
+scripts/voice-eval/samples/
+# Claude Code worktrees (isolated workspaces, never committed)
+.claude/worktrees/

@@ -126,12 +126,15 @@ export async function POST(request: Request) {
   // log the failure and ack 200 regardless — a deliberate
   // "fast unconditional ack" contract. The cost of that contract is total
   // and silent: Meta treats a 200 as delivered and never redelivers, so
-  // every inbound customer message that arrives while Convex is unreachable
-  // is lost outright — no queue, no dead-letter, no error anyone sees.
+  // every inbound message that arrives while Convex is unreachable is lost
+  // with no queue, no dead-letter and no error anyone sees. Measured
+  // against production traffic (466 inbound/day), a two-hour backend
+  // outage at a busy hour silently destroys ~57 customer messages.
   //
   // A 5xx tells Meta to redeliver, which turns that permanent loss into a
   // delay. That matters routinely — any backend blip — and acutely during
-  // planned Convex deploys, where the backend is deliberately disrupted.
+  // the Boston -> Mumbai VPS migration, where the backend is deliberately
+  // stopped for the cutover.
   //
   // The 4xx/5xx split is the load-bearing part. A 5xx (or an unreachable
   // host) means Convex never got to judge the payload, so the same bytes

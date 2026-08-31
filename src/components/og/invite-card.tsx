@@ -1,4 +1,5 @@
 import { ImageResponse } from 'next/og';
+import { BRAND, PRODUCT_NAME } from '@/lib/brand';
 
 // ============================================================
 // Shared 1200×630 social card for the /join invite page.
@@ -25,8 +26,7 @@ import { ImageResponse } from 'next/og';
 // Kept in one place so the route files' `export const size` and this
 // ImageResponse agree.
 export const INVITE_OG_SIZE = { width: 1200, height: 630 } as const;
-export const INVITE_OG_ALT =
-  'You are invited to join a team on Holidayys WA CRM';
+export const INVITE_OG_ALT = `You are invited to join a team on ${PRODUCT_NAME}`;
 export const INVITE_OG_CONTENT_TYPE = 'image/png';
 
 export function renderInviteOgImage(): ImageResponse {
@@ -72,7 +72,7 @@ export function renderInviteOgImage(): ImageResponse {
         </div>
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           <div style={{ fontSize: 28, letterSpacing: 4, color: '#a5b4fc' }}>
-            HOLIDAYYS
+            AMANI
           </div>
           <div style={{ fontSize: 40, fontWeight: 700 }}>WhatsApp CRM</div>
         </div>
@@ -108,7 +108,10 @@ export function renderInviteOgImage(): ImageResponse {
           }}
         />
         <div style={{ fontSize: 26, color: '#64748b' }}>
-          Holidays Tours LLC · Internal team access
+          {/* One interpolated child, not an expression + text node:
+              Satori requires an explicit `display` when a div has more
+              than one child, and splitting this string created two. */}
+          {`${BRAND.legalName} · Internal team access`}
         </div>
       </div>
     </div>,

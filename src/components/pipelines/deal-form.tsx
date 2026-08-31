@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useMemo } from "react";
 import { useMutation, usePaginatedQuery, useQuery } from "convex/react";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
@@ -65,40 +65,67 @@ export function DealForm({
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  // Reset the form fields every time the sheet opens or its input
-  // props change. This is a legitimate prop-driven sync; the rule is
-  // over-cautious here, hence the block-level disable.
-  /* eslint-disable react-hooks/set-state-in-effect */
-  useEffect(() => {
-    if (!open) return;
-    setConfirmDelete(false);
-    if (deal) {
-      setTitle(deal.title);
-      setValue(String(deal.value ?? ""));
-      setCurrency(deal.currency || defaultCurrency);
-      // contact_id is nullable when the contact has been deleted
-      // (migration 004: ON DELETE SET NULL). "" means "no selection".
-      setContactId(deal.contact_id ?? "");
-      setStageId(deal.stage_id);
-      setAssignedTo(deal.assigned_to ?? "");
-      // `expected_close_date` is an ISO string (see toUiDeal) — the
-      // date input only wants the "YYYY-MM-DD" prefix.
-      setExpectedCloseDate(
-        deal.expected_close_date ? deal.expected_close_date.slice(0, 10) : "",
-      );
-      setNotes(deal.notes ?? "");
-    } else {
-      setTitle("");
-      setValue("");
-      setCurrency(defaultCurrency);
-      setContactId("");
-      setStageId(defaultStageId || stages[0]?.id || "");
-      setAssignedTo("");
-      setExpectedCloseDate("");
-      setNotes("");
+  // Reset the form fields when the sheet opens, or when it is opened onto
+  // a different deal.
+  //
+  // Done during render, guarded by a key, rather than in an effect. The
+  // reset used to land after paint, so opening the sheet showed one frame
+  // of the PREVIOUS deal's values — the more jarring the more the two
+  // deals differed. Seeding during render means the first painted frame
+  // is already correct.
+  //
+  // The key is what the old dependency array was reaching for, made
+  // precise. It deliberately does NOT include `stages`: that array is a
+  // reactive query result, so any pipeline edit elsewhere changed its
+  // identity, re-ran the effect and WIPED whatever the user had typed
+  // into the open form. Only `stages[0]?.id` is read below, as the
+  // fallback stage for a new deal, so only that participates.
+  // `defaultStageId` and `defaultCurrency` stay in: both can arrive after
+  // the sheet is already open, and a new deal still needs to pick them up.
+  const resetKey = [
+    open,
+    deal?.id ?? "new",
+    defaultStageId ?? "",
+    defaultCurrency,
+    stages[0]?.id ?? "",
+  ].join("|");
+  // Recorded on EVERY change, including the close, while the reset itself
+  // runs only while open. Recording only when open would leave the
+  // closing transition unrecorded, so reopening the same deal would
+  // compare equal and skip its reset — the sheet would come back holding
+  // whatever was last typed into it.
+  const [lastResetKey, setLastResetKey] = useState(resetKey);
+  if (resetKey !== lastResetKey) {
+    setLastResetKey(resetKey);
+    if (open) {
+      setConfirmDelete(false);
+      if (deal) {
+        setTitle(deal.title);
+        setValue(String(deal.value ?? ""));
+        setCurrency(deal.currency || defaultCurrency);
+        // contact_id is nullable when the contact has been deleted
+        // (migration 004: ON DELETE SET NULL). "" means "no selection".
+        setContactId(deal.contact_id ?? "");
+        setStageId(deal.stage_id);
+        setAssignedTo(deal.assigned_to ?? "");
+        // `expected_close_date` is an ISO string (see toUiDeal) — the
+        // date input only wants the "YYYY-MM-DD" prefix.
+        setExpectedCloseDate(
+          deal.expected_close_date ? deal.expected_close_date.slice(0, 10) : "",
+        );
+        setNotes(deal.notes ?? "");
+      } else {
+        setTitle("");
+        setValue("");
+        setCurrency(defaultCurrency);
+        setContactId("");
+        setStageId(defaultStageId || stages[0]?.id || "");
+        setAssignedTo("");
+        setExpectedCloseDate("");
+        setNotes("");
+      }
     }
-  }, [open, deal, defaultStageId, stages, defaultCurrency]);
-  /* eslint-enable react-hooks/set-state-in-effect */
+  }
 
   // Contact picker — Convex has no non-paginated contacts list; 500
   // covers realistic pickers (see task report for the cap caveat).

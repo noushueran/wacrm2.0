@@ -1,4 +1,5 @@
 export type PushPayload = { title: string; body: string; url: string; tag: string };
+import { productName } from "./brand";
 
 const TYPE_LABEL: Record<string, string> = {
   image: "📷 Photo",
@@ -31,7 +32,7 @@ export function buildInboundPayload(input: {
   const url = `/inbox?c=${input.conversationId}`;
   const tag = input.conversationId;
   if (input.hidePreview) {
-    return { title: "Holidayys WA CRM", body: "New WhatsApp message", url, tag };
+    return { title: productName(), body: "New WhatsApp message", url, tag };
   }
   return {
     title: input.contactName?.trim() || "New message",
@@ -57,7 +58,7 @@ export function buildQualifiedLeadPayload(input: {
   const url = `/inbox?c=${input.conversationId}`;
   const tag = `qualified-${input.conversationId}`;
   if (input.hidePreview) {
-    return { title: "Holidayys WA CRM", body: "New qualified lead", url, tag };
+    return { title: productName(), body: "New qualified lead", url, tag };
   }
   const parts = [
     input.contactName?.trim() || "New lead",

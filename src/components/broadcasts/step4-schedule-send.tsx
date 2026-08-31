@@ -55,6 +55,18 @@ export function Step4ScheduleSend({
   const [showConfirm, setShowConfirm] = useState(false);
   const [estimatedReach, setEstimatedReach] = useState<number>(0);
   const [loadingReach, setLoadingReach] = useState(true);
+  // Recipients within the current selection already flagged do-not-contact.
+  // `broadcasts.create` silently drops these at send time and reports the
+  // count only in a post-send toast — this is the pre-send half, so a
+  // sender who picks 200 contacts and would actually reach 197 isn't
+  // surprised after the fact. Computed from the same paginated fetches as
+  // `estimatedReach` above (the raw `contacts.list`/`filterByTags` docs
+  // already carry `doNotContact` — they aren't run through `toUiContact`
+  // here, so the field stays camelCase rather than becoming
+  // `do_not_contact`). CSV rows aren't resolved to real contacts until
+  // send time, so they can't be checked here; they never count as skipped
+  // in this estimate.
+  const [skippedCount, setSkippedCount] = useState(0);
 
   useEffect(() => {
     async function calculateReach() {
@@ -65,6 +77,7 @@ export function Step4ScheduleSend({
           // `{ count: 'exact', head: true }` — page through every
           // contact via `contacts.list` instead.
           let total = 0;
+          let skipped = 0;
           let cursor: string | null = null;
           for (;;) {
             // Explicit type annotation avoids TS7022 (see
@@ -74,17 +87,19 @@ export function Step4ScheduleSend({
                 paginationOpts: { numItems: 500, cursor },
               });
             total += result.page.length;
+            skipped += result.page.filter((c) => !!c.doNotContact).length;
             if (result.isDone) break;
             cursor = result.continueCursor;
           }
           setEstimatedReach(total);
+          setSkippedCount(skipped);
         } else if (
           audience.type === 'tags' &&
           audience.tagIds &&
           audience.tagIds.length > 0
         ) {
           const tagIds = audience.tagIds.map((id) => id as Id<'tags'>);
-          const uniqueIds = new Set<Id<'contacts'>>();
+          const uniqueContacts = new Map<Id<'contacts'>, boolean>();
           const limit = 500;
           let offset = 0;
           for (;;) {
@@ -93,15 +108,22 @@ export function Step4ScheduleSend({
               limit,
               offset,
             });
-            for (const item of result.items) uniqueIds.add(item._id);
+            for (const item of result.items) {
+              uniqueContacts.set(item._id, !!item.doNotContact);
+            }
             offset += limit;
             if (offset >= result.total) break;
           }
-          setEstimatedReach(uniqueIds.size);
+          setEstimatedReach(uniqueContacts.size);
+          setSkippedCount(
+            [...uniqueContacts.values()].filter(Boolean).length,
+          );
         } else if (audience.type === 'csv' && audience.csvContacts) {
           setEstimatedReach(audience.csvContacts.length);
+          setSkippedCount(0);
         } else {
           setEstimatedReach(0);
+          setSkippedCount(0);
         }
       } finally {
         setLoadingReach(false);
@@ -170,6 +192,11 @@ export function Step4ScheduleSend({
             <p className="text-foreground">{template.language ?? 'en_US'}</p>
           </div>
         </div>
+        {!loadingReach && skippedCount > 0 && (
+          <p className="text-xs text-muted-foreground">
+            {t('scheduleSend.willSkipDoNotContact', { count: skippedCount })}
+          </p>
+        )}
       </div>
 
       {/* Processing overlay */}

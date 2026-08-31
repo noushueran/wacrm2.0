@@ -176,12 +176,12 @@ export function ApiKeysSettings() {
                           {k.name}
                         </span>
                         {status === 'revoked' && (
-                          <Badge className="border-border bg-muted text-muted-foreground text-[10px] tracking-wide uppercase">
+                          <Badge className="border-border bg-muted text-muted-foreground text-[11px] tracking-wide uppercase">
                             {t('revoked')}
                           </Badge>
                         )}
                         {status === 'expired' && (
-                          <Badge className="border-border bg-muted text-muted-foreground text-[10px] tracking-wide uppercase">
+                          <Badge className="border-border bg-muted text-muted-foreground text-[11px] tracking-wide uppercase">
                             {t('expired')}
                           </Badge>
                         )}
@@ -198,7 +198,7 @@ export function ApiKeysSettings() {
                           k.scopes.map((s) => (
                             <Badge
                               key={s}
-                              className="border-border bg-muted text-muted-foreground text-[10px]"
+                              className="border-border bg-muted text-muted-foreground text-[11px]"
                             >
                               {s}
                             </Badge>
@@ -412,7 +412,7 @@ function CreateKeyDialog({
                 <p className="text-muted-foreground text-xs">
                   {t.rich('scopesHint', {
                     code: (chunks: React.ReactNode) => (
-                      <code className="text-[11px]">{chunks}</code>
+                      <code className="text-[12px]">{chunks}</code>
                     ),
                   })}
                 </p>

@@ -69,19 +69,19 @@ describe('serializeMessage', () => {
   });
 
   it('prefers mediaKey over a legacy mediaUrl, resolved to a public R2 URL (Task 5: dual-read)', () => {
-    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.holidayys.co';
+    process.env.NEXT_PUBLIC_R2_PUBLIC_HOST = 'https://objs.amaniworld.com';
     const withKey: ConvexApiMessage = {
       _id: 'm2',
       _creationTime: Date.parse('2026-01-01T00:00:00Z'),
       conversationId: 'conv1',
       senderType: 'customer',
       contentType: 'image',
-      mediaUrl: 'https://convex-api.holidayys.co/api/storage/old',
+      mediaUrl: 'https://convex-api.amaniworld.com/api/storage/old',
       mediaKey: 'acc1/inbound/photo.jpg',
       status: 'delivered',
     };
     expect(serializeMessage(withKey).media_url).toBe(
-      'https://objs.holidayys.co/acc1/inbound/photo.jpg',
+      'https://objs.amaniworld.com/acc1/inbound/photo.jpg',
     );
     delete process.env.NEXT_PUBLIC_R2_PUBLIC_HOST;
   });

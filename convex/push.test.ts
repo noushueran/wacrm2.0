@@ -365,7 +365,7 @@ test("assembleDelivery: hidePreview collapses the payload to the generic body", 
   });
 
   expect(result.jobs).toHaveLength(1);
-  expect(result.jobs[0]!.payload.title).toBe("Holidayys WA CRM");
+  expect(result.jobs[0]!.payload.title).toBe("Testco WA CRM");
   expect(result.jobs[0]!.payload.body).toBe("New WhatsApp message");
   // Routing still works even with the preview hidden.
   expect(result.jobs[0]!.payload.url).toBe(`/inbox?c=${conversationId}`);

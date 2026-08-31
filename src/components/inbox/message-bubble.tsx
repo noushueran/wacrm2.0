@@ -1,8 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
 import { cn } from "@/lib/utils";
-import { downloadHrefFor, filenameFor } from "@/lib/media/download";
 import type { ContactsPayloadEntry, Message, MessageReaction } from "@/types";
 import {
   Clock,
@@ -22,12 +21,15 @@ import {
   Maximize2,
 } from "lucide-react";
 import { format } from "date-fns";
+import { MediaLightbox } from "./media-lightbox";
+import { useMediaObjectUrl } from "./use-media-object-url";
+import { useMediaDownload } from "./use-media-download";
 import { ReplyQuote } from "./reply-quote";
 import { MessageReactions } from "./message-reactions";
 import { AdReferralCard } from "./ad-referral-card";
 import { VoiceTranscript } from "./voice-transcript";
-import { MediaLightbox } from "./media-lightbox";
 import { InteractivePreview } from "@/components/interactive/interactive-preview";
+import { linkifyMessage } from "@/lib/inbox/linkify";
 import { useTranslations } from "next-intl";
 
 interface MessageBubbleProps {
@@ -69,107 +71,26 @@ function MediaUnavailable({ label, t }: { label: string, t: ReturnType<typeof us
   );
 }
 
-/**
- * Save control for a media bubble.
- *
- * `href` comes from `downloadHrefFor`, which routes cross-origin media
- * through `/api/media/download` — the `download` attribute below is
- * IGNORED by browsers on a cross-origin url, so without that indirection
- * this button would just navigate to the file.
- */
-function MediaDownloadButton({
-  href,
-  filename,
-  label,
-  className,
-}: {
-  href: string;
-  filename: string;
-  label: string;
-  className?: string;
-}) {
-  return (
-    <a
-      href={href}
-      download={filename}
-      title={label}
-      aria-label={label}
-      className={cn(
-        "inline-flex items-center justify-center rounded-md bg-black/55 p-1.5 text-white backdrop-blur-sm transition-colors hover:bg-black/75 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none",
-        className,
-      )}
-    >
-      <Download className="h-3.5 w-3.5" />
-    </a>
-  );
+/** Shared by every media type: the two strings `useMediaDownload` needs
+ *  for its failure toast, read off the bubble's own `t`. */
+function downloadLabels(t: ReturnType<typeof useTranslations>) {
+  return { failed: t("downloadFailed"), openInTab: t("openInTab") };
 }
 
-/** Corner overlay controls, revealed when the media is hovered or focused. */
-const OVERLAY_CONTROL =
-  "opacity-0 transition-opacity group-hover/media:opacity-100 group-focus-within/media:opacity-100";
-
-function MediaImage({
-  url,
-  alt,
-  message,
-  t,
-}: {
+interface MediaProps {
   url: string;
-  alt: string;
-  message: Message;
+  createdAt: Message["created_at"];
+  caption?: string;
   t: ReturnType<typeof useTranslations>;
-}) {
-  const [src, setSrc] = useState<string | null>(null);
-  const [error, setError] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [zoomed, setZoomed] = useState(false);
-  // The blob url must be revoked through a ref, not through `src`. The old
-  // cleanup closed over the render in which the effect ran, where `src` was
-  // still null — so it never revoked anything and every proxied image leaked
-  // for the life of the page.
-  const blobUrlRef = useRef<string | null>(null);
+}
 
-  useEffect(() => {
-    let cancelled = false;
-    setSrc(null);
-    setError(false);
-    setLoading(true);
+function MediaImage({ url, createdAt, caption, t }: MediaProps) {
+  const { src, state, markError } = useMediaObjectUrl(url);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const { download, pending } = useMediaDownload(downloadLabels(t));
+  const alt = caption || t("photo");
 
-    async function load() {
-      if (!url) return;
-
-      // Proxy URLs need auth fetch to create blob URL
-      if (url.startsWith("/api/whatsapp/media/")) {
-        try {
-          const res = await fetch(url);
-          if (!res.ok) throw new Error("Failed to load media");
-          const blob = await res.blob();
-          if (cancelled) return;
-          const blobUrl = URL.createObjectURL(blob);
-          blobUrlRef.current = blobUrl;
-          setSrc(blobUrl);
-        } catch {
-          if (!cancelled) setError(true);
-        } finally {
-          if (!cancelled) setLoading(false);
-        }
-      } else {
-        setSrc(url);
-        setLoading(false);
-      }
-    }
-
-    load();
-    return () => {
-      cancelled = true;
-      if (blobUrlRef.current) {
-        URL.revokeObjectURL(blobUrlRef.current);
-        blobUrlRef.current = null;
-      }
-    };
-  }, [url]);
-
-  if (error) {
+  if (state === "error") {
     return (
       <div className="flex h-40 w-60 items-center justify-center rounded-lg bg-muted">
         <ImageOff className="h-8 w-8 text-muted-foreground" />
@@ -177,7 +98,7 @@ function MediaImage({
     );
   }
 
-  if (loading) {
+  if (state === "loading" || !src) {
     return (
       <div className="flex h-40 w-60 items-center justify-center rounded-lg bg-muted">
         <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
@@ -185,135 +106,108 @@ function MediaImage({
     );
   }
 
-  const filename = filenameFor(message);
-  const downloadHref = message.media_url
-    ? downloadHrefFor(message.media_url, filename)
-    : null;
-
   return (
     <>
-      <div className="group/media relative w-fit">
-        <button
-          type="button"
-          onClick={() => setZoomed(true)}
-          aria-label={t("viewImage")}
-          className="block cursor-zoom-in rounded-lg focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-        >
-          {/* `object-contain` is a safeguard, not the fix. With only
-              `max-*` constraints and no fixed dimensions the box already
-              takes the image's own aspect ratio, so `cover` and `contain`
-              render identically today (measured: both 76.8×256 for a
-              600×2000 banner). `contain` states the intent and stays
-              correct if this ever gains explicit width/height, where
-              `cover` WOULD start cropping. What actually made a tall
-              banner unreadable is the thumbnail size itself — 77px wide
-              here — which is what the lightbox below exists to solve. */}
-          <img
-            src={src ?? ""}
-            alt={alt}
-            className="max-h-64 max-w-60 rounded-lg object-contain"
-            onError={() => setError(true)}
-          />
-        </button>
-        {downloadHref && (
-          <MediaDownloadButton
-            href={downloadHref}
-            filename={filename}
-            label={t("download")}
-            className={cn("absolute top-1.5 right-1.5", OVERLAY_CONTROL)}
-          />
-        )}
-      </div>
-      {src && (
-        <MediaLightbox
-          open={zoomed}
-          onOpenChange={setZoomed}
-          kind="image"
+      <button
+        type="button"
+        onClick={() => setViewerOpen(true)}
+        aria-label={t("viewLarger")}
+        className="block cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {/* Plain `<img>`, not `next/image`. `src` is a short-lived signed
+            URL for WhatsApp media on object storage: the host is not a fixed
+            origin that could be listed in `images.remotePatterns` (none is
+            configured), and routing an already-authenticated, expiring URL
+            through the optimizer would both re-fetch it server-side and bill
+            per transformation for images displayed at most once, in a chat
+            thread, at a fixed 240px cap. */}
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
           src={src}
           alt={alt}
-          title={alt}
-          // Falls back to the displayed source (a blob url for proxied
-          // media) when the message carries no resolvable media url.
-          downloadHref={downloadHref ?? src}
-          filename={filename}
-          downloadLabel={t("download")}
-          closeLabel={t("closeViewer")}
+          onError={markError}
+          // `object-contain`, not `object-cover`: a cover crop cuts the
+          // top and bottom off a tall banner, which is precisely the
+          // content an agent needs to check at a glance.
+          className="max-h-64 max-w-60 rounded-lg object-contain"
         />
-      )}
+      </button>
+      <MediaLightbox
+        open={viewerOpen}
+        onOpenChange={setViewerOpen}
+        kind="image"
+        src={src}
+        alt={alt}
+        caption={caption}
+        downloadPending={pending}
+        onDownload={() => void download({ kind: "image", url, createdAt })}
+        t={t}
+      />
     </>
   );
 }
 
-/**
- * Video bubble. The inline player keeps its native controls, so enlarging
- * is an explicit corner button rather than a click on the video itself —
- * clicking the frame belongs to play/pause.
- */
-function MediaVideo({
-  url,
-  message,
-  t,
-}: {
-  url: string;
-  message: Message;
-  t: ReturnType<typeof useTranslations>;
-}) {
-  const [zoomed, setZoomed] = useState(false);
-  const inlineRef = useRef<HTMLVideoElement>(null);
-  const filename = filenameFor(message);
-  const downloadHref = downloadHrefFor(url, filename);
-
-  // The lightbox mounts a SECOND player on the same source. Without this the
-  // inline one keeps playing behind the backdrop and the agent hears both.
-  function openZoomed() {
-    inlineRef.current?.pause();
-    setZoomed(true);
-  }
+function MediaVideo({ url, createdAt, caption, t }: MediaProps) {
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const { download, pending } = useMediaDownload(downloadLabels(t));
 
   return (
     <>
-      <div className="group/media relative w-fit">
-        <video
-          ref={inlineRef}
-          src={url}
-          controls
-          className="max-h-64 max-w-60 rounded-lg"
-        />
-        <div
-          className={cn(
-            "absolute top-1.5 right-1.5 flex items-center gap-1",
-            OVERLAY_CONTROL,
-          )}
+      {/* The video keeps its own click (play/pause), so enlarging needs a
+          control of its own rather than a click-through overlay. */}
+      <div className="relative w-fit">
+        <video src={url} controls className="max-h-64 max-w-60 rounded-lg" />
+        <button
+          type="button"
+          onClick={() => setViewerOpen(true)}
+          aria-label={t("viewLarger")}
+          className="absolute top-1.5 right-1.5 flex h-7 w-7 items-center justify-center rounded-full bg-black/60 text-white outline-none transition-colors hover:bg-black/80 focus-visible:ring-2 focus-visible:ring-white/60"
         >
-          <button
-            type="button"
-            onClick={openZoomed}
-            title={t("viewVideo")}
-            aria-label={t("viewVideo")}
-            className="inline-flex items-center justify-center rounded-md bg-black/55 p-1.5 text-white backdrop-blur-sm transition-colors hover:bg-black/75 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none"
-          >
-            <Maximize2 className="h-3.5 w-3.5" />
-          </button>
-          <MediaDownloadButton
-            href={downloadHref}
-            filename={filename}
-            label={t("download")}
-          />
-        </div>
+          <Maximize2 className="h-3.5 w-3.5" />
+        </button>
       </div>
       <MediaLightbox
-        open={zoomed}
-        onOpenChange={setZoomed}
+        open={viewerOpen}
+        onOpenChange={setViewerOpen}
         kind="video"
         src={url}
-        alt={t("video")}
-        title={t("video")}
-        downloadHref={downloadHref}
-        filename={filename}
-        downloadLabel={t("download")}
-        closeLabel={t("closeViewer")}
+        alt={caption || t("video")}
+        caption={caption}
+        downloadPending={pending}
+        onDownload={() => void download({ kind: "video", url, createdAt })}
+        t={t}
       />
     </>
+  );
+}
+
+function MediaDocument({ url, createdAt, caption, t }: MediaProps) {
+  const { download, pending } = useMediaDownload(downloadLabels(t));
+  const name = caption || t("document");
+
+  return (
+    <div className="flex items-center gap-1 rounded-lg bg-muted/50 pr-1 text-sm">
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-2 hover:bg-muted"
+      >
+        <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
+        <span className="truncate">{name}</span>
+      </a>
+      <button
+        type="button"
+        onClick={() =>
+          void download({ kind: "document", url, createdAt, documentName: caption })
+        }
+        disabled={pending}
+        aria-label={t("download")}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+      >
+        <Download className="h-4 w-4" />
+      </button>
+    </div>
   );
 }
 
@@ -328,12 +222,51 @@ function MessageContent({ message, t, isAgent }: { message: Message, t: ReturnTy
   );
 }
 
+/**
+ * Message text with its URLs turned into anchors. Until this existed
+ * every bubble rendered `content_text` as an inert string, so a link an
+ * agent sent — or a customer sent in — could not be clicked at all.
+ *
+ * `target="_blank"` keeps the inbox tab alive (an agent clicking a link
+ * mid-thread must not lose the conversation), and `rel` carries all
+ * three of noopener/noreferrer/nofollow because a large share of these
+ * URLs arrive in INBOUND messages and are therefore untrusted: noopener
+ * closes the reverse-tabnabbing hole that `target="_blank"` opens on its
+ * own, and nofollow keeps the CRM from vouching for whatever a stranger
+ * pasted. The href itself is constrained to http(s) by `linkifyMessage`.
+ *
+ * Colour is inherited rather than set: these bubbles come in two fills
+ * (agent = `bg-primary`, customer = muted), and a fixed link colour is
+ * unreadable on one of them.
+ */
+function LinkifiedText({ text }: { text: string }) {
+  return (
+    <>
+      {linkifyMessage(text).map((segment, i) =>
+        segment.type === "link" ? (
+          <a
+            key={i}
+            href={segment.href}
+            target="_blank"
+            rel="noopener noreferrer nofollow"
+            className="underline underline-offset-2 hover:opacity-80"
+          >
+            {segment.text}
+          </a>
+        ) : (
+          <span key={i}>{segment.text}</span>
+        ),
+      )}
+    </>
+  );
+}
+
 export function MessageContentBody({ message, t, isAgent }: { message: Message, t: ReturnType<typeof useTranslations>, isAgent: boolean }) {
   switch (message.content_type) {
     case "text":
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
-          {message.content_text}
+          <LinkifiedText text={message.content_text ?? ""} />
         </p>
       );
 
@@ -343,8 +276,8 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
           {message.media_url ? (
             <MediaImage
               url={message.media_url}
-              alt="Shared image"
-              message={message}
+              createdAt={message.created_at}
+              caption={message.content_text}
               t={t}
             />
           ) : (
@@ -352,7 +285,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
           )}
           {message.content_text && (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
-              {message.content_text}
+              <LinkifiedText text={message.content_text} />
             </p>
           )}
         </div>
@@ -362,13 +295,18 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       return (
         <div>
           {message.media_url ? (
-            <MediaVideo url={message.media_url} message={message} t={t} />
+            <MediaVideo
+              url={message.media_url}
+              createdAt={message.created_at}
+              caption={message.content_text}
+              t={t}
+            />
           ) : (
             <MediaUnavailable label={t("video")} t={t} />
           )}
           {message.content_text && (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
-              {message.content_text}
+              <LinkifiedText text={message.content_text} />
             </p>
           )}
         </div>
@@ -378,15 +316,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       return (
         <div>
           {message.media_url ? (
-            <div className="flex items-center gap-1.5">
-              <audio src={message.media_url} controls className="max-w-60" />
-              <MediaDownloadButton
-                href={downloadHrefFor(message.media_url, filenameFor(message))}
-                filename={filenameFor(message)}
-                label={t("download")}
-                className="shrink-0 bg-foreground/10 text-foreground hover:bg-foreground/20"
-              />
-            </div>
+            <audio src={message.media_url} controls className="max-w-60" />
           ) : (
             <MediaUnavailable label={t("audio")} t={t} />
           )}
@@ -406,35 +336,25 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
         </div>
       );
 
-    case "document": {
+    case "document":
       if (!message.media_url) {
         return <MediaUnavailable label={message.content_text || t("document")} t={t} />;
       }
-      // The row is the download. It used to `target="_blank"` straight at
-      // the media url, which — being cross-origin — opened the file in a
-      // tab instead of saving it, leaving no way to get the file at all.
-      const filename = filenameFor(message);
       return (
-        <a
-          href={downloadHrefFor(message.media_url, filename)}
-          download={filename}
-          className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm hover:bg-muted"
-        >
-          <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
-          <span className="truncate">
-            {message.content_text || t("document")}
-          </span>
-          <Download className="h-4 w-4 shrink-0 text-muted-foreground" />
-        </a>
+        <MediaDocument
+          url={message.media_url}
+          createdAt={message.created_at}
+          caption={message.content_text}
+          t={t}
+        />
       );
-    }
 
     case "template":
       return (
         <div>
           <span
             className={cn(
-              "mb-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
+              "mb-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium",
               // Outbound bubbles are filled with `bg-primary`, so the old
               // `bg-primary/20 text-primary` badge was purple-on-purple and
               // invisible — the reason a body-less template message rendered
@@ -450,7 +370,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
           </span>
           {message.content_text && (
             <p className="mt-1 whitespace-pre-wrap break-words text-sm">
-              {message.content_text}
+              <LinkifiedText text={message.content_text} />
             </p>
           )}
         </div>
@@ -480,19 +400,19 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       if (message.sender_type === "customer") {
         return (
           <div className="flex flex-col gap-0.5">
-            <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
               <CornerDownLeft className="h-3 w-3" />
               {t("buttonReply")}
             </span>
             <p className="whitespace-pre-wrap break-words text-sm">
-              {message.content_text || t("interactiveReply")}
+              <LinkifiedText text={message.content_text || t("interactiveReply")} />
             </p>
           </div>
         );
       }
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
-          {message.content_text || t("interactiveReply")}
+          <LinkifiedText text={message.content_text || t("interactiveReply")} />
         </p>
       );
     }
@@ -512,7 +432,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
       }
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
-          {message.content_text || t("contactCard")}
+          <LinkifiedText text={message.content_text || t("contactCard")} />
         </p>
       );
     }
@@ -520,7 +440,7 @@ export function MessageContentBody({ message, t, isAgent }: { message: Message, 
     default:
       return (
         <p className="whitespace-pre-wrap break-words text-sm">
-          {message.content_text || t("unsupported")}
+          <LinkifiedText text={message.content_text || t("unsupported")} />
         </p>
       );
   }
@@ -648,7 +568,7 @@ export function MessageBubble({
               glance. */}
           {message.ai_generated && (
             <span
-              className="inline-flex items-center gap-0.5 rounded-full bg-primary-foreground/20 px-1.5 py-px text-[9px] font-semibold uppercase leading-none tracking-wide text-primary-foreground"
+              className="inline-flex items-center gap-0.5 rounded-full bg-primary-foreground/20 px-1.5 py-px text-[10px] font-semibold uppercase leading-none tracking-wide text-primary-foreground"
               title={t("aiBadgeTitle")}
             >
               <Sparkles className="h-2.5 w-2.5" />
@@ -657,7 +577,7 @@ export function MessageBubble({
           )}
           <span
             className={cn(
-              "text-[10px]",
+              "text-[11px]",
               // Outbound bubbles sit on the primary fill, so the
               // timestamp must read against that (not the neutral
               // foreground) — otherwise it goes low-contrast in light

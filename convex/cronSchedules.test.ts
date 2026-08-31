@@ -121,6 +121,20 @@ test("wrapped cron records a success run end-to-end (dormant sweep no-op)", asyn
   expect(rows[0].finishedAt).toBeGreaterThanOrEqual(rows[0].startedAt);
 });
 
+// P3 Task 9: `lead-sequence` runs through the same wrapper discipline as
+// every other cron — a dormant sweep (no `running` rows due) still
+// stamps a success `cronRuns` row rather than silently doing nothing.
+test("wrapped lead-sequence cron records a success run end-to-end (dormant sweep no-op)", async () => {
+  const t = convexTest(schema, modules);
+
+  await t.action(internal.cronSchedules.runSweepLeadSequence, {});
+
+  const rows = await t.run((ctx) => ctx.db.query("cronRuns").collect());
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ name: "lead-sequence", status: "success" });
+  expect(rows[0].finishedAt).toBeGreaterThanOrEqual(rows[0].startedAt);
+});
+
 test("overview requires the admin role", async () => {
   const t = convexTest(schema, modules);
   const supervisor = await seedMember(t, "supervisor");

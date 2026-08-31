@@ -31,6 +31,45 @@ export const FUNNEL_STAGE_KEYS: FunnelStageKey[] = FUNNEL_STAGES.map(
 
 export type FunnelLane = "code" | "ctwa";
 
+/**
+ * The deals-pipeline columns: the funnel minus `new_lead`, because only a
+ * QUALIFIED session is a deal and a deal whose conversation still says
+ * `new_lead` belongs in the first column rather than off-board.
+ *
+ * Mirrors `src/lib/leads/pipeline.ts`'s `PIPELINE_STAGE_KEYS`, following
+ * this codebase's standing convention that the frontend never imports
+ * across the `convex/` boundary (see that file's own note about
+ * `LOSS_CATEGORIES`). Keep the two lists identical — `funnel.test.ts`
+ * pins this one against `FUNNEL_STAGES`, so a stage added there without
+ * being added here fails rather than silently vanishing from the board.
+ */
+export const PIPELINE_STAGE_KEYS = FUNNEL_STAGE_KEYS.filter(
+  (k) => k !== "new_lead",
+);
+
+export type PipelineStageKey = Exclude<FunnelStageKey, "new_lead">;
+
+/**
+ * Which pipeline column a qualified session sits in, or `null` when it is
+ * not a deal at all.
+ *
+ * Server-side twin of `effectivePipelineStage` in
+ * `src/lib/leads/pipeline.ts`, with identical rules: non-qualified sessions
+ * are not deals, and a deal with no funnel stage yet (or one still parked
+ * at the pre-deal `new_lead`) falls into the first column.
+ */
+export function effectivePipelineStage(input: {
+  status: string;
+  funnelStage: string | null | undefined;
+}): PipelineStageKey | null {
+  if (input.status !== "qualified") return null;
+  const stage = input.funnelStage;
+  if (stage && (PIPELINE_STAGE_KEYS as readonly string[]).includes(stage)) {
+    return stage as PipelineStageKey;
+  }
+  return "qualified";
+}
+
 export function getStage(key: FunnelStageKey) {
   const stage = FUNNEL_STAGES.find((s) => s.key === key);
   if (!stage) throw new Error(`unknown funnel stage: ${key}`);

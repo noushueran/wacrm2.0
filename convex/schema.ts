@@ -1,6 +1,11 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { authTables } from "@convex-dev/auth/server";
+import { ARCHIVE_REASONS } from "./lib/leadAnalysis/archive";
+import {
+  AI_USAGE_MODES,
+  AI_USAGE_PROVIDERS,
+} from "./lib/aiUsageStats";
 
 export default defineSchema({
   ...authTables,
@@ -84,6 +89,20 @@ export default defineSchema({
     name: v.optional(v.string()),
     email: v.optional(v.string()),
     company: v.optional(v.string()),
+    // A contact photo is ALWAYS manually uploaded. WhatsApp never supplies
+    // one: an inbound webhook carries `profile.name` and `wa_id` only (see
+    // `convex/lib/whatsapp/webhookParse.ts`), and the Cloud API has no
+    // endpoint for a customer's picture — `whatsapp_business_profile` is
+    // our own business avatar, not theirs. Contacts without one render a
+    // derived colour + initials disc (`src/lib/inbox/avatar.ts`), which is
+    // most of them.
+    //
+    // `avatarKey`/`avatarUrl` are the same dual-read pair as
+    // `memberships` — R2 object key preferred, legacy absolute URL as the
+    // fallback, resolved by `resolveMediaUrl`. `avatarUrl` was here first
+    // (never written by any mutation) and is kept so that a row carrying
+    // one still resolves.
+    avatarKey: v.optional(v.string()),
     avatarUrl: v.optional(v.string()),
     // Human-readable per-account identifier, e.g. "HC-000123". Optional in
     // the schema so pre-backfill rows validate, but written on every new
@@ -107,6 +126,23 @@ export default defineSchema({
     travelers: v.optional(v.string()),
     budget: v.optional(v.string()),
     notes: v.optional(v.string()),
+    // Denormalised from the `contactNotes` row whose `outcome` is
+    // `do_not_contact`. Denormalised on purpose: the Phase 3 gates run
+    // on every inbound message and every chase sweep and need an O(1)
+    // field read, not a per-contact note scan. `noteId` keeps the WHY
+    // one `db.get` away.
+    //
+    // ONE path clears this: `contactNotes.clearDoNotContact`. Deleting
+    // the note that set it does NOT, and neither does editing that
+    // note's outcome — a customer's stated wish must outlive an agent
+    // tidying up their notes.
+    doNotContact: v.optional(
+      v.object({
+        at: v.number(),
+        byUserId: v.optional(v.id("users")),
+        noteId: v.id("contactNotes"),
+      }),
+    ),
     // Lead-acquisition provenance. Set ONCE, the first time a contact
     // arrives via a Click-to-WhatsApp ad referral; never overwritten.
     acquisitionSource: v.optional(v.literal("ad")),
@@ -156,7 +192,12 @@ export default defineSchema({
     accountId: v.id("accounts"),
     contactId: v.id("contacts"),
     tagId: v.id("tags"),
-    source: v.optional(v.union(v.literal("ai"), v.literal("manual"))), // unset = manual (backward-compatible)
+    // unset = manual (backward-compatible). "ad" = derived from a
+    // click-to-WhatsApp referral before qualification ran
+    // (convex/adServiceTagging.ts).
+    source: v.optional(
+      v.union(v.literal("ai"), v.literal("manual"), v.literal("ad")),
+    ),
   })
     .index("by_contact", ["contactId"])
     .index("by_tag", ["tagId"])
@@ -196,7 +237,39 @@ export default defineSchema({
     assignedToUserId: v.optional(v.id("users")),
     lastMessageText: v.optional(v.string()),
     lastMessageAt: v.optional(v.number()),
+    // Denormalised sender type of the message that set `lastMessageText`
+    // and `lastMessageAt` above — written in the same patch, in the
+    // backend's single `insert("messages")` site, so it cannot drift.
+    //
+    // Read ONLY by `leadAnalysis.board`, to spare it a per-row `messages`
+    // query for the lane badge. `undefined` means "not backfilled yet",
+    // and every reader MUST fall back to the real query rather than
+    // assume a value: `leadLane` turns this into an automation-relevant
+    // verdict (`convex/lib/leadAnalysis/priority.ts` — "a customer
+    // waiting on US is never sequenced and never archived"), so a guess
+    // here could authorise a send. The sequence engine deliberately does
+    // NOT read this field; it keeps deriving eligibility from real
+    // message rows.
+    lastMessageSenderType: v.optional(
+      v.union(v.literal("customer"), v.literal("agent"), v.literal("bot")),
+    ),
     unreadCount: v.number(),
+    // When the OLDEST still-unanswered customer message in this thread
+    // arrived; absent when the thread is not waiting on us. This is the whole
+    // pairing state behind the `messageHourlyStats` reply-latency rollup: on
+    // an inbound it is set only if currently absent (so a customer who
+    // double-messages is still one sample, timed from their FIRST message),
+    // and on an outbound it is consumed to record the sample and cleared.
+    //
+    // Deliberately NOT derived from the lane fields beside it, which answer
+    // different questions: `awaitingReply` is a boolean with no timestamp,
+    // `lastInboundAt` moves on EVERY inbound (so it would time from the
+    // customer's latest nudge and flatter the average), and `firstReplyAt` is
+    // the ad-referral 72h anchor, set once and only on ad conversations.
+    // Recomputing it from `messages` instead would mean scanning a thread
+    // backwards to the last outbound — the unbounded read the rollup exists
+    // to remove.
+    pendingCustomerAtMs: v.optional(v.number()),
     // AI auto-reply control (migrations 029 + 033). In Postgres these were
     // NOT NULL DEFAULT false / NOT NULL DEFAULT 0 / nullable text. Convex
     // has no column defaults, and all three were added by later migrations
@@ -238,6 +311,48 @@ export default defineSchema({
         firstSeenAt: v.number(),
       }),
     ),
+    // Meta's AUTHORITATIVE messaging-window record, captured from
+    // outbound status webhooks (`statuses[].conversation`). Preferred
+    // over any local estimate. `isFreeEntryPoint` is derived from either
+    // era's spelling (CBP `origin.type === "referral_conversion"` or PMP
+    // `pricing.type === "free_entry_point"`). `expiresAt` only ever
+    // ADVANCES — status webhooks are unordered, so a late `delivered`
+    // must not shrink a live window.
+    metaWindow: v.optional(
+      v.object({
+        conversationMetaId: v.optional(v.string()),
+        originType: v.optional(v.string()),
+        expiresAt: v.optional(v.number()),
+        isFreeEntryPoint: v.boolean(),
+        // When the free-entry-point signal itself was last observed —
+        // distinct from `updatedAt`, which is rewritten on every status
+        // callback. The latch that carries `isFreeEntryPoint` forward
+        // across callbacks must age against THIS, or an unrelated stream
+        // of callbacks keeping the record warm would let a latch outlive
+        // the 72h window it describes.
+        fepObservedAt: v.optional(v.number()),
+        updatedAt: v.number(),
+      }),
+    ),
+    // Timestamp of the most recent CUSTOMER message — the anchor for
+    // Meta's 24h customer service window, which governs whether
+    // free-form (non-template) messages may be sent. Distinct from
+    // `lastMessageAt`, which includes outbound messages and therefore
+    // cannot express this window.
+    lastInboundAt: v.optional(v.number()),
+    /** UTC midnight of the day this conversation was last counted toward
+     *  `messageHourlyStats.activeConversations`. Compared for equality at the
+     *  message choke point; a difference means "not yet counted today", which
+     *  IS the dedup. Written in the patch that already happens on every
+     *  message, so it costs no extra read and no extra document.
+     *
+     *  Not backfilled: it is a forward-looking marker, and an absent value
+     *  correctly means the next message counts its day. */
+    lastActiveDayMs: v.optional(v.number()),
+    // Timestamp of the first outbound message sent AFTER
+    // `adReferral.startedAt`. Anchors the 72h free-entry-point ESTIMATE
+    // used before Meta confirms via `metaWindow`. Written once.
+    firstReplyAt: v.optional(v.number()),
     // Denormalized CURRENT funnel stage for fast inbox render + future
     // stage-filtering, without scanning `funnelTransitions`. `saleValue`/
     // `saleCurrency` are captured at the Purchased stage (and optionally at
@@ -260,6 +375,89 @@ export default defineSchema({
         saleCurrency: v.optional(v.string()),
       }),
     ),
+    // ---- Archive (spec 2026-07-26 §"Changes to conversations") ----
+    // `archivedAt` is the SYSTEM OF RECORD for archived state and the
+    // only thing the Inbox reads. Presence = archived.
+    //
+    // A TIMESTAMP rather than a fourth `status` literal, deliberately:
+    // `conversations.list` applies `status` as a post-index `.filter()`,
+    // which is safe today only because almost every row is "open" (the
+    // predicate matches early and often). Archived rows accumulate
+    // FOREVER, so as a filter they would make the Inbox scan grow
+    // without bound — the failure this file documents for
+    // `broadcastRecipients`, `conversionEvents` and `campaignAds`.
+    // Convex sorts a missing field before every present value, so
+    // `eq("archivedAt", undefined)` is one genuine index range over
+    // exactly the active set.
+    archivedAt: v.optional(v.number()),
+    // A schema-level union DERIVED from `lib/leadAnalysis/archive.ts`'s
+    // ARCHIVE_REASONS (mapped straight into `v.literal`s below), plus an
+    // optional human note. Not a plain string: every writer already
+    // routes through `isArchiveReason` before patching this field
+    // (`leadAnalysis.ts`'s `archive` and `archiveAutomated`), so the
+    // schema can enforce the same closed vocabulary as a second,
+    // independent gate — a plain string only trusted that every future
+    // writer would keep doing so. Deriving the union directly from
+    // ARCHIVE_REASONS (rather than hand-listing the literals here) means
+    // the two can never drift the way `aiUsageLog.mode` and
+    // `notifications.type` have.
+    archivedReason: v.optional(
+      v.union(...ARCHIVE_REASONS.map((reason) => v.literal(reason))),
+    ),
+    archivedNote: v.optional(v.string()),
+    // Absent = archived by automation (P3). Set for a manual archive.
+    archivedByUserId: v.optional(v.id("users")),
+    // When the customer last brought this thread BACK by replying. Drives
+    // the board's "returned" flag; never cleared.
+    returnedAt: v.optional(v.number()),
+    // ---- Manual overrides (spec 2026-07-28-inbox-manual-overrides) ----
+    // PRESENCE = snoozed; the value is when to wake. A snoozed thread
+    // appears in NO lane — that is what snooze means — and the lane
+    // queries get that for free by binding `eq("snoozedUntil", undefined)`
+    // as a single equality, exactly as they bind `archivedAt`.
+    //
+    // The wake sweep CLEARS this field rather than letting it sit in the
+    // past. That is load-bearing, not tidiness: an expired-but-uncleared
+    // row holds a number, not `undefined`, so it would fall out of every
+    // lane range and stay invisible forever. See `inboxOverrides`.
+    snoozedUntil: v.optional(v.number()),
+    snoozedByUserId: v.optional(v.id("users")),
+    /** Optional free text, shown on the Snoozed row so the tab is scannable. */
+    snoozedReason: v.optional(v.string()),
+
+    // PRESENCE = an agent has declared this lead ghosted, so it belongs
+    // in Chasing regardless of age. Unlike snooze this does not expire;
+    // it ends when the customer replies, the thread is archived, or an
+    // agent undoes it.
+    //
+    // This one costs a union (Chasing becomes derived ∪ forced) and is
+    // therefore an index key too, so Waiting can EXCLUDE forced rows by
+    // equality instead of filtering — without that a forced thread would
+    // appear in two lanes at once.
+    chasingForcedAt: v.optional(v.number()),
+    chasingForcedByUserId: v.optional(v.id("users")),
+    // ---- Lanes (spec 2026-07-27-inbox-lanes §Data model) ----
+    // TRUE = the customer spoke last so we owe a reply (Active), OR the
+    // conversation has no messages at all — an agent created it to write
+    // into, so we owe it the first message. FALSE = we spoke last
+    // (Waiting, or Chasing once `lastMessageAt` passes the cutoff).
+    //
+    // Written in `messages.ts`'s `insertMessageAndUpdateConversation`,
+    // the single `insert("messages")` in the backend, so it cannot drift
+    // from the fact it records.
+    //
+    // Both values are written EXPLICITLY, unlike `leadAnalyses.archived`
+    // (true-or-absent). That rule guards an accumulating set whose
+    // complement must never read past it; this is a genuine two-way
+    // partition where both sides are bounded and both need an exact
+    // range. `undefined` is not a third lane — it is a pre-backfill row,
+    // eliminated by `inboxBackfill` before any lane tab ships.
+    //
+    // Deliberately NOT a mirror of any engine's state. Waiting vs
+    // Chasing is a RANGE on `lastMessageAt`, computed at read time by
+    // `lib/inbox/lanes.ts` — see the spec's §Why time-derived and not
+    // sequence-derived for the three defects a mirror produced.
+    awaitingReply: v.optional(v.boolean()),
   })
     .index("by_account", ["accountId"])
     .index("by_contact", ["contactId"])
@@ -308,7 +506,84 @@ export default defineSchema({
       "accountId",
       "assignedToUserId",
       "lastMessageAt",
-    ]),
+    ])
+    // The Inbox's active list. `archivedAt` sits between `accountId` and
+    // `lastMessageAt` so `eq(accountId).eq(archivedAt, undefined)` is a
+    // real single range over the active set, still ordered by recency.
+    // The Archived tab uses the complementary `gt("archivedAt", 0)`
+    // range on this same index — which orders by `archivedAt`, i.e.
+    // most-recently-archived first. That is a deliberate semantic
+    // difference from the active tab's recency ordering, and the right
+    // one for a review queue.
+    .index("by_account_archived_last_message", [
+      "accountId",
+      "archivedAt",
+      "lastMessageAt",
+    ])
+    // Same, for the single-assignee plan (the Mine / Unassigned tabs).
+    // Two indexes rather than one because `conversations.list` has two
+    // distinct indexable plans: "any" needs global recency order, and
+    // "eq" binds the assignee first. A four-key index cannot serve both.
+    .index("by_account_archived_assigned_last_message", [
+      "accountId",
+      "archivedAt",
+      "assignedToUserId",
+      "lastMessageAt",
+    ])
+    // `dashboard.metrics`' open-conversation tile. `by_account_status`
+    // alone counts archived threads as open, and that error only grows,
+    // because archiving accumulates. The archive dimension has to be in
+    // the INDEX rather than a JS filter: that query's whole read-bound
+    // argument is "every document in this range is a match, so there is
+    // no `.filter()` to starve" — a post-take filter would both break
+    // that property and silently under-report, since the take would fill
+    // with archived rows.
+    .index("by_account_archived_status", ["accountId", "archivedAt", "status"])
+    // The Inbox's lane tabs. Every key before `lastMessageAt` is bound by
+    // EQUALITY — including `archivedAt` as `eq(undefined)` — leaving that
+    // final key free for both the range and the ordering:
+    //   Active  = no range,               order desc
+    //   Waiting = gt(cutoff),             order desc
+    //   Chasing = gt(0).lte(cutoff),      order ASC (longest-neglected first)
+    // Waiting and Chasing are complementary ranges on one key, so they
+    // are provably disjoint and exhaustive with no coordinating state.
+    //
+    // Chasing's `gt(0)` is the "field present" idiom
+    // `qualificationEngine.getDueSessions` uses: `lastMessageAt` is
+    // optional and Convex sorts a missing field before every present
+    // value, so without it a message-less conversation would fall into
+    // Chasing.
+    //
+    // Lanes are NOT available on the Archived tab: there `archivedAt` is
+    // ranged (`gt(0)`), and index keys after a range key are unordered —
+    // the same constraint the archived branch of `conversations.list`
+    // already hit with `assignedToUserId`.
+    .index("by_account_lane_last_message", [
+      "accountId",
+      "archivedAt",
+      "snoozedUntil",
+      "chasingForcedAt",
+      "awaitingReply",
+      "lastMessageAt",
+    ])
+    // Same, for the single-assignee plan (Mine / Unassigned), and for
+    // the auto-assign sweep's per-candidate Chasing-load count. Two
+    // indexes rather than one for the reason the archive pair documents:
+    // "any" needs global recency order, "eq" binds the assignee first,
+    // and no single index serves both.
+    .index("by_account_assigned_lane_last_message", [
+      "accountId",
+      "archivedAt",
+      "assignedToUserId",
+      "snoozedUntil",
+      "chasingForcedAt",
+      "awaitingReply",
+      "lastMessageAt",
+    ])
+    // The wake sweep's partition: `gt(0).lte(now)` is every snooze that
+    // has come due. Deployment-global, no accountId — the same shape as
+    // `qualificationSessions.by_due` and `leadAnalyses.by_score_due`.
+    .index("by_snoozed_until", ["snoozedUntil"]),
 
   // A single WhatsApp message within a `conversations` thread. Postgres
   // never gave `messages` its own `account_id` (tenancy was transitive via
@@ -395,6 +670,41 @@ export default defineSchema({
         storedImageKey: v.optional(v.string()),
       }),
     ),
+    // Meta's per-message billing outcome, captured from the status
+    // webhook (`statuses[].pricing`). All sub-fields optional and raw:
+    // Meta is mid-migration between conversation-based ("CBP") and
+    // per-message ("PMP") pricing, which spell categories differently.
+    // Phase 4 aggregates this for spend reporting.
+    pricing: v.optional(
+      v.object({
+        billable: v.optional(v.boolean()),
+        model: v.optional(v.string()),
+        category: v.optional(v.string()),
+        type: v.optional(v.string()),
+        capturedAt: v.number(),
+      }),
+    ),
+    // Meta's stated reason a `failed` status could not be delivered,
+    // captured from the same status webhook as `pricing` above
+    // (`statuses[].errors[0]`). DIAGNOSTIC ONLY, added after 435 of 583
+    // internal delivery alerts failed silently: Meta accepts a send
+    // synchronously (returns a wamid) and reports `failed` asynchronously,
+    // and `errors[0]` is the only place it ever states why. This field
+    // exists so that the NEXT such investigation has that reason to read —
+    // self-hosted Convex keeps no log history, so without it the reason is
+    // gone the moment the webhook finishes processing. All sub-fields
+    // optional and raw, same trade as `pricing`: Meta does not guarantee
+    // `message`/`error_data.details` are present even when `code`/`title`
+    // are.
+    deliveryError: v.optional(
+      v.object({
+        code: v.optional(v.number()),
+        title: v.optional(v.string()),
+        message: v.optional(v.string()),
+        details: v.optional(v.string()),
+        capturedAt: v.number(),
+      }),
+    ),
   })
     .index("by_conversation", ["conversationId"])
     // Per-conversation, per-senderType lookups: `ingest.ingestInbound`'s
@@ -439,6 +749,296 @@ export default defineSchema({
     // outgoing, matching what the chart previously counted per message.
     incoming: v.number(),
     outgoing: v.number(),
+    // Reply-latency rollup powering `dashboard.responseTime`, which had the
+    // SAME unbounded-`.collect()` bug the counts above exist to fix and blew
+    // up the same way in production ("too many system operations", which
+    // crashed the whole /dashboard route). Sum + count rather than a
+    // pre-divided average so the read can aggregate hours into local
+    // days-of-week and week-over-week figures and still get an EXACT mean —
+    // averaging stored averages would weight a quiet hour like a busy one.
+    //
+    // Bucketed by the hour of the CUSTOMER message, not of the reply, because
+    // that is what the chart bars are keyed on. The write therefore lands on
+    // whichever (possibly hours-old) bucket the question arrived in — see
+    // `recordResponseSample` in messages.ts.
+    //
+    // Optional: added after `incoming`/`outgoing` shipped, so pre-existing
+    // rows have neither. Readers treat absent as zero, and
+    // `backfillResponseHourlyStats` fills the current window.
+    responseCount: v.optional(v.number()),
+    responseTotalMs: v.optional(v.number()),
+
+    // ---- Reports rollup (docs/superpowers/specs/2026-08-05-reports-
+    // section-design.md). Every field below is optional and read as zero
+    // when absent — the same convention `responseCount`/`responseTotalMs`
+    // established — so this deploy changes nothing observable and no
+    // existing row needs touching.
+
+    /** Conversations created in this hour. Written at the single
+     *  `conversations.insertConversation` choke point.
+     *
+     *  READ THIS BEFORE PUTTING IT ON A CHART. Every path that creates a
+     *  conversation is find-or-create BY CONTACT with no status/archived
+     *  filter (`ingest.ts`, `conversations.findOrCreateForContact` and its
+     *  server-only twin, `qualificationEngine.ts`), so a contact has
+     *  exactly ONE conversation, forever. This counter therefore counts a
+     *  contact's FIRST and only conversation: it is a NEW-CONTACT count,
+     *  not a measure of repeat engagement. A returning customer messaging
+     *  again months later reuses their existing thread and adds nothing
+     *  here. Label it accordingly in the UI. */
+    conversationsStarted: v.optional(v.number()),
+    /** Of those, the ones that arrived from a Click-to-WhatsApp ad.
+     *  Written by `adReferrals.recordAdReferral`, which patches the
+     *  CONVERSATION's creation hour — the referral is recorded after the
+     *  row exists, so this lands on an hour in the past exactly like
+     *  `recordResponseSample` does. Inherits the same
+     *  one-conversation-per-contact caveat as `conversationsStarted`
+     *  above: capped at one per contact ever, so a retargeting campaign
+     *  that re-engages known contacts contributes zero to it. */
+    conversationsStartedAd: v.optional(v.number()),
+    /** Reply-latency histogram, alongside the existing sum+count. A single
+     *  `withinTarget` counter would bake one SLA threshold in at write time
+     *  and make history meaningless the day the target changes; six buckets
+     *  cost the same patch, are exact at every edge, and let p50/p90 be
+     *  interpolated as a range. See `lib/reportStats.ts`. */
+    responseBuckets: v.optional(
+      v.object({
+        m1: v.number(),
+        m5: v.number(),
+        m15: v.number(),
+        m60: v.number(),
+        m240: v.number(),
+        over: v.number(),
+      }),
+    ),
+    /** Distinct Meta conversation WINDOWS observed opening in this hour.
+     *  Written by `applyStatusPricing` on the branch that records a NEW
+     *  `conversationMetaId` — that branch is the dedup, since a status
+     *  callback fires repeatedly (sent → delivered → read) for one message.
+     *
+     *  NOT "billable": that branch carries no billability check, so
+     *  free-entry-point windows are counted here too — which is exactly
+     *  what `freeEntryPointConversations` below means by "of those". A
+     *  panel labelling this "billable conversations" would overstate
+     *  Meta's charge by precisely the free count; the billable figure, if
+     *  one is ever shown, is this counter MINUS that one. Named for what
+     *  it measures rather than for what it was first mistaken for. */
+    metaConversations: v.optional(v.number()),
+    /** Of those, the ones Meta flagged free-entry-point (the 72h CTWA
+     *  window) and therefore did NOT bill. Same branch, same dedup. */
+    freeEntryPointConversations: v.optional(v.number()),
+    /** Messages by Meta billing category. Incremented only when the message
+     *  had no `pricing` yet, so repeated callbacks cannot double-count.
+     *  `other` catches spellings from Meta's CBP/PMP migration that we do
+     *  not map — without it the categories would stop summing to the
+     *  message count. */
+    billedMessagesByCategory: v.optional(
+      v.object({
+        marketing: v.number(),
+        utility: v.number(),
+        service: v.number(),
+        authentication: v.number(),
+        free: v.number(),
+        other: v.number(),
+      }),
+    ),
+    /** Distinct conversations that saw any traffic — inbound or outbound.
+     *  Deduped per UTC DAY, not per hour: distinct counts are not additive
+     *  across buckets, so an hourly dedup summed into a day would yield
+     *  conversation-HOURS and could exceed the account's total conversation
+     *  count. The increment lands on the hour of the conversation's first
+     *  message of that UTC day, so the rollup stays hourly and the existing
+     *  local-day fold keeps working. See `conversations.lastActiveDayMs`. */
+    activeConversations: v.optional(v.number()),
+  })
+    // Range on the hour so a window read is a genuine index range rather
+    // than an account scan with a post-filter.
+    .index("by_account_hour", ["accountId", "hourStartMs"]),
+
+  // The /dashboard KPI tiles, precomputed — one row per account, refreshed
+  // by the `dashboard-snapshot` cron.
+  //
+  // WHY THIS TABLE EXISTS. The tiles used to be `dashboard.metrics`, a live
+  // aggregation measured in production at 1,882 document reads and ~8s of
+  // wall clock: a `.take(501)` over open conversations, two-day windows over
+  // `conversations`/`contacts`, and — the bulk of it — a ~1,300-row
+  // `messages` collect computing a "messages sent today" figure NO component
+  // ever rendered. Nine such subscriptions fired concurrently on page load,
+  // and on this deployment the first read to touch `messages` pays a cold
+  // penalty (measured: 12.7s for a SINGLE document, ~1.4s warm), so the
+  // route's time-to-content was dominated by work nobody was waiting on.
+  //
+  // Reading a KPI tile is now one indexed point read. The cost did not
+  // vanish — it moved onto a cron, where no one is watching the spinner.
+  //
+  // The tiles are consequently STALE by up to the cron interval, which is
+  // why `computedAtMs` is not optional: the UI states the age rather than
+  // presenting a lagging figure as live. Anything a salesperson acts on in
+  // the moment (the Needs Attention queue, unread badges) stays a live
+  // subscription and is deliberately NOT snapshotted here.
+  dashboardSnapshots: defineTable({
+    accountId: v.id("accounts"),
+    /** When the cron last rebuilt this row. Rendered, not just recorded. */
+    computedAtMs: v.number(),
+
+    // ---- Current-state counts. No timezone interpretation, so they are
+    // plain scalars rather than the hourly buckets below.
+    /** Open, non-archived conversations, clamped to `activeConversationsCap`.
+     *  Nothing in the app auto-closes a conversation, so this partition
+     *  grows without bound and the count is a `.take()` — see
+     *  `dashboard.refreshSnapshots`. */
+    activeConversations: v.number(),
+    /** True when the real figure exceeds `activeConversations`, so the UI
+     *  renders "500+" rather than presenting the ceiling as exact. */
+    activeConversationsCapped: v.boolean(),
+    /** The ceiling that produced the two fields above, stored rather than
+     *  assumed: a row written under an older cap must not be re-read under
+     *  a newer one and silently mean something else. */
+    activeConversationsCap: v.number(),
+    openDealsValue: v.number(),
+    openDealsCount: v.number(),
+
+    /** Conversations awaiting a reply, PRE-SPLIT BY ROLE SCOPE.
+     *
+     *  Load-bearing, not premature generality. `conversations.unreadTotal`
+     *  — which this replaces on the dashboard — is role-scoped: supervisor+
+     *  see every thread, an agent sees their own plus the unassigned pool,
+     *  a viewer sees the pool alone. A single account-wide total would show
+     *  an agent other people's workload, so the snapshot stores each scope's
+     *  count and the read picks one. `byUser` carries only members with a
+     *  non-zero count. */
+    waitingOnReply: v.object({
+      /** Supervisor+ — every awaiting thread in the account. */
+      all: v.number(),
+      /** Unassigned threads. A viewer's whole world, and half an agent's. */
+      pool: v.number(),
+      /** Assigned threads, per assignee. Absent user = zero. */
+      byUser: v.array(
+        v.object({ userId: v.id("users"), count: v.number() }),
+      ),
+    }),
+
+    /** New contacts per UTC hour over the newest `SNAPSHOT_HOURS`, bucketed
+     *  from `contacts._creationTime`. Hours with no arrivals are omitted.
+     *
+     *  Hourly rather than a pre-folded "today" scalar for the reason
+     *  `messageHourlyStats`'s own header gives: a day boundary is the
+     *  VIEWER's-timezone concept and a cron runs in UTC, so folding at write
+     *  time would bake one timezone in. `dashboard.snapshot` folds these
+     *  into the caller's local day on read. */
+    recentHours: v.array(
+      v.object({
+        hourStartMs: v.number(),
+        newContacts: v.number(),
+        /** Of those, Click-to-WhatsApp ad arrivals. */
+        newContactsAd: v.number(),
+        /** Conversations created in this hour that are open and unarchived
+         *  AS OF the refresh. Feeds the Active Conversations tile's
+         *  today-vs-yesterday delta — a current-state count has no clean
+         *  "vs yesterday" without historical snapshots, so what the tile
+         *  compares is the flow of NEW open threads, not yesterday's
+         *  standing total. */
+        newOpenConversations: v.number(),
+      }),
+    ),
+  })
+    // One row per account, so this is a point lookup and never a scan.
+    .index("by_account", ["accountId"]),
+
+  // Hourly rollup behind the /reports Funnel tab — the same move
+  // `messageHourlyStats` already made for the message charts, for the same
+  // reason and after the same measurement.
+  //
+  // `reports.funnelOverview` used to `.collect()` `funnelTransitions` and
+  // `conversionEvents` over the requested window. Both reads are bounded by
+  // the WINDOW but not by TRAFFIC: measured on production at 2,029 + 2,012 =
+  // 4,041 documents for a 30-day range, entirely a function of how busy the
+  // account was. That is the shape that has already taken this deployment
+  // down twice (see `messageHourlyStats`'s header), and it grows with the
+  // business rather than with the question being asked. Reading the rollup
+  // makes the cost a function of the WINDOW alone — two counters per UTC
+  // day, ~30 rows for a month, ~90 for a quarter — no matter how busy the
+  // account gets.
+  //
+  // HOURLY, for exactly the reason `messageHourlyStats`'s header gives, and
+  // this table shipped DAILY first and was wrong for it. A report window is
+  // built from LOCAL midnights (`reportWindow` in src/lib/reports/types.ts),
+  // and a local midnight is not a UTC midnight: for the UTC+4 account this
+  // runs on, `dayStartMs(sinceMs)` rounds down 20 hours, so every window
+  // dragged in 20 extra hours of the preceding day. Measured against
+  // production before the fix: the 7-day Ads figure came back 22.7% high
+  // (513 against a true 418) and the 14-day 6.5% high. A 30-day window
+  // happened to agree only because this account has no data that far back.
+  //
+  // An hour is the coarsest bucket that folds exactly into any whole-hour
+  // timezone offset, which is the whole point of the pattern. It costs
+  // ~464 rows for a 30-day window against 4,053 raw event rows — still an
+  // 8.7x read cut, and correct at the edges rather than approximately
+  // right in the middle.
+  //
+  // WHY EVERY COUNTER HERE IS ADDITIVE, which is the property that makes a
+  // rollup legitimate at all. A distinct count is NOT additive across
+  // buckets: summing "distinct conversations that reached `purchased`" over
+  // 30 daily buckets yields conversation-DAYS and can exceed the account's
+  // conversation count (the trap `messageHourlyStats.activeConversations`
+  // documents). `stageFirstReached` sidesteps it by counting each
+  // conversation's FIRST EVER arrival at a stage, decided at write time
+  // against the transition log — so a conversation contributes to exactly
+  // one bucket per stage, for all time, and any sum over any set of buckets
+  // is a true distinct count.
+  //
+  // The metric that makes exact is "conversations that first reached stage
+  // S within the window", where the live query counted "conversations that
+  // reached S within the window". They differ only for a conversation that
+  // re-enters a stage it has already visited — possible, since the manual
+  // `funnel.setStage` path does not pass `neverDowngrade` and can reopen a
+  // purchased deal. Measured across this account's entire history: ZERO
+  // conversations have ever re-entered a stage, so the two definitions
+  // return identical numbers today. First-reach is also the more defensible
+  // of the two going forward, since it cannot be inflated by reopening.
+  funnelHourlyStats: defineTable({
+    accountId: v.id("accounts"),
+    /** Start of the UTC hour — `lib/messageStats.ts`'s `hourStartMs`. */
+    hourStartMs: v.number(),
+
+    /** Per stage, conversations reaching it for the FIRST time this day.
+     *  Additive across days; see the table comment. Exhaustive over
+     *  `FUNNEL_STAGES` rather than a `Record<string, number>`, so adding a
+     *  stage is a compile error here rather than a silently uncounted one. */
+    stageFirstReached: v.object({
+      new_lead: v.number(),
+      qualified: v.number(),
+      price_quoted: v.number(),
+      itinerary_created: v.number(),
+      itinerary_sent: v.number(),
+      invoice_sent: v.number(),
+      purchased: v.number(),
+      lost: v.number(),
+    }),
+
+    /** Recorded sale value from `purchased` transitions landing this day.
+     *  A plain sum, so it is additive without qualification — unlike
+     *  `purchase.count`, which rides `stageFirstReached.purchased`. */
+    purchaseValueTotal: v.number(),
+
+    /** Meta delivery status counts for `conversionEvents` CREATED this day.
+     *
+     *  Keyed on the event's creation day and NOT on when its status last
+     *  changed, which is what keeps this exact against a MUTABLE field: a
+     *  retry that moves an event pending -> sent decrements `pending` and
+     *  increments `sent` in the event's original creation-day bucket, so the
+     *  bucket always reflects those events' CURRENT statuses. Keying on the
+     *  change instead would let one event contribute to two days. Every
+     *  status write goes through `reportRollup.moveConversionEventStatus`
+     *  for exactly this reason. */
+    eventsByStatus: v.object({
+      pending: v.number(),
+      sent: v.number(),
+      unmatched: v.number(),
+      error: v.number(),
+      abandoned: v.number(),
+      dormant: v.number(),
+    }),
   })
     // Range on the hour so a window read is a genuine index range rather
     // than an account scan with a post-filter.
@@ -569,15 +1169,77 @@ export default defineSchema({
     // fields.
     .index("by_account_field", ["accountId", "customFieldId"]),
 
-  // A free-text note an account member left on a contact.
+  // A note an account member left on a contact — the account's audit
+  // trail. Written by hand from the inbox AND automatically by five
+  // engines (funnel transitions, AI tag acceptance, sales-checklist
+  // steps, qualification, invitations), which is why the human-facing
+  // fields below are ALL optional: an engine-written row carries only
+  // `noteText`, and nothing about this table's history is rewritten.
   contactNotes: defineTable({
     accountId: v.id("accounts"),
     contactId: v.id("contacts"),
     createdByUserId: v.optional(v.id("users")),
     noteText: v.string(),
+
+    // Which thread the note was written in. Absent on engine-written
+    // rows and on notes added from the contacts page, which is why the
+    // inline thread query tolerates a null result.
+    conversationId: v.optional(v.id("conversations")),
+
+    // HOW the contact happened — the channel this system cannot see.
+    // Absent on legacy and engine-written rows; `noteKindOf` in
+    // `src/lib/inbox/notes.ts` derives a display kind for those.
+    kind: v.optional(
+      v.union(
+        v.literal("call"),
+        v.literal("whatsapp_external"),
+        v.literal("meeting"),
+        v.literal("email"),
+        v.literal("payment"),
+        v.literal("general"),
+      ),
+    ),
+
+    // WHAT IT MEANS. `do_not_contact` is the only value with teeth: it
+    // sets `contacts.doNotContact`, which gates automation in Phase 3.
+    outcome: v.optional(
+      v.union(
+        v.literal("no_answer"),
+        v.literal("follow_up"),
+        v.literal("do_not_contact"),
+        v.literal("not_interested"),
+      ),
+    ),
+
+    // R2 objects under `{accountId}/note/…`. Bounded at
+    // NOTE_ATTACHMENT_MAX_COUNT by the mutation, not the schema —
+    // a schema can't express a max length.
+    attachments: v.optional(
+      v.array(
+        v.object({
+          key: v.string(),
+          filename: v.string(),
+          contentType: v.string(),
+          size: v.number(),
+        }),
+      ),
+    ),
+
+    editedAt: v.optional(v.number()),
+
+    // Set by `clearDoNotContact` on the note that raised the flag. The
+    // `outcome` itself is NEVER erased — it records what the customer
+    // actually said, and `update` still refuses to change it. This
+    // records that a supervisor later overrode it, so the card can show
+    // both facts instead of claiming a block that is no longer in force.
+    outcomeClearedAt: v.optional(v.number()),
   })
     .index("by_contact", ["contactId"])
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    // The inline thread renders ONE conversation's notes. On
+    // `by_contact` that would over-read every note the contact has
+    // across every thread; this binds the conversation directly.
+    .index("by_conversation", ["conversationId"]),
 
   // ============================================================
   // Messaging + Settings (Phase 1, Task 2). Source: supabase/migrations
@@ -838,7 +1500,7 @@ export default defineSchema({
     .index("by_account", ["accountId"])
     .index("by_key_hash", ["keyHash"]),
 
-  // An account-registered HTTPS endpoint Holidayys WA CRM POSTs events to. Unlike
+  // An account-registered HTTPS endpoint this CRM POSTs events to. Unlike
   // `apiKeys.keyHash` (a bearer credential the *client* presents, so we
   // only need a hash), `secret` is the HMAC key *we* sign outgoing
   // payloads with, so the plaintext is needed at delivery time — it's
@@ -856,10 +1518,12 @@ export default defineSchema({
 
   // An in-app notification for one agent. `userId` is the recipient —
   // unlike every other `*UserId` field in this file, it is NOT an audit
-  // column. `type` has exactly one CHECK-allowed value today
-  // ("conversation_assigned"); modeled as a one-literal union rather
-  // than a bare string so a second notification type later is a visible,
-  // typed change instead of a silent widening.
+  // column. `type` started as migration 027's single CHECK-allowed value
+  // ("conversation_assigned") and has since grown to the six literals
+  // below; it stays an explicit union rather than a bare string so each
+  // new type is a visible, typed change instead of a silent widening.
+  // `convex/notifications.ts`'s header lists the five hand-copied
+  // declarations that must be updated together whenever it grows.
   notifications: defineTable({
     accountId: v.id("accounts"),
     userId: v.id("users"),
@@ -872,6 +1536,15 @@ export default defineSchema({
       // Proxy Meta Purchase fired for a highly-qualified lead
       // (purchase-signals spec §3.5).
       v.literal("purchase_signal"),
+      // An archived conversation came back — the customer replied
+      // (spec 2026-07-26 §"Stopping and returning").
+      v.literal("lead_returned"),
+      // No eligible agent existed when the auto-assign sweep reached an
+      // unowned Chasing thread, so it stayed in the pool. Silence would
+      // recreate the invisible-orphan problem one level up. Additive
+      // union literal — the `lead_returned` precedent; existing rows
+      // stay valid.
+      v.literal("chase_unassigned"),
     ),
     conversationId: v.optional(v.id("conversations")),
     contactId: v.optional(v.id("contacts")),
@@ -901,6 +1574,64 @@ export default defineSchema({
     // the composite indexes for THIS module's queries only.
     .index("by_account", ["accountId"])
     .index("by_user", ["userId"]),
+
+  // Ownership history for one conversation — the Inbox thread's inline
+  // "X assigned this to Y" line. `conversations.assignedToUserId` is a
+  // bare field with no history: before this table the only trace of a
+  // handover was a private `notifications` row to the recipient, so
+  // "who gave me this, and when" was unanswerable by anyone else.
+  //
+  // Deliberately NOT `contactNotes`: notes are user-deletable
+  // (`contactNotes.remove`), they store a baked English sentence (this
+  // UI is translated and members get renamed), and they are the
+  // AI-processable trail that `contactActivity` reads — assignment
+  // churn belongs in none of those.
+  //
+  // `kind` is what happened to ownership; `source` is which machinery
+  // did it. Separate on purpose: a new entry point adds one `source`
+  // literal instead of a branch in the renderer. `actorUserId` absent
+  // means the system did it (sweep, automation, cron). Written by
+  // exactly one function — `lib/assignment.ts`'s `applyAssignment` —
+  // and never updated or deleted.
+  conversationEvents: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    kind: v.union(v.literal("assigned"), v.literal("unassigned")),
+    actorUserId: v.optional(v.id("users")),
+    targetUserId: v.optional(v.id("users")),
+    previousUserId: v.optional(v.id("users")),
+    source: v.union(
+      v.literal("manual"),
+      v.literal("takeover"),
+      v.literal("release"),
+      v.literal("auto_assign"),
+      v.literal("automation"),
+      v.literal("offer_accept"),
+    ),
+  })
+    .index("by_conversation", ["conversationId"])
+    // `reports.assignmentsByAgent` (the /reports Agents tab) counts, per
+    // local day, how many distinct conversations each agent picked up.
+    // That is a window over the whole ACCOUNT's handovers, which
+    // `by_conversation` cannot express at all — it would mean visiting
+    // every conversation in the account to read its trail.
+    //
+    // Convex appends `_creationTime` to every index, so this one is
+    // really `["accountId", "_creationTime"]` and
+    // `eq(accountId).gte(_creationTime, sinceMs).lt(_creationTime,
+    // untilMs)` is a genuine single range over exactly the requested
+    // window — every document read is a match, with no `.filter()` on
+    // top that could starve the take. Both edges are bound for the reason
+    // `reports.ts`'s `readHours` documents on its own: the fold pools
+    // every row it is handed with no further per-row test, so an
+    // unbounded upper read would corrupt the counts, not merely cost
+    // extra reads.
+    //
+    // These rows are never updated or deleted, so the range is
+    // append-only and a descending take always reaches the newest days
+    // first.
+    .index("by_account", ["accountId"]),
 
   // One Web Push subscription = one browser/device for one user. A user
   // may have several (phone + laptop). `by_endpoint` is the upsert/prune
@@ -997,6 +1728,13 @@ export default defineSchema({
     executionCount: v.number(),
     lastExecutedAt: v.optional(v.number()),
     updatedAt: v.optional(v.number()),
+    // Cancel this automation's WAITING runs for a contact the moment
+    // that contact replies. Optional and default-off: `Wait → Send →
+    // Wait → Send` is the most common automation shape, and without this
+    // a customer who already answered keeps receiving scheduled nags —
+    // but turning it on for every existing automation would change
+    // behaviour under owners who never asked for it.
+    stopOnReply: v.optional(v.boolean()),
   }).index("by_account", ["accountId"]),
 
   // One node in an automation's step tree. `parentStepId`/`branch` are
@@ -1013,6 +1751,29 @@ export default defineSchema({
     // header comment above for why Postgres never had this column.
     accountId: v.id("accounts"),
     automationId: v.id("automations"),
+    // A stable per-step identity. NOT the row id: `replaceSteps` deletes
+    // and reinserts every step row on each save (see
+    // `convex/automations.ts`), so `_id` churns constantly and anything
+    // keyed on it — per-step counters, a suspended run's position —
+    // silently detaches after one edit. Same role, and same reasoning, as
+    // `flowNodes.nodeKey` below.
+    //
+    // Optional because rows written before this field existed have none.
+    // Readers derive an effective key as `stepKey ?? _id`, so old rows
+    // keep working. Both sides must apply that fallback or the two can
+    // never be joined: the WRITE side does it in `automationsEngine.ts`
+    // (`step.stepKey ?? step._id`, for `automationStepStats.stepKey` and a
+    // parked run's `currentStepKey`), the READ side in `convex/
+    // automations.ts`'s `toStepRow` — the single adapter every reader of
+    // this table's tree goes through.
+    //
+    // The next save of such a step then ADOPTS that effective key as its
+    // real one (the builder round-trips it via `toApiSteps` -> `id`, and
+    // `insertStepsTree` reuses any non-empty incoming key verbatim) rather
+    // than minting a fresh one — so counters accumulated under the old row
+    // id carry over instead of being orphaned. Only a step that has never
+    // been saved at all gets a freshly minted key.
+    stepKey: v.optional(v.string()),
     parentStepId: v.optional(v.id("automationSteps")),
     branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
     stepType: v.union(
@@ -1034,7 +1795,8 @@ export default defineSchema({
     position: v.number(),
   })
     .index("by_automation", ["automationId"])
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    .index("by_account_step_key", ["accountId", "stepKey"]),
 
   // An audit row written once per automation execution (one per
   // triggering event, not per step — `stepsExecuted` is the per-step
@@ -1066,6 +1828,111 @@ export default defineSchema({
     // itself rather than by a post-scan predicate, so a foreign
     // `automationId` still yields nothing.
     .index("by_account_automation", ["accountId", "automationId"]),
+
+  // One row per (automation, contact) enrolment — the thing an
+  // `automationLogs` row cannot express. A log says what HAPPENED; a run
+  // says where a contact IS. Before this table a `wait` step called
+  // `ctx.scheduler.runAfter` and persisted nothing, so a queued contact
+  // was invisible, uncountable and uncancellable, and deleting an
+  // automation left its resumes to fire into the void.
+  //
+  // `scheduledFnId` is what makes a wait cancellable. Same mechanism as
+  // `flowRuns.fallbackTimeoutId` below, for the same reason.
+  automationRuns: defineTable({
+    accountId: v.id("accounts"),
+    automationId: v.id("automations"),
+    // Nullable for the same reason as `automationLogs.contactId`: history
+    // must survive contact deletion.
+    contactId: v.optional(v.id("contacts")),
+    conversationId: v.optional(v.id("conversations")),
+    status: v.union(
+      v.literal("running"),
+      v.literal("waiting"),
+      v.literal("completed"),
+      v.literal("failed"),
+      v.literal("cancelled"),
+    ),
+    // The suspension point. All four travel together so a wait nested
+    // inside a condition branch resumes back into THAT branch — the same
+    // tuple `resume` already takes as arguments.
+    currentStepKey: v.optional(v.string()),
+    parentStepId: v.optional(v.id("automationSteps")),
+    branch: v.optional(v.union(v.literal("yes"), v.literal("no"))),
+    nextPosition: v.number(),
+    resumeAt: v.optional(v.number()),
+    scheduledFnId: v.optional(v.id("_scheduled_functions")),
+    logId: v.optional(v.id("automationLogs")),
+    context: v.optional(v.any()),
+    startedAt: v.number(),
+    updatedAt: v.number(),
+    endedAt: v.optional(v.number()),
+    errorMessage: v.optional(v.string()),
+    // How many LIVE scheduled resumes this run currently has pending.
+    // Every other suspension field above is singular — they describe ONE
+    // suspension point — but a condition can fan out into branches that
+    // each suspend independently, and each reaches its own entry call on
+    // resume. Without a count, `finishRun` fires once per branch: the
+    // terminal status stays correct (Task 3 made a recorded failure win
+    // regardless of call order) but `endedAt` is rewritten each time, and
+    // a straggler failing after an earlier branch already closed the run
+    // would flip it long after the fact.
+    //
+    // `createRun` seeds this at 1 (the initial dispatch is itself one
+    // live "lineage" until it either finishes or suspends).
+    // `markRunWaiting` increments it ONLY for a suspension that is
+    // genuinely new — a nested `condition` branch spawned within the
+    // current dispatch (`executeStepsFrom`'s `isEntryCall: false`
+    // recursion). A lineage's OWN entry-call scope suspending on its own
+    // `wait` is net-zero: that scheduled resume already firing is what
+    // produced this invocation, so parking on a new wait merely moves
+    // the SAME live slot forward rather than creating another one.
+    // `finishRun` is the only decrement, called unconditionally whenever
+    // an entry call's own scope runs out of steps without itself hitting
+    // another `wait` (whether it finishes cleanly, fails, or merely
+    // finishes DELEGATING to a child branch that is still suspended) —
+    // exactly the complement of the "net-zero" case above. A run may
+    // only be finished (status/`endedAt` written) once the count reaches
+    // zero.
+    //
+    // Fix wave (2026-08): a previous version incremented on every
+    // `wait` unconditionally and only ever decremented via `finishRun`'s
+    // "scope completed without suspending" path — which a re-suspending
+    // ENTRY call (two or more sequential waits in the same lineage)
+    // never reaches, since the `wait` case returns immediately. That
+    // stranded any automation with 2+ sequential waits at `status:
+    // "running"` forever, one credit short each additional wait. The
+    // seed-at-1 + net-zero-for-the-entry-call's-own-wait shape above is
+    // the fix; see `automationsEngine.ts`'s `markRunWaiting` and
+    // `executeStepsFrom` for the mechanism.
+    outstandingBranches: v.optional(v.number()),
+  })
+    .index("by_account_automation", ["accountId", "automationId"])
+    // The counts query and the per-step canvas chips both want "this
+    // automation's rows in this status". Keeping status in the index
+    // rather than filtering after the read matters because this table
+    // grows with every enrolment, exactly like `automationLogs`.
+    .index("by_account_automation_status", ["accountId", "automationId", "status"])
+    // Cancellation by contact: doNotContact and stopOnReply both ask
+    // "which of this contact's runs are still waiting?".
+    .index("by_account_contact_status", ["accountId", "contactId", "status"]),
+
+  // Cumulative per-step counters. Deliberately NOT columns on
+  // `automationSteps`: those rows are the automation's DEFINITION, and
+  // bumping a counter on them on every execution would put write traffic
+  // on the same documents the builder edits. "Waiting at this step" is
+  // absent on purpose — it is a live index read against `automationRuns`,
+  // so storing it would be a second source of truth that can drift.
+  automationStepStats: defineTable({
+    accountId: v.id("accounts"),
+    automationId: v.id("automations"),
+    stepKey: v.string(),
+    reached: v.number(),
+    sent: v.number(),
+    failed: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account_automation", ["accountId", "automationId"])
+    .index("by_account_step_key", ["accountId", "stepKey"]),
 
   // The definition envelope for one conversational flow (bot). Mirrors
   // `automations` above but for the graph-based engine. `entryNodeId`
@@ -1304,19 +2171,136 @@ export default defineSchema({
   aiUsageLog: defineTable({
     accountId: v.id("accounts"),
     conversationId: v.optional(v.id("conversations")),
-    mode: v.union(
-      v.literal("auto_reply"),
-      v.literal("draft"),
-      v.literal("classify"),
-      v.literal("qualify"),
-      v.literal("checklist"),
-    ),
-    provider: v.union(v.literal("openai"), v.literal("anthropic")),
+    // Derived from `lib/aiUsageStats.ts`'s AI_USAGE_MODES, which carries
+    // the per-mode rationale and is now the ONLY place the list is
+    // written down. This union and `aiUsage.log`'s args validator used to
+    // be two hand-maintained copies and drifted twice (`score`,
+    // `match_service`) — each time the mutation rejected a write the
+    // table allowed. Same idiom as `archivedReason` above.
+    mode: v.union(...AI_USAGE_MODES.map((mode) => v.literal(mode))),
+    provider: v.union(...AI_USAGE_PROVIDERS.map((p) => v.literal(p))),
     model: v.string(),
     promptTokens: v.number(),
     completionTokens: v.number(),
     totalTokens: v.number(),
+    // Both optional: rows written before the 2026-07-27 audit carry
+    // neither, and not every provider/endpoint reports them (the
+    // embeddings API has no notion of either). See `lib/ai/types.ts`'s
+    // `AiUsage` for the subset invariants — `cachedPromptTokens` is part
+    // of `promptTokens`, `reasoningTokens` part of `completionTokens`,
+    // so summing them into a total would double-count.
+    cachedPromptTokens: v.optional(v.number()),
+    reasoningTokens: v.optional(v.number()),
   }).index("by_account", ["accountId"]),
+
+  // Hourly AI token counts per account — the read-bounded source for the
+  // /agents Usage tab.
+  //
+  // `aiUsage.summary` used to `.collect()` every `aiUsageLog` row in the
+  // window and hand them to the client to aggregate: bounded by the
+  // window, NOT by traffic. At the ~4,000 calls/day this deployment logs
+  // that meant ~120,000 documents for the default 30-day view, so the
+  // card never loaded at all — `Your request timed out performing too
+  // many system operations`, the same failure `messageHourlyStats` above
+  // exists to fix, thrown inside `useQuery` on a page with no Error
+  // Boundary.
+  //
+  // Hourly and UTC for exactly the reasons `messageHourlyStats`
+  // documents: the day boundaries belong to the viewer, so a day-keyed
+  // rollup would have to pick a timezone at write time. See
+  // `lib/aiUsageStats.ts` for the fold and the whole-hour-offset caveat.
+  //
+  // Written at the single `insert("aiUsageLog")` choke point in
+  // `aiUsage.log`, so the rollup cannot drift from the ledger it
+  // summarises. The raw rows stay: they are the audit trail, and the
+  // backfill rebuilds these buckets from them.
+  aiUsageHourlyStats: defineTable({
+    accountId: v.id("accounts"),
+    /** Start of the UTC hour — `lib/aiUsageStats.ts`'s `hourStartMs`. */
+    hourStartMs: v.number(),
+    calls: v.number(),
+    promptTokens: v.number(),
+    completionTokens: v.number(),
+    totalTokens: v.number(),
+    /** Subset of `promptTokens`: served from the provider's prefix cache. */
+    cachedPromptTokens: v.number(),
+    /** Prompt tokens on the calls that actually REPORTED a cache figure,
+     *  so the hit rate is not diluted by rows predating the telemetry or
+     *  by endpoints (embeddings) that have no cache. A measured zero
+     *  counts here; an absent figure does not. */
+    cacheablePromptTokens: v.number(),
+    /** Subset of `completionTokens`. */
+    reasoningTokens: v.number(),
+    // Arrays, not a column per mode and certainly not per model: the mode
+    // list is closed but the MODEL list is open-ended (a new model string
+    // must not need a migration), and `v.record` appears nowhere else in
+    // this schema. Both stay tiny — at most one entry per mode (11) and
+    // one per provider:model actually used in that hour.
+    modes: v.array(
+      v.object({
+        mode: v.union(...AI_USAGE_MODES.map((mode) => v.literal(mode))),
+        calls: v.number(),
+        tokens: v.number(),
+      }),
+    ),
+    models: v.array(
+      v.object({
+        provider: v.union(...AI_USAGE_PROVIDERS.map((p) => v.literal(p))),
+        model: v.string(),
+        calls: v.number(),
+        tokens: v.number(),
+        // The per-model token split, added 2026-08-17 so the usage tab
+        // can price a model at all — `tokens` is the SUM of three spans
+        // that bill at three different rates, so it is unpriceable on
+        // its own (see `lib/aiUsageStats.ts`'s `ModelTally`).
+        //
+        // OPTIONAL for the hours written before that date, which have no
+        // split and never will until `aiUsage.backfillAiUsageHourlyStats`
+        // is re-run. Absent means UNKNOWN, not zero; the dashboard
+        // excludes those models from spend and names them rather than
+        // pricing them as free.
+        promptTokens: v.optional(v.number()),
+        completionTokens: v.optional(v.number()),
+        cachedPromptTokens: v.optional(v.number()),
+      }),
+    ),
+  }).index("by_account_hour", ["accountId", "hourStartMs"]),
+
+  // Per-model provider prices, one row per (account, model). Powers the
+  // spend figures on the /agents usage tab — `aiUsageLog` above has
+  // carried the token counts since the 2026-07-27 audit, but the repo
+  // held no price, so the tab could only report volume.
+  //
+  // Per account rather than global because rates are a property of the
+  // account's own billing arrangement with its BYO provider, not of the
+  // app: two accounts on different OpenAI tiers pay differently for the
+  // same model id. `src/lib/ai/pricing.ts`'s DEFAULT_MODEL_RATES is the
+  // fallback when no row exists here, and deliberately omits the models
+  // whose prices we cannot verify.
+  //
+  // Rates are billing-class data — both functions in
+  // `convex/aiModelRates.ts` gate on `ctx.requireRole("admin")`, the same
+  // floor `aiUsage.summary` and `apiKeys.list` enforce.
+  aiModelRates: defineTable({
+    accountId: v.id("accounts"),
+    provider: v.union(v.literal("openai"), v.literal("anthropic")),
+    // The raw provider model id exactly as it appears in
+    // `aiUsageLog.model`, because that is the key the dashboard joins on.
+    model: v.string(),
+    // All three in USD per 1,000,000 tokens. `cachedInputPerMTok` is
+    // stored explicitly rather than derived as a fraction of
+    // `inputPerMTok`: the ~10% cache-read ratio is provider policy that
+    // can change, and differs from the cache-WRITE multiplier.
+    inputPerMTok: v.number(),
+    cachedInputPerMTok: v.number(),
+    outputPerMTok: v.number(),
+    updatedAt: v.number(),
+    updatedByUserId: v.optional(v.id("users")),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_account_model", ["accountId", "model"]),
+
+
 
   // Fixed-window burst counter for AI auto-replies, one row per account.
   //
@@ -1606,7 +2590,7 @@ export default defineSchema({
   // Unified conversion outbox (funnel Phase 1). One row per
   // (conversation, stage) that maps to a Meta event. `backend`
   // discriminates delivery: "platformA" (website/code lane → web Pixel via
-  // go-holidayys) or "capi" (ad/ctwa lane → direct Meta CAPI). `eventId`
+  // go-amani) or "capi" (ad/ctwa lane → direct Meta CAPI). `eventId`
   // (= `${conversationId}:${stage}`) is our dedup key — Meta does not dedupe
   // business-messaging events. Dormant rows stay `pending` (no attempt bump)
   // until env is configured; the retry cron resends them.
@@ -1717,7 +2701,23 @@ export default defineSchema({
     .index("by_conversation", ["conversationId"])
     // Account-scoped, `_creationTime`-ordered scan for the funnel-analytics
     // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
-    .index("by_account", ["accountId"]),
+    .index("by_account", ["accountId"])
+    // `reports.adPerformance` needs only the `qualified` and `purchased`
+    // partitions — it asks `stages.has(...)` for those two and nothing else
+    // — but read every stage through `by_account`. Measured on production:
+    // 2,029 rows for a 30-day window, of which 1,838 were `new_lead` it
+    // fetched and discarded. Ranging `stage` in the index reads only the
+    // partitions actually used: a ~10x cut that changes no returned number.
+    //
+    // `stage` sits before the implicit `_creationTime`, so the window bound
+    // stays a genuine range within each partition rather than a post-scan
+    // filter.
+    .index("by_account_stage", ["accountId", "stage"])
+    // The contact panel's activity feed is per-CONTACT, not per-conversation
+    // — a contact can hold several threads and the panel shows the person's
+    // whole history. `by_conversation` cannot answer that without reading
+    // every conversation first.
+    .index("by_contact", ["contactId"]),
 
   // ============================================================
   // CTWA ad-capture (funnel Phase 0). Raw event log: one row per
@@ -1740,6 +2740,26 @@ export default defineSchema({
     body: v.optional(v.string()),
     mediaType: v.optional(v.string()),
     isFirstTouch: v.boolean(), // contact's first-ever ad referral
+    // ---- Ad→service tagging state (convex/adServiceTagging.ts). All
+    // optional: live rows predate this feature. "unmatched" and
+    // "ambiguous" behave identically for control flow — both advance
+    // the attempt counter and both fall through to the AI pass — and
+    // are kept apart only so an alias review can tell "no service term
+    // appeared" from "two services overlapped".
+    serviceMatchStatus: v.optional(
+      v.union(
+        v.literal("matched"),
+        v.literal("unmatched"),
+        v.literal("ambiguous"),
+        v.literal("suggested"),
+      ),
+    ),
+    /** The `kbServices.key` that matched. */
+    serviceMatchKey: v.optional(v.string()),
+    /** Which signal produced the hit — a `MatchSignals` key. */
+    serviceMatchedOn: v.optional(v.string()),
+    /** Rule passes spent. Hard-capped at 2 by `tagFromAd`. */
+    serviceMatchAttempts: v.optional(v.number()),
   })
     .index("by_account", ["accountId"])
     .index("by_account_ad", ["accountId", "adId"])
@@ -1847,6 +2867,14 @@ export default defineSchema({
     followUpDelaysMinutes: v.array(v.number()),
     maxFollowUps: v.number(),
     sessionWindowHours: v.number(),
+    // Days of our-turn silence before a thread moves from the Waiting
+    // lane to Chasing. ABSENT = `sessionWindowHours / 24`, i.e. exactly
+    // where this engine's own follow-up ladder gives up — so the two
+    // boundaries agree by construction. Lives here, next to the number
+    // it must match, rather than in `leadAnalysisConfigs`, which is
+    // gated on its own `enabled` flag while the lane boundary must work
+    // regardless. Computed by `lib/inbox/lanes.ts`, never inline.
+    chasingAfterDays: v.optional(v.number()),
     reengagementTemplateName: v.optional(v.string()),
     reengagementTemplateLanguage: v.optional(v.string()),
     closingMessage: v.string(),
@@ -2022,10 +3050,28 @@ export default defineSchema({
     // consumes it; status flips to "qualified" only there, so a P1-only
     // build never half-completes a lead.
     checklistSatisfiedAt: v.optional(v.number()),
+    // Newest customer message this session has been analysed through
+    // (token audit follow-up 2026-07-27). Lets the extraction pass skip
+    // outright when nothing new has arrived, which is what makes it safe
+    // to invoke from BOTH the debounced schedule and `dispatchInbound`
+    // without paying twice. Optional: sessions predating the field simply
+    // analyse once more and then carry a watermark.
+    analyzedThroughMs: v.optional(v.number()),
     pendingQuestion: v.optional(v.object({
       key: v.string(),
       text: v.string(),
       alternates: v.array(v.string()),
+      // When the analysis pass that PROPOSED this question ran. The
+      // question is only trustworthy while it post-dates
+      // `lastCustomerMessageAt` below: once the customer has spoken
+      // again, a question computed before they spoke may well be the
+      // one they just answered, and both consumers (the reply's
+      // steering in `getObjectives`, the follow-up cron's verbatim
+      // replay in `pickFollowUpText`) must stop using it. Optional
+      // because rows written before this shipped have no stamp — those
+      // are treated as stale, which costs one turn of steering and
+      // self-heals on the next inbound.
+      askedAt: v.optional(v.number()),
     })),
     lastCustomerMessageAt: v.optional(v.number()),
     humanTouchedAt: v.optional(v.number()),
@@ -2115,4 +3161,373 @@ export default defineSchema({
     ),
     error: v.optional(v.string()),
   }).index("by_name", ["name", "startedAt"]),
+
+  // ============================================================
+  // Lead Analysis (spec: docs/superpowers/specs/
+  // 2026-07-26-lead-analysis-design.md). One row per conversation;
+  // `by_conversation` doubles as the 1:1 enforcing index (a single
+  // upsert path), mirroring `qualificationSessions`.
+  //
+  // `by_score_due` and `by_sequence_due` are partitioned cron ranges,
+  // the same shape as `qualificationSessions.by_due` and
+  // `conversionEvents.by_status`: each sweep reads only its own
+  // partition, and a row that gives up LEAVES that partition
+  // ("failed" / "stopped") rather than accumulating in front of the
+  // rows the sweep still wants. `scoreStatus` is bound before
+  // `rescoreDueAt` so the due test is a genuine range, never a
+  // post-index `.filter()` — see this file's `broadcastRecipients`
+  // comment for what that filter costs once dead rows pile up.
+  //
+  // P1 writes only `sequenceStatus: "idle"`; the sequence fields exist
+  // now so P3 adds no second schema deploy.
+  // ============================================================
+  leadAnalyses: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+
+    // DENORMALISED mirror of `conversations.archivedAt` (presence →
+    // true). `conversations.archivedAt` stays the system of record; this
+    // exists purely so the board's read stays bounded.
+    //
+    // Without it, the board would read `by_account_score` and drop
+    // archived rows afterwards. Archiving only ever accumulates, so over
+    // time the query would read a mostly-archived page to surface a
+    // shrinking active set — the same unbounded shape this file warns
+    // about elsewhere.
+    //
+    // REPRESENTATION (load-bearing): archived rows hold `true`; active
+    // rows hold `undefined` — restore CLEARS the field rather than
+    // writing `false`. That is what makes `eq("archived", undefined)` an
+    // exact range over the active set. Writing `false` instead would
+    // split active rows across two index values and force the active
+    // view to read past archived rows to find them, which is the
+    // starvation this denormalisation exists to prevent.
+    //
+    // SYNC INVARIANT: for the "archive" direction, `leadAnalysis.ts`'s
+    // `archiveConversationCore` is the ONLY writer of this field or of
+    // `conversations.archivedAt` — both the supervisor-gated `archive`
+    // mutation and the sequence's unattended `archiveAutomated` mutation
+    // (P3) call it rather than duplicating its body. For the inverse
+    // (clear) direction, `leadAnalysis.restore` and
+    // `conversations.unarchiveOnInbound` are the only writers. Every
+    // writer patches BOTH rows in one mutation; Convex mutations are
+    // transactional, so the two cannot commit apart. Any future writer
+    // must uphold this — route through the core, don't add a fourth
+    // hand-rolled copy of the archive write.
+    archived: v.optional(v.boolean()),
+
+    score: v.optional(v.number()), // 1–10, absent until first scored
+    band: v.optional(
+      v.union(v.literal("hot"), v.literal("warm"), v.literal("cold")),
+    ),
+    reason: v.optional(v.string()),
+    signals: v.optional(v.array(v.string())),
+    // Denormalised copy of the conversation's newest
+    // `qualificationSessions.serviceName` as of the last score, so the
+    // board doesn't run a per-row session query. DISPLAY ONLY — nothing
+    // branches on it. `undefined` means "not cached yet" and the board
+    // falls back to the real query, so rows scored before this field
+    // existed keep rendering their service name.
+    serviceName: v.optional(v.string()),
+    scoredAt: v.optional(v.number()),
+    // Dedup key: the `_creationTime` of the newest message at the moment
+    // this row was last scored. A re-queue whose newest message has not
+    // moved short-circuits without spending an LLM call.
+    //
+    // Deliberately a TIMESTAMP, not a message count: a count derived from
+    // the bounded `.take(TRANSCRIPT_LIMIT)` transcript slice saturates at
+    // the limit, after which it can never change again and the
+    // conversation would be silently frozen at its last score forever.
+    scoredThroughMs: v.optional(v.number()),
+    model: v.optional(v.string()),
+    scoreStatus: v.union(
+      v.literal("pending"),
+      v.literal("scored"),
+      v.literal("failed"),
+      v.literal("skipped"),
+    ),
+    rescoreDueAt: v.optional(v.number()),
+    attempts: v.number(),
+    lastError: v.optional(v.string()),
+
+    sequenceStatus: v.union(
+      v.literal("idle"),
+      v.literal("running"),
+      v.literal("exhausted"),
+      v.literal("stopped"),
+    ),
+    followUpsSent: v.number(),
+    lastFollowUpAt: v.optional(v.number()),
+    nextFollowUpAt: v.optional(v.number()),
+    stoppedReason: v.optional(v.string()),
+  })
+    .index("by_conversation", ["conversationId"])
+    .index("by_account_score", ["accountId", "score"])
+    // The board's read, partitioned by archive state. Convex sorts a
+    // missing field before every present value, so
+    // `eq("archived", undefined)` and `eq("archived", true)` are two
+    // disjoint, exact ranges. Pre-archive rows (written before this
+    // field existed) hold `undefined` and so correctly land in the
+    // active partition with no backfill.
+    .index("by_account_archived_score", ["accountId", "archived", "score"])
+    .index("by_score_due", ["scoreStatus", "rescoreDueAt"])
+    .index("by_sequence_due", ["sequenceStatus", "nextFollowUpAt"]),
+
+  // Per-account Lead Analysis config, one row (`by_account` doubles as
+  // the enforcing unique index — same treatment as
+  // `qualificationConfigs`). DORMANT until `enabled`: every engine entry
+  // point gates on it, so deploying this schema changes nothing
+  // user-visible.
+  leadAnalysisConfigs: defineTable({
+    accountId: v.id("accounts"),
+    enabled: v.boolean(),
+
+    rescoreDebounceMinutes: v.number(),
+    scorePerRun: v.number(),
+    backfillEnabled: v.boolean(),
+    backfillPerRun: v.number(),
+
+    idleDaysBeforeSequence: v.number(),
+    humanQuietHours: v.number(),
+    dailySendCap: v.number(),
+    agedOutDays: v.optional(v.number()),
+    bands: v.array(
+      v.object({
+        key: v.union(v.literal("hot"), v.literal("warm"), v.literal("cold")),
+        minScore: v.number(),
+        maxScore: v.number(),
+        autoArchive: v.boolean(),
+        steps: v.array(
+          v.object({
+            delayDays: v.number(),
+            templateName: v.string(),
+            templateLanguage: v.optional(v.string()),
+          }),
+        ),
+      }),
+    ),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // Daily marketing-send budget, one row per account. Mirrors
+  // `aiAutoReplyRate`'s fixed-window shape, with one deliberate
+  // difference: `aiAutoReplyRate` PACES (a refusal there means "retry in
+  // N ms", because the bot answers every message), whereas this one
+  // REFUSES — a marketing template over the day's cap must not be sent
+  // today at all, and the caller reschedules to tomorrow.
+  //
+  // `dayStartMs` is the ACCOUNT-LOCAL midnight, derived from the same
+  // `qualificationConfigs.utcOffsetMinutes` the working hours use: a cap
+  // described as "100 per day" that reset at 4am local would be
+  // surprising to the person who set it.
+  leadSequenceSendRate: defineTable({
+    accountId: v.id("accounts"),
+    dayStartMs: v.number(),
+    count: v.number(),
+  }).index("by_account", ["accountId"]),
+
+  // ============================================================
+  // Knowledge gap agent (spec docs/superpowers/specs/
+  // 2026-08-09-knowledge-gap-agent-design.md). Mines `adminInquiries` —
+  // the questions the assistant escalated to staff — and turns the ones
+  // a human ANSWERED into knowledge-base drafts, while clustering the
+  // ones nobody answered into themes worth writing down.
+  //
+  // Measured in production 2026-08-09: 70 inquiries, 49 of them never
+  // answered by anyone. Those 49 are the real prize — questions
+  // customers keep asking that the business has never documented.
+  // ============================================================
+
+  kbGapConfigs: defineTable({
+    accountId: v.id("accounts"),
+    enabled: v.boolean(),
+    /** How many answered inquiries one sweep may turn into drafts. */
+    entriesPerRun: v.number(),
+    /** Answers shorter than this are deflections, not knowledge —
+     *  production holds "Okay" and "Tell them our team will contact
+     *  you". A cheap pre-filter, before any provider call. */
+    minAnswerChars: v.number(),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One row per inquiry the agent has considered — the idempotency
+  // record AND the audit trail. Without it a sweep would re-draft the
+  // same entry every run; with it, a skipped inquiry also says why.
+  kbGapProcessed: defineTable({
+    accountId: v.id("accounts"),
+    inquiryId: v.id("adminInquiries"),
+    outcome: v.union(
+      v.literal("drafted"),
+      v.literal("skipped_thin_answer"),
+      v.literal("skipped_not_durable"),
+    ),
+    /** The draft it produced, when it produced one. */
+    kbEntryId: v.optional(v.id("kbEntries")),
+    /** Why it was skipped, in the agent's own words. */
+    reason: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_inquiry", ["inquiryId"]),
+
+  // The clustered unanswered questions. Rewritten wholesale each sweep
+  // rather than merged: a theme is a view over the current backlog, not
+  // an entity with a life of its own, and merging would strand themes
+  // whose questions have since been answered.
+  kbGapThemes: defineTable({
+    accountId: v.id("accounts"),
+    theme: v.string(),
+    questionCount: v.number(),
+    /** Verbatim customer questions, so a reader can judge the theme. */
+    examples: v.array(v.string()),
+    updatedAt: v.number(),
+  }).index("by_account", ["accountId"]),
+
+  // ============================================================
+  // Sales coach (spec docs/superpowers/specs/
+  // 2026-08-09-sales-coach-design.md). Reads threads a human handled and
+  // writes specific, quotable observations about how they were handled.
+  //
+  // It does NOT score or rank anyone. Measured 2026-08-09: this account
+  // has ZERO deals and no conversation has ever reached price_quoted, so
+  // there is no outcome data. A number built on process alone would be
+  // invented precision that reads as objective — and this is the one
+  // agent whose output is about a named colleague.
+  // ============================================================
+
+  salesCoachConfigs: defineTable({
+    accountId: v.id("accounts"),
+    enabled: v.boolean(),
+    /** Threads reviewed per sweep. */
+    threadsPerRun: v.number(),
+    /** A thread with fewer messages than this has nothing to coach on. */
+    minMessages: v.number(),
+    /** How far back to look for threads worth reviewing. */
+    lookbackDays: v.number(),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One review of one thread. `subjectUserId` is the person it is about,
+  // and the index on it is what lets someone read their OWN coaching
+  // without being able to read a colleague's.
+  salesCoachNotes: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    subjectUserId: v.id("users"),
+    /** Every observation carries a verbatim quote from the thread.
+     *  Feedback about a colleague without evidence is an opinion, and
+     *  an opinion from a model is not something anyone should have to
+     *  answer for. */
+    observations: v.array(
+      v.object({
+        dimension: v.union(
+          v.literal("unanswered_question"),
+          v.literal("checklist_skipped"),
+          v.literal("slow_response"),
+          v.literal("tone"),
+        ),
+        observation: v.string(),
+        quote: v.optional(v.string()),
+      }),
+    ),
+    /** What went well, so this is coaching rather than a fault list. */
+    strengths: v.array(v.string()),
+    /** Computed in code, not judged by the model — minutes between the
+     *  customer's last message and this person's first reply. */
+    firstResponseMinutes: v.optional(v.number()),
+    /** `_creationTime` of the newest message covered, so a thread is
+     *  re-reviewed only once it has actually moved on. */
+    reviewedThroughMs: v.number(),
+    model: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_account", ["accountId"])
+    .index("by_subject", ["subjectUserId"])
+    .index("by_conversation", ["conversationId"]),
+
+  // Per-agent, per-account extra instructions, appended to that agent's
+  // prompt (spec docs/superpowers/specs/2026-08-09-agent-window-design.md).
+  //
+  // A SEPARATE table rather than a column on each agent's own config,
+  // because three agents have no config row at all and one row per
+  // (account, agent) keeps the shape identical for every agent — which
+  // is the entire point of the agent window.
+  agentInstructions: defineTable({
+    accountId: v.id("accounts"),
+    /** An `AgentKey` from `lib/agentRegistry.ts`. Not a union here: the
+     *  registry is the source of truth and validates on write, so a
+     *  schema union would be a second list to keep in sync. */
+    agentKey: v.string(),
+    extraInstructions: v.string(),
+    updatedByUserId: v.optional(v.id("users")),
+    updatedAt: v.number(),
+  }).index("by_account_agent", ["accountId", "agentKey"]),
+
+  // ============================================================
+  // Revival agent (spec docs/superpowers/specs/
+  // 2026-08-09-revival-agent-design.md). Drafts a nudge for leads that
+  // went quiet while still inside Meta's 24h window, and queues it for a
+  // human to send. It never sends by itself.
+  // ============================================================
+
+  // One row per account, `by_account` doubling as the uniqueness key —
+  // same shape as `aiConfigs`/`leadAnalysisConfigs`. With no enabled row
+  // the sweep selects nothing, so the feature costs nothing until it is
+  // switched on.
+  revivalConfigs: defineTable({
+    accountId: v.id("accounts"),
+    enabled: v.boolean(),
+    // How long a lead must have been quiet before it is worth a nudge.
+    minQuietMinutes: v.number(),
+    // Headroom left before the 24h window shuts, so a draft sitting in
+    // the queue cannot be approved into an already-expired window.
+    windowSafetyMinutes: v.number(),
+    // No second draft for the same conversation inside this many hours,
+    // in ANY status — a dismissed draft is a "no", not a retry.
+    cooldownHours: v.number(),
+    draftsPerRun: v.number(),
+    dailyDraftCap: v.number(),
+    minLeadScore: v.number(),
+    updatedAt: v.optional(v.number()),
+  }).index("by_account", ["accountId"]),
+
+  // One queued draft. Modelled on `tagSuggestions` — the same
+  // propose-then-accept shape already proven in the inbox.
+  revivalDrafts: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    body: v.string(),
+    // Why this lead, now — shown to the approver so they are accepting a
+    // judgement rather than just a sentence.
+    reason: v.string(),
+    // "template" exists so the cold-stock path needs no schema change
+    // once Meta approves re-engagement templates. NOTHING WRITES IT YET:
+    // 90% of this account's conversations are outside the 24h window and
+    // the only approved template is Meta's `hello_world` sample, so the
+    // free-text path is the whole of v1.
+    channel: v.union(v.literal("free_text"), v.literal("template")),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("sent"),
+      v.literal("dismissed"),
+      v.literal("expired"),
+    ),
+    // Routes to the lead's owner when there is one, rather than the
+    // shared queue. Assignment is deliberately NOT a disqualifier —
+    // skipping assigned threads would skip most of the Chasing lane,
+    // which is exactly the population worth reviving.
+    assignedToUserId: v.optional(v.id("users")),
+    model: v.string(),
+    confidence: v.union(v.literal("high"), v.literal("medium"), v.literal("low")),
+    reviewedByUserId: v.optional(v.id("users")),
+    reviewedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    // When the 24h window shuts. This is what keeps the queue honest: a
+    // draft past it is swept to `expired` rather than looking sendable.
+    expiresAt: v.number(),
+  })
+    .index("by_account_status", ["accountId", "status"])
+    .index("by_conversation", ["conversationId"]),
 });

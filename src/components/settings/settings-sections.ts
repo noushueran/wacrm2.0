@@ -8,6 +8,7 @@ import {
   LayoutGrid,
   Palette,
   PlugZap,
+  Repeat,
   Tags,
   Target,
   User,
@@ -38,6 +39,7 @@ export const SETTINGS_SECTIONS = [
   'api',
   'conversions',
   'qualification',
+  'lead-sequence',
   'cron',
 ] as const;
 
@@ -67,6 +69,7 @@ export const SECTION_META: Record<SettingsSection, SectionMeta> = {
   api: { id: 'api', label: 'API keys', icon: KeyRound, group: 'workspace' },
   conversions: { id: 'conversions', label: 'Conversions', icon: Target, group: 'workspace' },
   qualification: { id: 'qualification', label: 'Lead qualification', icon: ClipboardCheck, group: 'workspace' },
+  'lead-sequence': { id: 'lead-sequence', label: 'Follow-up sequence', icon: Repeat, group: 'workspace' },
   cron: { id: 'cron', label: 'Cron schedules', icon: CalendarClock, group: 'workspace' },
 };
 

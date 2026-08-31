@@ -4,16 +4,18 @@ import {
   internalQuery,
 } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
-import type { Id } from "./_generated/dataModel";
+import type { Doc, Id } from "./_generated/dataModel";
 import { internal } from "./_generated/api";
 import { v, ConvexError } from "convex/values";
-import { accountMutation } from "./lib/auth";
+import { accountMutation, accountQuery } from "./lib/auth";
 import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
+import { aiJudgeModel, aiJudgeReasoningEffort, promptCacheKey } from "./lib/ai/defaults";
 import {
   DEFAULT_SALES_CHECKLIST,
   buildChecklistPrompt,
   parseChecklistGeneration,
+  projectChecklist,
   type ChecklistItemSeed,
 } from "./lib/salesChecklist";
 import { generateReply } from "./lib/ai/generate";
@@ -105,9 +107,14 @@ export const setItemDone = accountMutation({
           : i,
       ),
     });
+    // Stamped with the conversation so the completion appears inline in
+    // that thread — the thread reads notes by conversation, so an
+    // unstamped row surfaced in no thread at all. Contacts with several
+    // threads get it filed against the right one.
     await ctx.db.insert("contactNotes", {
       accountId: ctx.accountId,
       contactId: checklist.contactId,
+      conversationId: checklist.conversationId,
       createdByUserId: ctx.userId,
       noteText: `✅ Checklist — ${item.title}: ${note}`,
     });
@@ -146,6 +153,7 @@ export const reopenItem = accountMutation({
     await ctx.db.insert("contactNotes", {
       accountId: ctx.accountId,
       contactId: checklist.contactId,
+      conversationId: checklist.conversationId,
       createdByUserId: ctx.userId,
       noteText: `↩️ Checklist task reopened: ${item.title}`,
     });
@@ -244,11 +252,21 @@ export const generateForSession = internalAction({
               })
             : [];
           if (excerpts.length > 0) {
+            // Parsed by `parseChecklistGeneration` into checklist items —
+            // internal, never customer-facing, so the judge tier.
+            const model = aiJudgeModel(aiCfg.provider, aiCfg.model);
+            const extraInstructions = await ctx.runQuery(
+              internal.agentInstructions.forAgent,
+              { accountId: args.accountId, agentKey: "checklist" },
+            );
             const gen = await generateReply({
               provider: aiCfg.provider,
-              model: aiCfg.model,
+              model,
               apiKey: aiCfg.apiKey,
+              reasoningEffort: aiJudgeReasoningEffort(),
+              promptCacheKey: promptCacheKey(args.accountId, "checklist"),
               systemPrompt: buildChecklistPrompt({
+                extraInstructions,
                 excerpts,
                 serviceName: info.serviceName,
               }),
@@ -265,10 +283,12 @@ export const generateForSession = internalAction({
                 accountId: args.accountId,
                 mode: "checklist",
                 provider: aiCfg.provider,
-                model: aiCfg.model,
+                model,
                 promptTokens: gen.usage?.promptTokens ?? 0,
                 completionTokens: gen.usage?.completionTokens ?? 0,
                 totalTokens: gen.usage?.totalTokens ?? 0,
+                cachedPromptTokens: gen.usage?.cachedPromptTokens,
+                reasoningTokens: gen.usage?.reasoningTokens,
               });
             } catch (err) {
               console.warn("[salesChecklist] usage log failed:", err);
@@ -321,5 +341,73 @@ export const backfill = internalMutation({
       created += 1;
     }
     return { created };
+  },
+});
+
+/**
+ * One conversation's sales checklist, for the Inbox contact panel — the
+ * Leads board's payload without the board. Returns null when the
+ * conversation never qualified or its checklist has not been generated
+ * yet; the panel renders nothing at all in that case, matching
+ * `QualificationChip`'s calm-by-default rule.
+ *
+ * Read access only ("view"): seeing the checklist is not working it.
+ * `setItemDone`/`reopenItem` keep their own stricter "own" gate, which
+ * is what makes the assigned salesperson the one who completes it.
+ */
+export const forConversation = accountQuery({
+  args: { conversationId: v.id("conversations") },
+  handler: async (ctx, args) => {
+    await requireConversationAccess(ctx, args.conversationId, "view");
+
+    const sessions = await ctx.db
+      .query("qualificationSessions")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .order("desc")
+      .take(5);
+
+    // One conversation holds SEVERAL sessions: a returning customer's new
+    // inquiry (a different service, or the same one after 48h) opens a
+    // fresh one — see `qualificationEngine.ts`'s duplicate-lead guards.
+    // That new session has no checklist until it qualifies, so reading
+    // only the newest would blank this panel and send the salesperson back
+    // to the Leads board — which still shows the earlier session's ticks —
+    // for exactly the repeat customer this feature exists to keep them in
+    // the thread for. Walk newest-first to the last session that actually
+    // has one. Five is deep enough for any real chat and keeps this a
+    // bounded read; `salesChecklists` has no by_conversation index and the
+    // spec rules out adding one.
+    let row: Doc<"salesChecklists"> | null = null;
+    for (const session of sessions) {
+      if (session.accountId !== ctx.accountId) continue;
+      const candidate = await ctx.db
+        .query("salesChecklists")
+        .withIndex("by_session", (q) => q.eq("sessionId", session._id))
+        .first();
+      if (candidate && candidate.accountId === ctx.accountId) {
+        row = candidate;
+        break;
+      }
+    }
+    if (!row) return null;
+
+    // Only the members who actually completed something — the board loads
+    // every membership because it renders every lead; one thread needs at
+    // most a handful.
+    const memberName = new Map<Id<"users">, string>();
+    for (const item of row.items) {
+      if (!item.doneByUserId || memberName.has(item.doneByUserId)) continue;
+      const membership = await ctx.db
+        .query("memberships")
+        .withIndex("by_user_account", (q) =>
+          q.eq("userId", item.doneByUserId!).eq("accountId", ctx.accountId),
+        )
+        .first();
+      if (membership) memberName.set(item.doneByUserId, membership.fullName ?? "Member");
+    }
+
+    return projectChecklist(row, memberName);
   },
 });

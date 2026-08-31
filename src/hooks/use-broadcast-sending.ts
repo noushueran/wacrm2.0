@@ -65,7 +65,9 @@ interface BroadcastPayload {
 }
 
 interface UseBroadcastSendingReturn {
-  createAndSendBroadcast: (payload: BroadcastPayload) => Promise<string>;
+  createAndSendBroadcast: (
+    payload: BroadcastPayload,
+  ) => Promise<{ broadcastId: string; skipped: number }>;
   isProcessing: boolean;
   progress: number;
 }
@@ -224,7 +226,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
   async function createAndSendBroadcast(
     payload: BroadcastPayload,
-  ): Promise<string> {
+  ): Promise<{ broadcastId: string; skipped: number }> {
     setIsProcessing(true);
     setProgress(0);
 
@@ -246,7 +248,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       // never sends anything itself (see that mutation's own header
       // comment).
       setProgress(50);
-      const broadcastId = await createBroadcast({
+      const { broadcastId, skipped } = await createBroadcast({
         name: payload.name,
         templateName: payload.template.name,
         templateLanguage: payload.template.language ?? 'en_US',
@@ -289,7 +291,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       }
 
       setProgress(100);
-      return broadcastId;
+      return { broadcastId, skipped };
     } finally {
       setIsProcessing(false);
     }

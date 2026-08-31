@@ -6,6 +6,7 @@ import { v, ConvexError } from "convex/values";
 import { encrypt, decrypt } from "./lib/whatsappEncryption";
 import { hasMinRole } from "./lib/roles";
 import { generateReply } from "./lib/ai/generate";
+import { aiJudgeReasoningEffort, promptCacheKey } from "./lib/ai/defaults";
 import { AiError } from "./lib/ai/types";
 
 // ============================================================
@@ -324,10 +325,18 @@ export const testConnection = action({
     try {
       await generateReply({
         provider: args.provider,
+        // The account's OWN model, never the judge tier — the entire
+        // point of this call is to prove THAT model and key work.
         model,
         apiKey: apiKeyPlain,
         systemPrompt: "You are a connectivity check. Reply with the single word: OK.",
         messages: [{ role: "user", content: "ping" }],
+        // A one-word ping needs no deliberation, and on a reasoning
+        // model the default effort would spend the output budget
+        // thinking — which returns empty content and would make a
+        // perfectly good key look broken.
+        reasoningEffort: aiJudgeReasoningEffort(),
+        promptCacheKey: promptCacheKey(accountId, "keytest"),
       });
     } catch (err) {
       if (err instanceof AiError) {

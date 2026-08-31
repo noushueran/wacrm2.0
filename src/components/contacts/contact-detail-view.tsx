@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useAction, useMutation, useQuery } from 'convex/react';
 import { useAuth } from '@/hooks/use-auth';
 import { useCan } from '@/hooks/use-can';
+import { hasMinRole } from '@/lib/auth/roles';
 import { useOpenContactChat } from '@/hooks/use-open-contact-chat';
 import { formatCurrency } from '@/lib/currency';
 import { formatPhoneDisplay } from '@/lib/whatsapp/phone-utils';
@@ -71,7 +72,7 @@ export function ContactDetailView({
   onUpdated,
 }: ContactDetailViewProps) {
   const t = useTranslations('Contacts.detailView');
-  const { defaultCurrency } = useAuth();
+  const { defaultCurrency, user, accountRole } = useAuth();
   const canEdit = useCan('send-messages');
 
   const [copiedPhone, setCopiedPhone] = useState(false);
@@ -590,7 +591,21 @@ export function ContactDetailView({
                       {t('notesTab.noNotes')}
                     </p>
                   ) : (
-                    notes.map((note) => (
+                    notes.map((note) => {
+                      // Mirrors `message-thread.tsx`'s `canManage` for
+                      // the same server rule (`contactNotes.remove`'s
+                      // `requireAuthorOrAdmin`): the note's own author,
+                      // or an admin. `!!note.user_id` guards against a
+                      // false-positive match on `"" === ""` while
+                      // `user` hasn't populated yet — `toUiContactNote`
+                      // maps a missing `createdByUserId` (engine-written
+                      // rows) to `""`, so without this guard a system
+                      // note would briefly show Delete to every signed-
+                      // out render, which the server would then reject.
+                      const canManage =
+                        (!!note.user_id && note.user_id === user?.id) ||
+                        (accountRole ? hasMinRole(accountRole, 'admin') : false);
+                      return (
                       <div
                         key={note.id}
                         className="rounded-lg bg-muted/50 border border-border/50 p-3 group"
@@ -599,12 +614,14 @@ export function ContactDetailView({
                           <p className="text-sm text-muted-foreground whitespace-pre-wrap flex-1">
                             {note.note_text}
                           </p>
-                          <button
-                            onClick={() => deleteNote(note.id)}
-                            className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-all cursor-pointer shrink-0"
-                          >
-                            <Trash2 className="size-3.5" />
-                          </button>
+                          {canManage && (
+                            <button
+                              onClick={() => deleteNote(note.id)}
+                              className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-all cursor-pointer shrink-0"
+                            >
+                              <Trash2 className="size-3.5" />
+                            </button>
+                          )}
                         </div>
                         <p className="text-xs text-muted-foreground mt-1.5">
                           {new Date(note.created_at).toLocaleDateString('en-US', {
@@ -616,7 +633,8 @@ export function ContactDetailView({
                           })}
                         </p>
                       </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </TabsContent>
@@ -689,7 +707,7 @@ export function ContactDetailView({
                           </p>
                           {deal.stage && (
                             <span
-                              className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+                              className="shrink-0 rounded-full px-1.5 py-0.5 text-[11px] font-medium"
                               style={{
                                 backgroundColor: `${deal.stage.color}20`,
                                 color: deal.stage.color,

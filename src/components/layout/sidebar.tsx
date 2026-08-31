@@ -12,6 +12,7 @@ import {
   Bot,
   ClipboardCheck,
   Crown,
+  Gauge,
   GitBranch,
   LayoutDashboard,
   LogOut,
@@ -95,13 +96,14 @@ const navItems: NavItem[] = [
   { href: "/dashboard", labelKey: "dashboard", icon: LayoutDashboard },
   { href: "/inbox", labelKey: "inbox", icon: MessageSquare },
   { href: "/leads", labelKey: "leads", icon: ClipboardCheck },
+  { href: "/lead-analysis", labelKey: "leadAnalysis", icon: Gauge },
   { href: "/contacts", labelKey: "contacts", icon: Users },
   { href: "/pipelines", labelKey: "pipelines", icon: GitBranch },
   { href: "/broadcasts", labelKey: "broadcasts", icon: Radio },
   { href: "/automations", labelKey: "automations", icon: Zap },
   { href: "/flows", labelKey: "flows", icon: Workflow, beta: true },
   { href: "/agents", labelKey: "aiAgents", icon: Bot },
-  { href: "/campaigns", labelKey: "campaigns", icon: BarChart3 },
+  { href: "/reports", labelKey: "reports", icon: BarChart3 },
 ];
 
 const bottomNavItems = [
@@ -306,7 +308,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                         <span
                           aria-label={t("beta")}
                           className={cn(
-                            "rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider",
+                            "rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
                             softBadge("amber"),
                             revealOnExpand,
                           )}
@@ -380,7 +382,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                     const Icon = meta.icon;
                     return (
                       <span
-                        className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${meta.className}`}
+                        className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wider ${meta.className}`}
                       >
                         <Icon className="size-3" />
                         {t(meta.labelKey as string)}

@@ -20,7 +20,19 @@ const ANTHROPIC_VERSION = "2023-06-01";
 
 interface AnthropicResponse {
   content?: { type?: string; text?: string }[];
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    /** Anthropic's prefix-cache counterpart to OpenAI's
+     *  `cached_tokens`. NOTE it is reported ALONGSIDE `input_tokens`
+     *  rather than inside it — see the call site for the adjustment. */
+    cache_read_input_tokens?: number;
+    /** Tokens written INTO the cache on this call (billed at a premium,
+     *  not a discount). Counted toward the prompt total for the same
+     *  reason as the read count, but deliberately NOT reported as
+     *  `cachedPromptTokens` — it is a cache miss, not a hit. */
+    cache_creation_input_tokens?: number;
+  };
 }
 
 /**
@@ -47,7 +59,7 @@ function normalizeForAnthropic(messages: ChatMessage[]): ChatMessage[] {
  * in `generate.ts`'s `generateReply`).
  */
 export async function generateAnthropic(args: ProviderArgs): Promise<ProviderResult> {
-  const { apiKey, model, systemPrompt, messages, timeoutMs, maxTokens } = args;
+  const { apiKey, model, systemPrompt, messages, timeoutMs } = args;
 
   let res: Response;
   try {
@@ -61,10 +73,7 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
       body: JSON.stringify({
         model,
         system: systemPrompt,
-        // Same per-call override as the OpenAI adapter — a structured
-        // caller (the qualification analysis) needs more than the
-        // WhatsApp-reply default. See `ProviderArgs.maxTokens`.
-        max_tokens: maxTokens ?? MAX_OUTPUT_TOKENS,
+        max_tokens: MAX_OUTPUT_TOKENS,
         messages: normalizeForAnthropic(messages),
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -89,9 +98,19 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
     });
   }
   // Anthropic reports input/output but no total — normalizeUsage sums.
+  //
+  // Unlike OpenAI (whose `cached_tokens` sits INSIDE `prompt_tokens`),
+  // Anthropic reports `input_tokens` net of cache, with the cached and
+  // cache-written halves as siblings. Summing all three restores the
+  // "cachedPromptTokens is a subset of promptTokens" invariant `AiUsage`
+  // documents and `normalizeUsage` clamps to — without this the clamp
+  // would silently truncate every cache hit to the uncached remainder.
+  const cacheRead = data?.usage?.cache_read_input_tokens ?? 0;
+  const cacheWrite = data?.usage?.cache_creation_input_tokens ?? 0;
   const usage = normalizeUsage({
-    prompt: data?.usage?.input_tokens,
+    prompt: (data?.usage?.input_tokens ?? 0) + cacheRead + cacheWrite,
     completion: data?.usage?.output_tokens,
+    cached: cacheRead,
   });
   return { text, usage };
 }

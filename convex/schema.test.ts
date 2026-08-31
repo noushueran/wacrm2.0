@@ -2,6 +2,7 @@
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import schema from "./schema";
+import { ARCHIVE_REASONS } from "./lib/leadAnalysis/archive";
 
 // Convex function modules for convex-test to resolve `api.*` references
 // against. Absolute so it resolves identically regardless of which file
@@ -705,4 +706,61 @@ test("messageTemplates.headerMediaKey and memberships.avatarKey round-trip along
   const membership = await t.run((ctx) => ctx.db.get(membershipId));
   expect(membership?.avatarUrl).toBe("https://legacy.example.com/priya.png");
   expect(membership?.avatarKey).toBe("acc1/avatar/priya.png");
+});
+
+// ============================================================
+// `conversations.archivedReason` (schema.ts) is a union DERIVED from
+// `lib/leadAnalysis/archive.ts`'s ARCHIVE_REASONS — mapped straight into
+// `v.literal`s, not hand-listed — so the two cannot drift apart the way
+// `aiUsageLog.mode` and `notifications.type` have in this codebase
+// before. The loop below is the pin that keeps that true in practice: it
+// imports ARCHIVE_REASONS itself and exercises every member through the
+// real schema validator, so a future member added to ARCHIVE_REASONS is
+// automatically covered here too, and a future maintainer who
+// de-derives the union (hand-lists literals in schema.ts instead of
+// mapping ARCHIVE_REASONS) would see this test still pass for the
+// current members but the schema comment above would then be lying —
+// the out-of-union assertion below is what actually fails if the schema
+// ever narrows to fewer members than ARCHIVE_REASONS lists.
+// ============================================================
+test("conversations.archivedReason accepts every ARCHIVE_REASONS member and rejects anything else", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await insertAccount(t);
+  const contactId = await t.run(async (ctx) =>
+    ctx.db.insert("contacts", {
+      accountId,
+      phone: "+15551234567",
+      phoneNormalized: "15551234567",
+    }),
+  );
+
+  for (const reason of ARCHIVE_REASONS) {
+    const conversationId = await t.run(async (ctx) =>
+      ctx.db.insert("conversations", {
+        accountId,
+        contactId,
+        status: "open",
+        unreadCount: 0,
+        archivedAt: Date.now(),
+        archivedReason: reason,
+      }),
+    );
+    const conversation = await t.run((ctx) => ctx.db.get(conversationId));
+    expect(conversation!.archivedReason).toBe(reason);
+  }
+
+  await expect(
+    t.run(async (ctx) =>
+      ctx.db.insert("conversations", {
+        accountId,
+        contactId,
+        status: "open",
+        unreadCount: 0,
+        archivedAt: Date.now(),
+        // Not a member of ARCHIVE_REASONS — proves the schema rejects
+        // it rather than silently accepting any string.
+        archivedReason: "not-a-real-reason" as unknown as "manual",
+      }),
+    ),
+  ).rejects.toThrow();
 });

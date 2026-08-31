@@ -5,9 +5,11 @@ import type { ActionCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { decideFallback, resolveFallbackPolicy } from "./lib/flows/fallback";
 import { chargeLeadIfAgent } from "./lib/leadCharge";
+import { blockedReason } from "./lib/notes/gate";
+import { dispatchTagAdded } from "./lib/automations/triggers";
 import { r2ConfigFromEnv } from "./lib/r2/config";
 import { resolveMediaUrlLazy } from "./lib/r2/url";
-import { parseMediaKey } from "./lib/r2/keys";
+import { parseMediaKey, type MediaKind } from "./lib/r2/keys";
 import type {
   CollectInputNodeConfig,
   ConditionNodeConfig,
@@ -97,6 +99,29 @@ import type { InteractiveMessagePayload } from "./lib/whatsapp/interactive";
 //      "ignore" verdict hands one off, so silently doing nothing would
 //      strand the run with no timeout ever scheduled again.
 // ============================================================
+
+/**
+ * The ONLY `convex/lib/r2/keys.ts` `MediaKind` a `send_media` node's
+ * `config.media_key` may ever forward to Meta via
+ * `internal.metaSend.sendMedia` (called directly below, NOT through
+ * `send.ts` — so `send.ts`'s own `SENDABLE_MEDIA_KINDS` guard never
+ * runs on this path). `node-config-form.tsx`'s `SendMediaForm` — the
+ * only place that ever writes a flow node's `media_key` — unconditionally
+ * mints its upload as kind `"flow"` (`uploadAccountMedia(..., "flow")`);
+ * there is no flow-builder path, import, or duplicate feature that
+ * writes an `"outbound"`, `"template"`, or other-kind key into this
+ * field. So `"flow"` is the only sendable kind here — a DIFFERENT
+ * allowlist from `send.ts`'s `{"outbound"}`, because the two dispatch
+ * paths have different legitimate senders (the inbox composer vs. the
+ * flow builder), so one shared allowlist would either over- or
+ * under-permit one of them. Most importantly this rejects `"note"` —
+ * internal-only evidence attached via `contactNotes.add`/`update` that
+ * must never reach a customer — the same non-leaky way an unowned or
+ * malformed key is already rejected below (`NOT_FOUND`-equivalent:
+ * lands in the surrounding try/catch as `send_media_failed`, never a
+ * distinguishable error).
+ */
+const FLOW_SENDABLE_MEDIA_KINDS: ReadonlySet<MediaKind> = new Set(["flow"]);
 
 // ------------------------------------------------------------
 // Types — mirrors `src/lib/flows/types.ts`'s `ParsedInbound` /
@@ -334,6 +359,29 @@ async function dispatchInboundInner(
     contactId,
   });
 
+  // do-not-contact gate — checked BEFORE any node executes, whether
+  // that would mean advancing `activeRun`'s current node (a reply) or
+  // starting a brand-new run (`findEntryFlow`/`startNewRun` below): both
+  // paths end in a `metaSend.*` call. `getOwnedContact` fails closed the
+  // same way `blockedReason` itself does — a contactId that doesn't
+  // belong to this account, or was deleted, reads as blocked. Does NOT
+  // end an already-active run here — leaving it `active` is safe because
+  // `timeout` (this file's other public entry point) re-checks this same
+  // gate independently and will end it cleanly the next time its
+  // scheduled callback fires; ending it here too would just race that.
+  const contact = await ctx.runQuery(internal.flowsEngine.getOwnedContact, {
+    accountId,
+    contactId,
+  });
+  if (blockedReason(contact) !== null) {
+    if (activeRun) {
+      await insertEvent(ctx, activeRun, "error", activeRun.currentNodeKey ?? undefined, {
+        reason: "blocked_do_not_contact",
+      });
+    }
+    return { consumed: false, flowRunId: activeRun?._id, outcome: "no_match" };
+  }
+
   if (activeRun) {
     const dupe: boolean = await ctx.runQuery(internal.flowsEngine.isDuplicateInbound, {
       flowRunId: activeRun._id,
@@ -382,6 +430,28 @@ export const timeout = internalAction({
     // poison the very reschedule the "reprompt" branch needs to make,
     // and the `convex-test` harness raises it as a hard invariant error.
     await ctx.runMutation(internal.flowsEngine.clearFallbackTimeoutId, { flowRunId: run._id });
+
+    // do-not-contact gate — required INDEPENDENTLY of `dispatchInbound`'s
+    // own gate: a scheduled `runAfter` callback like this one is exactly
+    // the window in which the flag can get set (the run suspended
+    // possibly hours or days ago), so a check only at dispatch time
+    // would miss it entirely. Ends the run cleanly (rather than leaving
+    // it stuck `active` with nothing left to ever revisit it) — the same
+    // "failed" terminal shape this handler already uses for every other
+    // way a timeout can go wrong below.
+    if (run.contactId) {
+      const contact = await ctx.runQuery(internal.flowsEngine.getOwnedContact, {
+        accountId: run.accountId,
+        contactId: run.contactId,
+      });
+      if (blockedReason(contact) !== null) {
+        await insertEvent(ctx, run, "error", run.currentNodeKey ?? undefined, {
+          reason: "blocked_do_not_contact",
+        });
+        await endRun(ctx, run._id, "failed", "blocked_do_not_contact");
+        return;
+      }
+    }
 
     if (!run.currentNodeKey) {
       await endRun(ctx, run._id, "failed", "active_run_missing_current_node");
@@ -700,9 +770,21 @@ async function advanceFromNodeKey(
         // loop — the same non-leaky treatment `send.ts`'s identical
         // check (and `files.ts`'s `remove`) already give this class of
         // key.
+        //
+        // The `kind` half of this check — `FLOW_SENDABLE_MEDIA_KINDS`,
+        // this module's own doc comment above explains why it differs
+        // from `send.ts`'s `SENDABLE_MEDIA_KINDS` — closes the same
+        // narrower but sharper gap that guard closes there: even a key
+        // this account DOES own could name a `kind` that must never
+        // reach a customer, most importantly `"note"`. This dispatch
+        // path calls `internal.metaSend.sendMedia` directly, so it never
+        // passes through `send.ts`'s own check at all.
+        const parsedMediaKey = cfg.media_key ? parseMediaKey(cfg.media_key) : null;
         if (
           cfg.media_key &&
-          parseMediaKey(cfg.media_key)?.accountId !== run.accountId
+          (!parsedMediaKey ||
+            parsedMediaKey.accountId !== run.accountId ||
+            !FLOW_SENDABLE_MEDIA_KINDS.has(parsedMediaKey.kind))
         ) {
           throw new Error("media_key does not belong to this account");
         }
@@ -1223,6 +1305,22 @@ export const getContactPhone = internalQuery({
 });
 
 /**
+ * Loads `contactId`, but only if it actually belongs to `accountId` —
+ * `null` otherwise (a foreign contact and a missing one are treated
+ * identically). Returns the full contact doc (not just the phone, unlike
+ * `getContactPhone` above) so `dispatchInboundInner`/`timeout` can feed
+ * it straight into `blockedReason` — mirrors `automationsEngine.ts`'s
+ * own `getOwnedContact`.
+ */
+export const getOwnedContact = internalQuery({
+  args: { accountId: v.id("accounts"), contactId: v.id("contacts") },
+  handler: async (ctx, args) => {
+    const contact = await ctx.db.get(args.contactId);
+    return contact && contact.accountId === args.accountId ? contact : null;
+  },
+});
+
+/**
  * Resolves the (already-existing) conversation + phone to send through
  * when STARTING a new run — mirrors `resolveSendTargetQuery`'s own
  * "resolve once, thread the result through" shape, simplified because a
@@ -1429,6 +1527,13 @@ export const applyTag = internalMutation({
         .first();
       if (!existing) {
         await ctx.db.insert("contactTags", { accountId: args.accountId, contactId: args.contactId, tagId: args.tagId });
+        // A flow's set_tag node adds a tag like any other path, so it
+        // fires `tag_added` automations too.
+        await dispatchTagAdded(ctx, {
+          accountId: args.accountId,
+          contactId: args.contactId,
+          tagId: args.tagId,
+        });
       }
       return;
     }

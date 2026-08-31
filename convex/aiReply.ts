@@ -11,10 +11,18 @@ import { v, ConvexError } from "convex/values";
 import { hasMinRole, canAccessConversation } from "./lib/roles";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
-import { aiContextMessageLimit, buildSystemPrompt, HANDOFF_SENTINEL } from "./lib/ai/defaults";
+import {
+  aiContextMessageLimit,
+  aiReplyReasoningEffort,
+  promptCacheKey,
+  buildSystemPrompt,
+  HANDOFF_SENTINEL,
+} from "./lib/ai/defaults";
 import { deliveryDelayMs } from "./lib/ai/pacing";
 import { landingUrlKey, type AdContext } from "./lib/ai/adContext";
 import { latestUserMessage } from "./lib/ai/query";
+import { blockedReason } from "./lib/notes/gate";
+import { deriveCustomerState, type CustomerState } from "./lib/notes/signals";
 import {
   AI_VISIBLE_MEDIA_TYPES,
   toChatMessages,
@@ -25,11 +33,15 @@ import { claimSlot, AUTO_REPLY_LIMIT } from "./lib/aiRateLimit";
 import {
   transcribeAudioFromUrl,
   describeImageFromUrl,
-  DESCRIBE_FALLBACK_MODEL,
+  describePdfFromUrl,
+  understandingFor,
+  transcribeModel,
+  type MediaUsage,
 } from "./lib/ai/media";
 import { AiError } from "./lib/ai/types";
-import type { GenerateResult } from "./lib/ai/types";
+import type { GenerateResult, ChatMessage } from "./lib/ai/types";
 import { r2ConfigFromEnv } from "./lib/r2/config";
+import { parseMediaKey } from "./lib/r2/keys";
 import { resolveMediaUrlLazy } from "./lib/r2/url";
 
 // ============================================================
@@ -181,6 +193,7 @@ export type AckOutcome =
   | "skipped_no_context" // loadDispatchContext returned null
   | "skipped_assigned" // a human owns the thread
   | "skipped_paused" // aiAutoreplyDisabled on this conversation
+  | "skipped_do_not_contact" // an agent recorded that this customer asked us to stop
   | "failed"; // the try/catch caught something
 
 /**
@@ -237,7 +250,21 @@ export const loadDispatchContext = internalQuery({
     if (!conversation || conversation.accountId !== args.accountId) return null;
     const contact = await ctx.db.get(args.contactId);
     if (!contact || contact.accountId !== args.accountId) return null;
-    return { conversation, to: contact.phone };
+
+    // Both derived here because this is the one query that already holds
+    // the contact — the gate needs an O(1) field, and the prompt needs
+    // the notes distilled. Note text itself never leaves this handler.
+    const notes = await ctx.db
+      .query("contactNotes")
+      .withIndex("by_contact", (q) => q.eq("contactId", args.contactId))
+      .collect();
+
+    return {
+      conversation,
+      to: contact.phone,
+      blocked: blockedReason(contact) !== null,
+      customerState: deriveCustomerState(notes),
+    };
   },
 });
 
@@ -332,12 +359,19 @@ export const latestInboundMessageId = internalQuery({
   },
 });
 
+/** Envelope types that can carry a readable object. `location` is
+ *  excluded: it is AI-visible but renders its own text inline and has no
+ *  file. Whether a given row is ACTUALLY readable is decided per-row by
+ *  `understandingFor` at dispatch time, from the stored extension. */
+const MEDIA_CONTENT_TYPES = ["audio", "image", "document", "video"] as const;
+type MediaContentType = (typeof MEDIA_CONTENT_TYPES)[number];
+
 /**
- * Customer media rows (voice notes / images) still awaiting an AI
- * transcription/description — newest first, bounded by `limit`. Only
- * rows whose media already resolved into storage (`mediaKey` OR
- * `mediaUrl` set) qualify; the rest keep their placeholder until a later
- * dispatch.
+ * Customer media rows (voice notes / images / documents / videos) still
+ * awaiting an AI transcription/description — newest first, bounded by
+ * `limit`. Only rows whose media already resolved into storage
+ * (`mediaKey` OR `mediaUrl` set) qualify; the rest keep their placeholder
+ * until a later dispatch.
  *
  * Returns the RAW `mediaKey`/`mediaUrl` pair rather than a resolved URL:
  * this is a `query`, and resolving requires `r2ConfigFromEnv()` — Convex
@@ -359,7 +393,7 @@ export const untranscribedMediaRows = internalQuery({
   ): Promise<
     {
       messageId: Id<"messages">;
-      contentType: "audio" | "image";
+      contentType: MediaContentType;
       mediaKey: string | null;
       mediaUrl: string | null;
       caption: string | null;
@@ -385,7 +419,7 @@ export const untranscribedMediaRows = internalQuery({
         (m) =>
           m.accountId === args.accountId &&
           m.senderType === "customer" &&
-          (m.contentType === "audio" || m.contentType === "image") &&
+          (MEDIA_CONTENT_TYPES as readonly string[]).includes(m.contentType) &&
           m._creationTime > cutoff &&
           (m.mediaKey || m.mediaUrl) &&
           !m.aiTranscription,
@@ -393,7 +427,7 @@ export const untranscribedMediaRows = internalQuery({
       .slice(0, args.limit)
       .map((m) => ({
         messageId: m._id,
-        contentType: m.contentType as "audio" | "image",
+        contentType: m.contentType as MediaContentType,
         mediaKey: m.mediaKey ?? null,
         mediaUrl: m.mediaUrl ?? null,
         caption: m.contentText?.trim() || null,
@@ -664,17 +698,32 @@ export const ackInbound = internalAction({
         return "skipped_inactive";
       }
 
-      const dispatchContext: { conversation: Doc<"conversations">; to: string } | null =
-        await ctx.runQuery(internal.aiReply.loadDispatchContext, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          contactId: args.contactId,
-        });
+      const dispatchContext: {
+        conversation: Doc<"conversations">;
+        to: string;
+        blocked: boolean;
+        customerState: CustomerState;
+      } | null = await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+      });
       if (!dispatchContext) {
         return "skipped_no_context";
       }
 
-      const { conversation } = dispatchContext;
+      const { conversation, blocked } = dispatchContext;
+
+      // A typing indicator / read receipt is itself an automated outbound
+      // signal to the customer — without this gate, a do-not-contact
+      // contact would get blue ticks and a "typing…" bubble that then
+      // resolves into silence (`dispatchInbound`'s own gate stops the
+      // reply), which reads worse than doing nothing. Same `blocked`
+      // field `dispatchInbound` gates on, for the same reason.
+      if (blocked) {
+        return "skipped_do_not_contact";
+      }
+
       if (conversation.assignedToUserId) {
         return "skipped_assigned"; // a human owns this thread
       }
@@ -711,6 +760,213 @@ export const ackInbound = internalAction({
  * There is deliberately NO reply cap: the bot answers every message
  * until a human takes over manually (owner decision 2026-07-18).
  */
+/**
+ * Transcribe / describe every not-yet-understood media row in a
+ * conversation, writing each result back with `setTranscription`.
+ * Returns true when at least one row gained text.
+ *
+ * Shared by BOTH entry points deliberately:
+ *   - `understandInboundMedia`, which runs on ARRIVAL whether or not the
+ *     bot is allowed to answer, and
+ *   - `dispatchInbound`, which needs the text before it can compose a
+ *     reply and must not depend on the first having succeeded.
+ * `untranscribedMediaRows` only returns rows that still lack text, so
+ * running both is idempotent and the second pass spends nothing.
+ */
+/**
+ * Run the qualification extraction and swallow anything it throws.
+ *
+ * Split out (rather than inlined at the two call sites) so the
+ * never-throws contract lives in one place: `dispatchInbound` awaits this
+ * before reading steering objectives, and the media pass re-runs it after
+ * a fresh transcript lands. Both are best-effort — the reply must go out
+ * either way.
+ */
+async function runQualificationAnalysis(
+  ctx: ActionCtx,
+  args: {
+    accountId: Id<"accounts">;
+    conversationId: Id<"conversations">;
+    contactId: Id<"contacts">;
+  },
+): Promise<void> {
+  try {
+    await ctx.runAction(internal.qualificationEngine.analyzeInbound, {
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+    });
+  } catch (err) {
+    console.warn("[ai auto-reply] qualification analysis failed:", err);
+  }
+}
+
+async function understandPendingMedia(
+  ctx: ActionCtx,
+  args: {
+    accountId: Id<"accounts">;
+    conversationId: Id<"conversations">;
+    contactId: Id<"contacts">;
+  },
+  openAiKey: string,
+): Promise<boolean> {
+  const pendingMedia = await ctx.runQuery(internal.aiReply.untranscribedMediaRows, {
+    accountId: args.accountId,
+    conversationId: args.conversationId,
+    limit: MAX_TRANSCRIPTIONS_PER_DISPATCH,
+  });
+  let transcribedAny = false;
+  // Spend from the media passes below, drained after the loop. Collected
+  // rather than logged inline so a `ctx.runMutation` per provider call
+  // never sits inside the per-row try/catch, where a logging failure
+  // would be indistinguishable from an understanding failure and would
+  // cost the row its transcript.
+  const mediaSpend: MediaUsage[] = [];
+  const onUsage = (u: MediaUsage) => mediaSpend.push(u);
+  for (const row of pendingMedia) {
+    try {
+      // Which pass can actually read this row — decided from the STORED
+      // EXTENSION, not the envelope type, so a passport scan sent via
+      // WhatsApp's "send as document" (a JPEG under a `document`
+      // envelope) reaches the vision model, while a .docx reaches
+      // nothing. Checked FIRST so an unreadable row costs neither an R2
+      // config read nor a provider call.
+      const understanding = understandingFor(row.contentType, {
+        key: row.mediaKey,
+        url: row.mediaUrl,
+      });
+      if (!understanding) continue;
+      // Resolved HERE, inside the per-row try — not in the query above,
+      // and not hoisted above this `try` — so that `r2ConfigFromEnv()`'s
+      // throw (only reachable when `row.mediaKey` is actually present;
+      // see `resolveMediaUrlLazy`'s doc comment) is caught by the same
+      // best-effort per-row handling as any other transcription failure,
+      // rather than aborting the whole run. The query's widened filter
+      // (`mediaKey || mediaUrl`) guarantees at least one is truthy for
+      // every row reaching this loop, so `link` is only ever null if
+      // that invariant is somehow violated — belt-and-braces.
+      const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
+        key: row.mediaKey,
+        url: row.mediaUrl,
+      });
+      if (!link) continue;
+      const text = isDryRun()
+        ? DRY_RUN_TRANSCRIPT
+        : understanding === "transcribe"
+          ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: link, onUsage })
+          : understanding === "pdf"
+            ? await describePdfFromUrl({
+                apiKey: openAiKey,
+                mediaUrl: link,
+                caption: row.caption ?? undefined,
+                onUsage,
+              })
+            : await describeImageFromUrl({
+                apiKey: openAiKey,
+                mediaUrl: link,
+                caption: row.caption ?? undefined,
+                onUsage,
+              });
+      if (text) {
+        await ctx.runMutation(internal.aiReply.setTranscription, {
+          accountId: args.accountId,
+          messageId: row.messageId,
+          text,
+        });
+        transcribedAny = true;
+      }
+    } catch (err) {
+      console.warn("[ai media] media understanding failed:", err);
+    }
+  }
+  // Media spend, one row per provider call. These calls have always been
+  // billed to the account's key and were never logged anywhere, so the
+  // usage page's "tokens spent on your provider key" only ever covered
+  // chat. Best-effort and OUTSIDE the per-row loop: bookkeeping must
+  // never cost a reply the customer is waiting on.
+  for (const u of mediaSpend) {
+    try {
+      await ctx.runMutation(internal.aiUsage.log, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        // Speech-to-text vs the vision pass — one `onUsage` sink serves
+        // both helpers, so the model id is what tells them apart.
+        mode: u.model === transcribeModel() ? "transcribe" : "describe",
+        // Always OpenAI: both helpers are OpenAI-only clients taking
+        // `openAiKey`, which on an Anthropic-model account is the
+        // separate embeddings key.
+        provider: "openai",
+        model: u.model,
+        promptTokens: u.promptTokens,
+        completionTokens: u.completionTokens,
+        totalTokens: u.totalTokens,
+        cachedPromptTokens: u.cachedPromptTokens,
+        reasoningTokens: u.reasoningTokens,
+      });
+    } catch (err) {
+      console.warn("[ai media] usage log failed:", err);
+    }
+  }
+  // A fresh transcript is fresh extractable lead data — let the
+  // qualification analysis see it (dormant-safe no-op otherwise; ingest
+  // only triggers analysis for TEXT inbounds).
+  if (transcribedAny) {
+    await ctx.scheduler.runAfter(0, internal.qualificationEngine.analyzeInbound, {
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      // A transcript attaches new content to an EXISTING message, so the
+      // newest-customer-message watermark has not moved — without this
+      // the extraction would skip exactly the data that just became
+      // readable. See `analyzeInbound`'s `force`.
+      force: true,
+    });
+  }
+  return transcribedAny;
+}
+
+/**
+ * Understand inbound media — voice note → transcript, image →
+ * description — as soon as it ARRIVES, independent of whether the bot is
+ * allowed to reply. Scheduled by `ingest` for every AI-visible media
+ * inbound. Sends nothing to anyone.
+ *
+ * Split out of `dispatchInbound` 2026-07-25. Transcription used to live
+ * inside it, BELOW the `autoReplyEnabled` gate, and `setTranscription`
+ * had exactly one caller — so an account with auto-reply off (the
+ * default; the owner enables it deliberately) never produced a single
+ * transcript, and the inbox showed a bare "[voice note]" forever. That
+ * welded together two different decisions: "let my agents read what the
+ * customer said" and "let the bot answer them automatically". An agent
+ * working the inbox needs the first without the second.
+ *
+ * Gated on `isActive` — the account's master AI switch, and what says we
+ * may spend their BYO key at all — but NOT on `autoReplyEnabled`.
+ */
+export const understandInboundMedia = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+  },
+  handler: async (ctx, args): Promise<void> => {
+    try {
+      const config = await ctx.runQuery(internal.aiConfig.loadDecrypted, {
+        accountId: args.accountId,
+      });
+      if (!config || !config.isActive) return;
+      const openAiKey =
+        config.provider === "openai" ? config.apiKey : (config.embeddingsApiKey ?? null);
+      if (!openAiKey) return;
+      await understandPendingMedia(ctx, args, openAiKey);
+    } catch (err) {
+      // Never throws: this runs best-effort off the ingest path, and a
+      // failure here must not affect message delivery or the inbox.
+      console.warn("[ai media] understandInboundMedia failed:", err);
+    }
+  },
+});
+
 export const dispatchInbound = internalAction({
   args: {
     accountId: v.id("accounts"),
@@ -744,7 +1000,7 @@ export const dispatchInbound = internalAction({
     // error budget and lose the message.
     pacingDeferrals: v.optional(v.number()),
   },
-  handler: async (ctx, args): Promise<void> => {
+  handler: async (ctx, args): Promise<AckOutcome | void> => {
     // Flipped right after delivery is successfully scheduled (before any
     // real Meta send happens): a failure AFTER this point must not retry
     // (delivery has been handed off, so this dispatch must not retry).
@@ -757,14 +1013,25 @@ export const dispatchInbound = internalAction({
       });
       if (!config || !config.isActive || !config.autoReplyEnabled) return;
 
-      const dispatchContext: { conversation: Doc<"conversations">; to: string } | null =
-        await ctx.runQuery(internal.aiReply.loadDispatchContext, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          contactId: args.contactId,
-        });
+      const dispatchContext: {
+        conversation: Doc<"conversations">;
+        to: string;
+        blocked: boolean;
+        customerState: CustomerState;
+      } | null = await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+        accountId: args.accountId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+      });
       if (!dispatchContext) return;
-      const { conversation, to } = dispatchContext;
+      const { conversation, to, blocked, customerState } = dispatchContext;
+
+      // An agent recorded that this customer asked not to be contacted.
+      // Checked before the assigned/paused gates so the outcome log says
+      // the real reason rather than whichever gate happens to be first.
+      if (blocked) {
+        return "skipped_do_not_contact";
+      }
 
       if (conversation.assignedToUserId) return; // a human owns this thread
       if (conversation.aiAutoreplyDisabled) return; // handed off / turned off here
@@ -795,65 +1062,11 @@ export const dispatchInbound = internalAction({
       // account. Best-effort per row — a failure keeps the placeholder.
       const openAiKey =
         config.provider === "openai" ? config.apiKey : (config.embeddingsApiKey ?? null);
-      if (openAiKey) {
-        const pendingMedia = await ctx.runQuery(internal.aiReply.untranscribedMediaRows, {
-          accountId: args.accountId,
-          conversationId: args.conversationId,
-          limit: MAX_TRANSCRIPTIONS_PER_DISPATCH,
-        });
-        let transcribedAny = false;
-        for (const row of pendingMedia) {
-          try {
-            // Resolved HERE, inside the per-row try — not in the query
-            // above, and not hoisted above this `try` — so that
-            // `r2ConfigFromEnv()`'s throw (only reachable when
-            // `row.mediaKey` is actually present; see
-            // `resolveMediaUrlLazy`'s doc comment) is caught by the same
-            // best-effort per-row handling as any other transcription
-            // failure, rather than aborting the whole dispatch. The
-            // query's widened filter (`mediaKey || mediaUrl`) guarantees
-            // at least one is truthy for every row reaching this loop,
-            // so `link` is only ever null if that invariant is somehow
-            // violated — the `continue` guard below is belt-and-braces.
-            const link = resolveMediaUrlLazy(r2ConfigFromEnv, {
-              key: row.mediaKey,
-              url: row.mediaUrl,
-            });
-            if (!link) continue;
-            const text = isDryRun()
-              ? DRY_RUN_TRANSCRIPT
-              : row.contentType === "audio"
-                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl: link })
-                : await describeImageFromUrl({
-                    apiKey: openAiKey,
-                    model:
-                      config.provider === "openai" ? config.model : DESCRIBE_FALLBACK_MODEL,
-                    mediaUrl: link,
-                    caption: row.caption ?? undefined,
-                  });
-            if (text) {
-              await ctx.runMutation(internal.aiReply.setTranscription, {
-                accountId: args.accountId,
-                messageId: row.messageId,
-                text,
-              });
-              transcribedAny = true;
-            }
-          } catch (err) {
-            console.warn("[ai auto-reply] media transcription failed:", err);
-          }
-        }
-        // A fresh transcript is fresh extractable lead data — let the
-        // qualification analysis see it (dormant-safe no-op otherwise;
-        // ingest only triggers analysis for TEXT inbounds).
-        if (transcribedAny) {
-          await ctx.scheduler.runAfter(0, internal.qualificationEngine.analyzeInbound, {
-            accountId: args.accountId,
-            conversationId: args.conversationId,
-            contactId: args.contactId,
-          });
-        }
-      }
+      // Normally a no-op by the time we get here: `understandInboundMedia`
+      // already ran at ingest. Kept so the reply never depends on that
+      // having succeeded — `untranscribedMediaRows` only returns rows
+      // that still lack text, so the second pass costs nothing.
+      if (openAiKey) await understandPendingMedia(ctx, args, openAiKey);
 
       const historyRows = await ctx.runQuery(internal.aiReply.recentMessages, {
         accountId: args.accountId,
@@ -864,6 +1077,27 @@ export const dispatchInbound = internalAction({
       if (messages.length === 0) return; // nothing to reply to
 
       const queryText = latestUserMessage(messages);
+
+      // Extraction BEFORE objectives are read. This used to be
+      // guaranteed structurally — `ingest` awaited the analysis inline,
+      // so it always completed before this dispatch was even scheduled.
+      // That analysis is now debounced (one extraction per burst instead
+      // of one per fragment), which would have raced the guarantee away:
+      // reading objectives that predate the customer's latest message is
+      // exactly how the assistant starts re-asking questions they just
+      // answered.
+      //
+      // So the reply now waits for its own extraction rather than hoping
+      // the scheduled one landed. Deliberately WITHOUT a
+      // `triggerMessageId`: the debounce token would make this stand down
+      // whenever a newer message exists, which is the opposite of what
+      // this call is for. `analyzeInbound`'s watermark keeps it cheap —
+      // when the scheduled run already covered the newest customer
+      // message, this returns before spending anything.
+      //
+      // Best-effort, like every other step here: extraction is steering,
+      // and a failed steer must never cost the customer their reply.
+      await runQualificationAnalysis(ctx, args);
 
       // Independent of each other — the knowledge lookup makes a network
       // call for embeddings, so overlapping them saves real wall-clock
@@ -876,6 +1110,14 @@ export const dispatchInbound = internalAction({
         return await ctx.runAction(internal.aiKnowledge.retrieve, {
           accountId: args.accountId,
           queryText,
+          // Grounds a reply we SEND to the customer, so it must never see
+          // `audience: "internal"` chunks — agent-only notes (pricing
+          // ranges, disqualification rules, "route to a human" playbooks)
+          // and `kbOpsBlocks`' PURCHASE CRITERIA sentinels. Compiled
+          // chunks carry only a `[Service — Notes]` header, nothing that
+          // marks them internal, so the model cannot self-censor: the
+          // filter is the only thing keeping them out.
+          audience: "customer",
         });
       })();
       // Unhandled-rejection guard (whole-branch review Fix F8): if
@@ -917,6 +1159,10 @@ export const dispatchInbound = internalAction({
       // ad links to — so the FIRST reply can greet with the actual
       // package instead of a blind "how can I help?".
       const adContext = await loadAdContext(ctx, args.accountId, conversation);
+      const replyInstructions = await ctx.runQuery(
+        internal.agentInstructions.forAgent,
+        { accountId: args.accountId, agentKey: "reply" },
+      );
 
       const systemPrompt = buildSystemPrompt({
         userPrompt: config.systemPrompt ?? null,
@@ -924,6 +1170,8 @@ export const dispatchInbound = internalAction({
         knowledge,
         qualification: qualification ?? undefined,
         adContext,
+        customerState,
+        extraInstructions: replyInstructions,
       });
 
       // ── Burst pacing (RATE_LIMITS.aiAutoReplyAccount) ──────────────
@@ -968,6 +1216,8 @@ export const dispatchInbound = internalAction({
             apiKey: config.apiKey,
             systemPrompt,
             messages,
+            reasoningEffort: aiReplyReasoningEffort(),
+            promptCacheKey: promptCacheKey(args.accountId, "reply"),
           });
       const { text, usage } = generation;
 
@@ -987,6 +1237,8 @@ export const dispatchInbound = internalAction({
           promptTokens: usage?.promptTokens ?? 0,
           completionTokens: usage?.completionTokens ?? 0,
           totalTokens: usage?.totalTokens ?? 0,
+          cachedPromptTokens: usage?.cachedPromptTokens,
+          reasoningTokens: usage?.reasoningTokens,
         });
       } catch (err) {
         console.warn("[ai auto-reply] usage log failed:", err);
@@ -1235,6 +1487,15 @@ export const deliverReply = internalAction({
         contactId: args.contactId,
       });
       if (!dispatchContext) return;
+      // Re-check do-not-contact (same stale-window reasoning as the two
+      // gates below): `dispatchInbound` already checked `blocked` before
+      // ever scheduling this delivery, but an agent can flag the contact
+      // from the note UI during the ~2-15s the reply spends generating —
+      // long enough to land here after the flag but before the send.
+      // `blocked` comes off the SAME `loadDispatchContext` re-read as
+      // `assignedToUserId`/`aiAutoreplyDisabled` below, so this is one
+      // fresh read, not a second round trip.
+      if (dispatchContext.blocked) return;
       if (dispatchContext.conversation.assignedToUserId) return;
       if (dispatchContext.conversation.aiAutoreplyDisabled) return;
 
@@ -1354,13 +1615,27 @@ const PLAYGROUND_MAX_TURNS = 20;
 const playgroundMessageValidator = v.object({
   role: v.union(v.literal("user"), v.literal("assistant")),
   content: v.string(),
+  // A user turn may carry a recorded voice note / uploaded image as a live
+  // R2 key for the server to transcribe/describe. The client replays
+  // already-understood media turns as plain text (no `media`), so at most
+  // one key is present per call.
+  media: v.optional(
+    v.object({
+      kind: v.union(v.literal("audio"), v.literal("image")),
+      key: v.string(),
+    }),
+  ),
 });
 
-/** Matches `src/app/api/ai/playground/route.ts`'s JSON body exactly
- *  (`{reply, handoff}` on success; `{error, code?}` — never thrown —
- *  for the same domain failures the route itself returns as a body
- *  rather than raising). */
-type PlaygroundResult = { reply: string; handoff: boolean } | { error: string; code?: string };
+/** `{reply, handoff}` on success (plus `understanding` when the newest turn
+ *  carried media); `{error, code?}` — never thrown — for domain failures. */
+type PlaygroundResult =
+  | {
+      reply: string;
+      handoff: boolean;
+      understanding?: { transcription: string | null; historyContent: string };
+    }
+  | { error: string; code?: string };
 
 /**
  * Admin+ "test-chat with the agent" action — Convex port of `POST
@@ -1406,10 +1681,13 @@ export const playground = action({
     // just shape-validation) rules the route's own filter/slice apply;
     // role/content shape itself is already enforced by the args
     // validator above, unlike the route's defensive re-check.
-    const messages = args.messages
-      .filter((m) => m.content.trim().length > 0)
+    // Keep turns that carry text OR media; drop pure blanks; bound the
+    // window. A media turn can legitimately have empty text (a voice note
+    // with no caption), so it must survive the blank filter.
+    const rawTurns = args.messages
+      .filter((m) => m.content.trim().length > 0 || m.media !== undefined)
       .slice(-PLAYGROUND_MAX_TURNS);
-    if (messages.length === 0) {
+    if (rawTurns.length === 0) {
       return { error: "Send a message to test the agent." };
     }
 
@@ -1426,17 +1704,106 @@ export const playground = action({
       };
     }
 
+    // The client attaches a live key only to the turn it is sending now
+    // (older media turns are replayed as plain text), and `understanding`
+    // can only describe one turn. Enforce that rather than silently running
+    // up to PLAYGROUND_MAX_TURNS transcriptions and reporting just the last.
+    if (rawTurns.filter((m) => m.media !== undefined).length > 1) {
+      return {
+        error: "Send one voice note or image at a time.",
+        code: "too_many_media",
+      };
+    }
+
+    // Media understanding — the SAME transcribe/describe step
+    // `dispatchInbound` runs, so the Playground exercises exactly what a
+    // real WhatsApp voice note / image produces. Only turns carrying a live
+    // R2 key are understood; already-understood media turns arrive as plain
+    // text. Key/model selection and the rendered history line are identical
+    // to production (`toChatMessages`), so the model sees the same string.
+    const openAiKey =
+      config.provider === "openai" ? config.apiKey : (config.embeddingsApiKey ?? null);
+    let understanding: { transcription: string | null; historyContent: string } | undefined;
+    const messages: ChatMessage[] = [];
+    for (const turn of rawTurns) {
+      if (!turn.media) {
+        messages.push({ role: turn.role, content: turn.content });
+        continue;
+      }
+      // Ownership: never resolve/fetch a key that isn't this account's —
+      // same non-leaky NOT_FOUND treatment as `files.remove`.
+      const owner = parseMediaKey(turn.media.key);
+      if (!owner || owner.accountId !== accountId) {
+        return { error: "That attachment could not be found.", code: "media_not_found" };
+      }
+      const caption = turn.content.trim() || undefined;
+      let transcription: string | null = null;
+      if (openAiKey) {
+        // Best-effort, mirroring `dispatchInbound`'s identical per-row
+        // guard above: `r2ConfigFromEnv()` throws when R2 env vars are
+        // unset, and `resolveMediaUrlLazy` deliberately forwards that
+        // throw whenever a key is present (its own doc comment: "left to
+        // throw, not swallowed"). `PlaygroundResult` must never reject the
+        // action's promise for this — degrade to the bare placeholder
+        // (`transcription` stays `null`) instead of letting the throw
+        // escape past this handler.
+        try {
+          const mediaUrl = resolveMediaUrlLazy(r2ConfigFromEnv, { key: turn.media.key });
+          if (mediaUrl) {
+            transcription =
+              turn.media.kind === "audio"
+                ? await transcribeAudioFromUrl({ apiKey: openAiKey, mediaUrl })
+                : await describeImageFromUrl({
+                    apiKey: openAiKey,
+                    mediaUrl,
+                    caption,
+                  });
+          }
+        } catch (err) {
+          console.warn("[ai playground] media understanding failed:", err);
+        }
+      }
+      // Reuse the production renderer so the string is byte-identical.
+      const [rendered] = toChatMessages([
+        {
+          senderType: "customer",
+          contentType: turn.media.kind,
+          contentText: caption,
+          transcription: transcription ?? undefined,
+        },
+      ]);
+      const historyContent =
+        rendered?.content ?? (turn.media.kind === "audio" ? "[voice note]" : "[image]");
+      messages.push({ role: turn.role, content: historyContent });
+      understanding = { transcription, historyContent };
+    }
+    if (messages.length === 0) {
+      return { error: "Send a message to test the agent." };
+    }
+
     const queryText = latestUserMessage(messages);
     let knowledge: string[] = [];
     const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, { accountId });
     if (hasKb) {
-      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, { accountId, queryText });
+      // Customer-facing reply — see the `audience` note on the
+      // `dispatchInbound` retrieval above.
+      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, {
+        accountId,
+        queryText,
+        audience: "customer",
+      });
     }
+
+    const replyInstructions = await ctx.runQuery(
+      internal.agentInstructions.forAgent,
+      { accountId, agentKey: "reply" },
+    );
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt ?? null,
       mode: "auto_reply",
       knowledge,
+      extraInstructions: replyInstructions,
     });
 
     try {
@@ -1446,8 +1813,13 @@ export const playground = action({
         apiKey: config.apiKey,
         systemPrompt,
         messages,
+        // Mirrors production exactly — the playground's whole purpose is
+        // to show what the customer would actually get, so it must not
+        // silently reason harder (or less) than `dispatchInbound`.
+        reasoningEffort: aiReplyReasoningEffort(),
+        promptCacheKey: promptCacheKey(accountId, "reply"),
       });
-      return { reply: text, handoff };
+      return { reply: text, handoff, understanding };
     } catch (err) {
       if (err instanceof AiError) return { error: err.message, code: err.code };
       throw err;
@@ -1562,18 +1934,58 @@ export const draft = action({
     let knowledge: string[] = [];
     const hasKb = await ctx.runQuery(internal.aiReply.hasKnowledgeChunks, { accountId });
     if (hasKb) {
-      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, { accountId, queryText });
+      // A draft is text the agent SENDS to the customer — usually with
+      // little or no editing — so it gets the same customer-only pool as
+      // auto-reply. An agent who wants the internal playbook reads the
+      // Notes section in /agents directly; it must not arrive pre-written
+      // into a message that is one tap away from being sent.
+      knowledge = await ctx.runAction(internal.aiKnowledge.retrieve, {
+        accountId,
+        queryText,
+        audience: "customer",
+      });
     }
 
     // Same ad-aware grounding the auto-reply gets — an agent drafting
     // the first reply to an ad lead wants the package context too.
     const adContext = await loadAdContext(ctx, accountId, conversation);
 
+    // Same distilled customer-history signal the auto-reply prompt gets
+    // (see `dispatchInbound` above) — a draft is text an agent sends with
+    // little or no editing, so it deserves the same context. Re-fetched
+    // via `loadDispatchContext` rather than duplicating the notes query:
+    // this action never had a `dispatchContext` in scope (only a
+    // `conversationId`, no `contactId`, until `conversation.contactId`
+    // resolves it here).
+    //
+    // `.blocked` is DELIBERATELY unused/ungated here — `lib/notes/gate
+    // .ts`'s own doc comment is explicit that humans are not gated by
+    // do-not-contact, only machines. This is safe only because a human
+    // reviews (and chooses to send) a draft before it goes anywhere; that
+    // review is what a machine-generated auto-reply skips. The premise
+    // this relies on: the do-not-contact status is VISIBLE in the thread
+    // UI via `src/components/inbox/do-not-contact-banner.tsx`, so the
+    // agent has already seen it before hitting "suggest a reply". If that
+    // banner is ever removed or relocated, this ungated path needs a
+    // second look.
+    const dispatchContext = await ctx.runQuery(internal.aiReply.loadDispatchContext, {
+      accountId,
+      conversationId: args.conversationId,
+      contactId: conversation.contactId,
+    });
+
+    const draftInstructions = await ctx.runQuery(
+      internal.agentInstructions.forAgent,
+      { accountId, agentKey: "reply" },
+    );
+
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt ?? null,
       mode: "draft",
       knowledge,
       adContext,
+      customerState: dispatchContext?.customerState,
+      extraInstructions: draftInstructions,
     });
 
     let generation: GenerateResult;
@@ -1584,6 +1996,13 @@ export const draft = action({
         apiKey: config.apiKey,
         systemPrompt,
         messages,
+        // A draft is read and edited by a human before it goes out, but
+        // it is still customer-facing prose from the same model on the
+        // same prompt — same effort as the auto-reply.
+        reasoningEffort: aiReplyReasoningEffort(),
+        // Same `reply` shape: `buildSystemPrompt` puts the same scaffold
+        // and Business Context in front, so it shares the cached prefix.
+        promptCacheKey: promptCacheKey(accountId, "reply"),
       });
     } catch (err) {
       if (err instanceof AiError) return { error: err.message, code: err.code };
@@ -1600,6 +2019,8 @@ export const draft = action({
         promptTokens: generation.usage?.promptTokens ?? 0,
         completionTokens: generation.usage?.completionTokens ?? 0,
         totalTokens: generation.usage?.totalTokens ?? 0,
+        cachedPromptTokens: generation.usage?.cachedPromptTokens,
+        reasoningTokens: generation.usage?.reasoningTokens,
       });
     } catch (err) {
       console.warn("[ai draft] usage log failed:", err);

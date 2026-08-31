@@ -4,6 +4,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { api } from "./_generated/api";
 import schema from "./schema";
 import { hashApiKey } from "./lib/apiKey";
+import { normalizePhone } from "./lib/phone";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 
@@ -614,6 +615,83 @@ test("sendMessage (image, DRY-RUN) requires media_url", async () => {
   expect(message?.mediaUrl).toBe("https://example.com/photo.jpg");
 });
 
+test("sendMessage rejects a do-not-contact contact with a clear error, rather than silently no-op'ing", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { keyHash } = await seedApiKey(t, { accountId, scopes: ["messages:send"] });
+
+  const phone = "+14155550777";
+  const phoneNormalized = normalizePhone(phone);
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone, phoneNormalized }),
+  );
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Asked us to stop",
+      kind: "call",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(contactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  // A single-message API call must be told it didn't happen — reject,
+  // not a silent success with nothing sent (that's right for broadcasts,
+  // which drop-and-report a count, but wrong for a call asking to send
+  // exactly one message).
+  await expect(
+    t.action(api.apiV1.sendMessage, { keyHash, to: phone, type: "text", text: "Hi there" }),
+  ).rejects.toMatchObject({ data: { code: "BAD_REQUEST" } });
+
+  const conversation = await t.run((ctx) =>
+    ctx.db
+      .query("conversations")
+      .withIndex("by_contact", (q) => q.eq("contactId", contactId))
+      .first(),
+  );
+  expect(conversation).toBeNull();
+});
+
+test("sendMessage still sends to a contact with notes but no do-not-contact flag", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  const t = convexTest(schema, modules);
+  const { accountId } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { keyHash } = await seedApiKey(t, { accountId, scopes: ["messages:send"] });
+
+  const phone = "+14155550778";
+  const phoneNormalized = normalizePhone(phone);
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", { accountId, phone, phoneNormalized }),
+  );
+  await t.run((ctx) =>
+    ctx.db.insert("contactNotes", {
+      accountId,
+      contactId,
+      noteText: "Called, will decide next week",
+      kind: "call",
+      outcome: "follow_up",
+    }),
+  );
+
+  const result = await t.action(api.apiV1.sendMessage, {
+    keyHash,
+    to: phone,
+    type: "text",
+    text: "Hi there",
+  });
+  expect(result.messageId).not.toBeNull();
+});
+
 test("sendMessage rejects an unsupported type, and an invalid 'to' phone", async () => {
   const t = convexTest(schema, modules);
   const { accountId } = await seedAccountMember(t, {
@@ -665,6 +743,68 @@ test("createBroadcast (DRY-RUN) persists + immediately delivers to resolved reci
   const finalBroadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
   expect(finalBroadcast?.status).toBe("sent");
   expect(finalBroadcast?.sentCount).toBe(2);
+});
+
+test("createBroadcast drops a do-not-contact recipient, and its reported accepted/total_recipients count matches the persisted broadcast row exactly", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "agent",
+  });
+  const { keyHash } = await seedApiKey(t, { accountId, scopes: ["broadcasts:send"] });
+
+  // Pre-create the opted-out contact so `findOrCreateByPhoneInternal`
+  // resolves the REST recipient to this exact (already-blocked) row,
+  // same as a returning customer would.
+  const dropContactId = await asUser.mutation(api.contacts.create, {
+    phone: "+14155550401",
+  });
+  await t.run(async (ctx) => {
+    const noteId = await ctx.db.insert("contactNotes", {
+      accountId,
+      contactId: dropContactId,
+      noteText: "Stop texting me",
+      kind: "whatsapp_external",
+      outcome: "do_not_contact",
+    });
+    await ctx.db.patch(dropContactId, { doNotContact: { at: Date.now(), noteId } });
+  });
+
+  const result = await t.action(api.apiV1.createBroadcast, {
+    keyHash,
+    templateName: "spring_sale",
+    recipients: [{ to: "+14155550401" }, { to: "+14155550402" }],
+  });
+
+  // Both resolved to a valid E.164 number, so neither was "rejected" —
+  // but one opted out, so only 1 will actually be messaged.
+  expect(result.rejected).toBe(0);
+  expect(result.skipped).toBe(1);
+  expect(result.totalRecipients).toBe(1);
+
+  // The invariant that must never break again: the public response's
+  // count and the persisted row's count agree.
+  const broadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
+  expect(broadcast?.totalRecipients).toBe(result.totalRecipients);
+
+  const recipients = await t.run((ctx) =>
+    ctx.db
+      .query("broadcastRecipients")
+      .withIndex("by_broadcast", (q) => q.eq("broadcastId", result.broadcastId))
+      .collect(),
+  );
+  expect(recipients).toHaveLength(1);
+  expect(recipients[0]!.contactId).not.toBe(dropContactId);
+
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  // The opted-out contact never received a message: `deliverOne` was
+  // scheduled once (for the sendable recipient) — never for `dropContactId`.
+  const finalBroadcast = await t.run((ctx) => ctx.db.get(result.broadcastId));
+  expect(finalBroadcast?.sentCount).toBe(1);
 });
 
 test("createBroadcast rejects an empty template_name or an empty/oversized recipients list", async () => {
