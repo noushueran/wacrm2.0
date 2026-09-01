@@ -24,6 +24,7 @@ import {
   EVENT_STATUS_KEYS,
   ASSIGNMENT_ROW_LIMIT,
   foldAssignmentEvents,
+  lifecycleFunnel,
 } from "./lib/reportStats";
 import { localDayKeyFromMs } from "./lib/dashboardDate";
 import type { Id } from "./_generated/dataModel";
@@ -788,8 +789,21 @@ export const funnelOverview = accountQuery({
       count: totals[stage],
     }));
 
+    // The 4-stage lead-quality funnel the Meta integration reports, and
+    // its rates (CAPI lifecycle spec §19). Derived from the SAME
+    // first-arrival counters as `funnel` above and the same stage→label
+    // mapping the outbox uses, so the report and the wire can never
+    // disagree about what an MQL is.
+    const lifecycle = lifecycleFunnel({
+      lead: totals.new_lead,
+      mql: totals.qualified,
+      sql: totals.price_quoted,
+      converted: totals.purchased,
+    });
+
     return {
       funnel,
+      lifecycle,
       purchase: { count: totals.purchased, totalValue, currency },
       meta: {
         sent: meta.sent,

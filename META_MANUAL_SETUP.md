@@ -210,3 +210,29 @@ in the meantime.
    from the same conversation would not currently produce a second
    `Purchase`. If repeat bookings per conversation are common, that
    deduplication key needs to become booking-scoped.
+
+## 9. Custom Conversions (optional, for reporting)
+
+If you want the brief's vocabulary to appear as named conversions in
+Ads Manager, build them on the label rather than on the event name:
+
+- [ ] Events Manager → **Custom Conversions** → New
+- [ ] Source: the dataset in `META_CAPI_DATASET_ID` (§2)
+- [ ] Rule: event `QualifiedLead` **and** `lead_stage` equals `MQL`
+      → name it **Marketing Qualified Lead**
+- [ ] Repeat for `InitiateCheckout` + `SQL` → **Sales Qualified Lead**
+- [ ] Repeat for `Purchase` + `CONVERTED` → **Converted Lead**
+
+## Rollback
+
+| Symptom | Action |
+| --- | --- |
+| Malformed-parameter warnings on `ph`/`em` | `npx convex env set META_CAPI_MATCH_KEYS off` — falls back to the documented-minimal `ctwa_clid` + `whatsapp_business_account_id` pair. No deploy, takes effect on the next event. |
+| Anything else wrong with delivery | `npx convex env unset META_CAPI_ACCESS_TOKEN` — the lane goes dormant and **parks** events rather than losing them; they deliver when the token returns. |
+| Wrong dataset configured | Unset the token first (above), fix `META_CAPI_DATASET_ID`, then set the token again. Also re-set `CONVERSION_DELIVERY_START_MS` so the newly-eligible backlog does not fire at the new dataset. |
+| Code-level rollback | `git revert` the integration commit. The schema is unchanged, so there is no migration to undo. |
+
+Nothing here deletes data: every failure mode parks events in the outbox
+rather than dropping them.
+
+---

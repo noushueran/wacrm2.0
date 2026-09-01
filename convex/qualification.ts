@@ -13,6 +13,7 @@ import { seedStageConversionEvent } from "./funnel";
 import {
   effectivePipelineStage,
   PIPELINE_STAGE_KEYS,
+  PURCHASE_SIGNAL_PROXY_STAGE,
   type PipelineStageKey,
 } from "./lib/funnel";
 
@@ -217,10 +218,16 @@ export const sendPurchaseSignal = accountMutation({
       value !== undefined
         ? (prior?.currency ?? account?.defaultCurrency ?? "USD")
         : undefined;
+    // Re-pointed with the automatic judge (CAPI lifecycle spec §2.4/§22):
+    // a supervisor asserting "this lead is ready to buy" is a buying-intent
+    // judgement, not a receipt, so it reports the SQL milestone. The
+    // CONVERTED event stays reserved for a recorded payment, which on this
+    // codebase means `funnel.setStage("purchased")` with its required
+    // amount. See `qualificationEngine.ts`'s PURCHASE SIGNALS header.
     const { conversionEventId } = await seedStageConversionEvent(ctx, {
       accountId: ctx.accountId,
       conversation,
-      stage: "purchased",
+      stage: PURCHASE_SIGNAL_PROXY_STAGE,
       ...(value !== undefined ? { value, currency } : {}),
     });
     if (!conversionEventId) {

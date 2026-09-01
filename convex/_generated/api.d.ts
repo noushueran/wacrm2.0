@@ -62,6 +62,7 @@ import type * as knowledge from "../knowledge.js";
 import type * as leadAnalysis from "../leadAnalysis.js";
 import type * as leadAnalysisEngine from "../leadAnalysisEngine.js";
 import type * as leadCharges from "../leadCharges.js";
+import type * as leadQuality from "../leadQuality.js";
 import type * as lib_ads_serviceMatch from "../lib/ads/serviceMatch.js";
 import type * as lib_agentRegistry from "../lib/agentRegistry.js";
 import type * as lib_ai_adContext from "../lib/ai/adContext.js";
@@ -249,6 +250,7 @@ declare const fullApi: ApiFromModules<{
   leadAnalysis: typeof leadAnalysis;
   leadAnalysisEngine: typeof leadAnalysisEngine;
   leadCharges: typeof leadCharges;
+  leadQuality: typeof leadQuality;
   "lib/ads/serviceMatch": typeof lib_ads_serviceMatch;
   "lib/agentRegistry": typeof lib_agentRegistry;
   "lib/ai/adContext": typeof lib_ai_adContext;

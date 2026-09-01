@@ -11,6 +11,7 @@ import {
   backendForLane,
   getStage,
   FUNNEL_STAGE_KEYS,
+  CONVERTED_STAGE,
   type FunnelStageKey,
 } from "./lib/funnel";
 import { allItemsDone, isLossCategory } from "./lib/salesChecklist";
@@ -77,6 +78,23 @@ export async function seedStageConversionEvent(
   const { conversation, stage } = args;
   const conversationId = conversation._id;
   const hasValue = args.value !== undefined && args.value > 0;
+
+  // Spec §2.4/§22: the CONVERTED milestone means money has been received,
+  // so it may not be reported to Meta without an amount. This is a
+  // structural guard rather than a caller convention on purpose — the
+  // authenticated path (`setStage`) already refuses a valueless
+  // `purchased` via `needsValue`, but that only covers the ONE caller who
+  // happens to check. Anything that reaches this seeder with
+  // `CONVERTED_STAGE` and no amount is, by definition, reporting a
+  // purchase it cannot evidence; it is refused here so no future caller
+  // can reopen the hole by forgetting the convention.
+  //
+  // Refusing (rather than seeding valueless) also keeps the eventId slot
+  // FREE: `${conversationId}:purchased` stays unclaimed, so the real sale
+  // still delivers when it lands.
+  if (stage === CONVERTED_STAGE && !hasValue) {
+    return { conversionEventId: undefined };
+  }
 
   let conversionEventId: Id<"conversionEvents"> | undefined;
   const attribution = conversation.attribution;

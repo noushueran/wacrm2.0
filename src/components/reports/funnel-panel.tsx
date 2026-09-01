@@ -12,6 +12,30 @@ import { downloadCsv } from '@/lib/reports/csv'
 import type { ReportPanelProps } from '@/lib/reports/types'
 import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
 
+/** The four lead-quality milestones, in funnel order. */
+const QUALITY_COUNT_KEYS = ['lead', 'mql', 'sql', 'converted'] as const
+
+/** The four rates between them, in the same order. */
+const QUALITY_RATE_KEYS = [
+  'mqlRate',
+  'sqlRate',
+  'convertedFromSqlRate',
+  'leadToCustomerRate',
+] as const
+
+/**
+ * A lifecycle rate for display. `null` means the denominator was zero, and
+ * it renders as an em dash rather than "0%" — the server deliberately
+ * returns null instead of 0 for exactly this reason (see
+ * `lifecycleFunnel` in convex/lib/reportStats.ts): "0% of 0 leads became
+ * MQL" is a claim the data cannot support, and showing it as 0% is how a
+ * quiet window gets misread as a collapse in lead quality.
+ */
+function formatRate(rate: number | null): string {
+  if (rate === null) return '—'
+  return `${(rate * 100).toFixed(1)}%`
+}
+
 const META_STATUS_KEYS = [
   'sent',
   'pending',
@@ -101,6 +125,18 @@ export function FunnelPanel({ reportWindow, canRead }: ReportPanelProps) {
                 stage,
                 byStage[stage] ?? 0,
               ]),
+              ...QUALITY_COUNT_KEYS.map((k) => [
+                'lead_quality',
+                k,
+                data.lifecycle[k],
+              ]),
+              ...QUALITY_RATE_KEYS.map((k) => [
+                'lead_quality',
+                k,
+                // Empty rather than "—" in a sheet: a dash is text and
+                // would poison the column's type for the whole export.
+                data.lifecycle[k] === null ? '' : data.lifecycle[k]!,
+              ]),
               ['purchases', 'count', data.purchase.count],
               ['purchases', 'recorded_value', data.purchase.totalValue],
               ['purchases', 'currency', data.purchase.currency],
@@ -134,6 +170,38 @@ export function FunnelPanel({ reportWindow, canRead }: ReportPanelProps) {
           icon={DollarSign}
           subtitle={t('funnel.recordedValueNote')}
         />
+      </div>
+
+      {/* Lead quality: the four milestones this CRM reports to Meta, and
+          the rates between them. The counts come from the SAME
+          first-arrival stage counters as the bars below (so a lead is
+          counted once per stage it reached, never per day), projected
+          onto the 4-stage lifecycle by `lifecycleFunnel` server-side —
+          which is also the mapping the outbox uses, so this card and the
+          wire can never disagree about what an MQL is. */}
+      <div className="rounded-xl border border-border bg-card p-5">
+        <h2 className="text-sm font-medium text-foreground">{t('funnel.qualityTitle')}</h2>
+        <p className="mt-1 text-xs text-muted-foreground">{t('funnel.qualityNote')}</p>
+        <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+          {QUALITY_COUNT_KEYS.map((k) => (
+            <div key={k} className="rounded-lg border border-border bg-background p-3">
+              <p className="text-xs text-muted-foreground">{t(`funnel.quality.${k}`)}</p>
+              <p className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+                {data.lifecycle[k].toLocaleString()}
+              </p>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+          {QUALITY_RATE_KEYS.map((k) => (
+            <div key={k} className="rounded-lg border border-border bg-background p-3">
+              <p className="text-xs text-muted-foreground">{t(`funnel.quality.${k}`)}</p>
+              <p className="mt-1 text-lg font-semibold tabular-nums text-foreground">
+                {formatRate(data.lifecycle[k])}
+              </p>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="rounded-xl border border-border bg-card p-5">
