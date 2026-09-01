@@ -1487,3 +1487,123 @@ export const requeueDeliverable = internalMutation({
     return { examined, requeued, dryRun, windowStartMs: windowStart, byStatus };
   },
 });
+
+
+/**
+ * Diagnostic: fire several payload VARIANTS of the same event down the real
+ * delivery path and report Meta's answer to each.
+ *
+ * Built for a question the ordinary probe cannot answer: a 200 with a
+ * trace id proves Meta ACCEPTED an event, not that it COUNTED it. Sending
+ * several variants at once and comparing what surfaces in the dataset is
+ * the only way to tell a payload problem from a reporting delay.
+ *
+ * Read the result patiently. This was written while `AddToCart` appeared
+ * to be silently dropped — it had returned 200 and was still missing after
+ * ninety minutes, while events sent later had already surfaced. It landed
+ * eventually. Event types backfill on DIFFERENT schedules, especially the
+ * first time a dataset sees a given name, so "a later event appeared and
+ * this one has not" is not evidence of rejection. Absence is only ever
+ * provisional; wait, then look again.
+ *
+ * Pass a `testEventCode` to route the variants to Events Manager's Test
+ * Events view, which reports within seconds instead of the live dataset's
+ * 30-minute-plus lag and does not touch live data. Uses a REAL `ctwa_clid`
+ * off an existing conversion so the events validate the way production
+ * ones do; a fake id is rejected outright (`error_subcode 2804087`).
+ */
+export const capiProbeMatrix = internalAction({
+  args: {
+    accountId: v.id("accounts"),
+    testEventCode: v.optional(v.string()),
+    variants: v.array(
+      v.object({
+        label: v.string(),
+        eventName: v.string(),
+        withContents: v.optional(v.boolean()),
+      }),
+    ),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<Array<{ label: string; eventName: string; httpStatus?: number; body?: unknown; error?: string }>> => {
+    const datasetId = process.env.META_CAPI_DATASET_ID;
+    if (!datasetId) return [{ label: "-", eventName: "-", error: "no dataset" }];
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId: args.accountId,
+    });
+    if (!config?.wabaId) return [{ label: "-", eventName: "-", error: "no wabaId" }];
+    const token =
+      process.env.META_CAPI_ACCESS_TOKEN ?? (await decrypt(config.accessToken));
+
+    const donor = await ctx.runQuery(internal.conversionEvents.getProbeIdentity, {
+      accountId: args.accountId,
+    });
+    if (!donor) return [{ label: "-", eventName: "-", error: "no ctwa_clid available" }];
+
+    const out = [];
+    for (const [i, variant] of args.variants.entries()) {
+      const custom: Record<string, unknown> = {
+        lead_stage: "PROBE",
+        crm_lead_id: "probe",
+      };
+      if (variant.withContents) {
+        // The hypothesis: commerce events may be dropped without content
+        // parameters, which is what distinguishes them from LeadSubmitted.
+        custom.currency = "AED";
+        custom.value = 1;
+        custom.content_type = "product";
+        custom.content_ids = ["probe-service"];
+        custom.contents = [{ id: "probe-service", quantity: 1, item_price: 1 }];
+      }
+      const body: Record<string, unknown> = {
+        data: [
+          {
+            event_name: variant.eventName,
+            event_time: Math.floor(Date.now() / 1000),
+            action_source: "business_messaging",
+            messaging_channel: "whatsapp",
+            event_id: `probe-matrix:${Date.now()}:${i}`,
+            user_data: {
+              whatsapp_business_account_id: config.wabaId,
+              ctwa_clid: donor.ctwaClid,
+            },
+            custom_data: custom,
+          },
+        ],
+      };
+      if (args.testEventCode) body.test_event_code = args.testEventCode;
+
+      const res = await fetch(
+        `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(datasetId)}/events?access_token=${encodeURIComponent(token)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      out.push({
+        label: variant.label,
+        eventName: variant.eventName,
+        httpStatus: res.status,
+        body: await res.json().catch(() => ({})),
+      });
+    }
+    return out;
+  },
+});
+
+/** A real `ctwa_clid` from a delivered conversion, for `capiProbeMatrix`. */
+export const getProbeIdentity = internalQuery({
+  args: { accountId: v.id("accounts") },
+  handler: async (ctx, args): Promise<{ ctwaClid: string } | null> => {
+    const row = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
+      .order("desc")
+      .filter((q) => q.eq(q.field("lane"), "ctwa"))
+      .first();
+    return row?.identifier ? { ctwaClid: row.identifier } : null;
+  },
+});
