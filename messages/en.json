@@ -597,10 +597,16 @@
       "recordedYes": "Recorded: Yes",
       "recordedYesValue": "Recorded: {value} {currency}",
       "recordedNo": "Recorded: No \u2014 not sent to Meta",
-      "recordPayment": "Payment received \u2014 record it now",
+      "revise": {
+        "genuine": "Actually a real customer \u2014 change to Yes",
+        "service": "Actually qualified for the service \u2014 change to Yes",
+        "intent": "Actually serious about booking \u2014 change to Yes",
+        "payment": "Payment received \u2014 record it now"
+      },
       "fromStage": "from CRM stage",
       "readOnly": "You cannot answer on this lead.",
-      "footnote": "One question at a time. Only a Yes is reported to Meta; a No is kept for your reporting. Answers are final \u2014 except payment, which you can record whenever the money arrives.",
+      "footnote": "One question at a time. Only a Yes is reported to Meta. A No can be changed to Yes whenever things change \u2014 a Yes is final, because Meta has already been told.",
+      "footnoteOrganic": "This lead did not come from an ad, so nothing here is reported to Meta. Answers are kept for your own reporting. A No can still be changed to Yes; a Yes is final.",
       "sequenceEnded": "Nothing further to record for this lead.",
       "reason": {
         "spam": "Spam",

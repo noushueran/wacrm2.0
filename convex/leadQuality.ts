@@ -119,14 +119,26 @@ export function latestFor(
  * nothing. The single exception is `revisable`, below.
  *
  * `revisable` — locked with a `no`, but still changeable to `yes`. TRUE
- * ONLY for `payment`, and only in that one direction. Money is the one
- * milestone here whose answer legitimately changes with time: a deal marked
- * unpaid on Tuesday is paid on Friday, and before this the panel had no way
- * to say so — the lead stayed "no" forever and its `Purchase` never
- * reached Meta, which is the single most valuable event this card exists to
- * send. The reverse is refused: a `yes` already put a `Purchase` on the
- * wire and Meta has no retraction, so un-saying it would only make the log
- * disagree with what was reported.
+ * for ANY step answered `no`, and only in that one direction.
+ *
+ * The asymmetry is the whole rule, and it comes straight from what each
+ * answer did. A `no` sent NOTHING — there is no code path from it to the
+ * outbox — so changing it later contradicts nothing Meta was ever told; it
+ * simply reports a milestone for the first time. A `yes` already put an
+ * event on the wire, and Meta has no retraction, so un-saying it could only
+ * make this log disagree with what was actually reported.
+ *
+ * Every one of these judgements is provisional in the way a `yes` is not.
+ * An agent marks a chat "not a real customer" and the customer replies
+ * three days later; a service looks unavailable until someone checks; a
+ * lead reads as browsing until they ask to book; a deal is unpaid until it
+ * is paid. Before this, each of those `no`s was permanent and its event was
+ * stranded forever — which is precisely the lead quality Meta is supposed
+ * to be learning from.
+ *
+ * Revising re-opens what the `no` had closed: `stepStates` derives the
+ * whole sequence from the log, so flipping a `no` to `yes` makes the next
+ * question available again with no special handling.
  *
  * `available` — answerable RIGHT NOW. Only one step is ever available: the
  * questions are a sequence, and each opens only once the one before it was
@@ -146,7 +158,7 @@ export type StepState = {
   locked: boolean;
   available: boolean;
   blocked: boolean;
-  /** A recorded `no` here may still be replaced by a `yes`. Payment only. */
+  /** A recorded `no` here may still be replaced by a `yes`. Never a `yes`. */
   revisable: boolean;
   answer: "yes" | "no" | null;
   viaStage: boolean;
@@ -168,6 +180,12 @@ export type StepState = {
  *
  * A `no` ENDS the sequence rather than skipping a step: every later
  * question presupposes the earlier answer was yes.
+ *
+ * It ends it PROVISIONALLY. Because the whole table is derived from the
+ * log, correcting a `no` to a `yes` re-opens the question after it by
+ * itself — the gate simply computes differently on the next read. Nothing
+ * here special-cases a revision, which is why the sequence cannot be left
+ * half-open by one.
  *
  * Pure and total — no clock, no database — so the table is unit-testable.
  */
@@ -207,10 +225,12 @@ export function stepStates(input: {
         ? ("yes" as const)
         : null;
 
-    // Payment, and payment alone, can be un-said in one direction. An
-    // implied lock is never revisable: implication only ever yields a
-    // `yes`, and a `yes` is final.
-    const revisable = step === "payment" && explicit?.answer === "no";
+    // Any `no` can be un-said, in one direction only. An implied lock is
+    // never revisable: implication only ever yields a `yes`, and a `yes` is
+    // final. `explicit` is required, so a step that is merely BLOCKED (an
+    // earlier `no` closed the gate before it) has nothing to revise —
+    // revision corrects an answer, it does not skip the sequence.
+    const revisable = explicit?.answer === "no";
 
     const state: StepState = {
       step,
@@ -288,13 +308,19 @@ export const getCardState = accountQuery({
       "view",
     );
 
-    // Only attributed leads can produce a Meta event, so only they are worth
-    // an agent's attention here. Checked before the answer read so an
-    // organic thread costs one document, not two.
-    if (conversation.attribution === undefined) {
-      return { attributed: false, canAnswer: false, steps: [], pendingCount: 0 };
-    }
-
+    // Organic threads get the SAME card. They used to return early with no
+    // steps, on the reasoning that only an attributed lead can produce a
+    // Meta event — true, but it made the panel appear and disappear between
+    // chats for a reason invisible to the agent, and it threw away the
+    // internal quality signal on roughly one lead in six.
+    //
+    // Nothing can leak to Meta as a result: `seedStageConversionEvent`
+    // creates an event only `if (attribution)`, so a `yes` here records the
+    // answer and seeds nothing. `attributed` is returned so the panel can
+    // say so plainly rather than implying these answers shape ad delivery.
+    //
+    // The cost is one extra indexed read on organic threads, which is what
+    // the old early return was saving.
     const rows = await ctx.db
       .query("leadQualityAnswers")
       .withIndex("by_conversation", (q) =>
@@ -317,7 +343,11 @@ export const getCardState = accountQuery({
         conversation.assignedToUserId === ctx.userId);
 
     return {
-      attributed: true,
+      // Was hardcoded `true` while the early return above owned the false
+      // case. It drives the panel's "nothing is reported for this lead"
+      // copy, so a stuck `true` would tell an agent their answers were
+      // tuning ad delivery when nothing was being sent at all.
+      attributed: conversation.attribution !== undefined,
       canAnswer,
       steps,
       pendingCount: steps.filter((s) => !s.locked).length,
@@ -333,12 +363,16 @@ export const getCardState = accountQuery({
  * `requireConversationAccess(..., "own")`), because this reaches the same
  * outbox by a different door and must not be the weaker one.
  *
- * A payment `no` may later be revised to `yes` — the ONLY answer this card
- * lets an agent change, and only in that direction. See
- * `StepState.revisable`. The revision writes a second row rather than
- * editing the first: `leadQualityAnswers` is an append-only log and
- * `latestFor` reads the newest per step, so both the original verdict and
- * the correction survive for reporting.
+ * ANY `no` may later be revised to `yes`, and never the reverse — see
+ * `StepState.revisable` for why the asymmetry is the honest one. The
+ * revision writes a second row rather than editing the first:
+ * `leadQualityAnswers` is an append-only log and `latestFor` reads the
+ * newest per step, so both the original verdict and the correction survive
+ * for reporting.
+ *
+ * On an ORGANIC conversation this records the answer and sends nothing.
+ * That is structural, not a check here: `seedStageConversionEvent` seeds an
+ * event only when the conversation carries an `attribution`.
  *
  * The sales-checklist gate that `setStage` applies to `purchased` is
  * deliberately NOT applied here (approved 2026-09-01). The card records that
@@ -378,9 +412,9 @@ export const answer = accountMutation({
     // than by hiding the buttons, because the panel is a live view that
     // another agent may have answered from a second later.
     //
-    // The exception is `revising` below: a payment `no` that becomes a
-    // `yes` has no event to contradict — none was ever sent — so it seeds
-    // the `Purchase` for the first time rather than duplicating one.
+    // The exception is `revising` below: a `no` that becomes a `yes` has no
+    // event to contradict — none was ever sent — so it seeds that
+    // milestone's event for the FIRST time rather than duplicating one.
     const existing = await ctx.db
       .query("leadQualityAnswers")
       .withIndex("by_conversation", (q) =>
@@ -393,14 +427,17 @@ export const answer = accountMutation({
     });
     const prior = priorStates.find((st) => st.step === step);
 
-    // The one reversal this card permits: a recorded `no` on PAYMENT,
-    // replaced by a `yes`. Deals close late — a lead marked unpaid pays a
-    // week later — and without this the `no` was permanent and its
-    // `Purchase` could never be reported, which is exactly the event the
-    // integration exists to send. `revisable` is computed in `stepStates`
-    // so the panel and this guard can never disagree about what may be
-    // changed; it is false for every other step and for a `yes`, which
-    // Meta has already been told and cannot be un-told.
+    // The one reversal this card permits, on any step: a recorded `no`
+    // replaced by a `yes`. Every judgement here is provisional in a way a
+    // `yes` is not — the chat dismissed as junk replies days later, the
+    // service turns out to be available, the unpaid deal pays — and a `no`
+    // sent nothing, so correcting it contradicts nothing Meta was told.
+    //
+    // `revisable` is computed in `stepStates`, so the panel and this guard
+    // can never disagree about what may be changed. It is false for a
+    // `yes`, which Meta has already been told and cannot be un-told, and
+    // false for a step with no answer of its own, so this cannot become a
+    // way to skip the sequence.
     const revising = args.answer === "yes" && prior?.revisable === true;
 
     if (args.answer !== "dismissed" && !revising) {

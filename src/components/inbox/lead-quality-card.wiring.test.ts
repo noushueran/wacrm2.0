@@ -59,6 +59,27 @@ describe("lead-quality card wiring", () => {
     expect(close).toBeGreaterThan(mount);
   });
 
+  it("submits a non-payment correction directly, without asking for money", () => {
+    // The correction button first shipped calling `setShowAmount(true)` for
+    // EVERY step. Only payment carries a figure, and the amount field's
+    // Save stays disabled until one is typed — so correcting "is this a
+    // real customer?" opened a money prompt that could never be submitted,
+    // making the correction unreachable on three of the four questions.
+    const revise = card.slice(card.indexOf("revise.${state.step}") - 900);
+    expect(revise).toContain('if (state.step === "payment")');
+    expect(revise).toContain('void onSubmit({ step: state.step, answer: "yes" })');
+  });
+
+  it("renders on organic threads too, gated only on the state existing", () => {
+    // The card used to bail on `!state.attributed`, so roughly one lead in
+    // six showed no panel at all with no visible reason.
+    expect(card).toContain("if (!state) return null;");
+    expect(card).not.toContain("!state.attributed) return null");
+    // And it must SAY that nothing is reported for those leads rather than
+    // looking identical to an attributed one.
+    expect(card).toContain("footnoteOrganic");
+  });
+
   it("keeps the query subscription INSIDE the wrapped component", () => {
     // `OptionalFeatureBoundary`'s header: a hook throws during the render
     // of whatever component CALLS it. If the card's query were lifted into

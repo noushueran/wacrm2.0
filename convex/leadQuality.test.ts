@@ -144,25 +144,57 @@ describe("stepStates", () => {
     expect(st.payment.locked).toBe(false);
   });
 
-  it("marks a payment NO as revisable — and nothing else", () => {
-    // Deals close late. A lead marked unpaid on Tuesday pays on Friday, and
-    // before this the `no` was permanent, so its Purchase — the most
-    // valuable event the card sends — could never be reported.
-    const st = statesOf([
-      { step: "genuine", answer: "yes", at: T0 },
-      { step: "service", answer: "yes", at: T0 + 1 },
-      { step: "intent", answer: "yes", at: T0 + 2 },
-      { step: "payment", answer: "no", at: T0 + 3 },
-    ]);
-    expect(st.payment).toMatchObject({ locked: true, answer: "no", revisable: true });
-    // The earlier questions are NOT revisable: their events are already on
-    // the wire and Meta has no retraction.
-    for (const step of ["genuine", "service", "intent"] as const) {
-      expect(st[step].revisable).toBe(false);
+  it("marks ANY recorded NO revisable — every judgement here is provisional", () => {
+    // The chat dismissed as junk replies three days later; the service
+    // turns out to be available; the unpaid deal pays. A `no` sent nothing,
+    // so correcting it contradicts nothing Meta was told.
+    for (const step of ["genuine", "service", "intent", "payment"] as const) {
+      // Walk far enough that `step` is the one being answered `no`.
+      const answers: AnswerRecord[] = [];
+      let at = T0;
+      for (const earlier of ["genuine", "service", "intent", "payment"] as const) {
+        if (earlier === step) break;
+        answers.push({ step: earlier, answer: "yes", at: at++ });
+      }
+      answers.push({ step, answer: "no", at: at++ });
+      const st = statesOf(answers);
+      expect(st[step]).toMatchObject({ locked: true, answer: "no", revisable: true });
     }
   });
 
-  it("never marks a payment YES revisable — that event is already sent", () => {
+  it("re-opens the next question when a NO is corrected to YES", () => {
+    // The correction must not leave the sequence half-open. Nothing
+    // special-cases this — the whole table is derived from the log, so the
+    // gate simply computes differently on the next read.
+    const rejected = statesOf([{ step: "genuine", answer: "no", at: T0 }]);
+    expect(rejected.service).toMatchObject({ blocked: true, available: false });
+
+    const corrected = statesOf([
+      { step: "genuine", answer: "no", at: T0 },
+      { step: "genuine", answer: "yes", at: T0 + 60_000 },
+    ]);
+    expect(corrected.genuine).toMatchObject({ answer: "yes", revisable: false });
+    expect(corrected.service).toMatchObject({ available: true, blocked: false });
+  });
+
+  it("never marks a YES revisable, at any step — those events are already sent", () => {
+    const st = statesOf([
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "yes", at: T0 + 1 },
+    ]);
+    expect(st.genuine.revisable).toBe(false);
+    expect(st.service.revisable).toBe(false);
+  });
+
+  it("does not mark a BLOCKED step revisable — revision is not a way to skip", () => {
+    // `service` was never answered; an earlier `no` merely closed the gate
+    // in front of it. There is no answer there to correct.
+    const st = statesOf([{ step: "genuine", answer: "no", at: T0 }]);
+    expect(st.service).toMatchObject({ blocked: true, revisable: false });
+    expect(st.payment).toMatchObject({ blocked: true, revisable: false });
+  });
+
+  it("never marks a payment YES revisable — that Purchase is already sent", () => {
     const st = statesOf([
       { step: "genuine", answer: "yes", at: T0 },
       { step: "service", answer: "yes", at: T0 + 1 },
@@ -542,7 +574,7 @@ test("payment bypasses the sales-checklist gate that blocks setStage", async () 
   expect(res.sentToMeta).toBe(true);
 });
 
-test("an organic chat logs feedback but can never seed an event, and shows no card", async () => {
+test("an organic chat SHOWS the card, logs feedback, and can never seed an event", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedMember(t);
   const { conversationId } = await seedLead(t, accountId, userId, {
@@ -552,9 +584,15 @@ test("an organic chat logs feedback but can never seed an event, and shows no ca
   const state = await asUser.query(api.leadQuality.getCardState, {
     conversationId,
   });
+  // The card renders for organic leads too — the answers are worth having
+  // internally — but `attributed: false` tells the panel to say outright
+  // that nothing here reaches Meta.
   expect(state.attributed).toBe(false);
-  expect(state.steps).toEqual([]);
-  expect(state.pendingCount).toBe(0);
+  expect(state.steps).toHaveLength(4);
+  expect(state.steps.find((s) => s.step === "genuine")).toMatchObject({
+    available: true,
+  });
+  expect(state.pendingCount).toBe(4);
 
   const res = await asUser.mutation(api.leadQuality.answer, {
     conversationId,
@@ -845,4 +883,156 @@ test("a LOST deal that later pays still reports the Purchase (stage stays lost)"
 
   const conv = await t.run((ctx) => ctx.db.get(conversationId));
   expect(conv?.funnel?.stage).toBe("lost");
+});
+
+test("a rejected lead can be reinstated, and the sequence continues from there", async () => {
+  // The case that prompted this: an agent marks a chat "not a real
+  // customer", and days later the customer replies asking to book.
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  const rejected = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "no",
+    reason: "no_intent",
+  });
+  expect(rejected.sentToMeta).toBe(false);
+  expect(await eventStages(t, conversationId)).toEqual(["new_lead"]);
+
+  // Everything after it is shut, and stays shut while the `no` stands.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "service",
+      answer: "yes",
+    }),
+  ).rejects.toThrow();
+
+  // The customer comes back.
+  const reinstated = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "yes",
+  });
+  expect(reinstated.sentToMeta).toBe(true);
+  expect(await eventStages(t, conversationId)).toContain("qualified");
+
+  // And the rest of the sequence is open again — the correction did not
+  // leave the lead stranded one question in.
+  const state = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(state.steps.find((s) => s.step === "service")).toMatchObject({
+    available: true,
+  });
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "service",
+    answer: "yes",
+  });
+  expect(await eventStages(t, conversationId)).toContain("itinerary_sent");
+});
+
+test("every step's NO can be corrected, and every YES stays final", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  // Answer `no` at each step in turn, correct it, and carry on. This walks
+  // the whole sequence through a correction at every position.
+  for (const step of ["genuine", "service", "intent"] as const) {
+    await asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step,
+      answer: "no",
+    });
+    await asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step,
+      answer: "yes",
+    });
+    // Now final: the event is on the wire and cannot be un-sent.
+    await expect(
+      asUser.mutation(api.leadQuality.answer, {
+        conversationId,
+        step,
+        answer: "no",
+      }),
+    ).rejects.toThrow();
+  }
+
+  expect(await eventStages(t, conversationId)).toEqual([
+    "itinerary_sent",
+    "new_lead",
+    "price_quoted",
+    "qualified",
+  ]);
+
+  // Each milestone was reported exactly ONCE despite being answered twice —
+  // the outbox dedups on `${conversationId}:${stage}`.
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("conversionEvents")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  expect(rows).toHaveLength(4);
+});
+
+test("correcting a NO cannot be used to skip the sequence", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "no",
+  });
+
+  // `intent` was never answered — an earlier `no` merely closed the gate in
+  // front of it — so there is nothing there to correct, and the revision
+  // path must not open it.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "intent",
+      answer: "yes",
+    }),
+  ).rejects.toThrow();
+  expect(await eventStages(t, conversationId)).toEqual(["new_lead"]);
+});
+
+test("an organic lead can be answered and corrected, and still sends nothing", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId, {
+    attributed: false,
+  });
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "no",
+  });
+  const corrected = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "yes",
+  });
+  // Recorded for internal reporting; nothing on the wire, because
+  // `seedStageConversionEvent` seeds only for an attributed conversation.
+  expect(corrected.sentToMeta).toBe(false);
+  expect(await eventStages(t, conversationId)).toEqual([]);
+
+  // The sequence still advances internally, so the panel keeps working.
+  const state = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(state.attributed).toBe(false);
+  expect(state.steps.find((s) => s.step === "service")).toMatchObject({
+    available: true,
+  });
 });

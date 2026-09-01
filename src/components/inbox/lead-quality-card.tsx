@@ -62,14 +62,20 @@ type StepState = {
  * A negative answer never reaches Meta — not by a check here, but because
  * `leadQuality.answer` has no code path from `no` to the conversion outbox.
  *
- * PAYMENT is the one answer that can be changed, and only from `no` to
- * `yes`. Deals close late: a lead marked unpaid pays the following week,
- * and with no way to say so the `no` was permanent and its `Purchase` — the
- * most valuable event this card sends — could never be reported. The
- * reverse stays refused, because a `yes` already put that event on the wire
- * and Meta has no retraction. The server decides this (`StepState.revisable`
- * in convex/leadQuality.ts); the panel only renders what it is told, so the
- * two cannot drift.
+ * ANY `no` can be changed to `yes`, and never the reverse. Every judgement
+ * here is provisional in a way a `yes` is not: the chat dismissed as junk
+ * replies three days later, the service turns out to be available, the
+ * unpaid deal pays. A `no` sent nothing, so correcting it contradicts
+ * nothing Meta was told — it reports that milestone for the first time, and
+ * re-opens the question after it. A `yes` already put an event on the wire
+ * and Meta has no retraction, so it stays final. The server decides this
+ * (`StepState.revisable` in convex/leadQuality.ts); the panel only renders
+ * what it is told, so the two cannot drift.
+ *
+ * ORGANIC threads get the card too, and are told plainly that nothing is
+ * reported for them. The answers are still worth having internally, and
+ * nothing can leak: `seedStageConversionEvent` seeds an event only for a
+ * conversation carrying an attribution.
  */
 export function LeadQualityCard({
   conversationId,
@@ -92,7 +98,7 @@ export function LeadQualityCard({
   const [amount, setAmount] = useState("");
   const [busy, setBusy] = useState(false);
 
-  if (!state || !state.attributed) return null;
+  if (!state) return null;
   const steps = state.steps as StepState[];
 
   const submit = async (args: {
@@ -184,7 +190,8 @@ export function LeadQualityCard({
               further applies. Said plainly so the empty panel is not read
               as a bug. */}
           {steps.some((s) => s.blocked) &&
-            !steps.some((s) => s.available) && (
+            !steps.some((s) => s.available) &&
+            !steps.some((s) => s.revisable && state.canAnswer) && (
               <p className="rounded-md border border-border bg-muted/40 px-2.5 py-2 text-[11px] text-muted-foreground">
                 {t("sequenceEnded")}
               </p>
@@ -192,7 +199,11 @@ export function LeadQualityCard({
         </div>
 
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-          {t("footnote")}
+          {/* An organic lead has no ad click behind it, so no answer here
+              can reach Meta. Said outright rather than left to look
+              identical to an attributed lead — an agent who believes these
+              answers are tuning ad delivery would be wrong. */}
+          {state.attributed ? t("footnote") : t("footnoteOrganic")}
         </p>
       </PopoverContent>
     </Popover>
@@ -290,9 +301,20 @@ function StepRow({
                 variant="outline"
                 className="mt-1.5 h-7 w-full text-[11px]"
                 disabled={busy}
-                onClick={() => setShowAmount(true)}
+                onClick={() => {
+                  // Only payment carries money. Opening the amount field
+                  // for the others would demand a figure that has no
+                  // meaning for "actually a real customer" — and the Save
+                  // button stays disabled until one is typed, so the
+                  // correction would be unreachable.
+                  if (state.step === "payment") {
+                    setShowAmount(true);
+                    return;
+                  }
+                  void onSubmit({ step: state.step, answer: "yes" });
+                }}
               >
-                {t("recordPayment")}
+                {t(`revise.${state.step}`)}
               </Button>
             )
           ) : null}
