@@ -2168,6 +2168,22 @@ function purchasedEventsFor(
       .collect());
 }
 
+/**
+ * Where the purchase JUDGE's verdict now lands: the SQL milestone
+ * (`price_quoted` → `InitiateCheckout`), not the CONVERTED one. The judge
+ * evidences buying intent, never a receipt — see the PURCHASE SIGNALS
+ * header in `qualificationEngine.ts` and CAPI lifecycle spec §2.4/§22.
+ */
+function proxyEventsFor(
+  t: TestConvex<typeof schema>,
+  conversationId: Id<"conversations">,
+) {
+  return t.run((ctx) =>
+    ctx.db.query("conversionEvents")
+      .withIndex("by_event_id", (q) => q.eq("eventId", `${conversationId}:price_quoted`))
+      .collect());
+}
+
 /** Ticks off the auto-generated sales checklist so the agent's real
  *  `setStage("purchased")` passes the deal-discipline gate. */
 async function completeSalesChecklist(
@@ -2197,7 +2213,7 @@ async function completeSalesChecklist(
   });
 }
 
-test("PS: criteria met fires the proxy Purchase — outbox row + session stamp + notification, funnel stage UNTOUCHED", async () => {
+test("PS: criteria met fires the SQL buying-intent event — NOT a Purchase — plus session stamp + notification, funnel stage UNTOUCHED", async () => {
   const t = convexTest(schema, modules);
   const base = await seedAttributed(t);
   await enablePurchaseSignals(t, base.accountId);
@@ -2209,9 +2225,13 @@ test("PS: criteria met fires the proxy Purchase — outbox row + session stamp +
     accountId: base.accountId, conversationId: base.conversationId,
   });
 
-  const events = await purchasedEventsFor(t, base.conversationId);
+  const events = await proxyEventsFor(t, base.conversationId);
   expect(events).toHaveLength(1);
-  expect(events[0].eventName).toBe("Purchase");
+  expect(events[0].eventName).toBe("InitiateCheckout");
+  expect(events[0].stage).toBe("price_quoted");
+  // The whole point of the re-point: an unpaid lead never produces the
+  // CONVERTED event (CAPI lifecycle spec §2.4/§22).
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
   expect(events[0].lane).toBe("ctwa");
   expect(events[0].identifier).toBe("clid-123");
   expect(events[0].value).toBe(9000);
@@ -2250,7 +2270,7 @@ test("PS: not-met stamps the verdict without firing; a later inbound re-evaluate
   });
   let [s] = await sessionsFor(t, base.conversationId);
   expect(s.purchase?.status).toBe("not_met");
-  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
+  expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(0);
 
   await clearPurchaseDebounce(t, base.conversationId);
   await seedCustomerMessage(t, base.accountId, base.conversationId,
@@ -2260,10 +2280,10 @@ test("PS: not-met stamps the verdict without firing; a later inbound re-evaluate
   });
   [s] = await sessionsFor(t, base.conversationId);
   expect(s.purchase?.status).toBe("sent");
-  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+  expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(1);
 });
 
-test("PS: proxy-then-agent — the later real sale links the SAME outbox row, no second event", async () => {
+test("PS: proxy-then-agent — the intent signal and the real sale are SEPARATE events, and only the sale is a Purchase", async () => {
   const t = convexTest(schema, modules);
   const base = await seedAttributed(t);
   await enablePurchaseSignals(t, base.accountId);
@@ -2272,7 +2292,10 @@ test("PS: proxy-then-agent — the later real sale links the SAME outbox row, no
   await t.action(internal.qualificationEngine.evaluatePurchase, {
     accountId: base.accountId, conversationId: base.conversationId,
   });
-  const [proxyEvent] = await purchasedEventsFor(t, base.conversationId);
+  const [proxyEvent] = await proxyEventsFor(t, base.conversationId);
+  expect(proxyEvent.eventName).toBe("InitiateCheckout");
+  // No Purchase yet — nobody has paid.
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
 
   await completeSalesChecklist(t, base.conversationId);
   await base.asUser.mutation(api.funnel.setStage, {
@@ -2282,15 +2305,27 @@ test("PS: proxy-then-agent — the later real sale links the SAME outbox row, no
     saleCurrency: "AED",
   });
 
-  const events = await purchasedEventsFor(t, base.conversationId);
-  expect(events).toHaveLength(1); // still just the proxy row
-  expect(events[0]._id).toBe(proxyEvent._id);
+  // The payment produces its OWN CONVERTED event carrying the real amount.
+  // Under the old behaviour the judge had already claimed the
+  // `:purchased` eventId, so the real sale silently linked the proxy's row
+  // and Meta never learned the true value — that is the regression this
+  // asserts against.
+  const purchased = await purchasedEventsFor(t, base.conversationId);
+  expect(purchased).toHaveLength(1);
+  expect(purchased[0]._id).not.toBe(proxyEvent._id);
+  expect(purchased[0].eventName).toBe("Purchase");
+  expect(purchased[0].value).toBe(12_000);
+  expect(purchased[0].currency).toBe("AED");
+
+  // The intent signal still stands as its own, single event.
+  expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(1);
+
   const conversation = await t.run((ctx) => ctx.db.get(base.conversationId));
   expect(conversation?.funnel?.stage).toBe("purchased"); // CRM truth advanced
   const transitions = await transitionsFor(t, base.conversationId);
   const purchasedTr = transitions.filter((tr) => tr.stage === "purchased");
   expect(purchasedTr).toHaveLength(1);
-  expect(purchasedTr[0].conversionEventId).toBe(proxyEvent._id); // linked, not duplicated
+  expect(purchasedTr[0].conversionEventId).toBe(purchased[0]._id);
 });
 
 test("PS: agent-then-proxy — an already-recorded real sale makes the judge a no-op on the outbox", async () => {
@@ -2344,7 +2379,7 @@ test("PS: gates — disabled toggle, organic conversation, unqualified session, 
   });
   [s] = await sessionsFor(t, organic.conversationId);
   expect(s.purchase).toBeUndefined();
-  expect(await purchasedEventsFor(t, organic.conversationId)).toHaveLength(0);
+  expect(await proxyEventsFor(t, organic.conversationId)).toHaveLength(0);
 
   // Still collecting: the judge never runs before qualification.
   const collecting = await seedAttributed(t);
@@ -2382,7 +2417,7 @@ test("PS: gates — disabled toggle, organic conversation, unqualified session, 
   });
   [s] = await sessionsFor(t, stale.conversationId);
   expect(s.purchase?.status ?? "not_met").toBe("not_met"); // never "sent"
-  expect(await purchasedEventsFor(t, stale.conversationId)).toHaveLength(0);
+  expect(await proxyEventsFor(t, stale.conversationId)).toHaveLength(0);
 });
 
 test("PS: a media message (visa documents) on a qualified session triggers evaluation via onInbound", async () => {
@@ -2417,7 +2452,7 @@ test("PS: a media message (visa documents) on a qualified session triggers evalu
 
     const [s] = await sessionsFor(t, base.conversationId);
     expect(s.purchase?.status).toBe("sent");
-    expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+    expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(1);
   } finally {
     vi.useRealTimers();
   }
@@ -2438,7 +2473,7 @@ test("PS: applyPurchaseVerdict enforces the confidence floor and idempotency", a
   expect(hesitant.fired).toBe(false);
   let [s] = await sessionsFor(t, base.conversationId);
   expect(s.purchase?.status).toBe("not_met");
-  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
+  expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(0);
 
   // criteria section missing → never fires, whatever met says.
   const noCriteria = await t.mutation(internal.qualificationEngine.applyPurchaseVerdict, {
@@ -2461,7 +2496,7 @@ test("PS: applyPurchaseVerdict enforces the confidence floor and idempotency", a
     verdict: { met: true, confidence: 90, reasons: ["all criteria met"], value: 3000, currency: null, criteriaFound: true },
   });
   expect(again.fired).toBe(false);
-  const events = await purchasedEventsFor(t, base.conversationId);
+  const events = await proxyEventsFor(t, base.conversationId);
   expect(events).toHaveLength(1);
   expect(events[0].currency).toBe("AED"); // account default backfills a value-bearing event
   [s] = await sessionsFor(t, base.conversationId);
@@ -2487,7 +2522,7 @@ test("PS: completing qualification schedules the first purchase evaluation autom
     expect(s.status).toBe("qualified");
     expect(s.purchase?.status).toBe("sent");
     expect(s.purchase?.value).toBe(3000);
-    expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(1);
+    expect(await proxyEventsFor(t, base.conversationId)).toHaveLength(1);
   } finally {
     vi.useRealTimers();
   }
@@ -2515,9 +2550,12 @@ test("PS: sendPurchaseSignal — supervisor+ fires manually (works with auto tog
   // Admin fires — even though purchaseSignalsEnabled is false (manual is
   // explicit human intent, the toggle only governs the automatic judge).
   await base.asUser.mutation(api.qualification.sendPurchaseSignal, { sessionId: s._id });
-  const events = await purchasedEventsFor(t, base.conversationId);
+  const events = await proxyEventsFor(t, base.conversationId);
   expect(events).toHaveLength(1);
-  expect(events[0].eventName).toBe("Purchase");
+  // A supervisor asserting readiness is buying intent, not a receipt — so
+  // the manual override reports SQL too, never CONVERTED (spec §2.4/§22).
+  expect(events[0].eventName).toBe("InitiateCheckout");
+  expect(await purchasedEventsFor(t, base.conversationId)).toHaveLength(0);
   const [after] = await sessionsFor(t, base.conversationId);
   expect(after.purchase?.status).toBe("sent");
   expect(after.purchase?.manual).toBe(true);

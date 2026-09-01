@@ -25,6 +25,7 @@ import { AssignmentEvent } from "./assignment-event";
 import { OptionalFeatureBoundary } from "./optional-feature-boundary";
 import { NoteComposer } from "./note-composer";
 import { DoNotContactBanner } from "./do-not-contact-banner";
+import { LeadQualityCard } from "@/components/inbox/lead-quality-card";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { cn } from "@/lib/utils";
@@ -1404,6 +1405,31 @@ export function MessageThread({
           byName={doNotContactByName}
           canClear={canClearDoNotContact}
         />
+      )}
+
+      {/* Lead-quality card (spec 2026-09-01-lead-quality-feedback-loop).
+          Sits with the other pre-composer banners rather than inside the
+          scrolling thread: an agent who has scrolled up to read history
+          must still see it, and a card that scrolls away is a card nobody
+          answers — which is the exact failure this replaces. It renders
+          nothing at all unless the server has a question pending, so a
+          settled or organic thread is untouched. */}
+      {conversationId && (
+        // Wrapped because Netlify builds the frontend from `main` while
+        // Convex deploys separately, so the window where this component
+        // exists and `leadQuality:getCardState` does not is real — and
+        // `useQuery` RETHROWS "Could not find public function" during
+        // render, which took the whole Inbox route down rather than
+        // hiding one supplementary card. `LeadQualityCard` owns its own
+        // subscription, so the throw happens inside this boundary; that
+        // is exactly the isolation `OptionalFeatureBoundary`'s header
+        // requires, and wrapping markup inside the card would catch
+        // nothing.
+        <OptionalFeatureBoundary feature="leadQuality.getCardState">
+          <LeadQualityCard
+            conversationId={conversationId as Id<"conversations">}
+          />
+        </OptionalFeatureBoundary>
       )}
 
       {/* Composer / claim-to-reply / read-only notice — role-gated

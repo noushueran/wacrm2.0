@@ -1734,6 +1734,113 @@ test("an ad-lead conversation with no source_url replies without a landing row",
   expect(landingRows).toHaveLength(0);
 });
 
+// A cached landing page that turns out to be Meta's login wall must not
+// reach the prompt. Asserted through `draft`, which shares
+// `loadAdContext` with `dispatchInbound` and — unlike it — puts the real
+// system prompt on the wire, where a stubbed `fetch` can read it back.
+//
+// Both rows below are seeded FRESH, so `ensureFresh` defers to the cache
+// and no landing fetch happens inside the test.
+test("the prompt takes a real landing page, drops a cached wall, and drops a JSON blob field-wise", async () => {
+  // Typed params so `mock.calls` carries the request init this test reads
+  // the system prompt back out of.
+  const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) =>
+    okChatCompletion("Happy to help with Georgia!"),
+  );
+  vi.stubGlobal("fetch", fetchSpy);
+  const t = convexTest(schema, modules);
+  const { accountId, asUser } = await seedAccountMember(t, {
+    name: "Ada",
+    email: "ada@example.com",
+  });
+  await configureAi(asUser);
+  const { conversationId } = await seedInboundThread(t, asUser, {
+    accountId,
+    phone: "15551232222",
+    messageText: "Hi",
+  });
+  const sourceUrl = "https://fb.me/27uVR4iqUN";
+  await t.run(async (ctx) => {
+    await ctx.db.patch(conversationId, {
+      adReferral: {
+        headline: "Georgia Summer Package",
+        body: "5 nights from AED 1299",
+        sourceUrl,
+        sourceType: "ad" as const,
+        startedAt: Date.now(),
+      },
+    });
+  });
+  const landingId = await t.run((ctx) =>
+    ctx.db.insert("adLandingPages", {
+      accountId,
+      urlKey: sourceUrl,
+      url: sourceUrl,
+      status: "ok" as const,
+      title: "Facebook",
+      content:
+        "Explore the things you love.\n\nLog into Facebook\n\nEmail or mobile number\n\n" +
+        "Password\n\nForgot password?\n\nCreate new account",
+      finalUrl: "https://www.facebook.com/login/?next=%2Fstory.php",
+      fetchStartedAt: Date.now(),
+      fetchedAt: Date.now(),
+    }),
+  );
+
+  await asUser.action(api.aiReply.draft, { conversationId });
+
+  const systemPromptOf = (call: number): string =>
+    JSON.parse(String(fetchSpy.mock.calls[call]![1]!.body)).messages[0].content;
+  const walled = systemPromptOf(0);
+  // The ad itself still grounds the reply — that is the whole point of
+  // dropping the wall rather than dropping the section.
+  expect(walled).toContain("Ad headline: Georgia Summer Package");
+  expect(walled).toContain("Ad text: 5 nights from AED 1299");
+  expect(walled).not.toContain("Linked page");
+  expect(walled).not.toContain("Log into Facebook");
+
+  // Same conversation, same cache row — but now holding the post the ad
+  // actually points at.
+  await t.run((ctx) =>
+    ctx.db.patch(landingId, {
+      title: "Amani Travel & Tourism on Instagram",
+      description: "Visa Change by Bus for Indians for AED 799.",
+      content: "Transportation, accommodation and border fees included.",
+      finalUrl: "https://www.instagram.com/p/DbEKZNHsJne/",
+      fetchedAt: Date.now(),
+    }),
+  );
+
+  await asUser.action(api.aiReply.draft, { conversationId });
+
+  const grounded = systemPromptOf(1);
+  expect(grounded).toContain("Linked page title: Amani Travel & Tourism on Instagram");
+  expect(grounded).toContain("AED 799");
+
+  // Same row again, but with the truncated-`<script>` residue 179
+  // production rows carried in `content`. That is dropped per-field: the
+  // og: metadata on those rows is the ad's own offer copy and the only
+  // real grounding in the cache, so it must survive the blob's removal.
+  await t.run((ctx) =>
+    ctx.db.patch(landingId, {
+      content:
+        '{"require":[["ScheduledServerJS","handle",null,[{"__bbox":{"define":' +
+        '[["cr:4474",["PolarisSearchBoxContainer.react"],{"__rc":["Polaris",null]},-1]'.repeat(10),
+      fetchedAt: Date.now(),
+    }),
+  );
+
+  await asUser.action(api.aiReply.draft, { conversationId });
+
+  const partial = systemPromptOf(2);
+  expect(partial).toContain("Linked page title: Amani Travel & Tourism on Instagram");
+  expect(partial).toContain("Linked page description: Visa Change by Bus for Indians for AED 799.");
+  expect(partial).not.toContain("ScheduledServerJS");
+  expect(partial).not.toContain("Linked page content");
+
+  vi.unstubAllGlobals();
+});
+
 // ============================================================
 // hasKnowledgeChunks — the retrieval gate over BOTH pools
 // ============================================================

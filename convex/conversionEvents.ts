@@ -6,8 +6,8 @@ import {
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
-import { resolveEventName, backendForLane } from "./lib/funnel";
-import { hashedPhone } from "./lib/metaHash";
+import { resolveEventName, backendForLane, resolveLeadStage } from "./lib/funnel";
+import { hashedPhone, hashedEmail } from "./lib/metaHash";
 import {
   applyStageTransition,
   recordConversionEventInRollup,
@@ -93,12 +93,27 @@ function networkError(err: unknown): TransientDeliveryError {
  */
 function logFieldsFor(row: Doc<"conversionEvents">) {
   return {
+    // Identity of the ROW, not of the person. `crmLeadId` is the
+    // conversation id, which is what correlates a Meta-side diagnostic
+    // back to a thread in this CRM without carrying anything about who
+    // the customer is.
+    crmLeadId: row.conversationId as string,
     eventId: row.eventId,
     eventName: row.eventName,
+    // `leadStage` is the MQL/SQL/Converted label. It is the field that
+    // makes these lines answerable for "which lifecycle step is
+    // failing", which is the whole reason the lead-quality work sends
+    // it to Meta in `custom_data` — see `lib/funnel.ts`.
+    leadStage: resolveLeadStage(row.stage),
     backend: row.backend,
     lane: row.lane,
     stage: row.stage,
+    eventTime: Math.floor(row._creationTime / 1000),
     attempt: row.attempts + 1,
+    // Transient failures spend a SEPARATE budget from permanent ones
+    // (see `errorPatchFor`), so a line that reports only `attempt`
+    // cannot explain why a row is still queued after many tries.
+    transientAttempt: row.transientAttempts ?? 0,
   };
 }
 
@@ -122,16 +137,24 @@ function logFieldsFor(row: Doc<"conversionEvents">) {
  * make every tick look broken.
  */
 function logDelivery(entry: {
+  crmLeadId: string;
   eventId: string;
   eventName: string;
+  leadStage: string | null;
   backend: string;
   lane: string;
   stage: string;
+  eventTime: number;
   attempt: number;
+  transientAttempt: number;
   outcome: "sent" | "unmatched" | "error" | "dormant";
   httpStatus?: number;
   fbTraceId?: string;
   error?: string;
+  // Which retry budget the failure spends. Carried alongside `error`
+  // rather than instead of it: the category is what you filter on, the
+  // message is what you read once you have filtered.
+  errorCategory?: "transient" | "permanent" | "unconfigured";
 }): void {
   const line = `[conversionEvents] ${JSON.stringify(entry)}`;
   if (entry.outcome === "error") console.error(line);
@@ -160,6 +183,65 @@ function errorPatchFor(err: unknown): {
   };
 }
 
+
+// ============================================================
+// User matching. Meta matches a server event back to the person who
+// clicked the ad using whatever identifiers we can legitimately supply.
+// On the CTWA lane `ctwa_clid` + `whatsapp_business_account_id` are the
+// authoritative pair, but they are only as good as the click record; a
+// hashed phone or email is a second, independent key that lifts Event
+// Match Quality when the click id alone does not resolve.
+//
+// NORMALIZATION AND HASHING LIVE IN `lib/metaHash.ts`, NOT HERE. They
+// are one operation — normalizing after hashing is not a thing you can
+// do — and that module is where the rule that actually bites is written
+// down and tested: Meta strips LEADING ZEROS before hashing its copy,
+// while this CRM's own `lib/phone.ts` deliberately keeps the trunk zero
+// for `by_account_phone` dedup. Hashing through `lib/phone.ts` would
+// silently mismatch every number stored in local format — `0585824488`
+// against the `971585824488` Meta holds — and a mismatch is invisible:
+// the request still returns 200, the event simply never attributes.
+// `metaHash.test.ts` pins the two normalizations apart for that reason.
+// ============================================================
+
+/**
+ * Whether to send the hashed `ph`/`em` match keys at all.
+ *
+ * Gated by `META_CAPI_MATCH_KEYS` so the extra keys can be dropped
+ * without a deploy: Meta's business-messaging reference documents the
+ * `ctwa_clid` + `whatsapp_business_account_id` pair explicitly but does
+ * not enumerate which additional `user_data` fields that channel
+ * accepts. If Events Manager ever flags a malformed-parameter warning
+ * against `ph`/`em`, set the var to "off" and the payload falls back to
+ * the documented-minimal pair. Default is ON, because better matching is
+ * the point of sending these at all.
+ */
+export function matchKeysEnabled(): boolean {
+  return (
+    (process.env.META_CAPI_MATCH_KEYS ?? "on").trim().toLowerCase() !== "off"
+  );
+}
+
+/**
+ * The hashed `user_data` match keys for one lead, omitting any key we do
+ * not genuinely have. Meta expects each as an ARRAY of digests.
+ *
+ * A key we cannot build is OMITTED rather than sent empty: a SHA-256 of
+ * `""` is a perfectly valid-looking digest that matches nobody, and Meta
+ * counts it as a supplied-but-unmatched key.
+ */
+export async function buildHashedMatchKeys(input: {
+  phone?: string | null;
+  email?: string | null;
+}): Promise<{ ph?: string[]; em?: string[] }> {
+  const keys: { ph?: string[]; em?: string[] } = {};
+  const ph = await hashedPhone(input.phone);
+  if (ph) keys.ph = [ph];
+  const em = await hashedEmail(input.email);
+  if (em) keys.em = [em];
+  return keys;
+}
+
 export const getById = internalQuery({
   args: { conversionEventId: v.id("conversionEvents") },
   handler: async (ctx, args): Promise<Doc<"conversionEvents"> | null> =>
@@ -174,6 +256,23 @@ export const getWabaId = internalQuery({
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .first();
     return cfg?.wabaId ?? null;
+  },
+});
+
+/**
+ * The contact's email, for the second hashed match key (spec §4). Separate
+ * from the outbox row because `conversionEvents` deliberately snapshots only
+ * what Platform A's contract needs (phone/waMessageId/firstMessageAt) — an
+ * email added to the contact AFTER the row was seeded should still improve
+ * the match on delivery, and a snapshot could not do that. Returns null for
+ * a contact with no email, which is most of them (WhatsApp never supplies
+ * one; it is only ever entered by an agent).
+ */
+export const getContactEmail = internalQuery({
+  args: { contactId: v.id("contacts") },
+  handler: async (ctx, args): Promise<string | null> => {
+    const contact = await ctx.db.get(args.contactId);
+    return contact?.email ?? null;
   },
 });
 
@@ -494,18 +593,46 @@ export const deliverConversionEvent = internalAction({
         });
         return;
       }
+      const email = matchKeysEnabled()
+        ? await ctx.runQuery(internal.conversionEvents.getContactEmail, {
+            contactId: row.contactId,
+          })
+        : null;
       try {
-        // `ph` is an ADDITIONAL match key, never a replacement for the two
-        // WhatsApp business-messaging requires (`whatsapp_business_account_id`
-        // + `ctwa_clid`, both sent unhashed — Meta's parameter reference says
-        // of `ctwa_clid` exactly "Do not hash"). It is normalized to Meta's
-        // rules and SHA-256'd by `lib/metaHash.ts`; see that module for why
-        // its normalization deliberately differs from `lib/phone.ts`'s.
-        // Omitted entirely rather than sent empty when the row carries no
-        // usable digits — an empty-string match key is a present-but-
-        // unmatchable one and drags Event Match Quality down.
-        const ph = await hashedPhone(row.phone);
+        // `user_data`: the documented business-messaging pair first, then
+        // the hashed match keys when enabled. Normalized to META's rules
+        // BEFORE hashing — see `lib/metaHash.ts`, and note that its phone
+        // rule deliberately differs from `lib/phone.ts`'s.
+        const userData: Record<string, unknown> = {
+          whatsapp_business_account_id: wabaId,
+          ctwa_clid: row.identifier,
+        };
+        if (matchKeysEnabled()) {
+          Object.assign(
+            userData,
+            await buildHashedMatchKeys({ phone: row.phone, email }),
+          );
+        }
+
+        // `custom_data` always carries the CRM lifecycle label + lead id.
+        // `lead_stage` is what Events Manager Custom Conversions and our
+        // own reporting segment on, because Meta's business-messaging
+        // `event_name` enum has no MQL/SQL/Converted member — see
+        // `lib/funnel.ts`'s header. `value`/`currency` ride along only when
+        // the milestone actually carried money.
+        const leadStage = resolveLeadStage(row.stage);
+        const customData: Record<string, unknown> = {
+          crm_lead_id: row.conversationId,
+          ...(leadStage ? { lead_stage: leadStage } : {}),
+        };
+        if (row.value !== undefined) {
+          customData.value = row.value;
+          customData.currency = row.currency;
+        }
         const event: Record<string, unknown> = {
+          // `event_time` is the milestone's OWN moment (the outbox row's
+          // creation), never "now" — a retry days later must still report
+          // when the lead actually reached this stage (spec Rule C).
           event_name: row.eventName,
           // The MILESTONE's time, not this attempt's: `_creationTime` is when
           // the outbox row was written, which is the moment the stage was
@@ -515,15 +642,9 @@ export const deliverConversionEvent = internalAction({
           action_source: "business_messaging",
           messaging_channel: "whatsapp",
           event_id: row.eventId,
-          user_data: {
-            whatsapp_business_account_id: wabaId,
-            ctwa_clid: row.identifier,
-            ...(ph ? { ph: [ph] } : {}),
-          },
+          user_data: userData,
+          custom_data: customData,
         };
-        if (row.value !== undefined) {
-          event.custom_data = { value: row.value, currency: row.currency };
-        }
         const body: Record<string, unknown> = { data: [event] };
         const partnerAgent = process.env.META_CAPI_PARTNER_AGENT;
         if (partnerAgent) body.partner_agent = partnerAgent;
@@ -570,13 +691,21 @@ export const deliverConversionEvent = internalAction({
           fbTraceId: data.fbtrace_id,
         });
       } catch (err) {
+        const patch = errorPatchFor(err);
         await ctx.runMutation(internal.conversionEvents.patchStatus, {
           conversionEventId: args.conversionEventId,
-          ...errorPatchFor(err),
+          ...patch,
         });
         logDelivery({
           ...logFieldsFor(row),
+          // The counters reflect what this attempt actually SPENT, which
+          // is not `logFieldsFor`'s pre-attempt view: a transient failure
+          // bumps `transientAttempts` and leaves `attempts` alone.
+          attempt: row.attempts + (patch.bumpAttempts ? 1 : 0),
+          transientAttempt:
+            (row.transientAttempts ?? 0) + (patch.transient ? 1 : 0),
           outcome: "error",
+          errorCategory: patch.transient ? "transient" : "permanent",
           error: err instanceof Error ? err.message : String(err),
         });
       }

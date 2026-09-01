@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  lifecycleFunnel,
   responseBucketFor,
   emptyResponseBuckets,
   addResponseBucket,
@@ -433,4 +434,36 @@ describe("foldHoursIntoVolume — activeConversations", () => {
     expect(out.get("2026-08-04")!.activeConversations).toBe(4);
     expect(out.get("2026-08-03")!.activeConversations).toBe(0);
   });
+});
+
+// --- lifecycleFunnel (CAPI lifecycle spec §19) ---------------------------
+
+describe("lifecycleFunnel", () => {
+it("derives the four rates from first-arrival counts", () => {
+  const f = lifecycleFunnel({ lead: 200, mql: 80, sql: 20, converted: 5 });
+  expect(f.mqlRate).toBeCloseTo(0.4); // 80/200
+  expect(f.sqlRate).toBeCloseTo(0.25); // 20/80
+  expect(f.convertedFromSqlRate).toBeCloseTo(0.25); // 5/20
+  expect(f.leadToCustomerRate).toBeCloseTo(0.025); // 5/200
+  // Counts pass through untouched — the rates are derived, not stored.
+  expect(f).toMatchObject({ lead: 200, mql: 80, sql: 20, converted: 5 });
+});
+
+it("reports an empty denominator as null, never as 0%", () => {
+  // A window with no leads cannot support "0% became MQL"; rendering that
+  // as zero is how a quiet week reads as a collapse in lead quality.
+  const empty = lifecycleFunnel({ lead: 0, mql: 0, sql: 0, converted: 0 });
+  expect(empty.mqlRate).toBeNull();
+  expect(empty.sqlRate).toBeNull();
+  expect(empty.convertedFromSqlRate).toBeNull();
+  expect(empty.leadToCustomerRate).toBeNull();
+
+  // Leads but nothing qualified yet: 0% MQL is a REAL claim, so it is 0 —
+  // while the downstream rates, still divided by zero, stay null.
+  const early = lifecycleFunnel({ lead: 50, mql: 0, sql: 0, converted: 0 });
+  expect(early.mqlRate).toBe(0);
+  expect(early.leadToCustomerRate).toBe(0);
+  expect(early.sqlRate).toBeNull();
+  expect(early.convertedFromSqlRate).toBeNull();
+});
 });

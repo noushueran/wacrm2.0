@@ -19,7 +19,12 @@ import {
   HANDOFF_SENTINEL,
 } from "./lib/ai/defaults";
 import { deliveryDelayMs } from "./lib/ai/pacing";
-import { landingUrlKey, type AdContext } from "./lib/ai/adContext";
+import {
+  isLoginWallLanding,
+  landingUrlKey,
+  looksLikeSerializedJunk,
+  type AdContext,
+} from "./lib/ai/adContext";
 import { latestUserMessage } from "./lib/ai/query";
 import { blockedReason } from "./lib/notes/gate";
 import { deriveCustomerState, type CustomerState } from "./lib/notes/signals";
@@ -646,10 +651,27 @@ async function loadAdContext(
         url: ref.sourceUrl,
       });
       const landing = await ctx.runQuery(internal.adLanding.get, { accountId, urlKey });
-      if (landing) {
+      // A wall the cache still holds is worse than no landing page at
+      // all: it grounds the agent's first reply in "Log into Facebook /
+      // Email or mobile number / Forgot password?" instead of the offer
+      // the customer just clicked. Dropping all three fields falls the
+      // prompt back to the referral's own headline and ad text, which
+      // remain accurate. `adLanding.ts` stopped WRITING walls, but rows
+      // written before that keep their content forever (nothing
+      // overwrites a last-good extraction), so the read side has to
+      // recognize them too.
+      if (landing && !isLoginWallLanding(landing)) {
         adContext.landingTitle = landing.title;
         adContext.landingDescription = landing.description;
-        adContext.landingContent = landing.content;
+        // Per-field, unlike the wall check above: a row whose `content` is
+        // a truncated-`<script>` JSON blob still has genuinely good og:
+        // title and description — on Meta post pages that metadata IS the
+        // offer copy ("Visa Change by Bus for Indians for AED 799"), and
+        // it is the only real ad grounding in the cache. Drop the blob,
+        // keep the rest.
+        adContext.landingContent = looksLikeSerializedJunk(landing.content)
+          ? undefined
+          : landing.content;
       }
     } catch (err) {
       console.warn("[ai reply] ad landing context failed:", err);

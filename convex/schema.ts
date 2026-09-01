@@ -2720,6 +2720,55 @@ export default defineSchema({
     .index("by_contact", ["contactId"]),
 
   // ============================================================
+  // Lead-quality feedback loop (spec 2026-09-01-lead-quality-feedback-
+  // loop-design.md). The answer log behind the inline card in the message
+  // thread — the discoverable front door that replaced relying on staff to
+  // drive the funnel stepper, which an audit found they did not know existed.
+  //
+  // Append-only: re-answering a step INSERTS rather than edits, so the trail
+  // shows what changed and when. The card reads the latest row per step.
+  //
+  // `conversionEventId` is the audit that makes the "only good leads reach
+  // Meta" rule checkable rather than merely intended: it is set only when the
+  // answer seeded an outbox row, so a `no`/`dismissed` row carrying one would
+  // be a bug you can query for. Negative answers are still RECORDED — the
+  // business wants the bad-lead signal for its own reporting; it just never
+  // leaves the building.
+  // ============================================================
+  leadQualityAnswers: defineTable({
+    accountId: v.id("accounts"),
+    conversationId: v.id("conversations"),
+    contactId: v.id("contacts"),
+    // The three business-funnel milestones an agent can attest to. Maps to
+    // funnel stages in `lib/leadQuality.ts` — NOT stored as a stage here,
+    // because the question ("is this a real customer?") and the stage
+    // (`qualified`) are deliberately different vocabularies.
+    step: v.union(
+      v.literal("genuine"),
+      v.literal("intent"),
+      v.literal("payment"),
+    ),
+    // "dismissed" is the card's `×`. It is a real answer, not an absence:
+    // it says an agent saw the question and declined it, which is signal
+    // worth keeping and is what the 1-day re-ask cooldown keys on.
+    answer: v.union(
+      v.literal("yes"),
+      v.literal("no"),
+      v.literal("dismissed"),
+    ),
+    reason: v.optional(v.string()),
+    value: v.optional(v.number()),
+    currency: v.optional(v.string()),
+    byUserId: v.id("users"),
+    conversionEventId: v.optional(v.id("conversionEvents")),
+  })
+    .index("by_conversation", ["conversationId"])
+    // Account-scoped, `_creationTime`-ordered scan for lead-quality
+    // reporting, window-bounded via `.gte("_creationTime")` — the same shape
+    // `conversionEvents.by_account` uses for the funnel rollup.
+    .index("by_account", ["accountId"]),
+
+  // ============================================================
   // CTWA ad-capture (funnel Phase 0). Raw event log: one row per
   // inbound message carrying a `referral`. `_creationTime` is the
   // received-at (codebase "rely on _creationTime" convention).

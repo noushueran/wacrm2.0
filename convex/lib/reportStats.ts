@@ -694,3 +694,67 @@ export function foldAssignmentEvents(
 
   return { days, agentTotals };
 }
+
+// --- Lead-quality lifecycle rollup (CAPI lifecycle spec §19) -------------
+
+/**
+ * The four business-funnel milestones, as counts of DISTINCT leads that
+ * reached each. Fed from `funnelOverview`'s `stageFirstReached` totals,
+ * which are first-arrival counters — so these are lead counts, never
+ * lead-days, and a lead that bounced between stages is counted once.
+ */
+export type LifecycleCounts = {
+  lead: number;
+  mql: number;
+  sql: number;
+  converted: number;
+};
+
+/**
+ * Lifecycle counts + the conversion rates between them.
+ *
+ * Each rate is a FRACTION in [0, 1] (multiply by 100 to display), and each
+ * is `null` — not 0 — when its denominator is zero. "0% of 0 leads became
+ * MQL" is a claim the data cannot support, and rendering it as 0% is how a
+ * quiet window gets read as a collapse in lead quality. The caller decides
+ * how to show "no data yet"; this function refuses to invent it.
+ */
+export type LifecycleFunnel = LifecycleCounts & {
+  /** MQL / Lead */
+  mqlRate: number | null;
+  /** SQL / MQL */
+  sqlRate: number | null;
+  /** Converted / SQL */
+  convertedFromSqlRate: number | null;
+  /** Converted / Lead — the headline lead-to-customer rate. */
+  leadToCustomerRate: number | null;
+};
+
+function rate(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? numerator / denominator : null;
+}
+
+/**
+ * Projects the 8-stage CRM funnel onto the 4-stage lead-quality funnel the
+ * Meta integration reports, and derives its rates.
+ *
+ * The projection is deliberately the SAME mapping the outbox uses
+ * (`lib/funnel.ts`'s `leadStage`): `qualified` is MQL, `price_quoted` is
+ * SQL, `purchased` is CONVERTED. Deriving it here from stage counts rather
+ * than from delivered Meta events is what makes this report honest about
+ * the BUSINESS funnel even while delivery is dark or backlogged — the
+ * event pipeline's health is a separate question, already answered by
+ * `funnelOverview.meta`.
+ *
+ * `lost` is not subtracted from anything: a lead that reached MQL and was
+ * later lost still reached MQL, and that is what Meta was told.
+ */
+export function lifecycleFunnel(counts: LifecycleCounts): LifecycleFunnel {
+  return {
+    ...counts,
+    mqlRate: rate(counts.mql, counts.lead),
+    sqlRate: rate(counts.sql, counts.mql),
+    convertedFromSqlRate: rate(counts.converted, counts.sql),
+    leadToCustomerRate: rate(counts.converted, counts.lead),
+  };
+}

@@ -580,6 +580,33 @@
       "updateError": "Couldn’t update the AI assistant.",
       "networkError": "Couldn’t reach the server."
     },
+    "leadQuality": {
+      "question": {
+        "genuine": "Is this a real customer?",
+        "intent": "Serious about booking?",
+        "payment": "Payment received?"
+      },
+      "yes": "Yes",
+      "no": "No",
+      "confirm": "Save",
+      "cancel": "Cancel",
+      "dismiss": "Not now",
+      "reasonPrompt": "What was wrong with it?",
+      "amountPrompt": "Amount received",
+      "reason": {
+        "spam": "Spam",
+        "supplier_vendor": "Supplier / vendor",
+        "job_seeker": "Job enquiry",
+        "wrong_service": "Wrong service",
+        "fake_number": "Fake number",
+        "duplicate": "Duplicate",
+        "no_intent": "No intent to buy",
+        "other": "Other"
+      },
+      "sentToast": "Saved \u2014 lead quality reported to Meta.",
+      "savedToast": "Saved to your lead-quality log.",
+      "error": "Could not save that. Try again."
+    },
     "funnel": {
       "label": "Stage",
       "crmOnly": "CRM only — not from an ad or tracked link, so not reported to Meta.",
@@ -709,19 +736,19 @@
       "checklistShort": "{done}/{total}"
     },
     "purchase": {
-      "title": "Purchase signal",
-      "sentBadge": "Purchase sent",
-      "sentTooltip": "Reported to Meta as a Purchase conversion",
-      "sent": "Reported to Meta as a Purchase",
+      "title": "Buying-intent signal",
+      "sentBadge": "Intent signal sent",
+      "sentTooltip": "Reported to Meta as a Sales qualified lead",
+      "sent": "Reported to Meta as a Sales qualified lead",
       "manual": "(sent manually)",
       "reportedValue": "Reported value ~{value} {currency}",
       "notMet": "Purchase criteria not met yet (confidence {confidence}/100)",
       "notEvaluated": "Not evaluated yet — the AI checks after each customer message.",
-      "send": "Send purchase signal",
-      "sentToast": "Purchase signal sent to Meta.",
+      "send": "Send buying-intent signal",
+      "sentToast": "Buying-intent signal sent to Meta.",
       "notAttributed": "This lead has no ad or website attribution — Meta has nothing to receive.",
-      "alreadySent": "A purchase signal was already sent for this lead.",
-      "error": "Could not send the purchase signal."
+      "alreadySent": "A buying-intent signal was already sent for this lead.",
+      "error": "Could not send the buying-intent signal."
     },
     "checklist": {
       "title": "Sales checklist",
@@ -1430,6 +1457,18 @@
         "error": "Error",
         "abandoned": "Abandoned",
         "total": "Total"
+      },
+      "qualityTitle": "Lead quality funnel",
+      "qualityNote": "Milestones reported to Meta. A rate needs leads in the stage above it \u2014 \u201c\u2014\u201d means none yet.",
+      "quality": {
+        "lead": "Leads",
+        "mql": "Marketing qualified",
+        "sql": "Sales qualified",
+        "converted": "Converted",
+        "mqlRate": "Lead \u2192 MQL",
+        "sqlRate": "MQL \u2192 SQL",
+        "convertedFromSqlRate": "SQL \u2192 Converted",
+        "leadToCustomerRate": "Lead \u2192 customer"
       }
     },
     "billing": {
@@ -2439,10 +2478,10 @@
       "enableLabel": "Enable lead qualification",
       "enableDesc": "Dormant until enabled. Turning this on starts tracking qualification sessions for new conversations.",
       "purchase": {
-        "title": "Purchase signals (Meta)",
-        "desc": "Report a Purchase conversion to Meta the moment a qualified lead also meets its service's purchase criteria — so Sales-objective ads optimize for your best leads instead of waiting weeks for the real sale.",
+        "title": "Buying-intent signals (Meta)",
+        "desc": "Report a Sales qualified lead to Meta the moment a qualified lead also meets its service's purchase criteria — so ads optimize for your best leads instead of waiting weeks for the real sale. The Converted event stays reserved for money actually received.",
         "criteriaHint": "Define the bar per service: add a \"PURCHASE CRITERIA — <Service>\" section to that service's knowledge-base document (e.g. minimum budget per person, documents received). An optional \"Report value: 3000 AED per person\" line sets the reported value.",
-        "strictnessHint": "Keep criteria strict — Meta optimizes toward whatever you call a purchase. Loose criteria buy cheap, unqualified leads at scale."
+        "strictnessHint": "Keep criteria strict — Meta optimizes toward whatever you call a qualified lead. Loose criteria buy cheap, unqualified leads at scale."
       },
       "alerts": {
         "title": "Admin alerts & templates",

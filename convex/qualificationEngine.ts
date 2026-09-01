@@ -29,6 +29,7 @@ import { latestUserMessage } from "./lib/ai/query";
 import { toChatMessages } from "./lib/ai/context";
 import { generateReply } from "./lib/ai/generate";
 import { applyStageTransition, seedStageConversionEvent } from "./funnel";
+import { PURCHASE_SIGNAL_PROXY_STAGE } from "./lib/funnel";
 import {
   buildPurchasePrompt,
   parsePurchaseVerdict,
@@ -1072,11 +1073,31 @@ export const completeQualification = internalMutation({
 // signals-design.md). A second, stricter judge that runs ONLY on
 // already-qualified sessions: does this lead also meet its service's
 // owner-editable `PURCHASE CRITERIA — <Service>` KB section? If yes,
-// seed the `purchased` conversionEvents row directly — WITHOUT moving
-// the operational funnel stage — so Meta's Sales-objective campaign
-// gets its Purchase the moment the lead is highly qualified, and the
-// later real sale (agent-marked `purchased`) links the same
-// `${conversationId}:purchased` row instead of double-sending.
+// seed a conversionEvents row directly — WITHOUT moving the operational
+// funnel stage — so Meta gets the quality signal the moment the lead is
+// highly qualified, and the later agent-marked stage links the SAME row
+// instead of double-sending.
+//
+// RE-POINTED (CAPI lifecycle spec §2.4/§22): this judge used to seed the
+// `purchased` row, which sent Meta a `Purchase` — the CONVERTED
+// milestone — for a lead that had paid nothing. That is precisely the
+// "Converted before payment" the lifecycle spec forbids, and it
+// contaminated the one event the whole integration exists to keep clean:
+// a Purchase feed mixing real receipts with LLM intent guesses teaches
+// Meta to optimize for leads that look ready, not leads that pay.
+//
+// The verdict is an INTENT judgement ("this lead meets the service's
+// purchase criteria"), never a receipt, so it now reports the SQL
+// milestone (`PURCHASE_SIGNAL_PROXY_STAGE` = `price_quoted` →
+// `InitiateCheckout`, `lead_stage: "SQL"`), which is what the verdict
+// actually evidences. CONVERTED is left to a recorded payment, and
+// `seedStageConversionEvent`'s payment guard now refuses a valueless
+// `purchased` from ANY caller, so this cannot regress silently.
+//
+// The dedup story is unchanged, just moved: the row is
+// `${conversationId}:price_quoted`, so an agent who later moves the
+// conversation to Price quoted links the existing row rather than
+// double-sending.
 // ============================================================
 
 /**
@@ -1231,18 +1252,18 @@ export const applyPurchaseVerdict = internalMutation({
       value !== undefined
         ? (verdict.currency ?? account?.defaultCurrency ?? "USD")
         : undefined;
-    // Did a row already exist (agent marked the real sale first)? Decides
+    // Did a row already exist (an agent reached this stage first)? Decides
     // whether this fire deserves its own notification.
     const existing = await ctx.db
       .query("conversionEvents")
       .withIndex("by_event_id", (q) =>
-        q.eq("eventId", `${args.conversationId}:purchased`),
+        q.eq("eventId", `${args.conversationId}:${PURCHASE_SIGNAL_PROXY_STAGE}`),
       )
       .first();
     const { conversionEventId } = await seedStageConversionEvent(ctx, {
       accountId: args.accountId,
       conversation,
-      stage: "purchased",
+      stage: PURCHASE_SIGNAL_PROXY_STAGE,
       ...(value !== undefined ? { value, currency } : {}),
     });
     if (!conversionEventId) {
@@ -1294,7 +1315,7 @@ export const applyPurchaseVerdict = internalMutation({
           type: "purchase_signal",
           conversationId: args.conversationId,
           contactId: session.contactId,
-          title: "Purchase signal sent to Meta",
+          title: "Buying-intent signal sent to Meta",
           body,
         });
       }

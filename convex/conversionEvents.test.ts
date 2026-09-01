@@ -77,7 +77,7 @@ async function seedEvent(
   );
 }
 
-const env = ["META_CAPI_DATASET_ID", "META_CAPI_ACCESS_TOKEN", "LANDING_CONVERSION_URL", "WA_CONVERSION_SHARED_SECRET", "META_CAPI_TEST_EVENT_CODE"];
+const env = ["META_CAPI_DATASET_ID", "META_CAPI_ACCESS_TOKEN", "LANDING_CONVERSION_URL", "WA_CONVERSION_SHARED_SECRET", "META_CAPI_TEST_EVENT_CODE", "META_CAPI_MATCH_KEYS"];
 const orig: Record<string, string | undefined> = {};
 for (const k of env) orig[k] = process.env[k];
 const origFetch = globalThis.fetch;
@@ -244,7 +244,15 @@ test("capi: POSTs the business_messaging payload and marks sent + fbTraceId", as
   expect(ev.messaging_channel).toBe("whatsapp");
   expect(ev.user_data.whatsapp_business_account_id).toBe("WABA1");
   expect(ev.user_data.ctwa_clid).toBe("clid-1");
-  expect(ev.custom_data).toEqual({ value: 1500, currency: "AED" });
+  // Lifecycle label + CRM id ride in custom_data, because Meta's
+  // business-messaging `event_name` enum has no CONVERTED member — this is
+  // what Events Manager Custom Conversions segment on (spec §1/§9).
+  expect(ev.custom_data).toEqual({
+    crm_lead_id: conversationId,
+    lead_stage: "CONVERTED",
+    value: 1500,
+    currency: "AED",
+  });
   const row = await t.run((ctx) => ctx.db.get(id));
   expect(row?.status).toBe("sent");
   expect(row?.fbTraceId).toBe("trace-9");
@@ -1304,3 +1312,133 @@ test("the access token never appears in a request body", async () => {
 
   expect(JSON.stringify(captured.get())).not.toContain("super-secret-token");
 });
+
+// ============================================================
+// CAPI payload: lifecycle labelling and the match-key kill switch.
+//
+// These cover the half of the Meta integration that no status-based test
+// can see. A payload missing `lead_stage` still returns 200; a payload
+// whose `ph` was normalized by the WRONG rule also returns 200. Both
+// simply never attribute, which is indistinguishable from "the ad had no
+// conversions" unless something asserts the shape.
+// ============================================================
+
+test("capi: custom_data carries the CRM lead id and the lifecycle label", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    stage: "qualified",
+    eventName: "QualifiedLead",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  const customData = event.custom_data as Record<string, unknown>;
+
+  // Meta's business-messaging `event_name` enum has no MQL member, so the
+  // lifecycle meaning has to travel as data. This is the field Custom
+  // Conversions and our own reporting segment on.
+  expect(customData.lead_stage).toBe("MQL");
+  expect(customData.crm_lead_id).toBe(conversationId);
+});
+
+test("capi: a milestone that carried money reports value and currency", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    stage: "purchased",
+    eventName: "Purchase",
+    value: 4200,
+    currency: "AED",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  const customData = event.custom_data as Record<string, unknown>;
+  expect(customData.lead_stage).toBe("CONVERTED");
+  expect(customData.value).toBe(4200);
+  expect(customData.currency).toBe("AED");
+});
+
+test("capi: META_CAPI_MATCH_KEYS=off falls back to the documented-minimal pair", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  process.env.META_CAPI_MATCH_KEYS = "off";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    identifier: "clid-off",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  const userData = event.user_data as Record<string, unknown>;
+
+  // The kill switch drops the OPTIONAL keys and must leave the two the
+  // channel actually requires untouched — otherwise flipping it to dodge
+  // a warning would take delivery down with it.
+  expect(userData.ph).toBeUndefined();
+  expect(userData.em).toBeUndefined();
+  expect(userData.ctwa_clid).toBe("clid-off");
+  expect(userData.whatsapp_business_account_id).toBe("WABA1");
+});
+
+test("capi: a local-format phone is hashed with META's leading-zero rule, not the CRM's", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const captured = captureCapiBody();
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    phone: "0585824488",
+  });
+
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const event = (captured.get()!.data as Array<Record<string, unknown>>)[0];
+  const userData = event.user_data as Record<string, unknown>;
+
+  // THE REGRESSION THIS EXISTS FOR. `lib/phone.ts` keeps the trunk zero on
+  // purpose (it is the `by_account_phone` dedup key); Meta strips leading
+  // zeros before hashing ITS copy. Hashing through the CRM's own
+  // normalizer therefore produces a digest Meta never computes — and the
+  // request still returns 200, so nothing else in the system notices.
+  const { sha256Hex } = await import("./lib/metaHash");
+  expect(userData.ph).toEqual([await sha256Hex("585824488")]);
+  expect(userData.ph).not.toEqual([await sha256Hex("0585824488")]);
+});
+
