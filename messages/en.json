@@ -597,9 +597,10 @@
       "recordedYes": "Recorded: Yes",
       "recordedYesValue": "Recorded: {value} {currency}",
       "recordedNo": "Recorded: No \u2014 not sent to Meta",
+      "recordPayment": "Payment received \u2014 record it now",
       "fromStage": "from CRM stage",
       "readOnly": "You cannot answer on this lead.",
-      "footnote": "One question at a time. Answers are final \u2014 only a Yes is reported to Meta; a No is kept for your reporting.",
+      "footnote": "One question at a time. Only a Yes is reported to Meta; a No is kept for your reporting. Answers are final \u2014 except payment, which you can record whenever the money arrives.",
       "sequenceEnded": "Nothing further to record for this lead.",
       "reason": {
         "spam": "Spam",

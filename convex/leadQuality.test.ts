@@ -34,6 +34,7 @@ function statesOf(
         blocked: s.blocked,
         answer: s.answer,
         viaStage: s.viaStage,
+        revisable: s.revisable,
       },
     ]),
   );
@@ -141,6 +142,42 @@ describe("stepStates", () => {
     expect(st.genuine).toMatchObject({ locked: true, answer: "yes", viaStage: true });
     expect(st.intent).toMatchObject({ locked: true, answer: "yes", viaStage: true });
     expect(st.payment.locked).toBe(false);
+  });
+
+  it("marks a payment NO as revisable — and nothing else", () => {
+    // Deals close late. A lead marked unpaid on Tuesday pays on Friday, and
+    // before this the `no` was permanent, so its Purchase — the most
+    // valuable event the card sends — could never be reported.
+    const st = statesOf([
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "yes", at: T0 + 1 },
+      { step: "intent", answer: "yes", at: T0 + 2 },
+      { step: "payment", answer: "no", at: T0 + 3 },
+    ]);
+    expect(st.payment).toMatchObject({ locked: true, answer: "no", revisable: true });
+    // The earlier questions are NOT revisable: their events are already on
+    // the wire and Meta has no retraction.
+    for (const step of ["genuine", "service", "intent"] as const) {
+      expect(st[step].revisable).toBe(false);
+    }
+  });
+
+  it("never marks a payment YES revisable — that event is already sent", () => {
+    const st = statesOf([
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "yes", at: T0 + 1 },
+      { step: "intent", answer: "yes", at: T0 + 2 },
+      { step: "payment", answer: "yes", at: T0 + 3, value: 900, currency: "AED" },
+    ]);
+    expect(st.payment).toMatchObject({ locked: true, answer: "yes", revisable: false });
+  });
+
+  it("does not mark an UNANSWERED or stage-implied payment revisable", () => {
+    // Nothing to revise while the question is still open...
+    expect(statesOf([]).payment.revisable).toBe(false);
+    // ...and implication only ever yields a `yes`, which is final.
+    const implied = statesOf([], "purchased");
+    expect(implied.payment).toMatchObject({ locked: true, viaStage: true, revisable: false });
   });
 
   it("treats `lost` as terminal, NOT as past every milestone", () => {
@@ -592,4 +629,220 @@ test("stage implication seeds an untouched lead, then yields to the answer log",
   });
   expect(res.sentToMeta).toBe(true);
   expect(await eventStages(t, fresh.conversationId)).toContain("price_quoted");
+});
+
+// ============================================================
+// The late payment. The one answer this card lets an agent change.
+// ============================================================
+
+/** Walk the first three questions so `payment` is the open one. */
+async function answerUpToPayment(
+  asUser: ReturnType<TestConvex<typeof schema>["withIdentity"]>,
+  conversationId: Id<"conversations">,
+) {
+  for (const step of ["genuine", "service", "intent"] as const) {
+    await asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step,
+      answer: "yes",
+    });
+  }
+}
+
+test("a payment NO can later become a YES, and only then sends the Purchase", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+  await answerUpToPayment(asUser, conversationId);
+
+  // Not paid yet — recorded, and deliberately never reported.
+  const unpaid = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "no",
+  });
+  expect(unpaid.sentToMeta).toBe(false);
+  expect(await eventStages(t, conversationId)).not.toContain("purchased");
+
+  // The panel offers the correction rather than closing the question for
+  // good, which is what used to strand the Purchase forever.
+  let state = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(state.steps.find((s) => s.step === "payment")).toMatchObject({
+    locked: true,
+    answer: "no",
+    revisable: true,
+  });
+
+  // The customer pays a week later.
+  const paid = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "yes",
+    value: 3200,
+  });
+  expect(paid.sentToMeta).toBe(true);
+  expect(await eventStages(t, conversationId)).toContain("purchased");
+
+  const purchase = await t.run(async (ctx) => {
+    const rows = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect();
+    return rows.find((r) => r.stage === "purchased");
+  });
+  expect(purchase?.eventName).toBe("Purchase");
+  expect(purchase?.value).toBe(3200);
+  expect(purchase?.currency).toBe("AED");
+
+  // Append-only: BOTH the original verdict and the correction survive, so
+  // the log still shows the deal was once marked unpaid.
+  const rows = await t.run((ctx) =>
+    ctx.db
+      .query("leadQualityAnswers")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
+  );
+  const payments = rows.filter((r) => r.step === "payment");
+  expect(payments.map((r) => r.answer).sort()).toEqual(["no", "yes"]);
+
+  // And now it is final in both directions.
+  state = await asUser.query(api.leadQuality.getCardState, { conversationId });
+  expect(state.steps.find((s) => s.step === "payment")).toMatchObject({
+    answer: "yes",
+    revisable: false,
+  });
+});
+
+test("a payment YES can never be taken back — Meta has no retraction", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+  await answerUpToPayment(asUser, conversationId);
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "yes",
+    value: 1500,
+  });
+
+  // The Purchase is already on the wire. Un-saying it would only make the
+  // log disagree with what Meta was told.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "payment",
+      answer: "no",
+    }),
+  ).rejects.toThrow();
+});
+
+test("the revision still demands an amount, and still refuses out of sequence", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+  await answerUpToPayment(asUser, conversationId);
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "no",
+  });
+
+  // `seedStageConversionEvent` refuses a valueless `purchased`, so the
+  // revision must collect money like any other Purchase.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "payment",
+      answer: "yes",
+    }),
+  ).rejects.toThrow();
+  expect(await eventStages(t, conversationId)).not.toContain("purchased");
+
+  // Revisability is not a general re-opening: the earlier milestones stay
+  // shut.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "genuine",
+      answer: "no",
+    }),
+  ).rejects.toThrow();
+});
+
+test("a payment NO reached without the sequence stays unrevisable", async () => {
+  // A lead rejected at the first question never reaches payment at all, so
+  // there is no `no` to revise and the correction must not become a side
+  // door into the sequence.
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "no",
+    reason: "spam",
+  });
+
+  const state = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(state.steps.find((s) => s.step === "payment")).toMatchObject({
+    blocked: true,
+    revisable: false,
+  });
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step: "payment",
+      answer: "yes",
+      value: 4000,
+    }),
+  ).rejects.toThrow();
+  expect(await eventStages(t, conversationId)).toEqual(["new_lead"]);
+});
+
+test("a LOST deal that later pays still reports the Purchase (stage stays lost)", async () => {
+  // The recovery case the revision exists for, at its most extreme: the
+  // deal was written off, then the customer paid.
+  //
+  // The Meta event — the whole point — fires. The CRM stage does NOT move
+  // back, because `applyStageTransition` is called with `neverDowngrade`
+  // and `lost` is appended LAST in FUNNEL_STAGES, so `purchased` reads as
+  // backwards from it. That is a KNOWN limitation, asserted here so it is
+  // a decision on the record rather than a surprise: the lead-quality
+  // report counts conversion EVENTS and so counts this sale, while "Funnel
+  // by stage" reads stages and still files it under Lost. Recovering a lost
+  // deal properly means clearing its loss reason and detail too, which is
+  // a larger change than this correction.
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+  await answerUpToPayment(asUser, conversationId);
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "no",
+  });
+  await asUser.mutation(api.funnel.setStage, {
+    conversationId,
+    stage: "lost",
+    lossCategory: "price",
+    lossDetail: "went quiet for weeks",
+  });
+
+  const res = await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "payment",
+    answer: "yes",
+    value: 777,
+  });
+  expect(res.sentToMeta).toBe(true);
+  expect(await eventStages(t, conversationId)).toContain("purchased");
+
+  const conv = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(conv?.funnel?.stage).toBe("lost");
 });

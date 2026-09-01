@@ -116,7 +116,17 @@ export function latestFor(
  * An answered question is answered for good: the Meta event it produced can
  * only fire once (the outbox dedups on `${conversationId}:${stage}`), so
  * offering the buttons again would invite a click that silently does
- * nothing.
+ * nothing. The single exception is `revisable`, below.
+ *
+ * `revisable` — locked with a `no`, but still changeable to `yes`. TRUE
+ * ONLY for `payment`, and only in that one direction. Money is the one
+ * milestone here whose answer legitimately changes with time: a deal marked
+ * unpaid on Tuesday is paid on Friday, and before this the panel had no way
+ * to say so — the lead stayed "no" forever and its `Purchase` never
+ * reached Meta, which is the single most valuable event this card exists to
+ * send. The reverse is refused: a `yes` already put a `Purchase` on the
+ * wire and Meta has no retraction, so un-saying it would only make the log
+ * disagree with what was reported.
  *
  * `available` — answerable RIGHT NOW. Only one step is ever available: the
  * questions are a sequence, and each opens only once the one before it was
@@ -136,6 +146,8 @@ export type StepState = {
   locked: boolean;
   available: boolean;
   blocked: boolean;
+  /** A recorded `no` here may still be replaced by a `yes`. Payment only. */
+  revisable: boolean;
   answer: "yes" | "no" | null;
   viaStage: boolean;
   value?: number;
@@ -195,11 +207,17 @@ export function stepStates(input: {
         ? ("yes" as const)
         : null;
 
+    // Payment, and payment alone, can be un-said in one direction. An
+    // implied lock is never revisable: implication only ever yields a
+    // `yes`, and a `yes` is final.
+    const revisable = step === "payment" && explicit?.answer === "no";
+
     const state: StepState = {
       step,
       locked,
       available: !locked && gateOpen,
       blocked: !locked && !gateOpen,
+      revisable,
       answer,
       viaStage: !explicit && implied,
       ...(explicit?.value !== undefined
@@ -315,6 +333,13 @@ export const getCardState = accountQuery({
  * `requireConversationAccess(..., "own")`), because this reaches the same
  * outbox by a different door and must not be the weaker one.
  *
+ * A payment `no` may later be revised to `yes` — the ONLY answer this card
+ * lets an agent change, and only in that direction. See
+ * `StepState.revisable`. The revision writes a second row rather than
+ * editing the first: `leadQualityAnswers` is an append-only log and
+ * `latestFor` reads the newest per step, so both the original verdict and
+ * the correction survive for reporting.
+ *
  * The sales-checklist gate that `setStage` applies to `purchased` is
  * deliberately NOT applied here (approved 2026-09-01). The card records that
  * money arrived — a fact — rather than certifying deal hygiene, and putting
@@ -346,12 +371,16 @@ export const answer = accountMutation({
       throw new ConvexError({ code: "BAD_REQUEST", reason: "value_required" });
     }
 
-    // Answer once. The Meta event a `yes` produces can only fire once (the
-    // outbox dedups on `${conversationId}:${stage}`), so a second answer
-    // could never reach Meta and would only make the log disagree with what
-    // was actually reported. Enforced server-side rather than by hiding the
-    // buttons, because the panel is a live view that another agent may have
-    // answered from a second later.
+    // Answer once, with one exception. The Meta event a `yes` produces can
+    // only fire once (the outbox dedups on `${conversationId}:${stage}`),
+    // so re-answering could never reach Meta and would only make the log
+    // disagree with what was actually reported. Enforced server-side rather
+    // than by hiding the buttons, because the panel is a live view that
+    // another agent may have answered from a second later.
+    //
+    // The exception is `revising` below: a payment `no` that becomes a
+    // `yes` has no event to contradict — none was ever sent — so it seeds
+    // the `Purchase` for the first time rather than duplicating one.
     const existing = await ctx.db
       .query("leadQualityAnswers")
       .withIndex("by_conversation", (q) =>
@@ -363,7 +392,18 @@ export const answer = accountMutation({
       currentStage: conversation.funnel?.stage ?? null,
     });
     const prior = priorStates.find((st) => st.step === step);
-    if (args.answer !== "dismissed") {
+
+    // The one reversal this card permits: a recorded `no` on PAYMENT,
+    // replaced by a `yes`. Deals close late — a lead marked unpaid pays a
+    // week later — and without this the `no` was permanent and its
+    // `Purchase` could never be reported, which is exactly the event the
+    // integration exists to send. `revisable` is computed in `stepStates`
+    // so the panel and this guard can never disagree about what may be
+    // changed; it is false for every other step and for a `yes`, which
+    // Meta has already been told and cannot be un-told.
+    const revising = args.answer === "yes" && prior?.revisable === true;
+
+    if (args.answer !== "dismissed" && !revising) {
       if (prior?.locked) {
         throw new ConvexError({
           code: "BAD_REQUEST",

@@ -25,6 +25,8 @@ type StepState = {
   locked: boolean;
   available: boolean;
   blocked: boolean;
+  /** Locked with a `no` that may still be corrected to `yes`. Payment only. */
+  revisable: boolean;
   answer: "yes" | "no" | null;
   viaStage: boolean;
   value?: number;
@@ -59,6 +61,15 @@ type StepState = {
  *
  * A negative answer never reaches Meta — not by a check here, but because
  * `leadQuality.answer` has no code path from `no` to the conversion outbox.
+ *
+ * PAYMENT is the one answer that can be changed, and only from `no` to
+ * `yes`. Deals close late: a lead marked unpaid pays the following week,
+ * and with no way to say so the `no` was permanent and its `Purchase` — the
+ * most valuable event this card sends — could never be reported. The
+ * reverse stays refused, because a `yes` already put that event on the wire
+ * and Meta has no retraction. The server decides this (`StepState.revisable`
+ * in convex/leadQuality.ts); the panel only renders what it is told, so the
+ * two cannot drift.
  */
 export function LeadQualityCard({
   conversationId,
@@ -237,20 +248,55 @@ function StepRow({
       </p>
 
       {state.locked ? (
-        <p className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground">
-          <Check className="h-3 w-3 shrink-0" />
-          {state.answer === "yes"
-            ? state.value !== undefined
-              ? t("recordedYesValue", {
-                  value: state.value,
-                  currency: state.currency ?? currency,
-                })
-              : t("recordedYes")
-            : t("recordedNo")}
-          {/* An implied lock had no author — say so rather than implying
-              somebody answered this question here. */}
-          {state.viaStage ? ` · ${t("fromStage")}` : ""}
-        </p>
+        <>
+          <p className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground">
+            <Check className="h-3 w-3 shrink-0" />
+            {state.answer === "yes"
+              ? state.value !== undefined
+                ? t("recordedYesValue", {
+                    value: state.value,
+                    currency: state.currency ?? currency,
+                  })
+                : t("recordedYes")
+              : t("recordedNo")}
+            {/* An implied lock had no author — say so rather than implying
+                somebody answered this question here. */}
+            {state.viaStage ? ` · ${t("fromStage")}` : ""}
+          </p>
+          {/* The one correction this card allows: money that arrived after
+              the question was answered. Rendered on the server's say-so
+              (`revisable`), never inferred from the step name here, so the
+              panel cannot offer a button the mutation would refuse. */}
+          {state.revisable && canAnswer ? (
+            showAmount ? (
+              <AmountEntry
+                currency={currency}
+                amount={amount}
+                onAmount={onAmount}
+                busy={busy}
+                onConfirm={() =>
+                  void onSubmit({
+                    step: state.step,
+                    answer: "yes",
+                    value: Number(amount),
+                  })
+                }
+                onCancel={() => setShowAmount(false)}
+                t={t}
+              />
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-1.5 h-7 w-full text-[11px]"
+                disabled={busy}
+                onClick={() => setShowAmount(true)}
+              >
+                {t("recordPayment")}
+              </Button>
+            )
+          ) : null}
+        </>
       ) : !canAnswer ? (
         <p className="mt-1 text-[11px] text-muted-foreground">{t("readOnly")}</p>
       ) : showReasons ? (
@@ -277,38 +323,21 @@ function StepRow({
           </button>
         </div>
       ) : showAmount ? (
-        <div className="mt-1.5 flex items-center gap-1.5">
-          <span className="text-[11px] text-muted-foreground">{currency}</span>
-          <Input
-            autoFocus
-            inputMode="decimal"
-            value={amount}
-            onChange={(e) => onAmount(e.target.value)}
-            className="h-7 w-24 text-xs"
-          />
-          <Button
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            disabled={busy || !(Number(amount) > 0)}
-            onClick={() =>
-              void onSubmit({
-                step: state.step,
-                answer: "yes",
-                value: Number(amount),
-              })
-            }
-          >
-            {t("confirm")}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 px-2 text-[11px]"
-            onClick={() => setShowAmount(false)}
-          >
-            {t("cancel")}
-          </Button>
-        </div>
+        <AmountEntry
+          currency={currency}
+          amount={amount}
+          onAmount={onAmount}
+          busy={busy}
+          onConfirm={() =>
+            void onSubmit({
+              step: state.step,
+              answer: "yes",
+              value: Number(amount),
+            })
+          }
+          onCancel={() => setShowAmount(false)}
+          t={t}
+        />
       ) : (
         <div className="mt-1.5 flex gap-1.5">
           <Button
@@ -344,6 +373,63 @@ function StepRow({
           </Button>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The amount field behind every `Purchase`.
+ *
+ * Shared by the two paths that can record one — answering payment for the
+ * first time, and correcting an earlier `no` — because they must ask for
+ * the same thing in the same way. A separate copy for the correction is how
+ * the two drift, and the amount is not cosmetic: `seedStageConversionEvent`
+ * refuses a valueless `purchased`, so a path that forgot to collect it
+ * would fail at the server instead of at the field.
+ */
+function AmountEntry({
+  currency,
+  amount,
+  onAmount,
+  busy,
+  onConfirm,
+  onCancel,
+  t,
+}: {
+  currency: string;
+  amount: string;
+  onAmount: (v: string) => void;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  return (
+    <div className="mt-1.5 flex items-center gap-1.5">
+      <span className="text-[11px] text-muted-foreground">{currency}</span>
+      <Input
+        autoFocus
+        inputMode="decimal"
+        value={amount}
+        onChange={(e) => onAmount(e.target.value)}
+        className="h-7 w-24 text-xs"
+      />
+      <Button
+        size="sm"
+        className="h-7 px-2 text-[11px]"
+        disabled={busy || !(Number(amount) > 0)}
+        onClick={onConfirm}
+      >
+        {t("confirm")}
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7 px-2 text-[11px]"
+        onClick={onCancel}
+      >
+        {t("cancel")}
+      </Button>
     </div>
   );
 }
