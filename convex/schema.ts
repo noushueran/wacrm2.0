@@ -2743,8 +2743,11 @@ export default defineSchema({
     // funnel stages in `lib/leadQuality.ts` — NOT stored as a stage here,
     // because the question ("is this a real customer?") and the stage
     // (`qualified`) are deliberately different vocabularies.
+    // Additive union literal — `service` was added after `genuine`/`intent`/
+    // `payment` shipped, so existing rows keep validating.
     step: v.union(
       v.literal("genuine"),
+      v.literal("service"),
       v.literal("intent"),
       v.literal("payment"),
     ),

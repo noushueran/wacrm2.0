@@ -28,11 +28,26 @@ import { ConvexError } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { accountMutation, accountQuery } from "./lib/auth";
 import { requireConversationAccess } from "./lib/conversationAccess";
-import { applyStageTransition } from "./funnel";
+import { applyStageTransition, seedStageConversionEvent } from "./funnel";
 import { FUNNEL_STAGE_KEYS, type FunnelStageKey } from "./lib/funnel";
 
-/** The three milestones an agent can attest to, in funnel order. */
-export const QUALITY_STEPS = ["genuine", "intent", "payment"] as const;
+/**
+ * The milestones an agent attests to, in the order the SALES CONVERSATION
+ * establishes them — which is not the order `FUNNEL_STAGES` indexes them
+ * in, and deliberately so. Eligibility ("can we even serve this person?")
+ * is settled before intent ("do they want to book?"), because a traveller
+ * can badly want a visa they are not entitled to; asking about intent
+ * first wastes the answer.
+ *
+ * That mismatch is why `answer` seeds the conversion event directly rather
+ * than relying on `applyStageTransition` to do it — see there.
+ */
+export const QUALITY_STEPS = [
+  "genuine",
+  "service",
+  "intent",
+  "payment",
+] as const;
 export type QualityStep = (typeof QUALITY_STEPS)[number];
 
 export type QualityAnswer = "yes" | "no" | "dismissed";
@@ -44,9 +59,10 @@ export type QualityAnswer = "yes" | "no" | "dismissed";
  * place the two are joined.
  */
 export const STEP_STAGE: Record<QualityStep, FunnelStageKey> = {
-  genuine: "qualified",
-  intent: "price_quoted",
-  payment: "purchased",
+  genuine: "qualified", // QualifiedLead — a real person worth selling to
+  service: "itinerary_sent", // AddToCart — the service is a fit for them
+  intent: "price_quoted", // InitiateCheckout — they mean to book
+  payment: "purchased", // Purchase — money received
 };
 
 export type AnswerRecord = {
@@ -96,11 +112,20 @@ export function latestFor(
 /**
  * One step's state for the panel.
  *
- * `locked` is the whole point of the redesign: an answered question is
- * answered for good. The Meta event it produced can only fire once (the
- * outbox dedups on `${conversationId}:${stage}`), so offering the buttons
- * again would invite a click that silently does nothing — the panel says
- * "recorded" instead.
+ * `locked` — already answered here, or already implied by the CRM stage.
+ * An answered question is answered for good: the Meta event it produced can
+ * only fire once (the outbox dedups on `${conversationId}:${stage}`), so
+ * offering the buttons again would invite a click that silently does
+ * nothing.
+ *
+ * `available` — answerable RIGHT NOW. Only one step is ever available: the
+ * questions are a sequence, and each opens only once the one before it was
+ * answered YES.
+ *
+ * `blocked` — unreachable, because an earlier step was answered `no`. There
+ * is no point asking whether someone is serious about booking once they
+ * have been marked "not a real customer", and a panel that offered the
+ * question anyway would invite a contradictory record.
  *
  * `viaStage` distinguishes "an agent answered this here" from "the CRM
  * stage already passed this milestone". Both lock the step; only the first
@@ -109,6 +134,8 @@ export function latestFor(
 export type StepState = {
   step: QualityStep;
   locked: boolean;
+  available: boolean;
+  blocked: boolean;
   answer: "yes" | "no" | null;
   viaStage: boolean;
   value?: number;
@@ -117,15 +144,18 @@ export type StepState = {
 };
 
 /**
- * Every step's state at once — the panel shows all three and lets an agent
- * answer whichever they can, whenever they can.
+ * Every step's state, as a strict sequence.
  *
- * This replaced a strictly progressive one-question-at-a-time machine. The
- * pacing was wrong in practice: a salesperson often learns "they're serious"
- * and "they paid" in the same conversation, and forcing the second answer to
- * wait on a cooldown after the first meant the information was known and
- * unrecordable. Independent steps also mean a skipped middle question never
- * blocks the one that matters most.
+ * A first build showed all questions at once and let an agent answer any of
+ * them in any order. That produced records that could not be true together
+ * — a lead marked "payment received" while "is this a real customer?" sat
+ * unanswered — and it let the most valuable event fire without the cheaper
+ * signals that give Meta the funnel shape. One question at a time, each
+ * unlocked by a YES on the one before, is what keeps the reported funnel
+ * monotonic.
+ *
+ * A `no` ENDS the sequence rather than skipping a step: every later
+ * question presupposes the earlier answer was yes.
  *
  * Pure and total — no clock, no database — so the table is unit-testable.
  */
@@ -133,8 +163,24 @@ export function stepStates(input: {
   answers: AnswerRecord[];
   currentStage: FunnelStageKey | null | undefined;
 }): StepState[] {
+  // Stage implication seeds the sequence from CRM state that predates the
+  // panel — so a lead an agent had already walked to `price_quoted` by hand
+  // is not asked whether it is a real customer.
+  //
+  // It applies ONLY while the panel is untouched. Once any answer exists,
+  // the log owns the sequence outright, because the panel MOVES the stage
+  // as it goes and the question order is not the funnel's index order:
+  // answering `service` advances the conversation to `itinerary_sent`,
+  // which sits deeper than the `price_quoted` that `intent` maps to, so
+  // implication would then lock the very next question and its
+  // `InitiateCheckout` would never fire.
+  const untouched = !input.answers.some(
+    (a) => a.answer === "yes" || a.answer === "no",
+  );
+
+  let gateOpen = true;
   return QUALITY_STEPS.map((step) => {
-    const implied = stageImplies(input.currentStage, step);
+    const implied = untouched && stageImplies(input.currentStage, step);
     const latest = latestFor(input.answers, step);
     // A dismissal is not an answer; it never locks a step.
     const explicit =
@@ -142,27 +188,41 @@ export function stepStates(input: {
         ? latest
         : null;
 
-    if (explicit) {
-      return {
-        step,
-        locked: true,
-        answer: explicit.answer as "yes" | "no",
-        viaStage: false,
-        ...(explicit.value !== undefined
-          ? { value: explicit.value, currency: explicit.currency }
-          : {}),
-        answeredAt: explicit.at,
-      };
-    }
-    if (implied) {
-      return { step, locked: true, answer: "yes" as const, viaStage: true };
-    }
-    return { step, locked: false, answer: null, viaStage: false };
+    const locked = Boolean(explicit) || implied;
+    const answer = explicit
+      ? (explicit.answer as "yes" | "no")
+      : implied
+        ? ("yes" as const)
+        : null;
+
+    const state: StepState = {
+      step,
+      locked,
+      available: !locked && gateOpen,
+      blocked: !locked && !gateOpen,
+      answer,
+      viaStage: !explicit && implied,
+      ...(explicit?.value !== undefined
+        ? { value: explicit.value, currency: explicit.currency }
+        : {}),
+      ...(explicit ? { answeredAt: explicit.at } : {}),
+    };
+
+    // The gate for the NEXT step: open only behind a recorded yes. An
+    // unanswered step closes it (nothing past the current question is
+    // reachable), and so does a `no`.
+    if (!locked || answer !== "yes") gateOpen = false;
+
+    return state;
   });
 }
 
+// Mirrors `leadQualityAnswers.step` in schema.ts — the two are separate
+// declarations and must be changed together; a step added to only one is
+// accepted by the mutation and then rejected by the insert (or vice versa).
 const stepValidator = v.union(
   v.literal("genuine"),
+  v.literal("service"),
   v.literal("intent"),
   v.literal("payment"),
 );
@@ -302,14 +362,26 @@ export const answer = accountMutation({
       answers: toRecords(existing),
       currentStage: conversation.funnel?.stage ?? null,
     });
-    if (
-      args.answer !== "dismissed" &&
-      priorStates.find((st) => st.step === step)?.locked
-    ) {
-      throw new ConvexError({
-        code: "BAD_REQUEST",
-        reason: "already_answered",
-      });
+    const prior = priorStates.find((st) => st.step === step);
+    if (args.answer !== "dismissed") {
+      if (prior?.locked) {
+        throw new ConvexError({
+          code: "BAD_REQUEST",
+          reason: "already_answered",
+        });
+      }
+      // The sequence is enforced HERE, not just by the panel hiding
+      // buttons. Answering out of order would report a deep milestone with
+      // no shallower ones behind it — Meta would see a Purchase on a lead
+      // it was never told was qualified — and would leave a record that
+      // cannot be true (payment received on a lead nobody confirmed was a
+      // real customer).
+      if (!prior?.available) {
+        throw new ConvexError({
+          code: "BAD_REQUEST",
+          reason: "out_of_sequence",
+        });
+      }
     }
 
     const account = await ctx.db.get(ctx.accountId);
@@ -318,32 +390,44 @@ export const answer = accountMutation({
     let conversionEventId: Id<"conversionEvents"> | undefined;
     if (args.answer === "yes") {
       const stage = STEP_STAGE[step];
+      const valueArgs =
+        step === "payment"
+          ? { value: args.value, currency }
+          : {};
+
+      // Seed the Meta event FIRST and unconditionally.
+      //
+      // The questions run in sales order, which is not `FUNNEL_STAGES`
+      // index order: `service` maps to `itinerary_sent` and the `intent`
+      // that follows it maps to the EARLIER `price_quoted`. Left to
+      // `applyStageTransition`, whose `neverDowngrade` guard returns before
+      // seeding, that step's event would silently never fire. Seeding here
+      // makes the event answer to the question asked rather than to the
+      // funnel's ordering. Idempotent: the `${conversationId}:${stage}`
+      // dedup means a second call returns the existing row.
+      const seeded = await seedStageConversionEvent(ctx, {
+        accountId: ctx.accountId,
+        conversation,
+        stage,
+        ...valueArgs,
+      });
+      conversionEventId = seeded.conversionEventId;
+
+      // Then advance the operational funnel — forward only. A backward
+      // stage is refused here (and only here), so the CRM's own record of
+      // where a deal stands never regresses because of question ordering.
       await applyStageTransition(ctx, {
         accountId: ctx.accountId,
         conversation,
         stage,
         byUserId: ctx.userId,
         auto: false,
-        // The card only asks about steps the stage does not already imply,
-        // so this is always forward. Passed anyway: a future caller reaching
-        // this mutation out of order must not walk a lead backwards.
         neverDowngrade: true,
         ...(step === "payment"
           ? { saleValue: args.value, saleCurrency: currency }
           : {}),
         defaultCurrency: account?.defaultCurrency ?? "USD",
       });
-      // Looked up rather than returned by `applyStageTransition`, which
-      // reports only whether it applied. An existing row is the right answer
-      // too: it means this milestone was already reported, and linking it
-      // records that this answer did not double-send.
-      const seeded = await ctx.db
-        .query("conversionEvents")
-        .withIndex("by_event_id", (q) =>
-          q.eq("eventId", `${args.conversationId}:${stage}`),
-        )
-        .first();
-      conversionEventId = seeded?._id;
     }
 
     const trimmedReason = args.reason?.trim();

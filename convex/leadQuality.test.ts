@@ -28,33 +28,83 @@ function statesOf(
   return Object.fromEntries(
     stepStates({ answers, currentStage }).map((s) => [
       s.step,
-      { locked: s.locked, answer: s.answer, viaStage: s.viaStage },
+      {
+        locked: s.locked,
+        available: s.available,
+        blocked: s.blocked,
+        answer: s.answer,
+        viaStage: s.viaStage,
+      },
     ]),
   );
 }
 
+/** Which step the panel would show as answerable. */
+function openStep(
+  answers: AnswerRecord[],
+  currentStage: Parameters<typeof stepStates>[0]["currentStage"] = null,
+) {
+  return stepStates({ answers, currentStage }).find((s) => s.available)?.step ?? null;
+}
+
 describe("stepStates", () => {
-  it("opens with all three questions unanswered", () => {
+  it("opens ONLY the first question — nothing else is answerable yet", () => {
     const st = statesOf([]);
-    for (const step of ["genuine", "intent", "payment"] as const) {
-      expect(st[step]).toEqual({ locked: false, answer: null, viaStage: false });
+    expect(st.genuine).toMatchObject({ available: true, blocked: false });
+    for (const step of ["service", "intent", "payment"] as const) {
+      expect(st[step]).toMatchObject({ locked: false, available: false });
     }
+    expect(openStep([])).toBe("genuine");
   });
 
-  it("locks each step INDEPENDENTLY — answering one never gates another", () => {
-    // The whole point of the redesign: a salesperson who learns "serious"
-    // and "paid" in one conversation can record both, and skipping the
-    // middle question does not block the one that matters most.
-    const st = statesOf([
-      { step: "payment", answer: "yes", at: T0, value: 2500, currency: "AED" },
-    ]);
-    expect(st.payment.locked).toBe(true);
-    expect(st.genuine.locked).toBe(false);
-    expect(st.intent.locked).toBe(false);
+  it("unlocks the next question only after a YES, one at a time", () => {
+    const answers: AnswerRecord[] = [];
+    expect(openStep(answers)).toBe("genuine");
+
+    answers.push({ step: "genuine", answer: "yes", at: T0 });
+    expect(openStep(answers)).toBe("service");
+    // And still exactly one is open.
+    expect(stepStates({ answers, currentStage: null }).filter((s) => s.available))
+      .toHaveLength(1);
+
+    answers.push({ step: "service", answer: "yes", at: T0 + 1 });
+    expect(openStep(answers)).toBe("intent");
+
+    answers.push({ step: "intent", answer: "yes", at: T0 + 2 });
+    expect(openStep(answers)).toBe("payment");
+
+    answers.push({
+      step: "payment", answer: "yes", at: T0 + 3, value: 2500, currency: "AED",
+    });
+    expect(openStep(answers)).toBeNull(); // sequence complete
+  });
+
+  it("a NO ends the sequence — later questions are blocked, not merely closed", () => {
+    // Every later question presupposes the earlier answer was yes. Asking
+    // "serious about booking?" of a lead marked "not a real customer"
+    // would invite a record that cannot be true.
+    const st = statesOf([{ step: "genuine", answer: "no", at: T0 }]);
+    expect(st.genuine).toMatchObject({ locked: true, answer: "no" });
+    for (const step of ["service", "intent", "payment"] as const) {
+      expect(st[step]).toMatchObject({ available: false, blocked: true });
+    }
+    expect(openStep([{ step: "genuine", answer: "no", at: T0 }])).toBeNull();
+  });
+
+  it("a NO midway blocks only what comes after it", () => {
+    const answers: AnswerRecord[] = [
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "no", at: T0 + 1 },
+    ];
+    const st = statesOf(answers);
+    expect(st.genuine.locked).toBe(true);
+    expect(st.service).toMatchObject({ locked: true, answer: "no" });
+    expect(st.intent.blocked).toBe(true);
+    expect(st.payment.blocked).toBe(true);
   });
 
   it("carries the recorded amount through for display", () => {
-    const [, , payment] = stepStates({
+    const [, , , payment] = stepStates({
       answers: [
         { step: "payment", answer: "yes", at: T0, value: 2500, currency: "AED" },
       ],
@@ -65,7 +115,7 @@ describe("stepStates", () => {
 
   it("locks a `no` too — an answer is an answer", () => {
     const st = statesOf([{ step: "genuine", answer: "no", at: T0 }]);
-    expect(st.genuine).toEqual({ locked: true, answer: "no", viaStage: false });
+    expect(st.genuine).toMatchObject({ locked: true, answer: "no", viaStage: false });
   });
 
   it("does NOT lock on a dismissal", () => {
@@ -79,7 +129,7 @@ describe("stepStates", () => {
       { step: "genuine", answer: "yes", at: T0 + 5000 },
     ];
     expect(latestFor(answers, "genuine")?.answer).toBe("yes");
-    expect(statesOf(answers).genuine).toEqual({
+    expect(statesOf(answers).genuine).toMatchObject({
       locked: true,
       answer: "yes",
       viaStage: false,
@@ -88,8 +138,8 @@ describe("stepStates", () => {
 
   it("treats a CRM stage past a milestone as an implied yes, marked as such", () => {
     const st = statesOf([], "price_quoted");
-    expect(st.genuine).toEqual({ locked: true, answer: "yes", viaStage: true });
-    expect(st.intent).toEqual({ locked: true, answer: "yes", viaStage: true });
+    expect(st.genuine).toMatchObject({ locked: true, answer: "yes", viaStage: true });
+    expect(st.intent).toMatchObject({ locked: true, answer: "yes", viaStage: true });
     expect(st.payment.locked).toBe(false);
   });
 
@@ -99,6 +149,7 @@ describe("stepStates", () => {
     // purchased" and imply all three were answered yes.
     const st = statesOf([], "lost");
     expect(st.genuine.locked).toBe(false);
+    expect(st.genuine.available).toBe(true);
     expect(stageImplies("lost", "payment")).toBe(false);
   });
 });
@@ -200,51 +251,86 @@ async function eventStages(
   return rows.map((r) => r.stage).sort();
 }
 
-test("yes on each step seeds exactly one Meta event of the right stage", async () => {
+test("answering the sequence reports all four milestones, in order", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedMember(t);
   const { conversationId } = await seedLead(t, accountId, userId);
 
-  let res = await asUser.mutation(api.leadQuality.answer, {
-    conversationId,
-    step: "genuine",
-    answer: "yes",
-  });
-  expect(res.sentToMeta).toBe(true);
-  expect(await eventStages(t, conversationId)).toEqual(["new_lead", "qualified"]);
-
-  res = await asUser.mutation(api.leadQuality.answer, {
-    conversationId,
-    step: "intent",
-    answer: "yes",
-  });
-  expect(res.sentToMeta).toBe(true);
-
-  res = await asUser.mutation(api.leadQuality.answer, {
+  for (const step of ["genuine", "service", "intent"] as const) {
+    const res = await asUser.mutation(api.leadQuality.answer, {
+      conversationId,
+      step,
+      answer: "yes",
+    });
+    expect(res.sentToMeta).toBe(true);
+  }
+  const paid = await asUser.mutation(api.leadQuality.answer, {
     conversationId,
     step: "payment",
     answer: "yes",
     value: 2499,
   });
-  expect(res.sentToMeta).toBe(true);
+  expect(paid.sentToMeta).toBe(true);
 
+  // Lead (automatic) + the four the agent attested to.
   expect(await eventStages(t, conversationId)).toEqual([
+    "itinerary_sent",
     "new_lead",
     "price_quoted",
     "purchased",
     "qualified",
   ]);
-  const purchase = await t.run((ctx) =>
+
+  const rows = await t.run((ctx) =>
     ctx.db
       .query("conversionEvents")
-      .withIndex("by_event_id", (q) =>
-        q.eq("eventId", `${conversationId}:purchased`),
-      )
-      .first(),
+      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
+      .collect(),
   );
-  expect(purchase?.eventName).toBe("Purchase");
-  expect(purchase?.value).toBe(2499);
-  expect(purchase?.currency).toBe("AED"); // account default backfills
+  const byStage = Object.fromEntries(rows.map((r) => [r.stage, r]));
+  expect(byStage.qualified.eventName).toBe("QualifiedLead");
+  expect(byStage.itinerary_sent.eventName).toBe("AddToCart");
+  expect(byStage.price_quoted.eventName).toBe("InitiateCheckout");
+  expect(byStage.purchased.eventName).toBe("Purchase");
+  expect(byStage.purchased.value).toBe(2499);
+  expect(byStage.purchased.currency).toBe("AED");
+});
+
+test("the sequence is enforced server-side, not just by hiding buttons", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  // Jumping straight to payment would report a Purchase on a lead Meta was
+  // never told was qualified, and record money against a customer nobody
+  // confirmed was real.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId, step: "payment", answer: "yes", value: 5000,
+    }),
+  ).rejects.toThrow();
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId, step: "intent", answer: "yes",
+    }),
+  ).rejects.toThrow();
+  expect(await eventStages(t, conversationId)).toEqual(["new_lead"]);
+});
+
+test("a NO stops the sequence — the next question cannot be answered at all", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId, step: "genuine", answer: "no", reason: "spam",
+  });
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
+      conversationId, step: "service", answer: "yes",
+    }),
+  ).rejects.toThrow();
+  expect(await eventStages(t, conversationId)).toEqual(["new_lead"]);
 });
 
 test("a bad lead is RECORDED but never reaches Meta", async () => {
@@ -286,8 +372,9 @@ test("a bad lead is RECORDED but never reaches Meta", async () => {
   const genuine = state.steps.find((s) => s.step === "genuine")!;
   expect(genuine.locked).toBe(true);
   expect(genuine.answer).toBe("no");
-  // The other two remain open: rejecting the lead does not pre-answer them.
-  expect(state.pendingCount).toBe(2);
+  // Nothing further is reachable: a rejected lead ends the sequence.
+  expect(state.steps.filter((s) => s.available)).toHaveLength(0);
+  expect(state.steps.filter((s) => s.blocked)).toHaveLength(3);
 });
 
 test("dismissing records the dodge, sends nothing, and leaves the question open", async () => {
@@ -307,7 +394,7 @@ test("dismissing records the dodge, sends nothing, and leaves the question open"
   });
   // A dismissal is not an answer, so the question stays answerable.
   expect(state.steps.find((s) => s.step === "genuine")!.locked).toBe(false);
-  expect(state.pendingCount).toBe(3);
+  expect(state.steps.find((s) => s.step === "genuine")!.available).toBe(true);
 });
 
 test("a step can only be answered once — the second attempt is refused", async () => {
@@ -404,6 +491,11 @@ test("payment bypasses the sales-checklist gate that blocks setStage", async () 
     }),
   ).rejects.toThrow(); // the gate the card is designed to skip
 
+  for (const step of ["genuine", "service", "intent"] as const) {
+    await asUser.mutation(api.leadQuality.answer, {
+      conversationId, step, answer: "yes",
+    });
+  }
   const res = await asUser.mutation(api.leadQuality.answer, {
     conversationId,
     step: "payment",
@@ -459,4 +551,45 @@ test("viewers cannot answer; supervisors can act on someone else's thread", asyn
     answer: "yes",
   });
   expect(res.sentToMeta).toBe(true);
+});
+
+test("stage implication seeds an untouched lead, then yields to the answer log", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  // Untouched by the panel, but an agent already walked it to price_quoted
+  // by hand: don't ask whether it is a real customer.
+  await t.run((ctx) =>
+    ctx.db.patch(conversationId, {
+      funnel: { stage: "price_quoted", stageUpdatedAt: Date.now() },
+    }),
+  );
+  let state = await asUser.query(api.leadQuality.getCardState, { conversationId });
+  expect(state.steps.find((s) => s.step === "genuine")!.viaStage).toBe(true);
+
+  // Now reset and drive it from the panel instead. Answering `service`
+  // advances the stage to `itinerary_sent`, which sits DEEPER than the
+  // `price_quoted` that `intent` maps to — if implication still applied,
+  // `intent` would lock and its InitiateCheckout would never fire.
+  const fresh = await seedLead(t, accountId, userId);
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId: fresh.conversationId, step: "genuine", answer: "yes",
+  });
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId: fresh.conversationId, step: "service", answer: "yes",
+  });
+  state = await asUser.query(api.leadQuality.getCardState, {
+    conversationId: fresh.conversationId,
+  });
+  const intent = state.steps.find((s) => s.step === "intent")!;
+  expect(intent.locked).toBe(false);
+  expect(intent.available).toBe(true);
+
+  // And it genuinely fires.
+  const res = await asUser.mutation(api.leadQuality.answer, {
+    conversationId: fresh.conversationId, step: "intent", answer: "yes",
+  });
+  expect(res.sentToMeta).toBe(true);
+  expect(await eventStages(t, fresh.conversationId)).toContain("price_quoted");
 });

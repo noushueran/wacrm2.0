@@ -586,6 +586,7 @@
       "progress": "{done}/{total} recorded",
       "question": {
         "genuine": "Is this a real customer?",
+        "service": "Qualified for the service?",
         "intent": "Serious about booking?",
         "payment": "Payment received?"
       },
@@ -598,7 +599,8 @@
       "recordedNo": "Recorded: No \u2014 not sent to Meta",
       "fromStage": "from CRM stage",
       "readOnly": "You cannot answer on this lead.",
-      "footnote": "Answers are final. Only a Yes is reported to Meta; a No is kept for your reporting.",
+      "footnote": "One question at a time. Answers are final \u2014 only a Yes is reported to Meta; a No is kept for your reporting.",
+      "sequenceEnded": "Nothing further to record for this lead.",
       "reason": {
         "spam": "Spam",
         "supplier_vendor": "Supplier / vendor",

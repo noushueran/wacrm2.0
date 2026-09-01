@@ -6,7 +6,12 @@
 // Labels live in i18n (`Inbox.leadQuality.*`), not here: this file carries
 // only the keys and their order.
 
-export const LEAD_QUALITY_STEPS = ["genuine", "intent", "payment"] as const;
+export const LEAD_QUALITY_STEPS = [
+  "genuine",
+  "service",
+  "intent",
+  "payment",
+] as const;
 export type LeadQualityStep = (typeof LEAD_QUALITY_STEPS)[number];
 
 /**

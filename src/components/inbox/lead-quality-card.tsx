@@ -23,6 +23,8 @@ import type { Id } from "../../../convex/_generated/dataModel";
 type StepState = {
   step: LeadQualityStep;
   locked: boolean;
+  available: boolean;
+  blocked: boolean;
   answer: "yes" | "no" | null;
   viaStage: boolean;
   value?: number;
@@ -44,11 +46,16 @@ type StepState = {
  * already use for "record something about this lead" — and stays out of
  * the way until opened.
  *
- * All three questions are shown at once and each is answered independently.
- * A strictly progressive version came first and paced badly in practice: a
- * salesperson often learns "they're serious" and "they paid" in the same
- * conversation, and making the second wait on the first meant known
- * information was unrecordable.
+ * ONE question at a time. The panel shows what has been answered and the
+ * single question now open; nothing further is rendered until that one is
+ * answered YES. An earlier build showed all of them at once and let an
+ * agent answer in any order, which produced records that could not be true
+ * together — "payment received" on a lead nobody had confirmed was real —
+ * and let the deepest event fire without the cheaper signals that give Meta
+ * the funnel shape.
+ *
+ * A `no` ends the sequence: every later question presupposes a yes before
+ * it, so the panel stops asking rather than inviting a contradiction.
  *
  * A negative answer never reaches Meta — not by a check here, but because
  * `leadQuality.answer` has no code path from `no` to the conversion outbox.
@@ -140,7 +147,13 @@ export function LeadQualityCard({
         </div>
 
         <div className="space-y-2">
-          {steps.map((s) => (
+          {/* Answered steps, plus the ONE that is open. `blocked` steps are
+              not rendered at all — showing a greyed-out question an agent
+              cannot reach reads as a broken control rather than as a
+              sequence. */}
+          {steps
+            .filter((s) => s.locked || s.available)
+            .map((s) => (
             <StepRow
               key={s.step}
               state={s}
@@ -155,7 +168,16 @@ export function LeadQualityCard({
               onSubmit={submit}
               t={t}
             />
-          ))}
+            ))}
+          {/* The sequence has stopped: a `no` was recorded and nothing
+              further applies. Said plainly so the empty panel is not read
+              as a bug. */}
+          {steps.some((s) => s.blocked) &&
+            !steps.some((s) => s.available) && (
+              <p className="rounded-md border border-border bg-muted/40 px-2.5 py-2 text-[11px] text-muted-foreground">
+                {t("sequenceEnded")}
+              </p>
+            )}
         </div>
 
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
