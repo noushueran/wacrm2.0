@@ -8,6 +8,7 @@ import {
   stepStates,
   stageImplies,
   latestFor,
+  summarizeSteps,
   type AnswerRecord,
 } from "./leadQuality";
 
@@ -1034,5 +1035,80 @@ test("an organic lead can be answered and corrected, and still sends nothing", a
   expect(state.attributed).toBe(false);
   expect(state.steps.find((s) => s.step === "service")).toMatchObject({
     available: true,
+  });
+});
+
+// ============================================================
+// The inbox-list badge. Same source as the panel's own count.
+// ============================================================
+
+describe("summarizeSteps", () => {
+  const summaryFor = (answers: AnswerRecord[], stage: Parameters<typeof stepStates>[0]["currentStage"] = null) =>
+    summarizeSteps(stepStates({ answers, currentStage: stage }));
+
+  it("counts an untouched lead as nothing answered, nothing ended", () => {
+    expect(summaryFor([])).toEqual({
+      answered: 0,
+      pending: 4,
+      total: 4,
+      ended: false,
+    });
+  });
+
+  it("agrees with the panel's own pending count, always", () => {
+    // The badge and the panel must never disagree — they are the same
+    // number, taken from the same `stepStates` call shape.
+    const cases: AnswerRecord[][] = [
+      [],
+      [{ step: "genuine", answer: "yes", at: T0 }],
+      [{ step: "genuine", answer: "no", at: T0 }],
+      [
+        { step: "genuine", answer: "yes", at: T0 },
+        { step: "service", answer: "yes", at: T0 + 1 },
+        { step: "intent", answer: "no", at: T0 + 2 },
+      ],
+    ];
+    for (const answers of cases) {
+      const steps = stepStates({ answers, currentStage: null });
+      // `getCardState`'s badge is exactly this expression.
+      expect(summarizeSteps(steps).pending).toBe(
+        steps.filter((s) => !s.locked).length,
+      );
+    }
+  });
+
+  it("marks a sequence stopped at a NO as ended, not as finished", () => {
+    // `ended` must not read as "done": the `no` is still correctable from
+    // inside the thread, so the row is actionable — it simply is not
+    // waiting on an unanswered question, and must not nag as if it were.
+    const stopped = summaryFor([{ step: "genuine", answer: "no", at: T0 }]);
+    expect(stopped).toMatchObject({ answered: 1, ended: true });
+    expect(stopped.answered).toBeLessThan(stopped.total);
+  });
+
+  it("does not mark a fully answered lead as ended", () => {
+    const done = summaryFor([
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "yes", at: T0 + 1 },
+      { step: "intent", answer: "yes", at: T0 + 2 },
+      { step: "payment", answer: "yes", at: T0 + 3, value: 10, currency: "AED" },
+    ]);
+    expect(done).toEqual({ answered: 4, pending: 0, total: 4, ended: false });
+  });
+
+  it("clears `ended` once the NO is corrected", () => {
+    const corrected = summaryFor([
+      { step: "genuine", answer: "no", at: T0 },
+      { step: "genuine", answer: "yes", at: T0 + 60_000 },
+    ]);
+    expect(corrected).toMatchObject({ answered: 1, pending: 3, ended: false });
+  });
+
+  it("counts a stage-implied lead without any answers of its own", () => {
+    // A lead an agent walked to `price_quoted` by hand has milestones
+    // behind it already; the badge must reflect that rather than reading 0.
+    const implied = summaryFor([], "price_quoted");
+    expect(implied.answered).toBeGreaterThan(0);
+    expect(implied.answered + implied.pending).toBe(implied.total);
   });
 });

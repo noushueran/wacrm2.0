@@ -15,6 +15,9 @@ import { dispatchConversationAssigned } from "./lib/automations/triggers";
 import { recipientsForInbound } from "./lib/pushRecipients";
 import { chasingCutoffMs, graceCutoffMs } from "./lib/inbox/lanes";
 import { bumpConversationStartedStat } from "./messages";
+// Pure state machine only — `lib/leadQuality`, never `./leadQuality`,
+// which would pull this query into that module's auth/funnel graph.
+import { stepStates, summarizeSteps } from "./lib/leadQuality";
 
 // ============================================================
 // Conversations — the Inbox list/thread read (`list`/`get`/
@@ -535,10 +538,42 @@ export const list = accountQuery({
                 .unique()
             : null;
 
+        // Lead-quality progress for the row badge. An agent could not see
+        // which threads still owed an answer without opening each one,
+        // which is most of why the panel went unused.
+        //
+        // A per-page join, the same shape and the same bound as the
+        // `leadAnalyses` read just above: one indexed lookup per row,
+        // capped by `numItems`. Ungated, unlike that one, because the
+        // badge belongs on every lane — and cheap in practice because the
+        // overwhelming majority of conversations have NO answer rows, so
+        // the query returns empty without reading a document.
+        //
+        // Derived through the same `stepStates` the panel renders from, so
+        // the badge and the panel cannot disagree about what is pending.
+        const answers = await ctx.db
+          .query("leadQualityAnswers")
+          .withIndex("by_conversation", (q) =>
+            q.eq("conversationId", conversation._id),
+          )
+          .collect();
+
         return {
           ...withContact,
           followUpsSent: analysis?.followUpsSent,
           sequenceStatus: analysis?.sequenceStatus,
+          leadQuality: summarizeSteps(
+            stepStates({
+              answers: answers.map((a) => ({
+                step: a.step,
+                answer: a.answer,
+                at: a._creationTime,
+                ...(a.value !== undefined ? { value: a.value } : {}),
+                ...(a.currency !== undefined ? { currency: a.currency } : {}),
+              })),
+              currentStage: conversation.funnel?.stage ?? null,
+            }),
+          ),
           // Manual lane overrides (Task 7) — already on `conversation`
           // itself (no extra read, unlike the `leadAnalyses` join just
           // above), so `...withContact` already carries them; spelled out

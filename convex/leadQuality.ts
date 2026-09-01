@@ -29,231 +29,40 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { accountMutation, accountQuery } from "./lib/auth";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { applyStageTransition, seedStageConversionEvent } from "./funnel";
-import { FUNNEL_STAGE_KEYS, type FunnelStageKey } from "./lib/funnel";
 
-/**
- * The milestones an agent attests to, in the order the SALES CONVERSATION
- * establishes them — which is not the order `FUNNEL_STAGES` indexes them
- * in, and deliberately so. Eligibility ("can we even serve this person?")
- * is settled before intent ("do they want to book?"), because a traveller
- * can badly want a visa they are not entitled to; asking about intent
- * first wastes the answer.
- *
- * That mismatch is why `answer` seeds the conversion event directly rather
- * than relying on `applyStageTransition` to do it — see there.
- */
-export const QUALITY_STEPS = [
-  "genuine",
-  "service",
-  "intent",
-  "payment",
-] as const;
-export type QualityStep = (typeof QUALITY_STEPS)[number];
+// The state machine itself lives in `lib/leadQuality.ts` — pure, and
+// therefore importable by `conversations.list` without dragging this
+// module's auth and funnel dependencies into the inbox list query.
+// Re-exported here so every existing `from "./leadQuality"` import, and
+// the tests, keep working against one definition.
+export {
+  QUALITY_STEPS,
+  STEP_STAGE,
+  stageImplies,
+  latestFor,
+  stepStates,
+  summarizeSteps,
+  QUALITY_STEP_COUNT,
+} from "./lib/leadQuality";
+export type {
+  QualityStep,
+  QualityAnswer,
+  AnswerRecord,
+  StepState,
+  LeadQualitySummary,
+} from "./lib/leadQuality";
 
-export type QualityAnswer = "yes" | "no" | "dismissed";
-
-/**
- * Which funnel stage a positive answer advances to. The question and the
- * stage are deliberately different vocabularies — "Is this a real customer?"
- * is answerable mid-chat, "Qualified lead" is not — and this map is the only
- * place the two are joined.
- */
-export const STEP_STAGE: Record<QualityStep, FunnelStageKey> = {
-  genuine: "qualified", // QualifiedLead — a real person worth selling to
-  service: "itinerary_sent", // AddToCart — the service is a fit for them
-  intent: "price_quoted", // InitiateCheckout — they mean to book
-  payment: "purchased", // Purchase — money received
-};
-
-export type AnswerRecord = {
-  step: QualityStep;
-  answer: QualityAnswer;
-  at: number;
-  value?: number;
-  currency?: string;
-};
-
-/**
- * Whether the CRM's own stage already implies this step was answered yes.
- *
- * Seeds the panel from reality as well as from its own log, so a lead an
- * agent moved manually to `price_quoted` is not asked "is this a real
- * customer?" — that milestone is already recorded and already reported.
- *
- * `lost` is excluded deliberately. It is appended LAST in `FUNNEL_STAGES`
- * (so the engine can never pull a lost deal back into the working stages),
- * which means a naive index comparison would read it as "past every
- * milestone" and imply all three steps were answered yes. It is a terminal
- * exit, not progression.
- */
-export function stageImplies(
-  currentStage: FunnelStageKey | null | undefined,
-  step: QualityStep,
-): boolean {
-  if (!currentStage || currentStage === "lost") return false;
-  return (
-    FUNNEL_STAGE_KEYS.indexOf(currentStage) >=
-    FUNNEL_STAGE_KEYS.indexOf(STEP_STAGE[step])
-  );
-}
-
-/** The latest answer logged for `step`, or null. */
-export function latestFor(
-  answers: AnswerRecord[],
-  step: QualityStep,
-): AnswerRecord | null {
-  let latest: AnswerRecord | null = null;
-  for (const a of answers) {
-    if (a.step === step && (!latest || a.at > latest.at)) latest = a;
-  }
-  return latest;
-}
-
-/**
- * One step's state for the panel.
- *
- * `locked` — already answered here, or already implied by the CRM stage.
- * An answered question is answered for good: the Meta event it produced can
- * only fire once (the outbox dedups on `${conversationId}:${stage}`), so
- * offering the buttons again would invite a click that silently does
- * nothing. The single exception is `revisable`, below.
- *
- * `revisable` — locked with a `no`, but still changeable to `yes`. TRUE
- * for ANY step answered `no`, and only in that one direction.
- *
- * The asymmetry is the whole rule, and it comes straight from what each
- * answer did. A `no` sent NOTHING — there is no code path from it to the
- * outbox — so changing it later contradicts nothing Meta was ever told; it
- * simply reports a milestone for the first time. A `yes` already put an
- * event on the wire, and Meta has no retraction, so un-saying it could only
- * make this log disagree with what was actually reported.
- *
- * Every one of these judgements is provisional in the way a `yes` is not.
- * An agent marks a chat "not a real customer" and the customer replies
- * three days later; a service looks unavailable until someone checks; a
- * lead reads as browsing until they ask to book; a deal is unpaid until it
- * is paid. Before this, each of those `no`s was permanent and its event was
- * stranded forever — which is precisely the lead quality Meta is supposed
- * to be learning from.
- *
- * Revising re-opens what the `no` had closed: `stepStates` derives the
- * whole sequence from the log, so flipping a `no` to `yes` makes the next
- * question available again with no special handling.
- *
- * `available` — answerable RIGHT NOW. Only one step is ever available: the
- * questions are a sequence, and each opens only once the one before it was
- * answered YES.
- *
- * `blocked` — unreachable, because an earlier step was answered `no`. There
- * is no point asking whether someone is serious about booking once they
- * have been marked "not a real customer", and a panel that offered the
- * question anyway would invite a contradictory record.
- *
- * `viaStage` distinguishes "an agent answered this here" from "the CRM
- * stage already passed this milestone". Both lock the step; only the first
- * has an author and a timestamp to show.
- */
-export type StepState = {
-  step: QualityStep;
-  locked: boolean;
-  available: boolean;
-  blocked: boolean;
-  /** A recorded `no` here may still be replaced by a `yes`. Never a `yes`. */
-  revisable: boolean;
-  answer: "yes" | "no" | null;
-  viaStage: boolean;
-  value?: number;
-  currency?: string;
-  answeredAt?: number;
-};
-
-/**
- * Every step's state, as a strict sequence.
- *
- * A first build showed all questions at once and let an agent answer any of
- * them in any order. That produced records that could not be true together
- * — a lead marked "payment received" while "is this a real customer?" sat
- * unanswered — and it let the most valuable event fire without the cheaper
- * signals that give Meta the funnel shape. One question at a time, each
- * unlocked by a YES on the one before, is what keeps the reported funnel
- * monotonic.
- *
- * A `no` ENDS the sequence rather than skipping a step: every later
- * question presupposes the earlier answer was yes.
- *
- * It ends it PROVISIONALLY. Because the whole table is derived from the
- * log, correcting a `no` to a `yes` re-opens the question after it by
- * itself — the gate simply computes differently on the next read. Nothing
- * here special-cases a revision, which is why the sequence cannot be left
- * half-open by one.
- *
- * Pure and total — no clock, no database — so the table is unit-testable.
- */
-export function stepStates(input: {
-  answers: AnswerRecord[];
-  currentStage: FunnelStageKey | null | undefined;
-}): StepState[] {
-  // Stage implication seeds the sequence from CRM state that predates the
-  // panel — so a lead an agent had already walked to `price_quoted` by hand
-  // is not asked whether it is a real customer.
-  //
-  // It applies ONLY while the panel is untouched. Once any answer exists,
-  // the log owns the sequence outright, because the panel MOVES the stage
-  // as it goes and the question order is not the funnel's index order:
-  // answering `service` advances the conversation to `itinerary_sent`,
-  // which sits deeper than the `price_quoted` that `intent` maps to, so
-  // implication would then lock the very next question and its
-  // `InitiateCheckout` would never fire.
-  const untouched = !input.answers.some(
-    (a) => a.answer === "yes" || a.answer === "no",
-  );
-
-  let gateOpen = true;
-  return QUALITY_STEPS.map((step) => {
-    const implied = untouched && stageImplies(input.currentStage, step);
-    const latest = latestFor(input.answers, step);
-    // A dismissal is not an answer; it never locks a step.
-    const explicit =
-      latest && (latest.answer === "yes" || latest.answer === "no")
-        ? latest
-        : null;
-
-    const locked = Boolean(explicit) || implied;
-    const answer = explicit
-      ? (explicit.answer as "yes" | "no")
-      : implied
-        ? ("yes" as const)
-        : null;
-
-    // Any `no` can be un-said, in one direction only. An implied lock is
-    // never revisable: implication only ever yields a `yes`, and a `yes` is
-    // final. `explicit` is required, so a step that is merely BLOCKED (an
-    // earlier `no` closed the gate before it) has nothing to revise —
-    // revision corrects an answer, it does not skip the sequence.
-    const revisable = explicit?.answer === "no";
-
-    const state: StepState = {
-      step,
-      locked,
-      available: !locked && gateOpen,
-      blocked: !locked && !gateOpen,
-      revisable,
-      answer,
-      viaStage: !explicit && implied,
-      ...(explicit?.value !== undefined
-        ? { value: explicit.value, currency: explicit.currency }
-        : {}),
-      ...(explicit ? { answeredAt: explicit.at } : {}),
-    };
-
-    // The gate for the NEXT step: open only behind a recorded yes. An
-    // unanswered step closes it (nothing past the current question is
-    // reachable), and so does a `no`.
-    if (!locked || answer !== "yes") gateOpen = false;
-
-    return state;
-  });
-}
+// A local binding for everything this module USES. `export ... from`
+// above re-exports the names for importers but binds nothing here — the
+// mutation's own `STEP_STAGE` lookup was a ReferenceError at runtime while
+// still typechecking clean, which the tests caught.
+import {
+  STEP_STAGE,
+  stepStates,
+  type QualityStep,
+  type AnswerRecord,
+  type StepState,
+} from "./lib/leadQuality";
 
 // Mirrors `leadQualityAnswers.step` in schema.ts — the two are separate
 // declarations and must be changed together; a step added to only one is

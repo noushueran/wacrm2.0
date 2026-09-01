@@ -341,6 +341,16 @@ export function toUiConversation(
     // Chasing-lane-only projections).
     snoozedUntil?: number;
     chasingForcedAt?: number;
+    /** Lead-quality progress for the row badge — see
+     *  `summarizeSteps` in convex/lib/leadQuality.ts. Returned by
+     *  `conversations.list` on every lane; absent from `conversations.get`,
+     *  which is why it is optional here. */
+    leadQuality?: {
+      answered: number;
+      pending: number;
+      total: number;
+      ended: boolean;
+    };
   },
 ): Conversation {
   const createdAt = new Date(doc._creationTime).toISOString();
@@ -403,6 +413,7 @@ export function toUiConversation(
       : undefined,
     followUpsSent: doc.followUpsSent,
     sequenceStatus: doc.sequenceStatus,
+    leadQuality: doc.leadQuality,
     snoozed_until: doc.snoozedUntil
       ? new Date(doc.snoozedUntil).toISOString()
       : undefined,

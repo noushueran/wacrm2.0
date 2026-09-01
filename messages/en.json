@@ -608,6 +608,9 @@
       "footnote": "One question at a time. Only a Yes is reported to Meta. A No can be changed to Yes whenever things change \u2014 a Yes is final, because Meta has already been told.",
       "footnoteOrganic": "This lead did not come from an ad, so nothing here is reported to Meta. Answers are kept for your own reporting. A No can still be changed to Yes; a Yes is final.",
       "sequenceEnded": "Nothing further to record for this lead.",
+      "listBadgeTitle": "Lead quality: {pending} still to answer",
+      "listBadgeDoneTitle": "Lead quality: all questions answered",
+      "listBadgeEndedTitle": "Lead quality: stopped at a No \u2014 open the chat to change it",
       "reason": {
         "spam": "Spam",
         "supplier_vendor": "Supplier / vendor",
