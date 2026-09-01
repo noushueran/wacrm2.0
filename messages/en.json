@@ -1468,6 +1468,7 @@
       },
       "qualityTitle": "Lead quality funnel",
       "qualityNote": "Milestones reported to Meta. A rate needs leads in the stage above it \u2014 \u201c\u2014\u201d means none yet.",
+      "qualityCappedNote": "\u2020 More leads recorded a step than the one before it, so that rate is capped at 100%. It happens when a question was added after leads had already moved past it, and clears as new leads answer the full sequence.",
       "quality": {
         "lead": "Leads",
         "mql": "Real customers",

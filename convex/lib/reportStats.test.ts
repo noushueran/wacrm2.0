@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   lifecycleFunnel,
+  rateIsInverted,
   responseBucketFor,
   emptyResponseBuckets,
   addResponseBucket,
@@ -482,5 +483,31 @@ it("reports an empty denominator as null, never as 0%", () => {
   expect(early.eligibleRate).toBeNull();
   expect(early.sqlRate).toBeNull();
   expect(early.convertedFromSqlRate).toBeNull();
+});
+
+it("keeps an out-of-sequence pair truthful, and flags it", () => {
+  // Production, 2026-09-01: the eligibility question shipped after leads had
+  // already answered `intent`, so `sql` outran `eligible` and the rate came
+  // out at 166.7%. The counts are conversion EVENTS — inflating `eligible`
+  // to cover the leads that skipped it would make this card disagree with
+  // what was actually sent to Meta, which is exactly what counting events
+  // instead of stage arrivals was meant to prevent.
+  const f = lifecycleFunnel({
+    lead: 1312, mql: 108, eligible: 3, sql: 5, converted: 3,
+  });
+  expect(f.sqlRate).toBeCloseTo(5 / 3); // NOT clamped in the data
+  expect(rateIsInverted(f.sqlRate)).toBe(true);
+  // Only the broken pair is flagged; its neighbours stay ordinary.
+  expect(rateIsInverted(f.eligibleRate)).toBe(false);
+  expect(rateIsInverted(f.convertedFromSqlRate)).toBe(false);
+});
+
+it("does not flag a full-conversion or empty rate", () => {
+  // 100% is impressive, not impossible — flagging it would cry wolf on a
+  // small window where every MQL happened to convert.
+  expect(rateIsInverted(1)).toBe(false);
+  expect(rateIsInverted(0)).toBe(false);
+  // Null is "no denominator", which already renders as an em dash.
+  expect(rateIsInverted(null)).toBe(false);
 });
 });

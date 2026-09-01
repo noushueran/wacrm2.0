@@ -11,6 +11,10 @@ import { formatCurrency } from '@/lib/currency'
 import { downloadCsv } from '@/lib/reports/csv'
 import type { ReportPanelProps } from '@/lib/reports/types'
 import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
+// From `convex/lib/reportStats`, NOT `convex/reports` — that module is
+// server-only and importing it from a `'use client'` component ships every
+// query handler in it to the browser. Same rule the other panels follow.
+import { rateIsInverted } from '../../../convex/lib/reportStats'
 
 /** The four lead-quality milestones, in funnel order. */
 const QUALITY_COUNT_KEYS = ['lead', 'mql', 'eligible', 'sql', 'converted'] as const
@@ -31,9 +35,18 @@ const QUALITY_RATE_KEYS = [
  * `lifecycleFunnel` in convex/lib/reportStats.ts): "0% of 0 leads became
  * MQL" is a claim the data cannot support, and showing it as 0% is how a
  * quiet window gets misread as a collapse in lead quality.
+ *
+ * A rate ABOVE 100% is capped here and marked with a dagger the footnote
+ * explains. Production showed "Qualified → Serious 166.7%", which is a real
+ * artifact (see `rateIsInverted`) and not a calculation error — but a
+ * conversion rate over 100% reads as a broken report, and a reader who
+ * distrusts one tile distrusts the panel. The cap is DISPLAY ONLY: the CSV
+ * export below writes the true fraction, so the artifact stays visible to
+ * anyone who goes looking for it.
  */
 function formatRate(rate: number | null): string {
   if (rate === null) return '—'
+  if (rateIsInverted(rate)) return '100%†'
   return `${(rate * 100).toFixed(1)}%`
 }
 
@@ -203,6 +216,15 @@ export function FunnelPanel({ reportWindow, canRead }: ReportPanelProps) {
             </div>
           ))}
         </div>
+        {/* Only shown when something is actually capped — a standing
+            disclaimer under a healthy funnel trains readers to ignore it,
+            which is precisely what it must not do on the window where it
+            matters. */}
+        {QUALITY_RATE_KEYS.some((k) => rateIsInverted(data.lifecycle[k])) && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {t('funnel.qualityCappedNote')}
+          </p>
+        )}
       </div>
 
       <div className="rounded-xl border border-border bg-card p-5">

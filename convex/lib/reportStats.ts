@@ -763,3 +763,29 @@ export function lifecycleFunnel(counts: LifecycleCounts): LifecycleFunnel {
     leadToCustomerRate: rate(counts.converted, counts.lead),
   };
 }
+
+/**
+ * Whether a lifecycle rate came out ABOVE 100% — more leads recorded a step
+ * than recorded the step before it.
+ *
+ * That is arithmetically correct and semantically impossible at the same
+ * time, and it is not a bug in `lifecycleFunnel`. The counts are actual
+ * conversion EVENTS, and the sequence gate in `leadQuality.answer` only
+ * binds going forward: leads answered before the eligibility question
+ * existed recorded `intent` without ever being asked `service`, so the
+ * middle milestone is under-counted relative to the one after it. Production
+ * read `sql: 5` against `eligible: 3` — a 166.7% "Qualified → Serious".
+ *
+ * The counts are NOT made monotonic to hide this. This card says
+ * "milestones reported to Meta", so inflating `eligible` to cover leads that
+ * skipped it would make the card disagree with the wire — the one thing the
+ * event-sourced rewrite of `funnelOverview` exists to prevent.
+ *
+ * So the pair is flagged instead, and the caller decides. It self-corrects
+ * as leads walk the full four-question sequence; until then a reader needs
+ * to be told why the number is impossible rather than left to conclude the
+ * whole panel is broken.
+ */
+export function rateIsInverted(rate: number | null): boolean {
+  return rate !== null && rate > 1;
+}
