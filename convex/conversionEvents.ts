@@ -156,6 +156,16 @@ function logDelivery(entry: {
   // rather than instead of it: the category is what you filter on, the
   // message is what you read once you have filtered.
   errorCategory?: "transient" | "permanent" | "unconfigured";
+  // Meta's OWN count of what it accepted, echoed back per request. A 200
+  // is only an acknowledgement that the request parsed; `events_received`
+  // is the acknowledgement that the EVENT counted. Logged on every send so
+  // "did it land" is answerable from the logs rather than from Events
+  // Manager an hour later, which is where it had to be answered before.
+  eventsReceived?: number;
+  // Meta's non-fatal complaints. Delivery is NOT failed on these — the
+  // event counted — but they are how a match-key problem announces itself
+  // while every status in the CRM still reads `sent`.
+  warnings?: string;
 }): void {
   const line = `[conversionEvents] ${JSON.stringify(entry)}`;
   if (entry.outcome === "error") console.error(line);
@@ -718,7 +728,31 @@ export const deliverConversionEvent = internalAction({
         }
         const data = (await res.json().catch(() => ({}))) as {
           fbtrace_id?: string;
+          events_received?: number;
+          messages?: unknown[];
         };
+        const warnings =
+          data.messages && data.messages.length > 0
+            ? JSON.stringify(data.messages).slice(0, 200)
+            : undefined;
+        // A 200 says the REQUEST was accepted; `events_received` says the
+        // EVENT was. They can disagree: Meta answers 200 with a zero count
+        // for a payload it parsed and then discarded, and every status in
+        // this CRM would read `sent` while the conversion attributed
+        // nothing. That gap is not hypothetical — it is why confirming one
+        // backlog took an hour of reading Events Manager instead of one
+        // line of log.
+        //
+        // Permanent by construction: `deliveryError` classifies anything
+        // outside 429/5xx as permanent, and a re-POST of the same payload
+        // earns the same zero. Retrying it would only spend the budget.
+        if (data.events_received === 0) {
+          throw deliveryError(
+            res.status,
+            `CAPI ${res.status} but events_received=0` +
+              (warnings ? `: ${warnings}` : ""),
+          );
+        }
         await ctx.runMutation(internal.conversionEvents.patchStatus, {
           conversionEventId: args.conversionEventId,
           status: "sent",
@@ -729,6 +763,10 @@ export const deliverConversionEvent = internalAction({
           outcome: "sent",
           httpStatus: res.status,
           fbTraceId: data.fbtrace_id,
+          // Absent (not zero) when Meta omits the field: an older response
+          // shape must not be read as "nothing counted".
+          eventsReceived: data.events_received,
+          warnings,
         });
       } catch (err) {
         const patch = errorPatchFor(err);
