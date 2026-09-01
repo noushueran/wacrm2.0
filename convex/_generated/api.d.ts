@@ -123,6 +123,7 @@ import type * as lib_leadAnalysis_sendRate from "../lib/leadAnalysis/sendRate.js
 import type * as lib_leadAnalysis_sequenceSchedule from "../lib/leadAnalysis/sequenceSchedule.js";
 import type * as lib_leadAnalysis_templatePicker from "../lib/leadAnalysis/templatePicker.js";
 import type * as lib_leadCharge from "../lib/leadCharge.js";
+import type * as lib_leadQuality from "../lib/leadQuality.js";
 import type * as lib_messageStats from "../lib/messageStats.js";
 import type * as lib_metaHash from "../lib/metaHash.js";
 import type * as lib_notes_gate from "../lib/notes/gate.js";
@@ -311,6 +312,7 @@ declare const fullApi: ApiFromModules<{
   "lib/leadAnalysis/sequenceSchedule": typeof lib_leadAnalysis_sequenceSchedule;
   "lib/leadAnalysis/templatePicker": typeof lib_leadAnalysis_templatePicker;
   "lib/leadCharge": typeof lib_leadCharge;
+  "lib/leadQuality": typeof lib_leadQuality;
   "lib/messageStats": typeof lib_messageStats;
   "lib/metaHash": typeof lib_metaHash;
   "lib/notes/gate": typeof lib_notes_gate;

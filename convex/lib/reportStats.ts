@@ -698,20 +698,29 @@ export function foldAssignmentEvents(
 // --- Lead-quality lifecycle rollup (CAPI lifecycle spec §19) -------------
 
 /**
- * The four business-funnel milestones, as counts of DISTINCT leads that
- * reached each. Fed from `funnelOverview`'s `stageFirstReached` totals,
- * which are first-arrival counters — so these are lead counts, never
- * lead-days, and a lead that bounced between stages is counted once.
+ * The five milestones reported to Meta, as counts of DISTINCT leads that
+ * reached each.
+ *
+ * Counted from the CONVERSION EVENTS, not from funnel-stage arrivals. The
+ * two diverge: the questions run in sales order, which is not the funnel's
+ * index order — eligibility maps to `itinerary_sent`, and the `intent` that
+ * follows maps to the earlier `price_quoted` — so `applyStageTransition`'s
+ * `neverDowngrade` guard refuses the later stage move and no transition is
+ * logged for it. On production that showed as `price_quoted` events 4 vs
+ * transitions 3. Counting stages would silently under-report exactly the
+ * middle of the funnel this report exists to show.
  */
 export type LifecycleCounts = {
   lead: number;
   mql: number;
+  /** Qualified for the service — eligibility, distinct from intent. */
+  eligible: number;
   sql: number;
   converted: number;
 };
 
 /**
- * Lifecycle counts + the conversion rates between them.
+ * Lifecycle counts plus the conversion rate between each consecutive pair.
  *
  * Each rate is a FRACTION in [0, 1] (multiply by 100 to display), and each
  * is `null` — not 0 — when its denominator is zero. "0% of 0 leads became
@@ -722,7 +731,9 @@ export type LifecycleCounts = {
 export type LifecycleFunnel = LifecycleCounts & {
   /** MQL / Lead */
   mqlRate: number | null;
-  /** SQL / MQL */
+  /** Eligible / MQL */
+  eligibleRate: number | null;
+  /** SQL / Eligible */
   sqlRate: number | null;
   /** Converted / SQL */
   convertedFromSqlRate: number | null;
@@ -735,26 +746,46 @@ function rate(numerator: number, denominator: number): number | null {
 }
 
 /**
- * Projects the 8-stage CRM funnel onto the 4-stage lead-quality funnel the
- * Meta integration reports, and derives its rates.
+ * Derives the rates between consecutive milestones.
  *
- * The projection is deliberately the SAME mapping the outbox uses
- * (`lib/funnel.ts`'s `leadStage`): `qualified` is MQL, `price_quoted` is
- * SQL, `purchased` is CONVERTED. Deriving it here from stage counts rather
- * than from delivered Meta events is what makes this report honest about
- * the BUSINESS funnel even while delivery is dark or backlogged — the
- * event pipeline's health is a separate question, already answered by
- * `funnelOverview.meta`.
- *
- * `lost` is not subtracted from anything: a lead that reached MQL and was
- * later lost still reached MQL, and that is what Meta was told.
+ * The chain follows the QUESTION order an agent answers, which is the order
+ * the business establishes these facts in — real customer, then eligible,
+ * then serious, then paid — and matches what `lib/funnel.ts` maps to Meta.
+ * It deliberately does not follow `FUNNEL_STAGES` index order.
  */
 export function lifecycleFunnel(counts: LifecycleCounts): LifecycleFunnel {
   return {
     ...counts,
     mqlRate: rate(counts.mql, counts.lead),
-    sqlRate: rate(counts.sql, counts.mql),
+    eligibleRate: rate(counts.eligible, counts.mql),
+    sqlRate: rate(counts.sql, counts.eligible),
     convertedFromSqlRate: rate(counts.converted, counts.sql),
     leadToCustomerRate: rate(counts.converted, counts.lead),
   };
+}
+
+/**
+ * Whether a lifecycle rate came out ABOVE 100% — more leads recorded a step
+ * than recorded the step before it.
+ *
+ * That is arithmetically correct and semantically impossible at the same
+ * time, and it is not a bug in `lifecycleFunnel`. The counts are actual
+ * conversion EVENTS, and the sequence gate in `leadQuality.answer` only
+ * binds going forward: leads answered before the eligibility question
+ * existed recorded `intent` without ever being asked `service`, so the
+ * middle milestone is under-counted relative to the one after it. Production
+ * read `sql: 5` against `eligible: 3` — a 166.7% "Qualified → Serious".
+ *
+ * The counts are NOT made monotonic to hide this. This card says
+ * "milestones reported to Meta", so inflating `eligible` to cover leads that
+ * skipped it would make the card disagree with the wire — the one thing the
+ * event-sourced rewrite of `funnelOverview` exists to prevent.
+ *
+ * So the pair is flagged instead, and the caller decides. It self-corrects
+ * as leads walk the full four-question sequence; until then a reader needs
+ * to be told why the number is impossible rather than left to conclude the
+ * whole panel is broken.
+ */
+export function rateIsInverted(rate: number | null): boolean {
+  return rate !== null && rate > 1;
 }

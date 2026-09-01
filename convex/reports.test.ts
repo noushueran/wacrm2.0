@@ -1934,3 +1934,70 @@ test("assignmentsByAgent is supervisor-gated", async () => {
     }),
   ).rejects.toThrow();
 });
+
+test("funnelOverview's lifecycle counts the EVENTS, not the stage transitions", async () => {
+  // The regression this guards: the lead-quality questions run in sales
+  // order, which is not `FUNNEL_STAGES` index order — eligibility maps to
+  // `itinerary_sent` and the `intent` that follows maps to the EARLIER
+  // `price_quoted`. `applyStageTransition`'s `neverDowngrade` guard then
+  // refuses that later stage move and logs no transition for it, while the
+  // conversion event fires correctly. Production showed `price_quoted`
+  // events 4 against transitions 3.
+  //
+  // So the lifecycle must read the outbox. Counting stages would silently
+  // under-report the middle of the funnel — the part this panel exists for.
+  const t = convexTest(schema, modules);
+  const clock = makeClock(T0);
+  clock(T0);
+  const { accountId, asSupervisor } = await seedAccountWithSupervisor(t);
+  const untilMs = T0 + 24 * 60 * 60 * 1000;
+
+  await t.run(async (ctx) => {
+    const phone = "+971500000411";
+    const contactId = await ctx.db.insert("contacts", {
+      accountId, phone, phoneNormalized: phone.replace(/\D/g, ""),
+    });
+    const conversationId = await ctx.db.insert("conversations", {
+      accountId, contactId, status: "open", unreadCount: 0,
+    });
+    const mk = (stage: string, eventName: string) =>
+      ctx.db.insert("conversionEvents", {
+        accountId, conversationId, contactId,
+        stage: stage as "qualified",
+        lane: "ctwa", backend: "capi", eventName,
+        identifier: "clid-report", phone: phone.replace(/\D/g, ""),
+        waMessageId: "wamid.r", firstMessageAt: T0,
+        eventId: `${conversationId}:${stage}`, status: "sent", attempts: 0,
+      });
+    await mk("new_lead", "LeadSubmitted");
+    await mk("qualified", "QualifiedLead");
+    await mk("itinerary_sent", "AddToCart");
+    await mk("price_quoted", "InitiateCheckout");
+    // NO funnelTransitions rows at all — exactly the state `neverDowngrade`
+    // leaves behind for the steps it refuses.
+  });
+
+  await buildFunnelRollup(t);
+  const out = await asSupervisor.query(api.reports.funnelOverview, {
+    sinceMs: 0,
+    untilMs,
+  });
+
+  expect(out.lifecycle).toMatchObject({
+    lead: 1,
+    mql: 1,
+    eligible: 1,
+    sql: 1,
+    converted: 0,
+  });
+  // Rates chain in question order: eligible over mql, sql over eligible.
+  expect(out.lifecycle.eligibleRate).toBe(1);
+  expect(out.lifecycle.sqlRate).toBe(1);
+  expect(out.lifecycle.convertedFromSqlRate).toBe(0);
+
+  // And the stage-based `funnel` block is legitimately empty here, which is
+  // the whole point: the two sources disagree, and the lifecycle uses the
+  // one that matches what Meta was told.
+  const byStage = Object.fromEntries(out.funnel.map((f) => [f.stage, f.count]));
+  expect(byStage.price_quoted ?? 0).toBe(0);
+});

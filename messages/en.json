@@ -581,8 +581,12 @@
       "networkError": "Couldn’t reach the server."
     },
     "leadQuality": {
+      "triggerLabel": "Lead quality",
+      "title": "Lead quality",
+      "progress": "{done}/{total} recorded",
       "question": {
         "genuine": "Is this a real customer?",
+        "service": "Qualified for the service?",
         "intent": "Serious about booking?",
         "payment": "Payment received?"
       },
@@ -590,9 +594,23 @@
       "no": "No",
       "confirm": "Save",
       "cancel": "Cancel",
-      "dismiss": "Not now",
-      "reasonPrompt": "What was wrong with it?",
-      "amountPrompt": "Amount received",
+      "recordedYes": "Recorded: Yes",
+      "recordedYesValue": "Recorded: {value} {currency}",
+      "recordedNo": "Recorded: No \u2014 not sent to Meta",
+      "revise": {
+        "genuine": "Actually a real customer \u2014 change to Yes",
+        "service": "Actually qualified for the service \u2014 change to Yes",
+        "intent": "Actually serious about booking \u2014 change to Yes",
+        "payment": "Payment received \u2014 record it now"
+      },
+      "fromStage": "from CRM stage",
+      "readOnly": "You cannot answer on this lead.",
+      "footnote": "One question at a time. Only a Yes is reported to Meta. A No can be changed to Yes whenever things change \u2014 a Yes is final, because Meta has already been told.",
+      "footnoteOrganic": "This lead did not come from an ad, so nothing here is reported to Meta. Answers are kept for your own reporting. A No can still be changed to Yes; a Yes is final.",
+      "sequenceEnded": "Nothing further to record for this lead.",
+      "listBadgeTitle": "Lead quality: {pending} still to answer",
+      "listBadgeDoneTitle": "Lead quality: all questions answered",
+      "listBadgeEndedTitle": "Lead quality: nothing to answer \u2014 stopped at a No. Open the chat to change it.",
       "reason": {
         "spam": "Spam",
         "supplier_vendor": "Supplier / vendor",
@@ -603,8 +621,8 @@
         "no_intent": "No intent to buy",
         "other": "Other"
       },
-      "sentToast": "Saved \u2014 lead quality reported to Meta.",
-      "savedToast": "Saved to your lead-quality log.",
+      "sentToast": "Recorded \u2014 reported to Meta.",
+      "savedToast": "Recorded in your lead-quality log.",
       "error": "Could not save that. Try again."
     },
     "funnel": {
@@ -1460,14 +1478,17 @@
       },
       "qualityTitle": "Lead quality funnel",
       "qualityNote": "Milestones reported to Meta. A rate needs leads in the stage above it \u2014 \u201c\u2014\u201d means none yet.",
+      "qualityCappedNote": "\u2020 More leads recorded a step than the one before it, so that rate is capped at 100%. It happens when a question was added after leads had already moved past it, and clears as new leads answer the full sequence.",
       "quality": {
         "lead": "Leads",
-        "mql": "Marketing qualified",
-        "sql": "Sales qualified",
+        "mql": "Real customers",
+        "eligible": "Qualified for service",
+        "sql": "Serious about booking",
         "converted": "Converted",
-        "mqlRate": "Lead \u2192 MQL",
-        "sqlRate": "MQL \u2192 SQL",
-        "convertedFromSqlRate": "SQL \u2192 Converted",
+        "mqlRate": "Lead \u2192 Real",
+        "eligibleRate": "Real \u2192 Qualified",
+        "sqlRate": "Qualified \u2192 Serious",
+        "convertedFromSqlRate": "Serious \u2192 Converted",
         "leadToCustomerRate": "Lead \u2192 customer"
       }
     },

@@ -31,6 +31,17 @@ describe("lead-quality card wiring", () => {
   const messageThread = read("components/inbox/message-thread.tsx");
   const card = read("components/inbox/lead-quality-card.tsx");
 
+  it("mounts the panel beside the notes button, not above the composer", () => {
+    // The footer strip crowded the message area on every unanswered lead.
+    // It now shares the notes FAB's positioning context.
+    expect(messageThread).toContain("<NoteComposer");
+    const notes = messageThread.indexOf("<NoteComposer");
+    const panel = messageThread.indexOf("<LeadQualityCard");
+    expect(panel).toBeGreaterThan(notes);
+    // And the card positions itself as a floating trigger.
+    expect(card).toContain("absolute bottom-4");
+  });
+
   it("mounts the card inside an OptionalFeatureBoundary", () => {
     expect(messageThread).toContain("OptionalFeatureBoundary");
     // The boundary must OPEN before the card and CLOSE after it — the
@@ -46,6 +57,27 @@ describe("lead-quality card wiring", () => {
     expect(open).toBeGreaterThan(-1);
     expect(mount).toBeGreaterThan(open);
     expect(close).toBeGreaterThan(mount);
+  });
+
+  it("submits a non-payment correction directly, without asking for money", () => {
+    // The correction button first shipped calling `setShowAmount(true)` for
+    // EVERY step. Only payment carries a figure, and the amount field's
+    // Save stays disabled until one is typed — so correcting "is this a
+    // real customer?" opened a money prompt that could never be submitted,
+    // making the correction unreachable on three of the four questions.
+    const revise = card.slice(card.indexOf("revise.${state.step}") - 900);
+    expect(revise).toContain('if (state.step === "payment")');
+    expect(revise).toContain('void onSubmit({ step: state.step, answer: "yes" })');
+  });
+
+  it("renders on organic threads too, gated only on the state existing", () => {
+    // The card used to bail on `!state.attributed`, so roughly one lead in
+    // six showed no panel at all with no visible reason.
+    expect(card).toContain("if (!state) return null;");
+    expect(card).not.toContain("!state.attributed) return null");
+    // And it must SAY that nothing is reported for those leads rather than
+    // looking identical to an attributed one.
+    expect(card).toContain("footnoteOrganic");
   });
 
   it("keeps the query subscription INSIDE the wrapped component", () => {

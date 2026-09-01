@@ -1021,7 +1021,7 @@ test("deliveryHealth reports the hold, its reason and its age for a dark backend
   expect(capi.heldCount).toBe(1);
   expect(capi.capped).toBe(false);
   expect(capi.reason).toBe(
-    "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
+    "META_CAPI_DATASET_ID unset",
   );
   expect(capi.oldestHeldAt).toBeTypeOf("number");
 
@@ -1172,6 +1172,22 @@ function captureCapiBody(): { get: () => Record<string, unknown> | null } {
     });
   }) as typeof fetch;
   return { get: () => body };
+}
+
+/**
+ * Deliver one row and hand back the single CAPI event that reached the
+ * wire. A thin wrapper over `captureCapiBody` for the tests that assert on
+ * the event itself rather than on the envelope around it.
+ */
+async function captureCapiEvent(
+  t: ReturnType<typeof convexTest>,
+  conversionEventId: Id<"conversionEvents">,
+) {
+  const captured = captureCapiBody();
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId,
+  });
+  return (captured.get()!.data as Array<Record<string, unknown>>)[0];
 }
 
 test("capi: sends ctwa_clid unhashed and phone SHA-256 hashed", async () => {
@@ -1442,3 +1458,114 @@ test("capi: a local-format phone is hashed with META's leading-zero rule, not th
   expect(userData.ph).not.toEqual([await sha256Hex("0585824488")]);
 });
 
+test("a row that failed then succeeded does not keep reading as broken", async () => {
+  process.env.META_CAPI_DATASET_ID = "ds";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  const id = await seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi", lane: "ctwa", stage: "qualified", eventName: "QualifiedLead",
+  });
+
+  // Fail once (permanent), then succeed.
+  globalThis.fetch = (async () => new Response("nope", { status: 400 })) as typeof fetch;
+  await t.action(internal.conversionEvents.deliverConversionEvent, { conversionEventId: id });
+  const failed = await t.run((ctx) => ctx.db.get(id));
+  expect(failed?.status).toBe("error");
+  expect(failed?.lastError).toContain("400");
+
+  await captureCapiEvent(t, id);
+  const ok = await t.run((ctx) => ctx.db.get(id));
+  expect(ok?.status).toBe("sent");
+  // The stale error must be gone: a `sent` row carrying a 400 message is
+  // what made a working delivery look rejected.
+  expect(ok?.lastError).toBeUndefined();
+});
+
+// ============================================================
+// Requeue — recovering conversions that failed for a since-fixed reason.
+// ============================================================
+
+test("requeue returns abandoned + dormant rows inside Meta's window to pending", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+
+  const abandoned = await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "qualified", eventName: "QualifiedLead",
+    status: "abandoned", attempts: MAX_DELIVER_ATTEMPTS,
+  });
+  const dormant = await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "price_quoted", eventName: "InitiateCheckout", status: "dormant",
+  });
+  const sent = await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "purchased", eventName: "Purchase", status: "sent",
+  });
+  await t.run((ctx) =>
+    ctx.db.patch(abandoned, { lastError: "CAPI 400: no WABA", transientAttempts: 3 }),
+  );
+
+  const res = await t.run((ctx) =>
+    ctx.runMutation(internal.conversionEvents.requeueDeliverable, {}),
+  );
+  expect(res.requeued).toBe(2);
+
+  const after = await t.run(async (ctx) => ({
+    abandoned: await ctx.db.get(abandoned),
+    dormant: await ctx.db.get(dormant),
+    sent: await ctx.db.get(sent),
+  }));
+
+  // Both retired rows are live again, with the counters that described a
+  // world which no longer exists wiped.
+  expect(after.abandoned?.status).toBe("pending");
+  expect(after.abandoned?.attempts).toBe(0);
+  expect(after.abandoned?.transientAttempts).toBe(0);
+  expect(after.abandoned?.lastError).toBeUndefined();
+  expect(after.dormant?.status).toBe("pending");
+
+  // A success is NEVER requeued — that would double-report it to Meta.
+  expect(after.sent?.status).toBe("sent");
+});
+
+test("requeue leaves rows Meta would reject exactly where they are", async () => {
+  vi.useFakeTimers();
+  try {
+    const t = convexTest(schema, modules);
+    const accountId = await seedAccount(t);
+    const { contactId, conversationId } = await seedConversation(t, accountId);
+    const old = await seedEvent(t, accountId, conversationId, contactId, {
+      stage: "qualified", eventName: "QualifiedLead", status: "dormant",
+    });
+
+    // Jump far past Meta's event_time window. Pushing this at Meta earns a
+    // permanent 4xx and spends the retry budget a second time for nothing.
+    vi.setSystemTime(Date.now() + 40 * 24 * 60 * 60 * 1000);
+    const res = await t.run((ctx) =>
+      ctx.runMutation(internal.conversionEvents.requeueDeliverable, {}),
+    );
+    expect(res.requeued).toBe(0);
+    expect((await t.run((ctx) => ctx.db.get(old)))?.status).toBe("dormant");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("requeue dryRun counts without moving anything", async () => {
+  const t = convexTest(schema, modules);
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  const row = await seedEvent(t, accountId, conversationId, contactId, {
+    stage: "qualified", eventName: "QualifiedLead", status: "dormant",
+  });
+
+  const res = await t.run((ctx) =>
+    ctx.runMutation(internal.conversionEvents.requeueDeliverable, { dryRun: true }),
+  );
+  expect(res.dryRun).toBe(true);
+  expect(res.byStatus.dormant).toBe(1);
+  expect(res.requeued).toBe(0);
+  expect((await t.run((ctx) => ctx.db.get(row)))?.status).toBe("dormant");
+});

@@ -52,6 +52,18 @@ const tWindow = ((key: string) =>
   typeof ConversationItem
 >["tWindow"];
 
+const T_QUALITY_STRINGS: Record<string, string> = {
+  listBadgeTitle: "Lead quality: still to answer",
+  listBadgeDoneTitle: "Lead quality: all questions answered",
+  listBadgeEndedTitle:
+    "Lead quality: nothing to answer — stopped at a No. Open the chat to change it.",
+};
+
+const tQuality = ((key: string) =>
+  T_QUALITY_STRINGS[key] ?? key) as unknown as React.ComponentProps<
+  typeof ConversationItem
+>["tQuality"];
+
 /** Fixed clock so the window assertions don't drift with wall time. */
 const NOW = Date.parse("2026-07-24T12:00:00.000Z");
 const HOUR = 60 * 60 * 1000;
@@ -94,6 +106,7 @@ function render(
       onHoverEnd: () => {},
       t,
       tWindow,
+      tQuality,
       nowMs: NOW,
       groups: [],
       // Every existing test in this file predates lane tabs, so the
@@ -450,5 +463,49 @@ describe("laneEmptyMessageKey", () => {
       "Nothing archived yet.",
     );
     expect(strings[laneEmptyMessageKey("snoozed")]).toBe("Nothing snoozed.");
+  });
+});
+
+describe("ConversationItem — lead-quality badge", () => {
+  const withQuality = (leadQuality: Conversation["leadQuality"]) =>
+    render(conversation({ leadQuality }));
+
+  it("shows progress on a row that still owes answers", () => {
+    // The whole point: which threads need work has to be readable from the
+    // list, without opening each one.
+    const html = withQuality({ answered: 1, pending: 3, total: 4, ended: false });
+    expect(html).toContain("1/");
+    expect(html).toContain("4");
+    expect(html).toContain("Lead quality: still to answer");
+    // Primary tone — this row wants something.
+    expect(html).toContain("bg-primary/15");
+  });
+
+  it("marks a fully answered row as done, not as outstanding", () => {
+    const html = withQuality({ answered: 4, pending: 0, total: 4, ended: false });
+    expect(html).toContain("Lead quality: all questions answered");
+    expect(html).toContain("text-emerald-400");
+    expect(html).not.toContain("bg-primary/15");
+  });
+
+  it("reads as green, not outstanding, when a No ended the sequence", () => {
+    // The reported bug: a lead rejected at question one showed "1/4" in the
+    // outstanding tone, nagging for three answers nobody could give. The
+    // colour answers "is there work here?", so nothing-to-do is green
+    // whether the sequence finished or stopped early.
+    const html = withQuality({ answered: 1, pending: 0, total: 4, ended: true });
+    expect(html).toContain("Lead quality: nothing to answer");
+    expect(html).toContain("text-emerald-400");
+    expect(html).not.toContain("bg-primary/15");
+    // The fraction still tells the truth about what was answered — 1/4
+    // green and 4/4 green are very different leads.
+    expect(html).toContain("1/");
+  });
+
+  it("renders no badge at all when the field was not joined", () => {
+    // `conversations.get` does not return it; a row rendered from that
+    // shape must not invent a 0/0 chip.
+    const html = render(conversation());
+    expect(html).not.toContain("Lead quality:");
   });
 });

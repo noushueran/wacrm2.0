@@ -321,6 +321,26 @@ export interface Conversation {
    */
   followUpsSent?: number;
   sequenceStatus?: "idle" | "running" | "exhausted" | "stopped";
+  /**
+   * Lead-quality progress, so the list can show which threads still owe an
+   * answer without opening each one. Derived server-side by
+   * `summarizeSteps` from the same `stepStates` the thread panel renders,
+   * so the row badge and the panel's own count cannot disagree.
+   *
+   * `ended` is "a recorded No stands with nothing open behind it" — NOT
+   * "finished". The No is correctable, so an ended row is still actionable;
+   * it just is not waiting on an unanswered question, and the badge must
+   * not nag as though it were.
+   *
+   * `undefined` is the "not joined" case: `conversations.list` returns it
+   * on every lane, `conversations.get` does not.
+   */
+  leadQuality?: {
+    answered: number;
+    pending: number;
+    total: number;
+    ended: boolean;
+  };
 }
 
 // ============================================================

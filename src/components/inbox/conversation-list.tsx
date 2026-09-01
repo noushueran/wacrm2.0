@@ -19,7 +19,7 @@ import type { AssignmentTab, InboxLane } from "@/lib/inbox/view";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag, TagGroup, Profile } from "@/types";
-import { Search, ChevronDown, X, Mail, Megaphone } from "lucide-react";
+import { Search, ChevronDown, X, Mail, Megaphone, Gauge } from "lucide-react";
 import { formatDistanceToNow, format } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Input } from "@/components/ui/input";
@@ -116,6 +116,9 @@ export function ConversationList({
 }: ConversationListProps) {
   const t = useTranslations("Inbox.conversationList");
   const tWindow = useTranslations("Inbox.messagingWindow");
+  // Same scope the thread panel reads, so the badge and the panel are
+  // worded from one place.
+  const tQuality = useTranslations("Inbox.leadQuality");
 
   // One clock for every row's free-window badge. 60s is plenty: the badge
   // is a boolean, so it only has to flip near the window's expiry.
@@ -621,6 +624,7 @@ export function ConversationList({
                 onHoverEnd={handleHoverEnd}
                 t={t}
                 tWindow={tWindow}
+                tQuality={tQuality}
                 nowMs={nowMs}
                 groups={groups}
                 lane={lane}
@@ -810,6 +814,8 @@ interface ConversationItemProps {
   t: ReturnType<typeof useTranslations>;
   /** `Inbox.messagingWindow` scope — the free-window badge. */
   tWindow: ReturnType<typeof useTranslations>;
+  /** `Inbox.leadQuality` scope — the lead-quality progress badge. */
+  tQuality: ReturnType<typeof useTranslations>;
   /** Shared ticking clock, owned by the parent list. Keeps render pure. */
   nowMs: number;
   groups: TagGroup[];
@@ -838,6 +844,7 @@ export function ConversationItem({
   onHoverEnd,
   t,
   tWindow,
+  tQuality,
   nowMs,
   groups,
   lane,
@@ -1020,6 +1027,51 @@ export function ConversationItem({
                   className="inline-flex items-center rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[11px] font-medium text-emerald-400"
                 >
                   {tWindow("listFreeBadge")}
+                </span>
+              )}
+              {/* Lead-quality progress. The panel inside the thread badges
+                  the same `pending` count, from the same server-side
+                  `stepStates` — an agent could not otherwise tell which
+                  threads still owed an answer without opening every one,
+                  which is most of why the panel went unused.
+
+                  The colour answers ONE question — is there work here? —
+                  so a lead whose sequence stopped at a No reads green
+                  alongside a fully answered one: neither is waiting on
+                  anybody. It is the fraction and the tooltip that say
+                  which is which, and they must, because 1/4 green and 4/4
+                  green are very different leads.
+
+                  An earlier build had a third, muted tone for the stopped
+                  case. It never rendered: it keyed on `pending === 0`
+                  while `pending` was still counting questions the `no` had
+                  cut off, so those rows came out primary — nagging for
+                  answers nobody could give. Fixed in `summarizeSteps`, at
+                  the source, rather than by special-casing the colour here.
+
+                  Kept last-but-one so it sits beside the assignee chip
+                  rather than competing with the lane badges above. */}
+              {conversation.leadQuality && (
+                <span
+                  title={
+                    conversation.leadQuality.pending > 0
+                      ? tQuality("listBadgeTitle", {
+                          pending: conversation.leadQuality.pending,
+                        })
+                      : conversation.leadQuality.ended
+                        ? tQuality("listBadgeEndedTitle")
+                        : tQuality("listBadgeDoneTitle")
+                  }
+                  className={cn(
+                    "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium tabular-nums",
+                    conversation.leadQuality.pending === 0
+                      ? "bg-emerald-500/15 text-emerald-400"
+                      : "bg-primary/15 text-primary",
+                  )}
+                >
+                  <Gauge className="h-3 w-3 shrink-0" />
+                  {conversation.leadQuality.answered}/
+                  {conversation.leadQuality.total}
                 </span>
               )}
               {assignee.kind !== "unassigned" && (

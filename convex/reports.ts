@@ -789,16 +789,46 @@ export const funnelOverview = accountQuery({
       count: totals[stage],
     }));
 
-    // The 4-stage lead-quality funnel the Meta integration reports, and
-    // its rates (CAPI lifecycle spec §19). Derived from the SAME
-    // first-arrival counters as `funnel` above and the same stage→label
-    // mapping the outbox uses, so the report and the wire can never
-    // disagree about what an MQL is.
+    // The 5-milestone lead-quality funnel and its rates (CAPI lifecycle
+    // spec §19), counted from the CONVERSION EVENTS rather than from the
+    // stage rollup above.
+    //
+    // They diverge, and the events are the honest source. The questions run
+    // in sales order, which is not `FUNNEL_STAGES` index order —
+    // eligibility maps to `itinerary_sent`, and the `intent` that follows
+    // maps to the EARLIER `price_quoted` — so `applyStageTransition`'s
+    // `neverDowngrade` guard refuses that later stage move and logs no
+    // transition for it. Production showed `price_quoted` events 4 against
+    // transitions 3: counting stages under-reports precisely the middle of
+    // the funnel this panel exists to show.
+    //
+    // Distinct CONVERSATIONS per stage, not row counts, so a lead that
+    // somehow produced two rows for one milestone still counts once. One
+    // window-bounded index range, the same `by_account` + `_creationTime`
+    // shape `campaigns.overview` uses.
+    const eventRows = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_account", (q) =>
+        q
+          .eq("accountId", ctx.accountId)
+          .gte("_creationTime", args.sinceMs)
+          .lt("_creationTime", args.untilMs),
+      )
+      .collect();
+    const convosByStage = new Map<string, Set<string>>();
+    for (const row of eventRows) {
+      let set = convosByStage.get(row.stage);
+      if (!set) convosByStage.set(row.stage, (set = new Set()));
+      set.add(row.conversationId);
+    }
+    const reached = (stage: string) => convosByStage.get(stage)?.size ?? 0;
+
     const lifecycle = lifecycleFunnel({
-      lead: totals.new_lead,
-      mql: totals.qualified,
-      sql: totals.price_quoted,
-      converted: totals.purchased,
+      lead: reached("new_lead"),
+      mql: reached("qualified"),
+      eligible: reached("itinerary_sent"),
+      sql: reached("price_quoted"),
+      converted: reached("purchased"),
     });
 
     return {
