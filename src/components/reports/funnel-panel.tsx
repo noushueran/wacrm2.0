@@ -13,11 +13,12 @@ import type { ReportPanelProps } from '@/lib/reports/types'
 import { LeadsPipelineCard } from '@/components/dashboard/leads-pipeline-card'
 
 /** The four lead-quality milestones, in funnel order. */
-const QUALITY_COUNT_KEYS = ['lead', 'mql', 'sql', 'converted'] as const
+const QUALITY_COUNT_KEYS = ['lead', 'mql', 'eligible', 'sql', 'converted'] as const
 
 /** The four rates between them, in the same order. */
 const QUALITY_RATE_KEYS = [
   'mqlRate',
+  'eligibleRate',
   'sqlRate',
   'convertedFromSqlRate',
   'leadToCustomerRate',
@@ -182,7 +183,7 @@ export function FunnelPanel({ reportWindow, canRead }: ReportPanelProps) {
       <div className="rounded-xl border border-border bg-card p-5">
         <h2 className="text-sm font-medium text-foreground">{t('funnel.qualityTitle')}</h2>
         <p className="mt-1 text-xs text-muted-foreground">{t('funnel.qualityNote')}</p>
-        <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-5">
           {QUALITY_COUNT_KEYS.map((k) => (
             <div key={k} className="rounded-lg border border-border bg-background p-3">
               <p className="text-xs text-muted-foreground">{t(`funnel.quality.${k}`)}</p>
@@ -192,7 +193,7 @@ export function FunnelPanel({ reportWindow, canRead }: ReportPanelProps) {
             </div>
           ))}
         </div>
-        <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-5">
           {QUALITY_RATE_KEYS.map((k) => (
             <div key={k} className="rounded-lg border border-border bg-background p-3">
               <p className="text-xs text-muted-foreground">{t(`funnel.quality.${k}`)}</p>

@@ -1470,12 +1470,14 @@
       "qualityNote": "Milestones reported to Meta. A rate needs leads in the stage above it \u2014 \u201c\u2014\u201d means none yet.",
       "quality": {
         "lead": "Leads",
-        "mql": "Marketing qualified",
-        "sql": "Sales qualified",
+        "mql": "Real customers",
+        "eligible": "Qualified for service",
+        "sql": "Serious about booking",
         "converted": "Converted",
-        "mqlRate": "Lead \u2192 MQL",
-        "sqlRate": "MQL \u2192 SQL",
-        "convertedFromSqlRate": "SQL \u2192 Converted",
+        "mqlRate": "Lead \u2192 Real",
+        "eligibleRate": "Real \u2192 Qualified",
+        "sqlRate": "Qualified \u2192 Serious",
+        "convertedFromSqlRate": "Serious \u2192 Converted",
         "leadToCustomerRate": "Lead \u2192 customer"
       }
     },
