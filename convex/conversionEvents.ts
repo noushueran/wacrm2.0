@@ -575,7 +575,7 @@ export const deliverConversionEvent = internalAction({
           reason: "META_CAPI_DATASET_ID unset",
         });
         logDelivery({
-          ...logBase,
+          ...logFieldsFor(row),
           outcome: "dormant",
           errorCategory: "unconfigured",
         });
@@ -1562,9 +1562,10 @@ export const capiProbeMatrix = internalAction({
     // it. Using a made-up number would test the wrong thing: Meta can
     // reject an identity for being unknown as easily as for being absent,
     // and only a number it has already seen separates those two answers.
-    const donorPhoneHash = donor.phone
-      ? await sha256Hex(normalizePhoneForMeta(donor.phone) ?? "")
-      : null;
+    // Routed through `lib/metaHash` like every other hash in this file —
+    // the probe must hash by exactly the rule production uses, or it
+    // answers a question about the probe rather than about delivery.
+    const donorPhoneHash = (await hashedPhone(donor.phone)) ?? null;
 
     const out = [];
     for (const [i, variant] of args.variants.entries()) {

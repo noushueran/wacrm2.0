@@ -1174,6 +1174,22 @@ function captureCapiBody(): { get: () => Record<string, unknown> | null } {
   return { get: () => body };
 }
 
+/**
+ * Deliver one row and hand back the single CAPI event that reached the
+ * wire. A thin wrapper over `captureCapiBody` for the tests that assert on
+ * the event itself rather than on the envelope around it.
+ */
+async function captureCapiEvent(
+  t: ReturnType<typeof convexTest>,
+  conversionEventId: Id<"conversionEvents">,
+) {
+  const captured = captureCapiBody();
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId,
+  });
+  return (captured.get()!.data as Array<Record<string, unknown>>)[0];
+}
+
 test("capi: sends ctwa_clid unhashed and phone SHA-256 hashed", async () => {
   process.env.META_CAPI_DATASET_ID = "DS1";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";
