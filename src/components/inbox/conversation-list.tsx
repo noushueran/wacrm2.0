@@ -1035,13 +1035,20 @@ export function ConversationItem({
                   threads still owed an answer without opening every one,
                   which is most of why the panel went unused.
 
-                  Three tones, because the three states call for different
-                  things and a single count would flatten them:
-                    · questions open  → primary, this row wants an answer
-                    · all answered    → emerald tick, nothing to do
-                    · stopped at a No → muted, nothing is ANSWERABLE right
-                      now (the No is still correctable inside the thread,
-                      so it is not "done" — it just must not nag).
+                  The colour answers ONE question — is there work here? —
+                  so a lead whose sequence stopped at a No reads green
+                  alongside a fully answered one: neither is waiting on
+                  anybody. It is the fraction and the tooltip that say
+                  which is which, and they must, because 1/4 green and 4/4
+                  green are very different leads.
+
+                  An earlier build had a third, muted tone for the stopped
+                  case. It never rendered: it keyed on `pending === 0`
+                  while `pending` was still counting questions the `no` had
+                  cut off, so those rows came out primary — nagging for
+                  answers nobody could give. Fixed in `summarizeSteps`, at
+                  the source, rather than by special-casing the colour here.
+
                   Kept last-but-one so it sits beside the assignee chip
                   rather than competing with the lane badges above. */}
               {conversation.leadQuality && (
@@ -1058,9 +1065,7 @@ export function ConversationItem({
                   className={cn(
                     "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium tabular-nums",
                     conversation.leadQuality.pending === 0
-                      ? conversation.leadQuality.ended
-                        ? "bg-muted text-muted-foreground"
-                        : "bg-emerald-500/15 text-emerald-400"
+                      ? "bg-emerald-500/15 text-emerald-400"
                       : "bg-primary/15 text-primary",
                   )}
                 >

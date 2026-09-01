@@ -128,7 +128,11 @@ export function LeadQualityCard({
     }
   };
 
-  const answeredCount = steps.length - state.pendingCount;
+  // Counted from the steps themselves, NOT as `total - pendingCount`.
+  // `pendingCount` is "how many answers are still owed", which is zero once
+  // a `no` ends the sequence — deriving progress from it would report
+  // "4/4 recorded" on a lead where exactly one question was ever answered.
+  const answeredCount = steps.filter((s) => s.locked).length;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

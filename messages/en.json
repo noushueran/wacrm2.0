@@ -610,7 +610,7 @@
       "sequenceEnded": "Nothing further to record for this lead.",
       "listBadgeTitle": "Lead quality: {pending} still to answer",
       "listBadgeDoneTitle": "Lead quality: all questions answered",
-      "listBadgeEndedTitle": "Lead quality: stopped at a No \u2014 open the chat to change it",
+      "listBadgeEndedTitle": "Lead quality: nothing to answer \u2014 stopped at a No. Open the chat to change it.",
       "reason": {
         "spam": "Spam",
         "supplier_vendor": "Supplier / vendor",

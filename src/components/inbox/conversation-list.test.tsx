@@ -55,7 +55,8 @@ const tWindow = ((key: string) =>
 const T_QUALITY_STRINGS: Record<string, string> = {
   listBadgeTitle: "Lead quality: still to answer",
   listBadgeDoneTitle: "Lead quality: all questions answered",
-  listBadgeEndedTitle: "Lead quality: stopped at a No",
+  listBadgeEndedTitle:
+    "Lead quality: nothing to answer — stopped at a No. Open the chat to change it.",
 };
 
 const tQuality = ((key: string) =>
@@ -487,15 +488,18 @@ describe("ConversationItem — lead-quality badge", () => {
     expect(html).not.toContain("bg-primary/15");
   });
 
-  it("does not nag a row whose sequence stopped at a No", () => {
-    // `ended` is not "finished" — the No is correctable inside the thread —
-    // but nothing is answerable from here, so it must read as muted rather
-    // than as an outstanding task.
+  it("reads as green, not outstanding, when a No ended the sequence", () => {
+    // The reported bug: a lead rejected at question one showed "1/4" in the
+    // outstanding tone, nagging for three answers nobody could give. The
+    // colour answers "is there work here?", so nothing-to-do is green
+    // whether the sequence finished or stopped early.
     const html = withQuality({ answered: 1, pending: 0, total: 4, ended: true });
-    expect(html).toContain("Lead quality: stopped at a No");
-    expect(html).toContain("bg-muted");
+    expect(html).toContain("Lead quality: nothing to answer");
+    expect(html).toContain("text-emerald-400");
     expect(html).not.toContain("bg-primary/15");
-    expect(html).not.toContain("text-emerald-400");
+    // The fraction still tells the truth about what was answered — 1/4
+    // green and 4/4 green are very different leads.
+    expect(html).toContain("1/");
   });
 
   it("renders no badge at all when the field was not joined", () => {

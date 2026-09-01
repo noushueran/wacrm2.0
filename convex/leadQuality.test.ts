@@ -1055,26 +1055,40 @@ describe("summarizeSteps", () => {
     });
   });
 
-  it("agrees with the panel's own pending count, always", () => {
-    // The badge and the panel must never disagree — they are the same
-    // number, taken from the same `stepStates` call shape.
-    const cases: AnswerRecord[][] = [
-      [],
-      [{ step: "genuine", answer: "yes", at: T0 }],
-      [{ step: "genuine", answer: "no", at: T0 }],
-      [
-        { step: "genuine", answer: "yes", at: T0 },
-        { step: "service", answer: "yes", at: T0 + 1 },
-        { step: "intent", answer: "no", at: T0 + 2 },
-      ],
-    ];
-    for (const answers of cases) {
-      const steps = stepStates({ answers, currentStage: null });
-      // `getCardState`'s badge is exactly this expression.
-      expect(summarizeSteps(steps).pending).toBe(
-        steps.filter((s) => !s.locked).length,
-      );
+  it("counts questions AHEAD on the path, but not ones a NO cut off", () => {
+    // The distinction the first build got wrong. On an untouched lead all
+    // four are outstanding even though only the first is answerable — they
+    // are ahead on the path. Once a `no` ends the sequence, the rest are
+    // not merely unanswered: they will never be asked, because each one
+    // presupposes the `no` was a yes.
+    expect(summaryFor([]).pending).toBe(4);
+    expect(summaryFor([{ step: "genuine", answer: "yes", at: T0 }]).pending).toBe(3);
+    expect(summaryFor([{ step: "genuine", answer: "no", at: T0 }]).pending).toBe(0);
+  });
+
+  it("reports nothing outstanding wherever the NO falls", () => {
+    // A lead rejected at question one showed "3 left" on the thread badge
+    // AND the list row — three answers nobody could give.
+    const answers: AnswerRecord[] = [];
+    let at = T0;
+    for (const step of ["genuine", "service", "intent"] as const) {
+      const stopped = summaryFor([...answers, { step, answer: "no", at: at + 100 }]);
+      expect(stopped.pending).toBe(0);
+      expect(stopped.ended).toBe(true);
+      answers.push({ step, answer: "yes", at: at++ });
     }
+  });
+
+  it("treats a NO on the LAST question as finished, not as cut short", () => {
+    // Nothing is outstanding and nothing was cut off — every question was
+    // asked and answered. An ordinary complete lead.
+    const unpaid = summaryFor([
+      { step: "genuine", answer: "yes", at: T0 },
+      { step: "service", answer: "yes", at: T0 + 1 },
+      { step: "intent", answer: "yes", at: T0 + 2 },
+      { step: "payment", answer: "no", at: T0 + 3 },
+    ]);
+    expect(unpaid).toEqual({ answered: 4, pending: 0, total: 4, ended: false });
   });
 
   it("marks a sequence stopped at a NO as ended, not as finished", () => {
@@ -1082,8 +1096,7 @@ describe("summarizeSteps", () => {
     // inside the thread, so the row is actionable — it simply is not
     // waiting on an unanswered question, and must not nag as if it were.
     const stopped = summaryFor([{ step: "genuine", answer: "no", at: T0 }]);
-    expect(stopped).toMatchObject({ answered: 1, ended: true });
-    expect(stopped.answered).toBeLessThan(stopped.total);
+    expect(stopped).toEqual({ answered: 1, pending: 0, total: 4, ended: true });
   });
 
   it("does not mark a fully answered lead as ended", () => {
@@ -1096,12 +1109,12 @@ describe("summarizeSteps", () => {
     expect(done).toEqual({ answered: 4, pending: 0, total: 4, ended: false });
   });
 
-  it("clears `ended` once the NO is corrected", () => {
+  it("brings the outstanding questions back once the NO is corrected", () => {
     const corrected = summaryFor([
       { step: "genuine", answer: "no", at: T0 },
       { step: "genuine", answer: "yes", at: T0 + 60_000 },
     ]);
-    expect(corrected).toMatchObject({ answered: 1, pending: 3, ended: false });
+    expect(corrected).toEqual({ answered: 1, pending: 3, total: 4, ended: false });
   });
 
   it("counts a stage-implied lead without any answers of its own", () => {
@@ -1111,4 +1124,44 @@ describe("summarizeSteps", () => {
     expect(implied.answered).toBeGreaterThan(0);
     expect(implied.answered + implied.pending).toBe(implied.total);
   });
+});
+
+test("a rejected lead stops asking — and says so on the badge, not '3 left'", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, userId, asUser } = await seedMember(t);
+  const { conversationId } = await seedLead(t, accountId, userId);
+
+  const before = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(before.pendingCount).toBe(4);
+
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "no",
+    reason: "spam",
+  });
+
+  // Nothing further can be asked of a lead that is not a real customer, so
+  // nothing is owed. This read 3 before: the three questions the `no` cut
+  // off were being counted as outstanding answers nobody could give.
+  const after = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(after.pendingCount).toBe(0);
+  expect(after.steps.filter((s) => s.available)).toHaveLength(0);
+
+  // The one thing still possible is the correction, and taking it brings
+  // the outstanding questions straight back.
+  expect(after.steps.find((s) => s.step === "genuine")?.revisable).toBe(true);
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "yes",
+  });
+  const reinstated = await asUser.query(api.leadQuality.getCardState, {
+    conversationId,
+  });
+  expect(reinstated.pendingCount).toBe(3);
 });

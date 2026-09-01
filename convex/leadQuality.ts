@@ -59,6 +59,7 @@ export type {
 import {
   STEP_STAGE,
   stepStates,
+  summarizeSteps,
   type QualityStep,
   type AnswerRecord,
   type StepState,
@@ -159,7 +160,12 @@ export const getCardState = accountQuery({
       attributed: conversation.attribution !== undefined,
       canAnswer,
       steps,
-      pendingCount: steps.filter((s) => !s.locked).length,
+      // Through `summarizeSteps`, not a second expression that looks
+      // similar: this is the SAME number the inbox list badges, and a
+      // lead whose sequence stopped at a `no` must show nothing
+      // outstanding in both places rather than nagging for answers that
+      // can never be given.
+      pendingCount: summarizeSteps(steps).pending,
     };
   },
 });

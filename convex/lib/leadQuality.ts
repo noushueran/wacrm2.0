@@ -263,12 +263,30 @@ export type LeadQualitySummary = {
 
 export function summarizeSteps(steps: StepState[]): LeadQualitySummary {
   const answered = steps.filter((s) => s.locked).length;
+
+  // A recorded `no` ENDS the sequence, so the questions behind it are not
+  // merely unanswered — they will never be asked. Every one of them
+  // presupposes the `no` was a yes: there is no sense in asking whether a
+  // lead is serious about booking once it is not a real customer.
+  //
+  // This is the whole reason `pending` is not `steps.filter(s => !s.locked)`.
+  // That count was the first thing shipped and it was wrong in the one case
+  // that matters most: a lead rejected at question one reported THREE
+  // outstanding answers that nobody could give, on both the thread badge
+  // and the list row. It also silently defeated the "stopped" styling,
+  // which keys on `pending === 0` and so could never fire.
+  //
+  // Steps not yet REACHED still count. On an untouched lead all four are
+  // outstanding even though only the first is answerable right now — they
+  // are ahead on the path, not cut off from it.
+  const stopped = steps.some((s) => s.locked && s.answer === "no");
+
   return {
     answered,
-    pending: steps.filter((s) => !s.locked).length,
+    pending: stopped ? 0 : steps.filter((s) => !s.locked).length,
     total: steps.length,
-    // Nothing open, but not everything answered — the sequence stopped at
-    // a `no` rather than running to the end.
-    ended: !steps.some((s) => s.available) && answered < steps.length,
+    // Stopped BEFORE the end. A `no` on the last question leaves nothing
+    // outstanding and nothing cut off, so it is an ordinary finished lead.
+    ended: stopped && answered < steps.length,
   };
 }
