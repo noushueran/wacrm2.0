@@ -31,6 +31,17 @@ describe("lead-quality card wiring", () => {
   const messageThread = read("components/inbox/message-thread.tsx");
   const card = read("components/inbox/lead-quality-card.tsx");
 
+  it("mounts the panel beside the notes button, not above the composer", () => {
+    // The footer strip crowded the message area on every unanswered lead.
+    // It now shares the notes FAB's positioning context.
+    expect(messageThread).toContain("<NoteComposer");
+    const notes = messageThread.indexOf("<NoteComposer");
+    const panel = messageThread.indexOf("<LeadQualityCard");
+    expect(panel).toBeGreaterThan(notes);
+    // And the card positions itself as a floating trigger.
+    expect(card).toContain("absolute bottom-4");
+  });
+
   it("mounts the card inside an OptionalFeatureBoundary", () => {
     expect(messageThread).toContain("OptionalFeatureBoundary");
     // The boundary must OPEN before the card and CLOSE after it — the

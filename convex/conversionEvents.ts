@@ -14,6 +14,7 @@ import {
   moveConversionEventStatusInRollup,
 } from "./funnel";
 import { accountQuery } from "./lib/auth";
+import { decrypt } from "./lib/whatsappEncryption";
 
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
 export const MAX_DELIVER_ATTEMPTS = 5;
@@ -429,7 +430,14 @@ export const patchStatus = internalMutation({
     if (args.fbTraceId !== undefined) patch.fbTraceId = args.fbTraceId;
     if (args.matchResult !== undefined) patch.matchResult = args.matchResult;
     if (args.lastError !== undefined) patch.lastError = args.lastError;
-    if (args.status === "sent") patch.sentAt = Date.now();
+    if (args.status === "sent") {
+      patch.sentAt = Date.now();
+      // Clear the previous attempt's error. Without this a row that failed
+      // once and then succeeded still reads as broken — which is exactly
+      // how a working delivery got mistaken for a rejected one while the
+      // WABA/dataset link was being fixed.
+      patch.lastError = undefined;
+    }
     if (bumping) {
       patch.attempts = nextAttempts;
       if (row.nextAttemptAt !== undefined) patch.nextAttemptAt = undefined;
@@ -561,11 +569,46 @@ export const deliverConversionEvent = internalAction({
 
     if (row.backend === "capi") {
       const datasetId = process.env.META_CAPI_DATASET_ID;
-      const token = process.env.META_CAPI_ACCESS_TOKEN;
-      if (!datasetId || !token) {
+      if (!datasetId) {
         await ctx.runMutation(internal.conversionEvents.retireDormant, {
           conversionEventId: args.conversionEventId,
-          reason: "META_CAPI_DATASET_ID/META_CAPI_ACCESS_TOKEN unset",
+          reason: "META_CAPI_DATASET_ID unset",
+        });
+        logDelivery({
+          ...logBase,
+          outcome: "dormant",
+          errorCategory: "unconfigured",
+        });
+        return;
+      }
+      // The credential is the account's OWN WhatsApp system-user token by
+      // default, not a second secret minted by hand.
+      //
+      // Why: a Click-to-WhatsApp event goes to the dataset that belongs to
+      // the WABA (`POST /{waba_id}/dataset`), and the principal owning that
+      // dataset is the same system user already sending and receiving
+      // messages — on this deployment `wa_api_user`, which carries
+      // `whatsapp_business_manage_events` and never expires. A token minted
+      // separately in Events Manager is scoped to a WEB pixel and draws
+      // "Object with ID ... cannot be loaded due to missing permissions"
+      // from the WABA's dataset, which is exactly how this lane sat broken.
+      //
+      // `META_CAPI_ACCESS_TOKEN` remains an explicit override for a
+      // deployment that must deliver to a dataset the WhatsApp system user
+      // cannot reach. Unset (the normal case), the account's own token is
+      // used and there is one credential to rotate rather than two.
+      const config = await ctx.runQuery(
+        internal.whatsappConfig.getForAccount,
+        { accountId: row.accountId },
+      );
+      const wabaId = config?.wabaId ?? null;
+      const token =
+        process.env.META_CAPI_ACCESS_TOKEN ??
+        (config ? await decrypt(config.accessToken) : undefined);
+      if (!token) {
+        await ctx.runMutation(internal.conversionEvents.retireDormant, {
+          conversionEventId: args.conversionEventId,
+          reason: "no CAPI token — WhatsApp not connected for account",
         });
         logDelivery({
           ...logFieldsFor(row),
@@ -574,9 +617,6 @@ export const deliverConversionEvent = internalAction({
         });
         return;
       }
-      const wabaId = await ctx.runQuery(internal.conversionEvents.getWabaId, {
-        accountId: row.accountId,
-      });
       if (!wabaId) {
         // Re-swept on every tick while the CAPI env is set (the sweep keys on
         // env, which is configured here) — a no-op round-trip per row until
@@ -953,7 +993,11 @@ export const retryConversionEvents = internalAction({
   args: {},
   handler: async (ctx): Promise<void> => {
     const backends: Array<"platformA" | "capi"> = [];
-    if (process.env.META_CAPI_DATASET_ID && process.env.META_CAPI_ACCESS_TOKEN) {
+    // Dataset id alone now decides whether capi can be attempted: the token
+    // is resolved PER ACCOUNT from its WhatsApp connection (see
+    // `deliverConversionEvent`), so a deployment-wide env check can no
+    // longer answer "is this configured".
+    if (process.env.META_CAPI_DATASET_ID) {
       backends.push("capi");
     }
     if (
@@ -1186,5 +1230,260 @@ export const getUnconfiguredHold = internalQuery({
       }),
     );
     return found.filter((row): row is NonNullable<typeof row> => row !== null);
+  },
+});
+
+
+/**
+ * Diagnostic: who owns the WhatsApp token, and can it carry CAPI events?
+ *
+ * Exists because the CAPI lane needs a token with
+ * `whatsapp_business_manage_events` on the WABA's dataset, and the
+ * obvious candidate is the system user ALREADY configured for sending and
+ * receiving messages — one credential the business already rotates,
+ * rather than a second one minted by hand in Events Manager.
+ *
+ * Returns metadata ONLY. The token is decrypted in memory to make the
+ * call and is never returned, logged, or echoed — the whole point is to
+ * answer "which system user is this, and does it have the scope" without
+ * anyone having to look at the secret itself.
+ */
+export const whoAmI = internalAction({
+  args: { accountId: v.id("accounts") },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    ok: boolean;
+    identity?: { id?: string; name?: string };
+    app?: { id?: string; name?: string };
+    type?: string;
+    expiresAt?: number | null;
+    scopes?: string[];
+    hasManageEvents?: boolean;
+    error?: string;
+  }> => {
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId: args.accountId,
+    });
+    if (!config) return { ok: false, error: "WhatsApp not configured" };
+    const token = await decrypt(config.accessToken);
+
+    const g = async (path: string) => {
+      const res = await fetch(
+        `https://graph.facebook.com/${GRAPH_VERSION}/${path}${path.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`,
+      );
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    };
+
+    // `/me` names the system user; `/debug_token` reports the app, type,
+    // expiry and the granted scope list.
+    const me = await g("me?fields=id,name");
+    const dbg = await g(
+      `debug_token?input_token=${encodeURIComponent(token)}`,
+    );
+    const data = (dbg.body as { data?: Record<string, unknown> }).data ?? {};
+    const scopes = (data.scopes as string[] | undefined) ?? [];
+    const expires = data.expires_at as number | undefined;
+
+    return {
+      ok: true,
+      identity: me.body as { id?: string; name?: string },
+      app: { id: data.app_id as string, name: data.application as string },
+      type: data.type as string,
+      // 0 / absent means "never expires" — what a system user token looks
+      // like, and the reason it is usable in production at all.
+      expiresAt: expires === undefined || expires === 0 ? null : expires,
+      scopes,
+      hasManageEvents: scopes.includes("whatsapp_business_manage_events"),
+    };
+  },
+});
+
+
+/**
+ * Diagnostic: POST one probe event down the exact production path and hand
+ * back Meta's raw answer.
+ *
+ * `deliverConversionEvent` records only a coarse outcome (`sent` / an error
+ * string), which was enough to know a delivery had failed but not enough to
+ * confirm one had genuinely landed — Meta's dataset stats lag by minutes to
+ * hours, so "no events yet" and "silently rejected" look identical for a
+ * long window. This closes that gap by returning `events_received` and the
+ * response body verbatim.
+ *
+ * Same credential resolution, same endpoint, same payload shape as the real
+ * sender. The probe carries a nonsense `ctwa_clid`, so Meta accepts it as a
+ * well-formed event that matches no real person — which is what makes it
+ * safe to run against a live dataset.
+ */
+export const capiProbe = internalAction({
+  args: { accountId: v.id("accounts") },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ httpStatus?: number; body?: unknown; error?: string }> => {
+    const datasetId = process.env.META_CAPI_DATASET_ID;
+    if (!datasetId) return { error: "META_CAPI_DATASET_ID unset" };
+    const config = await ctx.runQuery(internal.whatsappConfig.getForAccount, {
+      accountId: args.accountId,
+    });
+    if (!config?.wabaId) return { error: "no wabaId" };
+    const token =
+      process.env.META_CAPI_ACCESS_TOKEN ?? (await decrypt(config.accessToken));
+
+    const body = {
+      data: [
+        {
+          event_name: "QualifiedLead",
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: "business_messaging",
+          messaging_channel: "whatsapp",
+          event_id: `probe:${Date.now()}`,
+          user_data: {
+            whatsapp_business_account_id: config.wabaId,
+            ctwa_clid: "probe-not-a-real-click",
+          },
+          custom_data: { lead_stage: "MQL", crm_lead_id: "probe" },
+        },
+      ],
+    };
+    const res = await fetch(
+      `https://graph.facebook.com/${GRAPH_VERSION}/${encodeURIComponent(datasetId)}/events?access_token=${encodeURIComponent(token)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    return {
+      httpStatus: res.status,
+      body: await res.json().catch(() => ({})),
+    };
+  },
+});
+
+
+// ============================================================
+// Requeue — bringing back conversions that failed for a reason since fixed.
+// ============================================================
+
+/**
+ * Meta's acceptance window for `event_time` on the Conversions API. An
+ * event older than this is rejected on arrival, permanently.
+ *
+ * This is why the requeue is WINDOWED rather than "retry everything": the
+ * dormant backlog is mostly months old, and pushing it at Meta would earn
+ * one 4xx per row, spend each row's retry budget a second time, and leave
+ * them `abandoned` again with nothing gained. Rows outside the window are
+ * left exactly where they are — inert, still on record, still available if
+ * the decision is ever revisited.
+ */
+export const REQUEUE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Rows examined per pass. Bounded like `MIGRATE_BATCH`. */
+const REQUEUE_BATCH = 256;
+
+/** The two partitions a requeue can legitimately draw from. `sent` is
+ *  excluded by construction — re-delivering a success would double-report
+ *  it — and `pending`/`error` are already draining on their own. */
+const REQUEUEABLE = ["abandoned", "dormant"] as const;
+
+/**
+ * Returns `abandoned`/`dormant` rows to `pending` so the retry cron
+ * delivers them.
+ *
+ * Written for the aftermath of a configuration fault rather than a code
+ * one: while the CAPI lane pointed at the wrong dataset with the wrong
+ * token, Meta 400'd every event, five retries spent the budget, and real
+ * conversions retired to `abandoned`. Nothing was wrong with those rows.
+ *
+ * Resets `attempts` AND `transientAttempts` to zero and clears the backoff
+ * gate, because the failures they accumulated describe a world that no
+ * longer exists. Clearing `lastError` too, so a requeued row does not go
+ * on reading as broken while it waits.
+ *
+ * Deliberately does NOT schedule delivery itself. Setting `pending` hands
+ * the rows to `getPendingToRetry`, which already staggers its sends — a
+ * few hundred rows scheduled at once would be exactly the self-inflicted
+ * burst that `DELIVER_STAGGER_MS` exists to prevent.
+ *
+ * `dryRun` reports what would move without moving it. The counts are the
+ * point: "requeue the backlog" is a decision that deserves a number in
+ * front of it first.
+ */
+export const requeueDeliverable = internalMutation({
+  args: {
+    /** Oldest `_creationTime` eligible. Defaults to Meta's 7-day window. */
+    sinceMs: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+    cursorMs: v.optional(v.number()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    examined: number;
+    requeued: number;
+    dryRun: boolean;
+    windowStartMs: number;
+    byStatus: Record<string, number>;
+  }> => {
+    const windowStart = args.sinceMs ?? Date.now() - REQUEUE_WINDOW_MS;
+    const from = Math.max(windowStart, args.cursorMs ?? 0);
+    const dryRun = args.dryRun === true;
+
+    let examined = 0;
+    let requeued = 0;
+    const byStatus: Record<string, number> = {};
+    let lastSeen = from;
+
+    for (const status of REQUEUEABLE) {
+      // Bound on the INDEX — `by_status` ends implicitly with
+      // `_creationTime`, so this is a genuine range starting at the window
+      // rather than a scan of every retired row ever accumulated.
+      const page = await ctx.db
+        .query("conversionEvents")
+        .withIndex("by_status", (q) =>
+          q.eq("status", status).gte("_creationTime", from),
+        )
+        .take(REQUEUE_BATCH);
+
+      for (const row of page) {
+        examined++;
+        lastSeen = Math.max(lastSeen, row._creationTime);
+        if (dryRun) {
+          byStatus[status] = (byStatus[status] ?? 0) + 1;
+          continue;
+        }
+        await ctx.db.patch(row._id, {
+          status: "pending",
+          attempts: 0,
+          transientAttempts: 0,
+          nextAttemptAt: undefined,
+          lastError: undefined,
+        });
+        await moveConversionEventStatusInRollup(ctx, {
+          accountId: row.accountId,
+          createdAtMs: row._creationTime,
+          from: row.status,
+          to: "pending",
+        });
+        byStatus[status] = (byStatus[status] ?? 0) + 1;
+        requeued++;
+      }
+    }
+
+    // More to walk: continue past the newest row seen. Only when a full
+    // page came back, so a partial page ends the walk rather than looping.
+    if (!dryRun && examined >= REQUEUE_BATCH) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.conversionEvents.requeueDeliverable,
+        { sinceMs: windowStart, cursorMs: lastSeen + 1 },
+      );
+    }
+
+    return { examined, requeued, dryRun, windowStartMs: windowStart, byStatus };
   },
 });

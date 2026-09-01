@@ -5,11 +5,9 @@ import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 import {
-  nextQuestion,
+  stepStates,
   stageImplies,
   latestFor,
-  NO_COOLDOWN_MS,
-  DISMISS_COOLDOWN_MS,
   type AnswerRecord,
 } from "./leadQuality";
 
@@ -22,129 +20,57 @@ const T0 = 1_700_000_000_000;
 // table is exercised directly.
 // ============================================================
 
-describe("nextQuestion", () => {
-  it("opens with the genuine question on a fresh attributed lead", () => {
-    expect(
-      nextQuestion({ answers: [], currentStage: null, now: T0 }),
-    ).toBe("genuine");
-    expect(
-      nextQuestion({ answers: [], currentStage: "new_lead", now: T0 }),
-    ).toBe("genuine");
-  });
+/** Convenience: the map of step -> locked/answer for assertions. */
+function statesOf(
+  answers: AnswerRecord[],
+  currentStage: Parameters<typeof stepStates>[0]["currentStage"] = null,
+) {
+  return Object.fromEntries(
+    stepStates({ answers, currentStage }).map((s) => [
+      s.step,
+      { locked: s.locked, answer: s.answer, viaStage: s.viaStage },
+    ]),
+  );
+}
 
-  it("walks genuine → intent → payment as each is answered yes", () => {
-    const answers: AnswerRecord[] = [
-      { step: "genuine", answer: "yes", at: T0 },
-    ];
-    expect(nextQuestion({ answers, currentStage: "qualified", now: T0 })).toBe(
-      "intent",
-    );
-
-    answers.push({ step: "intent", answer: "yes", at: T0 });
-    expect(
-      nextQuestion({ answers, currentStage: "price_quoted", now: T0 }),
-    ).toBe("payment");
-
-    answers.push({ step: "payment", answer: "yes", at: T0 });
-    expect(
-      nextQuestion({ answers, currentStage: "purchased", now: T0 }),
-    ).toBeNull();
-  });
-
-  it("retires permanently on genuine:no — a non-customer does not improve with time", () => {
-    const answers: AnswerRecord[] = [{ step: "genuine", answer: "no", at: T0 }];
-    expect(nextQuestion({ answers, currentStage: null, now: T0 })).toBeNull();
-    // Still silent a year later. This is the bad-lead branch: logged, never
-    // asked again, and nothing was sent to Meta.
-    expect(
-      nextQuestion({ answers, currentStage: null, now: T0 + 365 * 86_400_000 }),
-    ).toBeNull();
-  });
-
-  it("re-asks intent and payment after the no-cooldown, but not before", () => {
-    for (const step of ["intent", "payment"] as const) {
-      const answers: AnswerRecord[] = [
-        { step: "genuine", answer: "yes", at: T0 },
-        ...(step === "payment"
-          ? [{ step: "intent" as const, answer: "yes" as const, at: T0 }]
-          : []),
-        { step, answer: "no" as const, at: T0 },
-      ];
-      const stage = step === "payment" ? "price_quoted" : "qualified";
-      expect(nextQuestion({ answers, currentStage: stage, now: T0 })).toBeNull();
-      expect(
-        nextQuestion({
-          answers,
-          currentStage: stage,
-          now: T0 + NO_COOLDOWN_MS - 1,
-        }),
-      ).toBeNull();
-      expect(
-        nextQuestion({ answers, currentStage: stage, now: T0 + NO_COOLDOWN_MS }),
-      ).toBe(step);
+describe("stepStates", () => {
+  it("opens with all three questions unanswered", () => {
+    const st = statesOf([]);
+    for (const step of ["genuine", "intent", "payment"] as const) {
+      expect(st[step]).toEqual({ locked: false, answer: null, viaStage: false });
     }
   });
 
-  it("re-asks a dismissed question after the shorter dismiss-cooldown", () => {
-    const answers: AnswerRecord[] = [
-      { step: "genuine", answer: "dismissed", at: T0 },
-    ];
-    expect(nextQuestion({ answers, currentStage: null, now: T0 })).toBeNull();
-    expect(
-      nextQuestion({
-        answers,
-        currentStage: null,
-        now: T0 + DISMISS_COOLDOWN_MS - 1,
-      }),
-    ).toBeNull();
-    expect(
-      nextQuestion({
-        answers,
-        currentStage: null,
-        now: T0 + DISMISS_COOLDOWN_MS,
-      }),
-    ).toBe("genuine");
-    // A dismissal is a shorter snooze than a "no" — that ordering is the
-    // point, so pin it rather than trusting two independent constants.
-    expect(DISMISS_COOLDOWN_MS).toBeLessThan(NO_COOLDOWN_MS);
+  it("locks each step INDEPENDENTLY — answering one never gates another", () => {
+    // The whole point of the redesign: a salesperson who learns "serious"
+    // and "paid" in one conversation can record both, and skipping the
+    // middle question does not block the one that matters most.
+    const st = statesOf([
+      { step: "payment", answer: "yes", at: T0, value: 2500, currency: "AED" },
+    ]);
+    expect(st.payment.locked).toBe(true);
+    expect(st.genuine.locked).toBe(false);
+    expect(st.intent.locked).toBe(false);
   });
 
-  it("skips questions the CRM stage already implies", () => {
-    // An agent moved this to price_quoted by hand. Asking "is this a real
-    // customer?" would be insulting; only payment is still unknown.
-    expect(
-      nextQuestion({ answers: [], currentStage: "price_quoted", now: T0 }),
-    ).toBe("payment");
-    expect(
-      nextQuestion({ answers: [], currentStage: "invoice_sent", now: T0 }),
-    ).toBe("payment");
-    expect(
-      nextQuestion({ answers: [], currentStage: "purchased", now: T0 }),
-    ).toBeNull();
+  it("carries the recorded amount through for display", () => {
+    const [, , payment] = stepStates({
+      answers: [
+        { step: "payment", answer: "yes", at: T0, value: 2500, currency: "AED" },
+      ],
+      currentStage: null,
+    });
+    expect(payment).toMatchObject({ value: 2500, currency: "AED", answer: "yes" });
   });
 
-  it("treats `lost` as terminal, NOT as past every milestone", () => {
-    // `lost` is appended last in FUNNEL_STAGES so the engine cannot pull a
-    // lost deal forward; a naive index compare would read it as "past
-    // purchased" and imply all three answers were yes. It must retire the
-    // card instead.
-    expect(
-      nextQuestion({ answers: [], currentStage: "lost", now: T0 }),
-    ).toBeNull();
-    expect(stageImplies("lost", "genuine")).toBe(false);
-    expect(stageImplies("lost", "payment")).toBe(false);
+  it("locks a `no` too — an answer is an answer", () => {
+    const st = statesOf([{ step: "genuine", answer: "no", at: T0 }]);
+    expect(st.genuine).toEqual({ locked: true, answer: "no", viaStage: false });
   });
 
-  it("does not jump the funnel while an earlier step is snoozed", () => {
-    // intent is snoozed; payment must NOT be asked in its place, or Meta
-    // would get a Converted with no SQL before it.
-    const answers: AnswerRecord[] = [
-      { step: "genuine", answer: "yes", at: T0 },
-      { step: "intent", answer: "no", at: T0 },
-    ];
-    expect(
-      nextQuestion({ answers, currentStage: "qualified", now: T0 + 1000 }),
-    ).toBeNull();
+  it("does NOT lock on a dismissal", () => {
+    const st = statesOf([{ step: "genuine", answer: "dismissed", at: T0 }]);
+    expect(st.genuine.locked).toBe(false);
   });
 
   it("acts on the LATEST answer per step, the log being append-only", () => {
@@ -153,9 +79,27 @@ describe("nextQuestion", () => {
       { step: "genuine", answer: "yes", at: T0 + 5000 },
     ];
     expect(latestFor(answers, "genuine")?.answer).toBe("yes");
-    expect(
-      nextQuestion({ answers, currentStage: "qualified", now: T0 + 6000 }),
-    ).toBe("intent");
+    expect(statesOf(answers).genuine).toEqual({
+      locked: true,
+      answer: "yes",
+      viaStage: false,
+    });
+  });
+
+  it("treats a CRM stage past a milestone as an implied yes, marked as such", () => {
+    const st = statesOf([], "price_quoted");
+    expect(st.genuine).toEqual({ locked: true, answer: "yes", viaStage: true });
+    expect(st.intent).toEqual({ locked: true, answer: "yes", viaStage: true });
+    expect(st.payment.locked).toBe(false);
+  });
+
+  it("treats `lost` as terminal, NOT as past every milestone", () => {
+    // `lost` is appended last in FUNNEL_STAGES so the engine cannot pull a
+    // lost deal forward; a naive index compare would read it as "past
+    // purchased" and imply all three were answered yes.
+    const st = statesOf([], "lost");
+    expect(st.genuine.locked).toBe(false);
+    expect(stageImplies("lost", "payment")).toBe(false);
   });
 });
 
@@ -335,14 +279,18 @@ test("a bad lead is RECORDED but never reaches Meta", async () => {
   const conv = await t.run((ctx) => ctx.db.get(conversationId));
   expect(conv?.funnel).toBeUndefined();
 
-  // The card stops asking.
+  // The question is now locked — answered, and never askable again.
   const state = await asUser.query(api.leadQuality.getCardState, {
     conversationId,
   });
-  expect(state.step).toBeNull();
+  const genuine = state.steps.find((s) => s.step === "genuine")!;
+  expect(genuine.locked).toBe(true);
+  expect(genuine.answer).toBe("no");
+  // The other two remain open: rejecting the lead does not pre-answer them.
+  expect(state.pendingCount).toBe(2);
 });
 
-test("dismissing records the dodge, sends nothing, and asks again tomorrow", async () => {
+test("dismissing records the dodge, sends nothing, and leaves the question open", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedMember(t);
   const { conversationId } = await seedLead(t, accountId, userId);
@@ -357,30 +305,40 @@ test("dismissing records the dodge, sends nothing, and asks again tomorrow", asy
   const state = await asUser.query(api.leadQuality.getCardState, {
     conversationId,
   });
-  expect(state.step).toBeNull(); // snoozed right now
+  // A dismissal is not an answer, so the question stays answerable.
+  expect(state.steps.find((s) => s.step === "genuine")!.locked).toBe(false);
+  expect(state.pendingCount).toBe(3);
 });
 
-test("re-answering yes does not double-send", async () => {
+test("a step can only be answered once — the second attempt is refused", async () => {
   const t = convexTest(schema, modules);
   const { accountId, userId, asUser } = await seedMember(t);
   const { conversationId } = await seedLead(t, accountId, userId);
 
-  for (let i = 0; i < 3; i++) {
-    await asUser.mutation(api.leadQuality.answer, {
+  await asUser.mutation(api.leadQuality.answer, {
+    conversationId,
+    step: "genuine",
+    answer: "yes",
+  });
+  // Answered once, locked for good: the Meta event it produced can only
+  // fire once, so a second answer could never be reported and would only
+  // make the log disagree with what Meta was actually told.
+  await expect(
+    asUser.mutation(api.leadQuality.answer, {
       conversationId,
       step: "genuine",
-      answer: "yes",
-    });
-  }
+      answer: "no",
+    }),
+  ).rejects.toThrow();
+
   expect(await eventStages(t, conversationId)).toEqual(["new_lead", "qualified"]);
-  // Three answers logged (append-only trail), one event.
   const rows = await t.run((ctx) =>
     ctx.db
       .query("leadQualityAnswers")
       .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId))
       .collect(),
   );
-  expect(rows).toHaveLength(3);
+  expect(rows).toHaveLength(1);
 });
 
 test("payment yes without an amount is refused", async () => {
@@ -466,7 +424,8 @@ test("an organic chat logs feedback but can never seed an event, and shows no ca
     conversationId,
   });
   expect(state.attributed).toBe(false);
-  expect(state.step).toBeNull();
+  expect(state.steps).toEqual([]);
+  expect(state.pendingCount).toBe(0);
 
   const res = await asUser.mutation(api.leadQuality.answer, {
     conversationId,

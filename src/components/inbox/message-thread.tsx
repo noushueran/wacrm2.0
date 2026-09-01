@@ -1350,6 +1350,24 @@ export function MessageThread({
             conversationId={conversationId as Id<"conversations">}
           />
         )}
+        {/* Lead-quality panel (spec 2026-09-01-lead-quality-feedback-loop).
+            Deliberately HERE rather than above the composer: it is a
+            floating action beside the notes button — the affordance agents
+            already use to record something about a lead — and it shares
+            that button's positioning context. An earlier build put one
+            question inline in the footer, which crowded the message area on
+            every unanswered lead. Wrapped because Netlify builds the
+            frontend from `main` while Convex deploys separately, so the
+            window where this component exists and
+            `leadQuality:getCardState` does not is real, and `useQuery`
+            rethrows during render. */}
+        {conversationId && (
+          <OptionalFeatureBoundary feature="leadQuality.getCardState">
+            <LeadQualityCard
+              conversationId={conversationId as Id<"conversations">}
+            />
+          </OptionalFeatureBoundary>
+        )}
       </div>
 
       {/* Free-window unlock nudge. Meta opens the 72h free-entry-point
@@ -1405,31 +1423,6 @@ export function MessageThread({
           byName={doNotContactByName}
           canClear={canClearDoNotContact}
         />
-      )}
-
-      {/* Lead-quality card (spec 2026-09-01-lead-quality-feedback-loop).
-          Sits with the other pre-composer banners rather than inside the
-          scrolling thread: an agent who has scrolled up to read history
-          must still see it, and a card that scrolls away is a card nobody
-          answers — which is the exact failure this replaces. It renders
-          nothing at all unless the server has a question pending, so a
-          settled or organic thread is untouched. */}
-      {conversationId && (
-        // Wrapped because Netlify builds the frontend from `main` while
-        // Convex deploys separately, so the window where this component
-        // exists and `leadQuality:getCardState` does not is real — and
-        // `useQuery` RETHROWS "Could not find public function" during
-        // render, which took the whole Inbox route down rather than
-        // hiding one supplementary card. `LeadQualityCard` owns its own
-        // subscription, so the throw happens inside this boundary; that
-        // is exactly the isolation `OptionalFeatureBoundary`'s header
-        // requires, and wrapping markup inside the card would catch
-        // nothing.
-        <OptionalFeatureBoundary feature="leadQuality.getCardState">
-          <LeadQualityCard
-            conversationId={conversationId as Id<"conversations">}
-          />
-        </OptionalFeatureBoundary>
       )}
 
       {/* Composer / claim-to-reply / read-only notice — role-gated

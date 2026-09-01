@@ -581,6 +581,9 @@
       "networkError": "Couldn’t reach the server."
     },
     "leadQuality": {
+      "triggerLabel": "Lead quality",
+      "title": "Lead quality",
+      "progress": "{done}/{total} recorded",
       "question": {
         "genuine": "Is this a real customer?",
         "intent": "Serious about booking?",
@@ -590,9 +593,12 @@
       "no": "No",
       "confirm": "Save",
       "cancel": "Cancel",
-      "dismiss": "Not now",
-      "reasonPrompt": "What was wrong with it?",
-      "amountPrompt": "Amount received",
+      "recordedYes": "Recorded: Yes",
+      "recordedYesValue": "Recorded: {value} {currency}",
+      "recordedNo": "Recorded: No \u2014 not sent to Meta",
+      "fromStage": "from CRM stage",
+      "readOnly": "You cannot answer on this lead.",
+      "footnote": "Answers are final. Only a Yes is reported to Meta; a No is kept for your reporting.",
       "reason": {
         "spam": "Spam",
         "supplier_vendor": "Supplier / vendor",
@@ -603,8 +609,8 @@
         "no_intent": "No intent to buy",
         "other": "Other"
       },
-      "sentToast": "Saved \u2014 lead quality reported to Meta.",
-      "savedToast": "Saved to your lead-quality log.",
+      "sentToast": "Recorded \u2014 reported to Meta.",
+      "savedToast": "Recorded in your lead-quality log.",
       "error": "Could not save that. Try again."
     },
     "funnel": {

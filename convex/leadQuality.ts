@@ -49,32 +49,20 @@ export const STEP_STAGE: Record<QualityStep, FunnelStageKey> = {
   payment: "purchased",
 };
 
-/**
- * How long the card waits before re-asking. A `no` on intent/payment means
- * "not yet", not "never" — the lead may well come good — so it returns after
- * a few days rather than never. A dismissal is a shorter snooze because it
- * carries no judgement about the lead at all, only about the moment.
- *
- * `genuine: no` is the exception and is handled in `nextQuestion`: it means
- * "this is not a customer", which does not change with time.
- */
-export const NO_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
-export const DISMISS_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-
 export type AnswerRecord = {
   step: QualityStep;
   answer: QualityAnswer;
   at: number;
+  value?: number;
+  currency?: string;
 };
 
 /**
  * Whether the CRM's own stage already implies this step was answered yes.
  *
- * Seeds the machine from reality as well as from its own log, so a lead an
- * agent moved manually to `price_quoted` is never asked "is this a real
- * customer?". Because the card only ever asks about steps that are NOT
- * implied, every transition it applies is forward — which is what makes
- * `neverDowngrade` a second line of defence rather than the only one.
+ * Seeds the panel from reality as well as from its own log, so a lead an
+ * agent moved manually to `price_quoted` is not asked "is this a real
+ * customer?" — that milestone is already recorded and already reported.
  *
  * `lost` is excluded deliberately. It is appended LAST in `FUNNEL_STAGES`
  * (so the engine can never pull a lost deal back into the working stages),
@@ -93,8 +81,7 @@ export function stageImplies(
   );
 }
 
-/** The latest answer logged for `step`, or null. Rows are append-only, so
- *  "latest" is what the card acts on and the older rows are the trail. */
+/** The latest answer logged for `step`, or null. */
 export function latestFor(
   answers: AnswerRecord[],
   step: QualityStep,
@@ -107,45 +94,71 @@ export function latestFor(
 }
 
 /**
- * The question the card should ask right now, or null for "ask nothing".
+ * One step's state for the panel.
  *
- * Pure and total — no clock, no database — so the whole decision table is
- * unit-testable. `now` is passed in for the same reason.
+ * `locked` is the whole point of the redesign: an answered question is
+ * answered for good. The Meta event it produced can only fire once (the
+ * outbox dedups on `${conversationId}:${stage}`), so offering the buttons
+ * again would invite a click that silently does nothing — the panel says
+ * "recorded" instead.
  *
- * Walks the three steps in funnel order and stops at the first one that is
- * neither implied by the CRM stage nor already settled. A step that is
- * awaiting its cooldown stops the walk rather than being skipped: asking
- * "did they pay?" while "are they serious?" is still snoozed would jump the
- * funnel and produce an SQL-less Converted.
+ * `viaStage` distinguishes "an agent answered this here" from "the CRM
+ * stage already passed this milestone". Both lock the step; only the first
+ * has an author and a timestamp to show.
  */
-export function nextQuestion(input: {
+export type StepState = {
+  step: QualityStep;
+  locked: boolean;
+  answer: "yes" | "no" | null;
+  viaStage: boolean;
+  value?: number;
+  currency?: string;
+  answeredAt?: number;
+};
+
+/**
+ * Every step's state at once — the panel shows all three and lets an agent
+ * answer whichever they can, whenever they can.
+ *
+ * This replaced a strictly progressive one-question-at-a-time machine. The
+ * pacing was wrong in practice: a salesperson often learns "they're serious"
+ * and "they paid" in the same conversation, and forcing the second answer to
+ * wait on a cooldown after the first meant the information was known and
+ * unrecordable. Independent steps also mean a skipped middle question never
+ * blocks the one that matters most.
+ *
+ * Pure and total — no clock, no database — so the table is unit-testable.
+ */
+export function stepStates(input: {
   answers: AnswerRecord[];
   currentStage: FunnelStageKey | null | undefined;
-  now: number;
-}): QualityStep | null {
-  const { answers, currentStage, now } = input;
-  // A lost deal is finished. Nothing to ask, nothing to report.
-  if (currentStage === "lost") return null;
+}): StepState[] {
+  return QUALITY_STEPS.map((step) => {
+    const implied = stageImplies(input.currentStage, step);
+    const latest = latestFor(input.answers, step);
+    // A dismissal is not an answer; it never locks a step.
+    const explicit =
+      latest && (latest.answer === "yes" || latest.answer === "no")
+        ? latest
+        : null;
 
-  for (const step of QUALITY_STEPS) {
-    if (stageImplies(currentStage, step)) continue;
-
-    const latest = latestFor(answers, step);
-    if (!latest) return step;
-
-    if (latest.answer === "yes") continue;
-
-    if (latest.answer === "no") {
-      // "Not a real customer" is not a state that improves with time.
-      if (step === "genuine") return null;
-      return now >= latest.at + NO_COOLDOWN_MS ? step : null;
+    if (explicit) {
+      return {
+        step,
+        locked: true,
+        answer: explicit.answer as "yes" | "no",
+        viaStage: false,
+        ...(explicit.value !== undefined
+          ? { value: explicit.value, currency: explicit.currency }
+          : {}),
+        answeredAt: explicit.at,
+      };
     }
-
-    // dismissed
-    return now >= latest.at + DISMISS_COOLDOWN_MS ? step : null;
-  }
-
-  return null;
+    if (implied) {
+      return { step, locked: true, answer: "yes" as const, viaStage: true };
+    }
+    return { step, locked: false, answer: null, viaStage: false };
+  });
 }
 
 const stepValidator = v.union(
@@ -165,20 +178,19 @@ function toRecords(rows: Doc<"leadQualityAnswers">[]): AnswerRecord[] {
     step: r.step,
     answer: r.answer,
     at: r._creationTime,
+    ...(r.value !== undefined ? { value: r.value } : {}),
+    ...(r.currency !== undefined ? { currency: r.currency } : {}),
   }));
 }
 
 /**
- * What the inline card should render for one conversation.
+ * Everything the lead-quality panel renders for one conversation.
  *
  * `"view"` access, not `"own"`: a supervisor reading someone else's thread
  * should see the same state the assigned agent sees. Answering is gated
  * separately and more tightly (see `answer`), so a reader who cannot act
- * gets `canAnswer: false` and the card renders read-only rather than
+ * gets `canAnswer: false` and the panel renders read-only rather than
  * offering buttons that would throw.
- *
- * `step: null` covers every "ask nothing" case — settled, snoozed, lost, or
- * an organic chat — and the card renders nothing at all for it.
  */
 export const getCardState = accountQuery({
   args: { conversationId: v.id("conversations") },
@@ -186,11 +198,11 @@ export const getCardState = accountQuery({
     ctx,
     args,
   ): Promise<{
-    step: QualityStep | null;
-    canAnswer: boolean;
-    /** False for organic chats: the card still would not show, but this
-     *  says WHY, so the UI can explain rather than silently vanish. */
     attributed: boolean;
+    canAnswer: boolean;
+    steps: StepState[];
+    /** How many steps are still open — the trigger's badge. */
+    pendingCount: number;
   }> => {
     const conversation = await requireConversationAccess(
       ctx,
@@ -201,9 +213,8 @@ export const getCardState = accountQuery({
     // Only attributed leads can produce a Meta event, so only they are worth
     // an agent's attention here. Checked before the answer read so an
     // organic thread costs one document, not two.
-    const attributed = conversation.attribution !== undefined;
-    if (!attributed) {
-      return { step: null, canAnswer: false, attributed: false };
+    if (conversation.attribution === undefined) {
+      return { attributed: false, canAnswer: false, steps: [], pendingCount: 0 };
     }
 
     const rows = await ctx.db
@@ -213,22 +224,26 @@ export const getCardState = accountQuery({
       )
       .collect();
 
-    const step = nextQuestion({
+    const steps = stepStates({
       answers: toRecords(rows),
       currentStage: conversation.funnel?.stage ?? null,
-      now: Date.now(),
     });
 
-    // Mirrors `answer`'s own gate, so the card never offers a button that
+    // Mirrors `answer`'s own gate, so the panel never offers a button that
     // would throw: agents act on their own threads, supervisors+ on any.
     const canAnswer =
-      ctx.role !== "viewer" &&
-      (ctx.role === "owner" ||
-        ctx.role === "admin" ||
-        ctx.role === "supervisor" ||
+      ctx.role === "owner" ||
+      ctx.role === "admin" ||
+      ctx.role === "supervisor" ||
+      (ctx.role === "agent" &&
         conversation.assignedToUserId === ctx.userId);
 
-    return { step, canAnswer, attributed: true };
+    return {
+      attributed: true,
+      canAnswer,
+      steps,
+      pendingCount: steps.filter((s) => !s.locked).length,
+    };
   },
 });
 
@@ -269,6 +284,32 @@ export const answer = accountMutation({
     const hasValue = args.value !== undefined && args.value > 0;
     if (step === "payment" && args.answer === "yes" && !hasValue) {
       throw new ConvexError({ code: "BAD_REQUEST", reason: "value_required" });
+    }
+
+    // Answer once. The Meta event a `yes` produces can only fire once (the
+    // outbox dedups on `${conversationId}:${stage}`), so a second answer
+    // could never reach Meta and would only make the log disagree with what
+    // was actually reported. Enforced server-side rather than by hiding the
+    // buttons, because the panel is a live view that another agent may have
+    // answered from a second later.
+    const existing = await ctx.db
+      .query("leadQualityAnswers")
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", args.conversationId),
+      )
+      .collect();
+    const priorStates = stepStates({
+      answers: toRecords(existing),
+      currentStage: conversation.funnel?.stage ?? null,
+    });
+    if (
+      args.answer !== "dismissed" &&
+      priorStates.find((st) => st.step === step)?.locked
+    ) {
+      throw new ConvexError({
+        code: "BAD_REQUEST",
+        reason: "already_answered",
+      });
     }
 
     const account = await ctx.db.get(ctx.accountId);
