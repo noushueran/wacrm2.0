@@ -1521,6 +1521,22 @@ export const capiProbeMatrix = internalAction({
         label: v.string(),
         eventName: v.string(),
         withContents: v.optional(v.boolean()),
+        /**
+         * Which identity to put in `user_data`.
+         *
+         * - `ctwa` (default) — the documented business-messaging pair,
+         *   `whatsapp_business_account_id` + a real `ctwa_clid`. What
+         *   production sends.
+         * - `phone` — WABA id + hashed phone, NO click id. This is the
+         *   organic question: a chat that never came from an ad has no
+         *   `ctwa_clid` to send, so whether Meta accepts this decides
+         *   whether organic conversions can be reported at all.
+         * - `none` — WABA id alone. The negative control; if this were
+         *   accepted the endpoint would not be validating identity.
+         */
+        identity: v.optional(
+          v.union(v.literal("ctwa"), v.literal("phone"), v.literal("none")),
+        ),
       }),
     ),
   },
@@ -1541,6 +1557,14 @@ export const capiProbeMatrix = internalAction({
       accountId: args.accountId,
     });
     if (!donor) return [{ label: "-", eventName: "-", error: "no ctwa_clid available" }];
+
+    // A real, delivered phone number, hashed the same way production hashes
+    // it. Using a made-up number would test the wrong thing: Meta can
+    // reject an identity for being unknown as easily as for being absent,
+    // and only a number it has already seen separates those two answers.
+    const donorPhoneHash = donor.phone
+      ? await sha256Hex(normalizePhoneForMeta(donor.phone) ?? "")
+      : null;
 
     const out = [];
     for (const [i, variant] of args.variants.entries()) {
@@ -1565,10 +1589,15 @@ export const capiProbeMatrix = internalAction({
             action_source: "business_messaging",
             messaging_channel: "whatsapp",
             event_id: `probe-matrix:${Date.now()}:${i}`,
-            user_data: {
-              whatsapp_business_account_id: config.wabaId,
-              ctwa_clid: donor.ctwaClid,
-            },
+            user_data: (() => {
+              const identity = variant.identity ?? "ctwa";
+              const ud: Record<string, unknown> = {
+                whatsapp_business_account_id: config.wabaId,
+              };
+              if (identity === "ctwa") ud.ctwa_clid = donor.ctwaClid;
+              if (identity === "phone" && donorPhoneHash) ud.ph = donorPhoneHash;
+              return ud;
+            })(),
             custom_data: custom,
           },
         ],
@@ -1594,16 +1623,27 @@ export const capiProbeMatrix = internalAction({
   },
 });
 
-/** A real `ctwa_clid` from a delivered conversion, for `capiProbeMatrix`. */
+/** A real `ctwa_clid` (and its phone) from a delivered conversion, for
+ *  `capiProbeMatrix`. Both are real values Meta has already seen, so a
+ *  rejection means the SHAPE was refused rather than the identity being
+ *  unrecognised. */
 export const getProbeIdentity = internalQuery({
   args: { accountId: v.id("accounts") },
-  handler: async (ctx, args): Promise<{ ctwaClid: string } | null> => {
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ ctwaClid: string; phone?: string } | null> => {
     const row = await ctx.db
       .query("conversionEvents")
       .withIndex("by_account", (q) => q.eq("accountId", args.accountId))
       .order("desc")
       .filter((q) => q.eq(q.field("lane"), "ctwa"))
       .first();
-    return row?.identifier ? { ctwaClid: row.identifier } : null;
+    return row?.identifier
+      ? {
+          ctwaClid: row.identifier,
+          ...(row.phone ? { phone: row.phone } : {}),
+        }
+      : null;
   },
 });
