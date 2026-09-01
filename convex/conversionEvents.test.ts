@@ -1458,6 +1458,109 @@ test("capi: a local-format phone is hashed with META's leading-zero rule, not th
   expect(userData.ph).not.toEqual([await sha256Hex("0585824488")]);
 });
 
+// ============================================================
+// `events_received` — the difference between "Meta answered" and
+// "Meta counted it".
+//
+// Every test here would PASS on a delivery path that only checks
+// `res.ok`, which is exactly why they exist. A 200 carrying a zero count
+// is the one failure mode that leaves no trace anywhere in this system:
+// the row reads `sent`, no error is logged, and the conversion attributes
+// nothing.
+// ============================================================
+
+/** Stub the CAPI POST with an arbitrary 200 body. */
+function capiRespondsWith(body: Record<string, unknown>) {
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify(body), { status: 200 })) as typeof fetch;
+}
+
+async function seedOneCapiRow(t: ReturnType<typeof convexTest>) {
+  const accountId = await seedAccount(t);
+  const { contactId, conversationId } = await seedConversation(t, accountId);
+  await seedWaba(t, accountId);
+  return seedEvent(t, accountId, conversationId, contactId, {
+    backend: "capi",
+    lane: "ctwa",
+    stage: "qualified",
+    eventName: "QualifiedLead",
+  });
+}
+
+test("capi: a 200 that counted nothing is a failure, not a delivery", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const id = await seedOneCapiRow(t);
+
+  capiRespondsWith({ events_received: 0, fbtrace_id: "t", messages: [] });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("error");
+  expect(row?.lastError).toContain("events_received=0");
+});
+
+test("capi: events_received=0 spends the PERMANENT budget, not the transient one", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const id = await seedOneCapiRow(t);
+
+  capiRespondsWith({ events_received: 0, fbtrace_id: "t" });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  // Re-POSTing an identical payload earns an identical zero, so this must
+  // walk toward `abandoned` rather than backing off forever on the
+  // transient budget.
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.attempts).toBe(1);
+  expect(row?.transientAttempts ?? 0).toBe(0);
+});
+
+test("capi: a response with no events_received field still delivers", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const id = await seedOneCapiRow(t);
+
+  // The guard keys on an EXPLICIT zero. An omitted field is not evidence
+  // that nothing counted, and reading it as a failure would strand every
+  // delivery the moment Meta trimmed its response shape.
+  capiRespondsWith({ fbtrace_id: "t" });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  expect((await t.run((ctx) => ctx.db.get(id)))?.status).toBe("sent");
+});
+
+test("capi: warnings alongside a counted event do not fail the delivery", async () => {
+  process.env.META_CAPI_DATASET_ID = "DS1";
+  process.env.META_CAPI_ACCESS_TOKEN = "tok";
+  const t = convexTest(schema, modules);
+  const id = await seedOneCapiRow(t);
+
+  // Meta warns about match quality on events it DID count. Failing here
+  // would retire healthy conversions over an advisory note.
+  capiRespondsWith({
+    events_received: 1,
+    fbtrace_id: "t",
+    messages: ["Invalid match key: em"],
+  });
+  await t.action(internal.conversionEvents.deliverConversionEvent, {
+    conversionEventId: id,
+  });
+
+  const row = await t.run((ctx) => ctx.db.get(id));
+  expect(row?.status).toBe("sent");
+  expect(row?.lastError).toBeUndefined();
+});
+
 test("a row that failed then succeeded does not keep reading as broken", async () => {
   process.env.META_CAPI_DATASET_ID = "ds";
   process.env.META_CAPI_ACCESS_TOKEN = "tok";
