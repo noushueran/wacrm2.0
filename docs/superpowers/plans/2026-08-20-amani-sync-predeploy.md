@@ -90,20 +90,38 @@ optional, so the old code simply ignores rows the new features wrote.
 
 ## 6. Known gaps carried by this sync
 
-- **Media download needs R2 CORS.** This tree ships Amani's client-side
-  download path (`fetch` -> blob -> anchor), which only works where the R2
-  bucket names this app's origin in its CORS policy for GET. The
-  server-side route at `src/app/api/media/download/route.ts` is PRESERVED
-  and still tested but is not currently wired to the UI. Either add the
-  CORS entry for `https://wa.holidayys.co`, or do the R3 rewire
-  (`docs/superpowers/plans/2026-08-02-media-viewer-reconciliation.md`) to
-  point the lightbox back at the route.
-- **`reasoning.ts` was dropped**, orphaned by Amani's provider structure.
-  Amani's `supportsReasoningEffort` covers the `-chat` case but does NOT
-  send `"minimal"` for the gpt-5.0 family, which reportedly rejects
-  `"none"`. Confirm `aiConfigs.model` on this deployment is >= gpt-5.1
-  (this repo's own notes reference `gpt-5.4-mini`, which is fine) before
-  deploying.
+- ~~**Media download needs R2 CORS.**~~ **RESOLVED — the gap was never
+  real. Verified against production 2026-09-01:**
+
+      curl -I -H "Origin: https://wa.holidayys.co" \
+        https://objs.holidayys.co/<a real inbound key>
+      HTTP/2 200
+      access-control-allow-origin: https://wa.holidayys.co
+
+  The bucket's CORS policy covers **GET**, not only the PUT upload path as
+  this note originally claimed — the preflight answers
+  `access-control-allow-methods: GET, PUT`. The same object requested with
+  any other `Origin` returns 200 with **no** `access-control-allow-origin`,
+  so the policy is correctly scoped to one origin rather than open.
+
+  The client-side path (`fetch` -> blob -> anchor) therefore works in
+  production, which is also what `src/lib/media/download.ts`'s own header
+  says. That single-origin scope is why the same fetch FAILS from
+  `localhost`; `use-media-download.ts` already handles the rejection with an
+  open-in-a-tab fallback, so local dev degrades rather than breaks.
+
+  This matches the Amani deployment, which has no server-side route at all.
+  `src/app/api/media/download/route.ts` stays preserved and tested as a
+  same-origin alternative if the CORS entry is ever lost, but wiring it up
+  is not needed and the R3 rewire is not required.
+- ~~**`reasoning.ts` was dropped**~~ **CHECKED — not an issue here.**
+  It was orphaned by Amani's provider structure, whose
+  `supportsReasoningEffort` covers the `-chat` case but does not send
+  `"minimal"` for the gpt-5.0 family, which reportedly rejects `"none"`.
+  That only bites a deployment pinned to gpt-5.0. Read from production
+  2026-09-01: both `aiConfigs` rows are `gpt-5.4-mini` on `openai`, well
+  clear of the affected family. Re-check this if anyone ever pins the model
+  backwards.
 - **The build IS verified — in CI, not locally.** The local run was
   abandoned (the machine ran out of disk), but opening the sync PR
   triggered `.github/workflows/ci.yml` and it passed: lint, typecheck,
