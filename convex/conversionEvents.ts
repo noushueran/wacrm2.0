@@ -1341,19 +1341,47 @@ export const whoAmI = internalAction({
 
 /**
  * Diagnostic: POST one probe event down the exact production path and hand
- * back Meta's raw answer.
+ * back Meta's raw answer. Confirms CREDENTIALS AND CONNECTIVITY — it cannot
+ * confirm that a real event lands. Read the next paragraph before acting on
+ * its result.
  *
- * `deliverConversionEvent` records only a coarse outcome (`sent` / an error
- * string), which was enough to know a delivery had failed but not enough to
- * confirm one had genuinely landed — Meta's dataset stats lag by minutes to
- * hours, so "no events yet" and "silently rejected" look identical for a
- * long window. This closes that gap by returning `events_received` and the
- * response body verbatim.
+ * A SUCCESSFUL RUN RETURNS HTTP 400. Meta validates `ctwa_clid` against its
+ * own record of real ad clicks, so the nonsense id this probe sends is
+ * always rejected:
+ *
+ *     400 · code 100 · subcode 2804087
+ *     "The ctwa_clid parameter is invalid, please provide a valid value
+ *      for the ctwa_clid parameter in user data."
+ *
+ * That answer is the pass condition, not a failure. Reaching a
+ * field-validation error means the token resolved, the dataset id was
+ * accepted, the endpoint was reached and the payload parsed — everything
+ * this probe can actually test. A genuinely broken setup fails EARLIER and
+ * differently: an OAuth error (code 190, or 200/803 for a token lacking
+ * `whatsapp_business_manage_events`) rather than a complaint about one
+ * field. So classify by WHICH error came back, never by ok/not-ok.
+ *
+ * Verified live 2026-09-01 against the production dataset.
+ *
+ * This corrects an earlier version of this comment, which claimed Meta
+ * "accepts it as a well-formed event that matches no real person — which is
+ * what makes it safe to run against a live dataset". The safety conclusion
+ * was right and the mechanism was wrong: nothing is written because the
+ * event is REJECTED, not because it is accepted-but-unmatched. The
+ * difference matters, because the old wording implied a 200 was the goal
+ * and left the only outcome this function can produce looking like a broken
+ * integration.
+ *
+ * To confirm events genuinely LAND, don't use this — read the outbox
+ * (`conversionEvents.status`, or Settings → Conversions), which records the
+ * real deliveries and their `events_received`. `capiProbeMatrix` can send a
+ * valid `ctwa_clid`, but only by borrowing a REAL lead's identity from
+ * `getProbeIdentity`, which attributes a synthetic event to an actual
+ * customer in the production dataset — so it is a deliberate,
+ * ask-first operation, not a routine health check.
  *
  * Same credential resolution, same endpoint, same payload shape as the real
- * sender. The probe carries a nonsense `ctwa_clid`, so Meta accepts it as a
- * well-formed event that matches no real person — which is what makes it
- * safe to run against a live dataset.
+ * sender, so a change that breaks production breaks this too.
  */
 export const capiProbe = internalAction({
   args: { accountId: v.id("accounts") },
