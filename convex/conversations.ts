@@ -1037,6 +1037,90 @@ export const unassign = accountMutation({
 });
 
 /**
+ * Offboarding tool: hand every conversation currently assigned to
+ * `fromUserId` over to `toUserId`, in batches.
+ *
+ * `members.remove` deletes ONLY the `memberships` row — it never touches
+ * `conversations.assignedToUserId`. A thread left pointing at a departed
+ * member is not lost, but it is stranded: it falls outside every agent's
+ * and viewer's role scope (`conversationScope`), `recipientsForInbound`
+ * pages only its assignee so a new inbound notifies nobody, and
+ * `aiReply` treats a set assignee as "a human owns this thread" and stays
+ * silent. Moving the assignments BEFORE removing the member is what
+ * avoids all three.
+ *
+ * `internalMutation`, not an `accountMutation`: this is driven from the
+ * CLI/dashboard by an operator, which has no signed-in user to derive
+ * `ctx.accountId` from — hence the explicit `accountId`, which the index
+ * range below scopes every read and write to.
+ *
+ * Goes through `applyAssignment` (the field + one `conversationEvents`
+ * line) and NOT through `assign`, deliberately. The public path also
+ * bumps `status` to "pending", runs `chargeLeadIfAgent`, fires the
+ * `conversation_assigned` automation trigger and inserts a notification
+ * — correct for one human handover, wrong several hundred times over for
+ * a bookkeeping move: it would bill a lead per thread, re-open settled
+ * conversations, and could send automation messages to every one of
+ * those customers.
+ *
+ * Batched because one mutation is one transaction: call it repeatedly
+ * until `more` is false. `dryRun` reports what a real call would move
+ * without writing.
+ */
+export const reassignAllFromUser = internalMutation({
+  args: {
+    accountId: v.id("accounts"),
+    fromUserId: v.id("users"),
+    toUserId: v.id("users"),
+    limit: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    if (args.fromUserId === args.toUserId) {
+      throw new ConvexError({ code: "SAME_USER" });
+    }
+    // The destination must still be a member of this account — assigning
+    // to a non-member is the very state this tool exists to clean up.
+    const membership = await ctx.db
+      .query("memberships")
+      .withIndex("by_user_account", (q) =>
+        q.eq("userId", args.toUserId).eq("accountId", args.accountId),
+      )
+      .first();
+    if (!membership) {
+      throw new ConvexError({ code: "NOT_FOUND", entity: "member" });
+    }
+
+    const limit = args.limit ?? 100;
+    // `take(limit + 1)` so `more` is answered by the read itself rather
+    // than by a second count query over the same range.
+    const rows = await ctx.db
+      .query("conversations")
+      .withIndex("by_account_assigned_last_message", (q) =>
+        q.eq("accountId", args.accountId).eq("assignedToUserId", args.fromUserId),
+      )
+      .take(limit + 1);
+    const batch = rows.slice(0, limit);
+    const more = rows.length > limit;
+
+    if (args.dryRun) return { moved: 0, scanned: batch.length, more };
+
+    let moved = 0;
+    for (const conversation of batch) {
+      // No `actorUserId`: nobody clicked this. The absence is what the
+      // thread's own timeline line reads to phrase it as a system move.
+      const changed = await applyAssignment(ctx, {
+        conversation,
+        nextAssignee: args.toUserId,
+        source: "manual",
+      });
+      if (changed) moved += 1;
+    }
+    return { moved, scanned: batch.length, more };
+  },
+});
+
+/**
  * One conversation's ownership history, OLDEST first — the thread renders
  * these inline beside messages and notes, the same chronological order
  * `contactNotes.listForConversation` uses.
