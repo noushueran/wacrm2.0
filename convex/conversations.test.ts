@@ -3671,3 +3671,224 @@ test("listEvents refuses a conversation the caller cannot reach", async () => {
     other.asUser.query(api.conversations.listEvents, { conversationId }),
   ).rejects.toThrow();
 });
+
+// ------------------------------------------------------------------
+// reassignAllFromUser — the offboarding sweep
+// ------------------------------------------------------------------
+
+/** Seeds `count` conversations assigned to `userId`, one contact each. */
+async function seedAssignedConversations(
+  t: TestConvex<typeof schema>,
+  accountId: Id<"accounts">,
+  userId: Id<"users">,
+  count: number,
+) {
+  const ids: Id<"conversations">[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const contactId = await t.run((ctx) =>
+      ctx.db.insert("contacts", {
+        accountId,
+        phone: `9${i}`,
+        phoneNormalized: `9${i}`,
+        name: `C${i}`,
+      }),
+    );
+    ids.push(
+      await seedConversation(t, { accountId, contactId, assignedToUserId: userId }),
+    );
+  }
+  return ids;
+}
+
+test("reassignAllFromUser moves every one of the leaver's threads to the new owner", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  const ids = await seedAssignedConversations(t, owner.accountId, leaver, 3);
+
+  const result = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId,
+    fromUserId: leaver,
+    toUserId: keeper,
+  });
+
+  expect(result).toEqual({ moved: 3, scanned: 3, more: false });
+  for (const id of ids) {
+    const doc = await t.run((ctx) => ctx.db.get(id));
+    expect(doc?.assignedToUserId).toBe(keeper);
+  }
+});
+
+test("reassignAllFromUser records a handover on the thread's own timeline", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  const [conversationId] = await seedAssignedConversations(t, owner.accountId, leaver, 1);
+
+  await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper,
+  });
+
+  const events = await eventsOf(t, conversationId);
+  expect(events).toHaveLength(1);
+  expect(events[0].kind).toBe("assigned");
+  expect(events[0].targetUserId).toBe(keeper);
+  expect(events[0].previousUserId).toBe(leaver);
+  // Nobody clicked this — the absent actor is what the UI reads to
+  // phrase the line as a system move.
+  expect(events[0].actorUserId).toBeUndefined();
+});
+
+test("reassignAllFromUser leaves status untouched and bills no lead", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  // An "agent" destination is the case that would be charged had this
+  // gone through `conversations.assign` — see `chargeLeadIfAgent`.
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  const contactId = await t.run((ctx) =>
+    ctx.db.insert("contacts", {
+      accountId: owner.accountId, phone: "555", phoneNormalized: "555", name: "C",
+    }),
+  );
+  const conversationId = await seedConversation(t, {
+    accountId: owner.accountId, contactId, status: "closed", assignedToUserId: leaver,
+  });
+
+  await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper,
+  });
+
+  const doc = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(doc?.status).toBe("closed");
+  const charges = await t.run((ctx) => ctx.db.query("leadCharges").collect());
+  expect(charges).toHaveLength(0);
+  const notifications = await t.run((ctx) => ctx.db.query("notifications").collect());
+  expect(notifications).toHaveLength(0);
+});
+
+test("reassignAllFromUser batches, and `more` reports the remainder", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  await seedAssignedConversations(t, owner.accountId, leaver, 5);
+
+  const first = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper, limit: 2,
+  });
+  expect(first).toEqual({ moved: 2, scanned: 2, more: true });
+
+  const second = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper, limit: 10,
+  });
+  expect(second).toEqual({ moved: 3, scanned: 3, more: false });
+
+  const third = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper, limit: 10,
+  });
+  expect(third).toEqual({ moved: 0, scanned: 0, more: false });
+});
+
+test("reassignAllFromUser dry run writes nothing", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  const [conversationId] = await seedAssignedConversations(t, owner.accountId, leaver, 2);
+
+  const result = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper, dryRun: true,
+  });
+
+  expect(result).toEqual({ moved: 0, scanned: 2, more: false });
+  const doc = await t.run((ctx) => ctx.db.get(conversationId));
+  expect(doc?.assignedToUserId).toBe(leaver);
+  expect(await eventsOf(t, conversationId)).toHaveLength(0);
+});
+
+test("reassignAllFromUser refuses a destination who is not a member of the account", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const other = await seedAccountMember(t, {
+    name: "Other", email: "other@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+
+  await expect(
+    t.mutation(internal.conversations.reassignAllFromUser, {
+      accountId: owner.accountId, fromUserId: leaver, toUserId: other.userId,
+    }),
+  ).rejects.toThrow();
+});
+
+test("reassignAllFromUser ignores another account's identically-assigned threads", async () => {
+  const t = convexTest(schema, modules);
+  const owner = await seedAccountMember(t, {
+    name: "Owner", email: "owner@example.com", role: "owner",
+  });
+  const other = await seedAccountMember(t, {
+    name: "Other", email: "other@example.com", role: "owner",
+  });
+  const leaver = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
+  });
+  // The same user also carries threads on a SECOND account (the shape
+  // `members.remove` leaves behind, since a user can hold memberships in
+  // more than one account).
+  await t.run((ctx) =>
+    ctx.db.insert("memberships", {
+      userId: leaver, accountId: other.accountId, role: "viewer",
+      fullName: "Leaver", email: "leaver@example.com",
+    }),
+  );
+  const keeper = await seedTeammate(t, {
+    accountId: owner.accountId, name: "Keeper", email: "keeper@example.com", role: "agent",
+  });
+  const [mine] = await seedAssignedConversations(t, owner.accountId, leaver, 1);
+  const [theirs] = await seedAssignedConversations(t, other.accountId, leaver, 1);
+
+  const result = await t.mutation(internal.conversations.reassignAllFromUser, {
+    accountId: owner.accountId, fromUserId: leaver, toUserId: keeper,
+  });
+
+  expect(result.moved).toBe(1);
+  expect((await t.run((ctx) => ctx.db.get(mine)))?.assignedToUserId).toBe(keeper);
+  expect((await t.run((ctx) => ctx.db.get(theirs)))?.assignedToUserId).toBe(leaver);
+});
