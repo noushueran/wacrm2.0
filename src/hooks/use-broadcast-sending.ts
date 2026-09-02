@@ -35,12 +35,13 @@ export interface AudienceConfig {
  * `value`.
  *
  * This shape is passed through verbatim as `broadcasts.templateVariables`
- * (`v.any()`), but `convex/broadcasts.ts`'s `deliverOne` only ever reads
- * it back out when it happens to already be a plain `string[]` —
- * per-contact resolution of `field`/`custom_field` mappings (what this
- * type actually models) has no Convex-side consumer yet. Wiring that up
- * means touching `convex/broadcasts.ts`, which is out of scope for this
- * task (composer-only rewire) — see this task's report.
+ * (`v.any()`) and resolved per recipient at delivery time by
+ * `convex/broadcasts.ts`'s `resolveBroadcastParams`, which turns these
+ * mappings into the positional `params: string[]` Meta wants. Until that
+ * resolver existed, `deliverOne` used `templateVariables` only when it
+ * already happened to be a plain `string[]` — which this object shape
+ * never is — so every broadcast of a template with body variables
+ * reached Meta with no parameters and was rejected for every recipient.
  */
 export type VariableMapping =
   | { type: 'static'; value: string }
@@ -53,15 +54,35 @@ interface BroadcastPayload {
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
   /**
-   * Media URL for an IMAGE/VIDEO/DOCUMENT header. The pre-Convex send
-   * path forwarded this to every per-recipient API call;
-   * `convex/metaSend.ts`'s `sendTemplate` action has no equivalent
-   * parameter yet, so this currently has no server-side sink at all
-   * (see this task's report). Kept on the payload so Step 3's UI keeps
-   * working and the value isn't silently dropped from the type the
-   * moment a Convex-side consumer is added.
+   * Media URL for an IMAGE/VIDEO/DOCUMENT header. Persisted onto the
+   * broadcast row (`headerMediaUrl`/`headerMediaType`, paired by
+   * `resolveHeaderMedia` below) and rebuilt into Meta's header
+   * component by `deliverOne` on every per-recipient send — Meta
+   * requires it each time and rejects the delivery without it.
    */
   headerMediaUrl?: string;
+}
+
+/** Header formats that require a media component on every send. */
+const MEDIA_HEADER_TYPES = ['image', 'video', 'document'] as const;
+type MediaHeaderType = (typeof MEDIA_HEADER_TYPES)[number];
+
+/**
+ * Narrows the chosen template's header format to the media kinds and
+ * pairs it with the URL Step 3 collected. Returns an empty object for a
+ * text-only/header-less template (or a media header the user left
+ * blank), so the broadcast row simply carries no header columns and
+ * `deliverOne` omits the component.
+ */
+function resolveHeaderMedia(
+  template: MessageTemplate,
+  headerMediaUrl: string | undefined,
+): { headerMediaUrl?: string; headerMediaType?: MediaHeaderType } {
+  const url = headerMediaUrl?.trim();
+  if (!url) return {};
+  const format = template.header_type;
+  if (!MEDIA_HEADER_TYPES.includes(format as MediaHeaderType)) return {};
+  return { headerMediaUrl: url, headerMediaType: format as MediaHeaderType };
 }
 
 interface UseBroadcastSendingReturn {
@@ -254,6 +275,12 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         templateLanguage: payload.template.language ?? 'en_US',
         contactIds,
         templateVariables: payload.variables,
+        // A media-header template is rejected by Meta on every delivery
+        // without its header component, so the URL Step 3 collected has
+        // to reach the broadcast row. `headerMediaType` comes off the
+        // chosen template's own header format — delivery only reads the
+        // broadcast row, never the template.
+        ...resolveHeaderMedia(payload.template, payload.headerMediaUrl),
         audienceFilter: {
           type: payload.audience.type,
           tagIds: payload.audience.tagIds,

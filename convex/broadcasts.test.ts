@@ -5,7 +5,12 @@ import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
-import { colsForStatus, isValidStatusTransition } from "./broadcasts";
+import {
+  colsForStatus,
+  isValidStatusTransition,
+  needsCustomValues,
+  resolveBroadcastParams,
+} from "./broadcasts";
 
 // Belt-and-suspenders cleanup for the delivery (`send`/`deliverOne`)
 // tests further below, which opt into `vi.useFakeTimers()` +
@@ -1573,4 +1578,154 @@ test("an opt-out that lands after create still stops the send", async () => {
   const after = await recipientsOf(asUser, broadcastId);
   expect(after[0]!.status).toBe("failed");
   expect(after[0]!.errorMessage).toContain("opted_out");
+});
+
+// ============================================================
+// resolveBroadcastParams / needsCustomValues — pure functions, direct
+// unit tests (same treatment as colsForStatus above). These cover the
+// bug that made every parameterised broadcast undeliverable: the
+// composer stores ONE mapping per placeholder keyed "1"/"2"/…, and
+// `deliverOne` used to forward `templateVariables` only when it was
+// already a plain `string[]`, so the mapping object resolved to no
+// params at all and Meta rejected the send for every recipient.
+// ============================================================
+
+const CONTACT = {
+  name: "Alice",
+  phone: "+15550000001",
+  email: "alice@example.com",
+  company: "Acme",
+};
+
+test("resolveBroadcastParams resolves the composer's mapping object against the recipient", () => {
+  const params = resolveBroadcastParams(
+    {
+      "1": { type: "field", value: "name" },
+      "2": { type: "static", value: "20% off" },
+      "3": { type: "custom_field", value: "fld_city" },
+    },
+    CONTACT,
+    { fld_city: "Dubai" },
+  );
+  expect(params).toEqual(["Alice", "20% off", "Dubai"]);
+});
+
+test("resolveBroadcastParams orders by placeholder number, not object key order, and fills a gap rather than shifting later values", () => {
+  // "2" deliberately unmapped — collapsing it would slide "Alice" into
+  // {{2}}, which is worse than one blank.
+  const params = resolveBroadcastParams(
+    { "3": { type: "field", value: "name" }, "1": { type: "static", value: "Hi" } },
+    CONTACT,
+    {},
+  );
+  expect(params).toEqual(["Hi", "", "Alice"]);
+});
+
+test("resolveBroadcastParams yields an empty string for data the contact doesn't have, never a dropped slot", () => {
+  const params = resolveBroadcastParams(
+    {
+      "1": { type: "field", value: "company" },
+      "2": { type: "custom_field", value: "fld_missing" },
+      "3": { type: "field", value: "not_a_column" },
+    },
+    { name: "Bob", phone: "+15550000002" }, // no company
+    {},
+  );
+  expect(params).toEqual(["", "", ""]);
+});
+
+test("resolveBroadcastParams passes a positional string[] straight through (the REST-API / legacy shape)", () => {
+  expect(resolveBroadcastParams(["a", "b"], CONTACT, {})).toEqual(["a", "b"]);
+  // A bare literal per key, without the {type,value} wrapper.
+  expect(resolveBroadcastParams({ "1": "Alice" }, CONTACT, {})).toEqual(["Alice"]);
+});
+
+test("resolveBroadcastParams returns undefined when there is nothing to send, so sendTemplate omits the body component", () => {
+  expect(resolveBroadcastParams(undefined, CONTACT, {})).toBeUndefined();
+  expect(resolveBroadcastParams({}, CONTACT, {})).toBeUndefined();
+  expect(resolveBroadcastParams({ notANumber: "x" }, CONTACT, {})).toBeUndefined();
+  // A non-string array is not a usable positional param list.
+  expect(resolveBroadcastParams([1, 2], CONTACT, {})).toBeUndefined();
+});
+
+test("needsCustomValues is true only when a mapping actually names a custom field", () => {
+  expect(needsCustomValues({ "1": { type: "custom_field", value: "f" } })).toBe(true);
+  expect(needsCustomValues({ "1": { type: "field", value: "name" } })).toBe(false);
+  expect(needsCustomValues({ "1": { type: "static", value: "hi" } })).toBe(false);
+  expect(needsCustomValues(["a"])).toBe(false);
+  expect(needsCustomValues(undefined)).toBe(false);
+});
+
+// Asserts the two halves the delivery path newly depends on: the loader
+// hands `deliverOne` THIS recipient's own custom values, and the header
+// columns survive `create`. The Meta request body itself is not
+// observable here — DRY-RUN short-circuits before the fetch, and
+// broadcasts pass no `contentText` for the message row to echo — so the
+// resolution itself is asserted directly by the unit tests above.
+test("the delivery loader supplies each recipient's OWN custom-field value, and the media header columns survive create", async () => {
+  process.env.CONVEX_META_DRY_RUN = "1";
+  vi.useFakeTimers();
+  const t = convexTest(schema, modules);
+  const { asUser } = await seedAccountMember(t, {
+    name: "Alice",
+    email: "alice@example.com",
+    role: "supervisor",
+  });
+  const [c1, c2] = await seedContacts(asUser, 2);
+
+  const fieldId = await asUser.mutation(api.customFields.create, {
+    fieldName: "City",
+    fieldType: "text",
+  });
+  await asUser.mutation(api.customFields.setForContact, {
+    contactId: c1!,
+    values: [{ customFieldId: fieldId, value: "Dubai" }],
+  });
+  await asUser.mutation(api.customFields.setForContact, {
+    contactId: c2!,
+    values: [{ customFieldId: fieldId, value: "Kochi" }],
+  });
+
+  const { broadcastId } = await asUser.mutation(api.broadcasts.create, {
+    ...baseBroadcast,
+    contactIds: [c1!, c2!],
+    templateVariables: {
+      "1": { type: "field", value: "name" },
+      "2": { type: "custom_field", value: fieldId },
+    },
+    headerMediaUrl: "https://cdn.example.com/spring.jpg",
+    headerMediaType: "image",
+  });
+
+  // The header columns survive `create` — without them every delivery
+  // of a media-header template is rejected by Meta.
+  const broadcast = await t.run((ctx) => ctx.db.get(broadcastId));
+  expect(broadcast!.headerMediaUrl).toBe("https://cdn.example.com/spring.jpg");
+  expect(broadcast!.headerMediaType).toBe("image");
+
+  await asUser.action(api.broadcasts.send, { broadcastId });
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+
+  const recipients = await recipientsOf(asUser, broadcastId);
+  expect(recipients.map((r) => r.status)).toEqual(["sent", "sent"]);
+
+  // Each recipient's delivery payload is built from ITS OWN contact:
+  // same broadcast, different resolved params.
+  const resolved = await Promise.all(
+    recipients.map(async (recipient) => {
+      const loaded = await t.query(
+        internal.broadcasts.getRecipientForDeliveryInternal,
+        { accountId: broadcast!.accountId, recipientId: recipient._id },
+      );
+      return resolveBroadcastParams(
+        loaded!.broadcast.templateVariables,
+        loaded!.contact!,
+        loaded!.customValues,
+      );
+    }),
+  );
+  const cities = resolved.map((params) => params![1]).sort();
+  expect(cities).toEqual(["Dubai", "Kochi"]);
+  // …and the name slot tracked the same contact, never a shared value.
+  expect(new Set(resolved.map((params) => params![0])).size).toBe(2);
 });

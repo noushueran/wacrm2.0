@@ -337,6 +337,12 @@ export const create = accountMutation({
     templateLanguage: v.string(),
     contactIds: v.array(v.id("contacts")),
     templateVariables: v.optional(v.any()),
+    // See `schema.ts`'s own comment on these two columns — a media
+    // header template is undeliverable without them.
+    headerMediaUrl: v.optional(v.string()),
+    headerMediaType: v.optional(
+      v.union(v.literal("image"), v.literal("video"), v.literal("document")),
+    ),
     audienceFilter: v.optional(v.any()),
     status: v.optional(
       v.union(
@@ -807,6 +813,142 @@ export const startSendingInternal = internalMutation({
   },
 });
 
+// ---- per-recipient template personalization ------------------------
+//
+// The composer (`step3-personalize.tsx`) stores ONE mapping per body
+// placeholder, keyed by the placeholder's number: `{"1": {type, value}}`
+// where `type` is `static` (a literal), `field` (a built-in contact
+// column) or `custom_field` (a `customFields` row id). Meta, however,
+// wants a positional `params: string[]` resolved for the RECIPIENT of
+// this particular send.
+//
+// That resolution had no Convex-side consumer: `deliverOne` only used
+// `templateVariables` when it already happened to be a `string[]`, which
+// the composer's object shape never is — so every broadcast of a
+// template with body variables went to Meta with NO parameters at all
+// and was rejected for every recipient (Meta requires the body
+// component's parameter count to match the approved template).
+//
+// Both shapes are accepted here: the composer's mapping object, and the
+// bare `string[]`/`{"1": "Alice"}` forms the REST API (`apiV1
+// .createBroadcast`) and older rows can carry, which are recipient
+// -independent and pass straight through.
+
+/** One placeholder's source, as the composer's Step 3 records it. */
+type VariableMapping = {
+  type?: unknown;
+  value?: unknown;
+};
+
+/** The built-in contact columns `type: "field"` can name. */
+const CONTACT_FIELDS = ["name", "phone", "email", "company"] as const;
+
+type ContactForParams = {
+  name?: string;
+  phone: string;
+  email?: string;
+  company?: string;
+};
+
+/**
+ * True when `templateVariables` names at least one `custom_field`
+ * source, i.e. when resolving it needs the recipient's
+ * `contactCustomValues` rows. Lets `getRecipientForDeliveryInternal`
+ * skip that extra indexed read on the common broadcast that uses only
+ * static/field mappings — this runs once per RECIPIENT, so a wasted
+ * read is paid per contact in the audience, not once per broadcast.
+ */
+export function needsCustomValues(templateVariables: unknown): boolean {
+  if (!isMappingObject(templateVariables)) return false;
+  return Object.values(templateVariables).some(
+    (m) =>
+      typeof m === "object" &&
+      m !== null &&
+      (m as VariableMapping).type === "custom_field",
+  );
+}
+
+/** A plain (non-array, non-null) object — the composer's mapping shape. */
+function isMappingObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Resolves a broadcast's stored `templateVariables` into the positional
+ * `params` for ONE recipient. Returns `undefined` when the broadcast
+ * carries no usable variables at all, which is exactly what a template
+ * with no body placeholders wants (`sendTemplate` then omits the body
+ * component entirely).
+ *
+ * Placeholders are keyed "1", "2", … (`{{1}}` → key "1"), so the output
+ * array is built by index and runs to the HIGHEST key present. A gap
+ * (say "1" and "3" mapped, "2" not) resolves to an empty string rather
+ * than collapsing the array — collapsing would shift every later value
+ * into the wrong placeholder, which is worse than one blank.
+ *
+ * An unresolvable source (a `field` naming an empty column, a
+ * `custom_field` the contact has no value for) also becomes an empty
+ * string: the composer already blocks Next until every placeholder has
+ * a mapping, so reaching here with a blank means the CONTACT lacks the
+ * data, and one blank beats failing the whole send.
+ */
+export function resolveBroadcastParams(
+  templateVariables: unknown,
+  contact: ContactForParams,
+  customValues: Record<string, string>,
+): string[] | undefined {
+  // Already positional (REST API / legacy rows) — recipient-independent.
+  if (Array.isArray(templateVariables)) {
+    return templateVariables.every((v) => typeof v === "string")
+      ? (templateVariables as string[])
+      : undefined;
+  }
+
+  if (!isMappingObject(templateVariables)) return undefined;
+
+  // Only numeric keys address a placeholder; anything else is ignored.
+  const indices = Object.keys(templateVariables)
+    .filter((k) => /^\d+$/.test(k))
+    .map(Number)
+    .filter((n) => n >= 1);
+  if (indices.length === 0) return undefined;
+
+  const highest = Math.max(...indices);
+  const params: string[] = [];
+  for (let i = 1; i <= highest; i++) {
+    params.push(
+      resolveOne(templateVariables[String(i)], contact, customValues),
+    );
+  }
+  return params;
+}
+
+function resolveOne(
+  mapping: unknown,
+  contact: ContactForParams,
+  customValues: Record<string, string>,
+): string {
+  // `{"1": "Alice"}` — a bare literal, no mapping wrapper.
+  if (typeof mapping === "string") return mapping;
+  if (typeof mapping !== "object" || mapping === null) return "";
+
+  const { type, value } = mapping as VariableMapping;
+  if (typeof value !== "string") return "";
+
+  switch (type) {
+    case "static":
+      return value;
+    case "field":
+      return (CONTACT_FIELDS as readonly string[]).includes(value)
+        ? (contact[value as (typeof CONTACT_FIELDS)[number]] ?? "")
+        : "";
+    case "custom_field":
+      return customValues[value] ?? "";
+    default:
+      return "";
+  }
+}
+
 /**
  * Loads a "pending" recipient's contact + parent broadcast in one
  * round-trip for `deliverOne` below. `null` covers every "nothing to
@@ -851,7 +993,25 @@ export const getRecipientForDeliveryInternal = internalQuery({
       }
     }
 
-    return { recipient, contact, broadcast, optedOut };
+    // The recipient's custom-field values, keyed by `customFieldId` —
+    // the `type: "custom_field"` half of `resolveBroadcastParams`.
+    // Loaded ONLY when this broadcast's mappings actually name one
+    // (`needsCustomValues`): this query runs once per recipient, so an
+    // unconditional read would cost one extra indexed scan per contact
+    // in the audience for the majority of broadcasts that use only
+    // static/field mappings.
+    const customValues: Record<string, string> = {};
+    if (contact && needsCustomValues(broadcast.templateVariables)) {
+      const rows = await ctx.db
+        .query("contactCustomValues")
+        .withIndex("by_contact", (q) => q.eq("contactId", contact._id))
+        .collect();
+      for (const row of rows) {
+        customValues[row.customFieldId] = row.value ?? "";
+      }
+    }
+
+    return { recipient, contact, broadcast, optedOut, customValues };
   },
 });
 
@@ -962,20 +1122,25 @@ export const deliverOne = internalAction({
         { accountId: args.accountId, contactId: contact._id },
       );
 
-      // `broadcasts.templateVariables` is `v.any()` — only usable
-      // directly as `metaSend.sendTemplate`'s positional `params:
-      // string[]` when it already IS a plain string array. Per-contact
-      // personalization (the source hook's `resolveVariables`,
-      // resolving `{type:'field'|'custom_field'|'static'}` mappings per
-      // recipient) has no Convex data model yet — the composer UI
-      // rewire (a separate later task) owns wiring that up; until then
-      // every recipient gets the same broadcast-level params, or none.
-      const params =
-        Array.isArray(broadcast.templateVariables) &&
-        broadcast.templateVariables.every(
-          (value: unknown) => typeof value === "string",
-        )
-          ? (broadcast.templateVariables as string[])
+      // `broadcasts.templateVariables` is `v.any()`, holding either the
+      // composer's per-placeholder mapping object or a bare positional
+      // array — `resolveBroadcastParams` resolves both against THIS
+      // recipient (see its own doc comment).
+      const params = resolveBroadcastParams(
+        broadcast.templateVariables,
+        contact,
+        loaded.customValues,
+      );
+
+      // Only sent when the broadcast actually names a media header —
+      // `sendTemplate` omits the component entirely otherwise, which is
+      // what a text-header or header-less template needs.
+      const header =
+        broadcast.headerMediaType && broadcast.headerMediaUrl
+          ? {
+              type: broadcast.headerMediaType,
+              link: broadcast.headerMediaUrl,
+            }
           : undefined;
 
       const result = await ctx.runAction(internal.metaSend.sendTemplate, {
@@ -985,6 +1150,7 @@ export const deliverOne = internalAction({
         templateName: broadcast.templateName,
         language: broadcast.templateLanguage,
         params,
+        header,
         senderType: "bot",
       });
 

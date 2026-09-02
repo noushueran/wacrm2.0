@@ -1340,6 +1340,19 @@ export default defineSchema({
     templateName: v.string(),
     templateLanguage: v.string(), // NOT NULL DEFAULT 'en_US'
     templateVariables: v.optional(v.any()),
+    // Media for an IMAGE/VIDEO/DOCUMENT template header. Meta requires
+    // the header component on EVERY delivery of such a template (the
+    // approved sample does not ride along by itself), so a broadcast of
+    // one is rejected per-recipient without it. The composer's Step 3
+    // already collects and validates the URL — these two columns are
+    // where it lands so `deliverOne` can rebuild the component.
+    // `headerMediaType` is captured at create time from the chosen
+    // template's own header format, since the broadcast row is the only
+    // thing delivery reads back.
+    headerMediaUrl: v.optional(v.string()),
+    headerMediaType: v.optional(
+      v.union(v.literal("image"), v.literal("video"), v.literal("document")),
+    ),
     audienceFilter: v.optional(v.any()),
     scheduledAt: v.optional(v.number()),
     status: v.union(
