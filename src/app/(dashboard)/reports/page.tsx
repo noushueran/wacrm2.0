@@ -25,6 +25,7 @@ import { ConversationsPanel } from '@/components/reports/conversations-panel'
 import { AdsPanel } from '@/components/reports/ads-panel'
 import { ResponsePanel } from '@/components/reports/response-panel'
 import { FunnelPanel } from '@/components/reports/funnel-panel'
+import { EventsPanel } from '@/components/reports/events-panel'
 import { BillingPanel } from '@/components/reports/billing-panel'
 import { AgentsPanel } from '@/components/reports/agents-panel'
 import { ActivityPanel } from '@/components/reports/activity-panel'
@@ -113,6 +114,7 @@ export default function ReportsPage() {
       {tab === 'ads' && <AdsPanel reportWindow={reportWindow} canRead={canRead} />}
       {tab === 'response' && <ResponsePanel reportWindow={reportWindow} canRead={canRead} />}
       {tab === 'funnel' && <FunnelPanel reportWindow={reportWindow} canRead={canRead} />}
+      {tab === 'events' && <EventsPanel reportWindow={reportWindow} canRead={canRead} />}
       {tab === 'billing' && <BillingPanel reportWindow={reportWindow} canRead={canRead} />}
       {tab === 'agents' && <AgentsPanel reportWindow={reportWindow} canRead={canRead} />}
       {tab === 'activity' && <ActivityPanel reportWindow={reportWindow} canRead={canRead} />}

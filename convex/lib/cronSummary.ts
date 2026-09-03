@@ -33,6 +33,8 @@ export const CRON_REGISTRY = [
   { name: "sales-coach-sweep", intervalMinutes: 1440 },
   { name: "automations-time-based", intervalMinutes: 15 },
   { name: "dashboard-snapshot", intervalMinutes: 2 },
+  { name: "meta-audience-sync", intervalMinutes: 1440 },
+  { name: "meta-dataset-stats", intervalMinutes: 1440 },
 ] as const;
 
 export type CronName = (typeof CRON_REGISTRY)[number]["name"];

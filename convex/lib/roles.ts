@@ -65,6 +65,35 @@ export function conversationScope(role: AccountRole): ConversationScope {
   }
 }
 
+/**
+ * Does one conversation fall inside a caller's `ConversationScope`?
+ *
+ * Extracted so the two places that count unread conversations cannot
+ * drift: `conversations.unreadTotal` (the number the app renders) and
+ * `push.assembleDelivery` (the number the service worker writes to the
+ * app-icon badge). A badge that disagrees with the screen is worse than
+ * no badge, and the only way to guarantee it doesn't is one predicate.
+ *
+ * `assignedToUserId` is passed exactly as it sits on the row —
+ * `undefined` means unassigned (the claimable pool). Deliberately not
+ * `== null`: the schema field is `v.optional(...)`, so `undefined` is the
+ * only absent form, and a looser check would silently widen the pool.
+ */
+export function conversationInScope(
+  scope: ConversationScope,
+  assignedToUserId: string | undefined,
+  callerUserId: string,
+): boolean {
+  switch (scope) {
+    case "all":
+      return true;
+    case "own_and_pool":
+      return assignedToUserId === callerUserId || assignedToUserId === undefined;
+    case "unassigned":
+      return assignedToUserId === undefined;
+  }
+}
+
 /** May the caller read a contact's real phone number for a
  *  conversation? admin/owner/supervisor always; an agent only on a
  *  conversation assigned to them; a viewer never. */

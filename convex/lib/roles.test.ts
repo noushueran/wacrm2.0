@@ -3,6 +3,7 @@ import {
   hasMinRole,
   roleRank,
   conversationScope,
+  conversationInScope,
   canSeeContactPhone,
   canAssignToOthers,
   canAccessConversation,
@@ -70,4 +71,32 @@ test("settings split: operational supervisor+, critical admin+", () => {
   expect(canEditOperationalSettings("agent")).toBe(false);
   expect(canEditCriticalSettings("supervisor")).toBe(false);
   expect(canEditCriticalSettings("admin")).toBe(true);
+});
+
+test("conversationInScope: badge count and on-screen count use one rule", () => {
+  const me = "user_me";
+  const other = "user_other";
+
+  // supervisor+ sees everything, assigned to anyone or no one.
+  expect(conversationInScope("all", other, me)).toBe(true);
+  expect(conversationInScope("all", undefined, me)).toBe(true);
+
+  // An agent sees their own chats plus the unassigned pool — and
+  // crucially NOT a colleague's, which is what stops the badge from
+  // over-counting relative to the inbox they can actually open.
+  expect(conversationInScope("own_and_pool", me, me)).toBe(true);
+  expect(conversationInScope("own_and_pool", undefined, me)).toBe(true);
+  expect(conversationInScope("own_and_pool", other, me)).toBe(false);
+
+  // A viewer sees the pool only, never even their own assignment.
+  expect(conversationInScope("unassigned", undefined, me)).toBe(true);
+  expect(conversationInScope("unassigned", me, me)).toBe(false);
+});
+
+test("conversationInScope: unassigned means undefined, matching the optional schema field", () => {
+  // The rows come straight from `conversations`, where assignedToUserId
+  // is `v.optional(...)`. Widening this to a loose null check would put
+  // colleagues' chats into an agent's pool.
+  expect(conversationInScope("own_and_pool", undefined, "user_me")).toBe(true);
+  expect(conversationInScope("unassigned", undefined, "user_me")).toBe(true);
 });

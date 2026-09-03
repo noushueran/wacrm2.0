@@ -19,6 +19,7 @@ import {
   type ReportHourRow,
   type VolumeTotals,
   type BillingTotals,
+  DAY_MS,
   emptyStageCounts,
   emptyEventStatusCounts,
   EVENT_STATUS_KEYS,
@@ -27,6 +28,13 @@ import {
   lifecycleFunnel,
 } from "./lib/reportStats";
 import { localDayKeyFromMs } from "./lib/dashboardDate";
+import {
+  buildReconciliation,
+  coversWindow,
+  datasetDayKeys,
+  sumMetaCounts,
+  META_EVENT_CATALOGUE,
+} from "./lib/metaEventStats";
 import type { Id } from "./_generated/dataModel";
 import type { DatabaseReader } from "./_generated/server";
 
@@ -1049,5 +1057,214 @@ export const assignmentsByAgent = accountQuery({
       .sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId));
 
     return { days, agents, truncated, earliestCoveredDay };
+  },
+});
+
+/**
+ * Reports → Events: our funnel against Meta's dataset, per event.
+ *
+ * TAKES `rangeDays`, NOT `sinceMs`/`untilMs`, which is the one place this
+ * query deliberately departs from every sibling in this file.
+ *
+ * The siblings take a window the CLIENT built from the viewer's local
+ * midnights, which is right for them. This tab cannot use it. Meta's
+ * counts arrive pre-bucketed into whole days in the DATASET's business
+ * timezone, and that boundary cannot be re-bucketed on read. So the window
+ * is rebuilt here from the dataset's own offset and all three columns are
+ * folded against it.
+ *
+ * The alternative — our columns on the viewer's days, Meta's on Meta's —
+ * manufactures a delta at every window edge that looks exactly like a
+ * delivery failure. That is the same mismatch that made the 7-day Ads
+ * figure 22.7% high; see `funnelOverview`.
+ *
+ * With no sync state yet there is no dataset offset to pin to, so the
+ * window falls back to UTC days and `meta.available` is false — every
+ * `recorded` is null, and the panel says why rather than showing zeros.
+ *
+ * SETTLED DAYS ONLY. The window ends at YESTERDAY's local midnight, so on
+ * day Q it covers through Q-2 — every column here is folded over days
+ * that closed at least a full day ago. See the `untilMs` comment in the
+ * handler for both reasons: a day still in progress (or one that closed
+ * minutes ago) cannot honestly be reconciled, and the two-day edge is
+ * exactly what lets a DAILY sync satisfy the coverage check at any phase
+ * rather than blacking the tab out until each day's run lands.
+ *
+ * TWO INDEPENDENT REASONS `recorded` can be unknown, and they are
+ * reported separately: `meta.lastError` (the sync failed) and
+ * `meta.coverageGap` (the sync worked but has not read back across this
+ * window). Both produce nulls, neither produces zeros, and conflating
+ * them would send someone hunting an outage that does not exist.
+ */
+export const metaEventReconciliation = accountQuery({
+  args: { rangeDays: v.number() },
+  handler: async (ctx, args) => {
+    ctx.requireRole("supervisor");
+
+    const state = await ctx.db
+      .query("metaDatasetSyncState")
+      .withIndex("by_account", (q) => q.eq("accountId", ctx.accountId))
+      .unique();
+
+    const tzOffsetMinutes = state?.tzOffsetMinutes ?? 0;
+    const shift = tzOffsetMinutes * 60_000;
+    // Clamped to a whole day >= 1: an unguarded `rangeDays` of 0 or less
+    // (or a fractional value) collapses `sinceMs >= untilMs`, which makes
+    // `datasetDayKeys` below return an EMPTY array — and its first/last
+    // elements feed straight into `.gte("dayKey", ...).lte("dayKey", ...)`
+    // on the `metaEventDailyStats` index as `undefined`. `Math.trunc` also
+    // closes the same hole for a fractional `rangeDays` (e.g. 2.5), which
+    // `v.number()` otherwise admits.
+    // Upper bound too: the widest range the picker offers is 90 days
+    // (`RANGE_OPTIONS`), and an arbitrarily large `rangeDays` would walk
+    // `datasetDayKeys` for that many iterations before reading a range no
+    // sync could ever have covered. A year is generous headroom over the
+    // picker and still bounded.
+    const rangeDays = Math.min(365, Math.max(1, Math.trunc(args.rangeDays)));
+    // Exclusive upper bound: YESTERDAY's local midnight in the dataset's
+    // zone. On day Q the window therefore ends on day Q-2, and every
+    // column here — `reached`, `delivered`, `recorded` — is folded over
+    // days that closed at least a full day ago.
+    //
+    // TWO REASONS, and the second is an inequality worth checking rather
+    // than trusting.
+    //
+    // (1) A day still in progress cannot be reconciled. The sync reads
+    // Meta up to `now` — a time-of-day — so today's Meta count is a
+    // partial read that keeps settling, while `reached` and `delivered`
+    // are live. Folding them together yields a small negative delta on
+    // every row, every day, rendered as a plain number with no degraded
+    // marker: this feature's own failure mode in miniature. And a day
+    // that closed MINUTES ago is barely better — Meta's counts for a day
+    // are still settling when it closes, which is the whole reason the
+    // sync re-reads a trailing window at all. Reconciling a day that has
+    // been closed for at least a full day is the honest choice, not
+    // merely the convenient one.
+    //
+    // (2) It is what makes a DAILY cron sufficient at any phase. Work the
+    // inequality: a sync running on day R claims through R-1 (the last
+    // COMPLETE day — see `lastCompleteDayKey` in `metaEventStats.ts`), and
+    // `coversWindow` requires `coveredUntil >= dayKeys[last]`. Ending the
+    // window at today's midnight makes `dayKeys[last] = Q-1`, so the
+    // requirement is `R-1 >= Q-1`, i.e. `R >= Q` — the sync must already
+    // have run TODAY, and the tab is blacked out from local midnight
+    // until it does. Ending it at yesterday's midnight makes
+    // `dayKeys[last] = Q-2`, so the requirement is `R-1 >= Q-2`, i.e.
+    // `R >= Q-1`: YESTERDAY's run suffices, continuously, including the
+    // instant after local midnight.
+    //
+    // Do NOT "fix" this forward to make recent days appear. The tab lags
+    // by up to two days on purpose. Both halves of that trade are load-
+    // bearing: shrink it and either the delta goes subtly wrong or the
+    // whole tab em-dashes for part of every day.
+    const untilMs =
+      Math.floor((Date.now() - shift) / DAY_MS) * DAY_MS + shift - DAY_MS;
+    const sinceMs = untilMs - rangeDays * DAY_MS;
+
+    const events = await ctx.db
+      .query("conversionEvents")
+      .withIndex("by_account", (q) =>
+        q
+          .eq("accountId", ctx.accountId)
+          .gte("_creationTime", sinceMs)
+          .lt("_creationTime", untilMs),
+      )
+      // The Events tab reconciles the CTWA business-messaging dataset
+      // ONLY — the `recorded` column can never contain a code-lane
+      // (web-pixel) event, because that lane reports to a completely
+      // different Meta surface. Mixing lanes in here would count
+      // web-pixel conversions into `reached`/`delivered` against a
+      // `recorded` column that structurally cannot include them,
+      // manufacturing a permanent false gap — exactly the failure this
+      // feature exists to detect. It would also mix vocabularies: the
+      // same `stage` maps to a DIFFERENT wire name per lane (see
+      // `lib/funnel.ts`'s `metaCapi` vs `webPixel` — e.g. `invoice_sent`
+      // is `OrderCreated` on ctwa but `InitiateCheckout` on code).
+      //
+      // `conversionEvents` has no index over `lane` (see schema.ts) — the
+      // cheapest correct option is this engine-side filter within the
+      // already `_creationTime`-bounded `by_account` range, rather than a
+      // second index. Do NOT remove this filter to "simplify" the query.
+      .filter((q) => q.eq(q.field("lane"), "ctwa"))
+      .collect();
+
+    // `metaCounts === null` is the load-bearing signal: it is what makes
+    // every `recorded` unknown rather than zero. Only an AVAILABLE sync
+    // whose recorded coverage spans the WHOLE requested window produces a
+    // Map, so neither an unsynced dataset nor a synced-but-shallow one
+    // can be rendered as "Meta received nothing".
+    //
+    // `available: true` alone is not enough, and that gap is what made
+    // this query lie. The sync's routine window is a few trailing days;
+    // this picker offers up to 90 and defaults to 30. Summing only the
+    // days that happen to be stored, against a `delivered` counted across
+    // the full window, produced a large negative delta on every row from
+    // the first cron run onward — the feature alleging a catastrophic
+    // delivery failure that did not occur.
+    //
+    // A partially-covered window is UNKNOWN. Not a partial Map (a partial
+    // sum looks like a number and is read as one), and not a silently
+    // shrunk window (the viewer asked for 30 days and would be shown 3
+    // under a "30 days" label).
+    let metaCounts: Map<string, number> | null = null;
+    let coverageGap: string | null = null;
+    if (state?.available && state.datasetId) {
+      const dayKeys = datasetDayKeys(sinceMs, untilMs, tzOffsetMinutes);
+      if (
+        coversWindow(
+          state.coveredSinceDayKey,
+          state.coveredUntilDayKey,
+          dayKeys,
+        )
+      ) {
+        const statRows = await ctx.db
+          .query("metaEventDailyStats")
+          .withIndex("by_account_dataset_day_event", (q) =>
+            q
+              .eq("accountId", ctx.accountId)
+              .eq("datasetId", state.datasetId)
+              .gte("dayKey", dayKeys[0])
+              .lte("dayKey", dayKeys[dayKeys.length - 1]),
+          )
+          .collect();
+        metaCounts = sumMetaCounts(statRows, dayKeys);
+      } else {
+        // A DISTINCT field from `lastError`, not an overload of it. The
+        // sync did not fail — it worked and simply has not reached back
+        // this far — and reporting that as an error would send someone
+        // hunting a token or an outage that does not exist.
+        coverageGap =
+          state.coveredSinceDayKey && state.coveredUntilDayKey
+            ? `${state.coveredSinceDayKey} to ${state.coveredUntilDayKey}`
+            : "";
+      }
+    }
+
+    return {
+      rows: buildReconciliation({
+        events: events.map((e) => ({
+          conversationId: e.conversationId as string,
+          stage: e.stage,
+          status: e.status,
+        })),
+        metaCounts,
+      }),
+      meta: {
+        available: state?.available ?? false,
+        datasetId: state?.datasetId ?? null,
+        tzName: state?.tzName ?? null,
+        tzOffsetMinutes,
+        lastSyncedAt: state?.lastSyncedAt ?? null,
+        lastError: state?.lastError ?? null,
+        /** The covered day range ("2026-08-25 to 2026-09-03") when it
+         *  does not span the requested window, "" when no coverage is
+         *  recorded at all, and null when coverage is complete. Non-null
+         *  means every `recorded` in `rows` is null for that reason. */
+        coverageGap,
+        sinceMs,
+        untilMs,
+        catalogueSize: META_EVENT_CATALOGUE.length,
+      },
+    };
   },
 });

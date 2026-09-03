@@ -227,6 +227,16 @@ export const runRefreshDashboardSnapshots = internalAction({
     ),
 });
 
+export const runMetaAudienceSync = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(
+      ctx,
+      "meta-audience-sync",
+      internal.metaAudienceSync.syncAudience,
+    ),
+});
+
 export const runRevivalSweep = internalAction({
   args: {},
   handler: (ctx): Promise<void> =>
@@ -249,6 +259,16 @@ export const runSweepTimeBased = internalAction({
   args: {},
   handler: (ctx): Promise<void> =>
     runWrapped(ctx, "automations-time-based", internal.automationsEngine.sweepTimeBased),
+});
+
+export const runSyncDatasetStats = internalAction({
+  args: {},
+  handler: (ctx): Promise<void> =>
+    runWrapped(
+      ctx,
+      "meta-dataset-stats",
+      internal.metaEventStats.syncAllAccounts,
+    ),
 });
 
 function pickRun(row: Doc<"cronRuns">) {

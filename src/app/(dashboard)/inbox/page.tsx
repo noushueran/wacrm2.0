@@ -13,7 +13,10 @@ import {
   conversationListArgs,
   conversationRowsToRender,
   conversationTabKey,
+  historyActionForClose,
+  historyActionForOpen,
   inboxUrl,
+  parseAssignmentTab,
   INITIAL_CONVERSATION_PAGE_SIZE,
   type AssignmentTab,
   type InboxLane,
@@ -85,7 +88,13 @@ export default function InboxPage() {
   // Which assignment "bucket" the list shows: everything, only chats
   // assigned to me, or only the unassigned pool. Server-filtered via the
   // `assignment` arg below so each tab paginates its own complete set.
-  const [assignment, setAssignment] = useState<AssignmentTab>("all");
+  // Seeded from `?assignment=`, which is what makes the manifest's
+  // "Unassigned leads" home-screen shortcut actually land on that tab.
+  // A lazy initialiser, so the parameter is read once on mount and the
+  // agent's later tab clicks are never overwritten by the URL.
+  const [assignment, setAssignment] = useState<AssignmentTab>(() =>
+    parseAssignmentTab(searchParams.get("assignment")),
+  );
 
   // Which lane the list shows. Server-filtered via the `lane`/`archived`
   // args below, so each tab paginates its own complete set — unlike the
@@ -139,6 +148,83 @@ export default function InboxPage() {
   // elsewhere) must not snap the user back to the deep-linked
   // conversation if they've already navigated away.
   const autoSelectedForDeepLinkRef = useRef<string | null>(null);
+
+  /**
+   * Whether THIS page pushed a history entry for the open thread — i.e.
+   * whether there is a list entry sitting behind it to go back to.
+   *
+   * A ref, not state: nothing renders from it, and it must be readable
+   * and writable inside the same tick as the `history` call it describes.
+   * Kept in step in exactly three places — set when opening pushes
+   * (`handleSelectConversation`), set when a deep link synthesises a list
+   * entry (the auto-select effect), cleared whenever a `popstate` lands
+   * back on the list.
+   */
+  const pushedThreadEntryRef = useRef(false);
+
+  /**
+   * Open a conversation in the URL bar. `push` gives the hardware back
+   * button somewhere to go; `replace` overwrites the current entry. See
+   * `historyActionForOpen` for which applies when.
+   */
+  const writeThreadHistory = useCallback(
+    (conversationId: string, action: "push" | "replace") => {
+      if (action === "push") {
+        window.history.pushState(null, "", inboxUrl(conversationId));
+        pushedThreadEntryRef.current = true;
+      } else {
+        window.history.replaceState(null, "", inboxUrl(conversationId));
+      }
+    },
+    [],
+  );
+
+  /**
+   * Give a `?c=` deep link a list entry to fall back to.
+   *
+   * Landing straight on a thread — which is what every push notification
+   * does, and notifications are this app's main entry point — leaves the
+   * thread as the FIRST entry in the app's history. Back from there exits
+   * to whatever preceded the app. Rewriting the current entry as the
+   * list and then pushing the thread onto it means back lands on the
+   * conversation list, the way a native messaging app behaves when you
+   * open it from a notification.
+   *
+   * Both calls are synchronous, so React only ever observes the final
+   * URL. Guarded by the ref so it happens at most once per opened thread.
+   */
+  const synthesizeListEntry = useCallback((conversationId: string) => {
+    if (pushedThreadEntryRef.current) return;
+    window.history.replaceState(null, "", inboxUrl(null));
+    window.history.pushState(null, "", inboxUrl(conversationId));
+    pushedThreadEntryRef.current = true;
+  }, []);
+
+  /**
+   * Hardware back / forward. The URL is the source of truth here: read
+   * `?c=` off the location that the browser has already restored and
+   * bring `activeConversationId` into line with it.
+   *
+   * `autoSelectedForDeepLinkRef` is cleared rather than set, so the
+   * auto-select effect below is free to re-run for this URL. It won't
+   * duplicate the work — it returns early once `activeConversationId`
+   * already equals the deep link — and clearing keeps a later, genuine
+   * deep link to the same id working.
+   *
+   * Registered once. Listening on `window` rather than using Next's
+   * router because the entries being walked were written with the native
+   * history API, not by a route change.
+   */
+  useEffect(() => {
+    const onPopState = () => {
+      const next = new URLSearchParams(window.location.search).get("c");
+      setActiveConversationId(next);
+      autoSelectedForDeepLinkRef.current = null;
+      if (next === null) pushedThreadEntryRef.current = false;
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   // Conversations — reactive Convex paginated query. Convex pushes
   // updates automatically whenever any underlying row changes (a new
@@ -333,6 +419,10 @@ export default function InboxPage() {
       // outcome here, not a deferred cleanup.
       // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot sync driven by the ref guard above; this effect also performs a network mutation, so it cannot move into render
       setActiveConversationId(listMatch.id);
+      // Give the hardware back button the conversation list to return to
+      // — this thread was opened by a URL, not by a click, so nothing has
+      // pushed an entry for it.
+      synthesizeListEntry(listMatch.id);
       markRead({ conversationId: listMatch.id as Id<"conversations"> }).catch(
         (err) => {
           console.error("Failed to mark conversation read:", err);
@@ -347,6 +437,8 @@ export default function InboxPage() {
     if (fallbackConversation && fallbackConversation._id === deepLinkConvId) {
       autoSelectedForDeepLinkRef.current = deepLinkConvId;
       setActiveConversationId(fallbackConversation._id);
+      // Same reason as the in-list branch above.
+      synthesizeListEntry(fallbackConversation._id);
       markRead({ conversationId: fallbackConversation._id }).catch((err) => {
         console.error("Failed to mark conversation read:", err);
       });
@@ -358,6 +450,7 @@ export default function InboxPage() {
     fallbackConversation,
     activeConversationId,
     markRead,
+    synthesizeListEntry,
   ]);
 
   const wa = useQuery(api.whatsappConfig.connectionState);
@@ -376,31 +469,54 @@ export default function InboxPage() {
       // deep-link.
       autoSelectedForDeepLinkRef.current = conversation.id;
       // Reflect the selection in the URL so a refresh lands the user back
-      // in the same thread and copy-paste links work — but via the native
-      // history API, NOT `router.replace`. router.replace runs a soft
-      // navigation to `/inbox`, which re-runs the auth middleware and
-      // refetches the route's RSC payload on EVERY click, even though the
-      // visible thread is already driven by React state. replaceState
-      // updates the URL with none of that work, and (unlike pushState)
-      // keeps rapid chat-switching out of the back/forward stack.
-      window.history.replaceState(null, "", inboxUrl(conversation.id));
+      // in the same thread and copy-paste links work — via the native
+      // history API either way, never `router.push`/`router.replace`.
+      //
+      // List → thread pushes, so back returns to the list; thread →
+      // thread replaces, so rapid chat-switching stays out of the
+      // back/forward stack. `historyActionForOpen` owns that rule and is
+      // unit-tested; see its comment for why each branch is what it is.
+      writeThreadHistory(
+        conversation.id,
+        historyActionForOpen(activeConversationId),
+      );
       markRead({
         conversationId: conversation.id as Id<"conversations">,
       }).catch((err) => {
         console.error("Failed to mark conversation read:", err);
       });
     },
-    [activeConversationId, markRead],
+    [activeConversationId, markRead, writeThreadHistory],
   );
 
   // Mobile "back" — deselect the conversation so the list pane comes
   // back. Also clears the ?c= param so a refresh lands on the list
   // instead of re-opening the thread the user just backed out of.
+  //
+  // When opening pushed an entry this delegates to `history.back()` and
+  // lets the popstate handler above do the state change, so the in-app
+  // control and the hardware button are literally the same navigation —
+  // no dead `?c=` entries piling up behind the user, and no way for the
+  // two paths to drift. Otherwise (a deep link with no list entry behind
+  // it) it rewrites the URL as before. `historyActionForClose` owns that
+  // choice and is unit-tested.
   const handleCloseConversation = useCallback(() => {
+    // Deselect SYNCHRONOUSLY, before either history branch. `history.back()`
+    // only delivers its state change via `popstate`, one task later, and
+    // `handleMarkUnread` below depends on this deselect having already
+    // flushed by the time it fires its mutation — otherwise the restored
+    // unread count can race back down onto a thread that is still open and
+    // immediately re-read it. The popstate handler re-derives `null` from
+    // the URL a moment later, which is idempotent.
     setActiveConversationId(null);
     // Clearing the ref lets the deep-link auto-selector fire again if
     // the user later visits /inbox?c=<same-id> — desirable UX.
     autoSelectedForDeepLinkRef.current = null;
+
+    if (historyActionForClose(pushedThreadEntryRef.current) === "back") {
+      window.history.back();
+      return;
+    }
     window.history.replaceState(null, "", inboxUrl(null));
   }, []);
 

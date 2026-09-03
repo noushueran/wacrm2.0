@@ -4,13 +4,19 @@ import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Share, X } from "lucide-react";
 import { isIOS, isStandalone } from "@/lib/push/platform";
+import {
+  DISMISSED_AT_KEY,
+  LEGACY_DISMISS_KEY,
+  VISITS_KEY,
+  parseDismissedAt,
+  parseVisits,
+  shouldOfferInstall,
+} from "@/lib/pwa/install-offer";
 
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
 };
-
-const DISMISS_KEY = "wacrm:pwa:install-dismissed";
 
 // A dismissible install card. Chromium fires `beforeinstallprompt` (we
 // capture it and show a button); iOS gets manual Add-to-Home-Screen help.
@@ -22,9 +28,34 @@ export function InstallPrompt() {
 
   useEffect(() => {
     if (isStandalone()) return; // already installed
+
+    // Count this visit, then decide. `shouldOfferInstall` holds the rules
+    // (and their tests): not before the visitor has used the product a
+    // few times, and not while a dismissal is still in date.
+    let visits = 0;
+    let dismissedAt: number | null = null;
     try {
-      if (localStorage.getItem(DISMISS_KEY) === "true") return;
-    } catch {}
+      visits = parseVisits(localStorage.getItem(VISITS_KEY)) + 1;
+      localStorage.setItem(VISITS_KEY, String(visits));
+      dismissedAt = parseDismissedAt(
+        localStorage.getItem(DISMISSED_AT_KEY),
+        localStorage.getItem(LEGACY_DISMISS_KEY),
+      );
+    } catch {
+      // Private mode: no counter, so never nag. Failing closed here is
+      // right — an install card is an offer, not a feature.
+      return;
+    }
+    if (
+      !shouldOfferInstall({
+        installed: false,
+        visits,
+        dismissedAt,
+        now: Date.now(),
+      })
+    ) {
+      return;
+    }
     // STAYS AN EFFECT. Every input to this decision is browser-only —
     // `isStandalone()` reads matchMedia, the guard above reads
     // localStorage, and the branch below reads navigator. None exist
@@ -55,7 +86,10 @@ export function InstallPrompt() {
   const close = () => {
     setDismissed(true);
     try {
-      localStorage.setItem(DISMISS_KEY, "true");
+      // A timestamp, not a boolean: this dismissal expires. The legacy
+      // permanent flag is cleared so it cannot outlive the new rule.
+      localStorage.setItem(DISMISSED_AT_KEY, String(Date.now()));
+      localStorage.removeItem(LEGACY_DISMISS_KEY);
     } catch {}
   };
 

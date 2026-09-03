@@ -219,3 +219,75 @@ export function overrideControls(
     wake: snoozed,
   };
 }
+
+// ---------------------------------------------------------------------
+// Mobile back-navigation
+// ---------------------------------------------------------------------
+
+/** What to do to the history stack when a conversation is opened. */
+export type InboxHistoryAction = "push" | "replace";
+
+/**
+ * Opening a conversation: does it create a history entry, or overwrite
+ * the current one?
+ *
+ * Coming FROM THE LIST it must push. On a phone the list and the thread
+ * are two full-screen views, so the hardware back button (and Android's
+ * edge-swipe) has to walk thread → list the way every native messaging
+ * app does. With only `replaceState` — which is what this page did
+ * before — opening a chat created no entry at all, so back left the app
+ * entirely: the loudest "this is a website" tell there is.
+ *
+ * Switching thread → thread must NOT push. Chat-hopping is rapid and the
+ * intermediate chats are not places a user wants to walk back through
+ * one at a time; the original `replaceState` reasoning holds exactly
+ * here. One entry stands for "a thread is open", whichever thread it is.
+ *
+ * Neither branch uses `router.push`/`router.replace`: a soft navigation
+ * re-runs the auth middleware and refetches the route's RSC payload on
+ * EVERY click, and the visible thread is driven by React state anyway.
+ * The native history API moves the URL with none of that work.
+ */
+export function historyActionForOpen(
+  previousActiveId: string | null,
+): InboxHistoryAction {
+  return previousActiveId === null ? "push" : "replace";
+}
+
+/** How the in-app back control should close a thread. */
+export type InboxCloseAction = "back" | "replace";
+
+/**
+ * Closing a conversation via the in-app back control.
+ *
+ * When opening pushed an entry, this must be a real `history.back()` so
+ * the in-app control and the hardware button do the same thing and the
+ * stack stays balanced — otherwise every open/close cycle would leave a
+ * dead `?c=` entry behind, and a user who closed three chats would have
+ * to press hardware-back three times to leave the inbox.
+ *
+ * When nothing was pushed (the thread came from a `?c=` deep link that
+ * the page could not turn into a list entry) there is nothing to go back
+ * TO, so fall back to rewriting the current URL.
+ */
+export function historyActionForClose(
+  pushedEntry: boolean,
+): InboxCloseAction {
+  return pushedEntry ? "back" : "replace";
+}
+
+/**
+ * Read the `?assignment=` tab off a URL.
+ *
+ * Exists because the manifest's "Unassigned leads" home-screen shortcut
+ * points at `/inbox?assignment=unassigned`. Without this the parameter
+ * was simply ignored and the shortcut opened the All tab — a shortcut
+ * that lies about where it goes is worse than no shortcut.
+ *
+ * Anything unrecognised falls back to "all" rather than throwing: this
+ * value arrives from a URL a person can type, and a bad tab name is not
+ * a reason to fail to render an inbox.
+ */
+export function parseAssignmentTab(raw: string | null | undefined): AssignmentTab {
+  return raw === "mine" || raw === "unassigned" || raw === "all" ? raw : "all";
+}

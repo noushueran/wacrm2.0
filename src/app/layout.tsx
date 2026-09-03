@@ -6,6 +6,7 @@ import Script from "next/script";
 import { ConvexAuthNextjsServerProvider } from "@convex-dev/auth/nextjs/server";
 import "./globals.css";
 import { BRAND, PRODUCT_NAME } from "@/lib/brand";
+import { appleSplashLinks } from "@/lib/pwa/splash";
 import { ConvexClientProvider } from "./ConvexClientProvider";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ThemedToaster } from "@/components/themed-toaster";
@@ -50,6 +51,10 @@ export const metadata: Metadata = {
     capable: true,
     title: BRAND.name,
     statusBarStyle: "black-translucent",
+    // iOS shows a blank `background_color` screen for the whole cold
+    // boot unless one of these matches the device. See `@/lib/pwa/splash`
+    // for why only iOS needs them and why they are portrait-only.
+    startupImage: appleSplashLinks(),
   },
   formatDetection: {
     email: false,

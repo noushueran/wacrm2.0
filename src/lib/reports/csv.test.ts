@@ -74,6 +74,27 @@ describe("toCsv", () => {
     expect(csv).toBe("\uFEFFname\r\nدبي مول");
   });
 
+  it("carries an UNKNOWN Meta count out as an empty cell, never 0 and never \"null\"", () => {
+    // The Events tab's one rule — a null `recorded` is unknown and must
+    // not become a zero — has exactly one unguarded hop left, and it is
+    // this one: the moment the table leaves the screen for a spreadsheet.
+    // A row shaped like the Events export (`events-panel.tsx`), with both
+    // Meta-side cells unknown.
+    const csv = toCsv(
+      ["milestone", "event", "reached", "delivered", "recorded", "delta"],
+      [["Qualified lead", "QualifiedLead", 9, 8, null, null]],
+    );
+    expect(csv).toBe(
+      "\uFEFFmilestone,event,reached,delivered,recorded,delta\r\n" +
+        "Qualified lead,QualifiedLead,9,8,,",
+    );
+    // Spelled out, because both wrong answers are silently plausible in a
+    // spreadsheet: "8,0," would allege Meta recorded none, and "null"
+    // would be read as text.
+    expect(csv).not.toContain("8,0");
+    expect(csv).not.toContain("null");
+  });
+
   it("quotes independently per cell — one dirty cell does not affect its row-mates", () => {
     const csv = toCsv(
       ["a", "b", "c"],

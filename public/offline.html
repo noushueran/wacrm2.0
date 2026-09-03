@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#020617" />
+    <title>You're offline</title>
+    <!--
+      SELF-CONTAINED BY REQUIREMENT — do not add a stylesheet link, an
+      external script, an <img>, or a webfont to this file. Inline <style>
+      and inline <script> are fine: they are part of the cached document and
+      need no second request.
+
+      This is the service worker's offline fallback (`OFFLINE_URL` in
+      public/sw.js). It is served at the one moment the device provably has
+      no network, so every external reference in it is a request that CANNOT
+      succeed. It previously lived at `src/app/offline/page.tsx`, which meant
+      the SW cached the HTML document while the 14 JS chunks and 2
+      stylesheets that document depends on stayed uncached — so the fallback
+      painted unstyled and never hydrated. A plain file under `public/` has
+      no such dependencies: `cache.add()` on this URL caches the whole page.
+
+      Everything below is therefore inline: styles in a <style> block, the
+      icon as an inline <svg>, both colour schemes via prefers-color-scheme
+      (a static file cannot read the app's localStorage theme, so it follows
+      the OS instead), and one inline script that does nothing but listen for
+      `online` and reload. The page renders and reads correctly with
+      scripting disabled — an offline page that needs a runtime to say
+      "you're offline" is the bug this file exists to fix.
+    -->
+    <style>
+      :root {
+        --bg: #ffffff;
+        --fg: #020617;
+        --muted: #64748b;
+        --rule: #e2e8f0;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #020617;
+          --fg: #e2e8f0;
+          --muted: #94a3b8;
+          --rule: #1e293b;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        /* Keep the card clear of the notch / home indicator: this page can
+           be shown inside the installed PWA, which runs viewport-fit=cover. */
+        padding: calc(1.5rem + env(safe-area-inset-top, 0px)) 1.5rem
+          calc(1.5rem + env(safe-area-inset-bottom, 0px));
+        text-align: center;
+      }
+      .card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.75rem;
+        max-width: 22rem;
+      }
+      .icon {
+        color: var(--muted);
+        margin-bottom: 0.25rem;
+      }
+      h1 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        line-height: 1.4;
+        margin: 0;
+      }
+      p {
+        font-size: 0.875rem;
+        line-height: 1.55;
+        color: var(--muted);
+        margin: 0;
+      }
+      .hint {
+        font-size: 0.75rem;
+        color: var(--muted);
+        border-top: 1px solid var(--rule);
+        padding-top: 0.75rem;
+        margin-top: 0.5rem;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <svg
+        class="icon"
+        width="32"
+        height="32"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.75"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="m2 2 20 20" />
+        <path d="M8.5 16.5a5 5 0 0 1 7 0" />
+        <path d="M2 8.82a15 15 0 0 1 4.17-2.65" />
+        <path d="M10.66 5c4.01-.36 8.14.9 11.34 3.76" />
+        <path d="M16.85 11.25a10 10 0 0 1 2.22 1.68" />
+        <path d="M5 13a10 10 0 0 1 5.24-2.76" />
+        <line x1="12" y1="20" x2="12.01" y2="20" />
+      </svg>
+      <h1>You&rsquo;re offline</h1>
+      <p>Reconnect to load the latest conversations.</p>
+      <p class="hint">
+        Any message you were writing is still on this device. This page will
+        reload itself once you&rsquo;re back on a network.
+      </p>
+    </main>
+    <script>
+      // Recover on its own the moment the device is back on a network, so an
+      // agent walking out of a basement doesn't have to think about pulling
+      // to refresh. `location.reload()` re-requests the URL the user was
+      // actually on — the SW's fetch handler then serves the real page.
+      addEventListener("online", function () {
+        location.reload();
+      });
+    </script>
+  </body>
+</html>
