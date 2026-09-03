@@ -358,6 +358,12 @@ html[data-theme="rose"] {
 @layer base {
   html {
     -webkit-tap-highlight-color: transparent;
+    /* Stops a scroll that reaches the end of an inner list from chaining
+       to the page — which on Android triggers pull-to-refresh and
+       RELOADS the installed app mid-conversation, and on iOS rubber-bands
+       the whole shell under a fixed header. `contain` (not `none`) keeps
+       normal scrolling inside the page intact. */
+    overscroll-behavior-y: contain;
   }
   /* Never let a stray wide child scroll the whole page sideways on phones. */
   body {

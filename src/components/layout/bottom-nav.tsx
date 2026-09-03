@@ -41,7 +41,11 @@ export function BottomNav({ onOpenMore }: { onOpenMore: () => void }) {
             href={item.href}
             aria-label={t(item.labelKey)}
             className={cn(
-              "relative flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium",
+              // `min-h-14` (56px), not the ~44px this used to compute to.
+              // 44 is the accessibility FLOOR, not a comfortable target —
+              // and this bar sits at the bottom edge of a phone held one-
+              // handed, which is the least accurate place to tap.
+              "relative flex min-h-14 flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium",
               active ? "text-primary" : "text-muted-foreground",
             )}
           >
@@ -55,7 +59,7 @@ export function BottomNav({ onOpenMore }: { onOpenMore: () => void }) {
         type="button"
         onClick={onOpenMore}
         aria-label={t("openMenu")}
-        className="flex flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium text-muted-foreground"
+        className="flex min-h-14 flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[12px] font-medium text-muted-foreground"
       >
         <Menu className="h-5 w-5" />
         {t("more")}

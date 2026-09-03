@@ -19,6 +19,11 @@ const isProtectedRoute = createRouteMatcher([
   "/broadcasts(.*)",
   "/automations(.*)",
   "/settings(.*)",
+  // The Web Share Target landing page. Not optional: it lives under
+  // `(dashboard)` and so renders the app shell, and without this an
+  // unauthenticated share got a 200 and a flash of chrome before the
+  // client-side guard bounced it.
+  "/share(.*)",
 ]);
 
 // Non-webhook WhatsApp API routes that require a session (webhooks are

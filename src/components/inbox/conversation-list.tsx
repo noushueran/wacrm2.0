@@ -584,7 +584,7 @@ export function ConversationList({
           every conversation instead of shrinking to the remaining
           space — the list then overflows and gets clipped by the
           parent's overflow-hidden with no scrollbar (issue #229). */}
-      <ScrollArea className="min-h-0 flex-1">
+      <ScrollArea className="min-h-0 flex-1 overscroll-contain">
         {/* The skeleton is for having NOTHING to show, not merely for
             `LoadingFirstPage`. The page keeps handing this component the
             tab's last rows through a mid-session pagination reset (see

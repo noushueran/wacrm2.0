@@ -1233,7 +1233,10 @@ export function MessageThread({
           recursion, which is spec-compliant but not worth depending on
           silently). */}
       <div className="relative flex-1 flex flex-col min-h-0">
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto overscroll-contain px-4 py-4"
+        >
           {area === "loading" ? (
             <ThreadSkeleton />
           ) : area === "empty" && timelineGroups.length === 0 ? (
