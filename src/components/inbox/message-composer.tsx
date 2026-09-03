@@ -64,6 +64,7 @@ import type { InteractiveMessagePayload, QuickReply } from "@/types";
 import { QuickReplyPicker } from "./quick-reply-picker";
 
 import { api } from "../../../convex/_generated/api";
+import { draftStorageKey } from "@/lib/inbox/outbox";
 import type { Id } from "../../../convex/_generated/dataModel";
 
 /** Media content types an agent can send from the composer. */
@@ -149,6 +150,38 @@ export function MessageComposer({
   const startUpload = useMutation(api.files.startUpload);
 
   const [text, setText] = useState("");
+
+  // Draft persistence, per conversation.
+  //
+  // A half-typed reply is real work, and on a phone it is lost to
+  // anything that tears the web view down — a task switch under memory
+  // pressure, an OS kill, a crash. None of those are rare on the devices
+  // this runs on. Keyed by conversation so switching chats restores the
+  // right draft rather than leaking one thread's text into another.
+  //
+  // Restore is an effect, not a lazy initialiser: `localStorage` cannot
+  // be read during render without making the render impure and
+  // disagreeing with the server-rendered markup.
+  useEffect(() => {
+    if (!conversationId) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem(draftStorageKey(conversationId));
+    } catch {
+      saved = null;
+    }
+    setText(saved ?? "");
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    try {
+      if (text) localStorage.setItem(draftStorageKey(conversationId), text);
+      else localStorage.removeItem(draftStorageKey(conversationId));
+    } catch {
+      // Private mode / quota — drafting still works for this session.
+    }
+  }, [text, conversationId]);
   const [sending, setSending] = useState(false);
   const [drafting, setDrafting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);

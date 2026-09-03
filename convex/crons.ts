@@ -181,4 +181,48 @@ crons.interval(
   {},
 );
 
+// Daily reconcile of the Meta customer-list audience: add contacts that
+// now belong, remove the ones that no longer do (do-not-contact set, or
+// converted). No-op while META_CUSTOM_AUDIENCE_ID is unset.
+crons.interval(
+  "meta-audience-sync",
+  { minutes: 1440 },
+  internal.cronSchedules.runMetaAudienceSync,
+  {},
+);
+
+// Pull Meta's own per-event counts for the CAPI dataset into
+// metaEventDailyStats — the third column of Reports → Events.
+//
+// Daily, and daily is the grain of the SOURCE rather than a cost choice:
+// Meta returns counts already bucketed into whole business days.
+//
+// Daily is ENOUGH at any phase, and that is a property of the read side
+// rather than luck — but the derivation is easy to get wrong by one day,
+// so here it is in full. A run on day R claims coverage through R-1 (the
+// last COMPLETE day: `lastCompleteDayKey` in `metaEventStats.ts`). A
+// query on day Q asks for days through Q-2 (its window ends at
+// YESTERDAY's local midnight: `metaEventReconciliation`'s `untilMs`).
+// `coversWindow` needs `coveredUntil >= dayKeys[last]`, i.e.
+// `R-1 >= Q-2`, i.e. `R >= Q-1`: YESTERDAY's run always suffices, at
+// every hour of day Q including the instant after local midnight.
+//
+// Note where that lands if either side moves. With the query's window
+// ending at TODAY's midnight instead, the requirement becomes `R >= Q` —
+// the sync must already have run today, and the tab em-dashes from local
+// midnight until it does. An earlier version of this work had exactly
+// that, and answered it by running this cron four times a day to bound
+// the blackout. That was treating a symptom; the day boundary was the
+// cause, and this interval is only safe because of it.
+//
+// Each run re-syncs a trailing window because Meta's counts settle after
+// the fact, and closes any gap left by failed runs; the upsert makes
+// re-reading a day safe.
+crons.interval(
+  "meta-dataset-stats",
+  { minutes: 1440 },
+  internal.cronSchedules.runSyncDatasetStats,
+  {},
+);
+
 export default crons;

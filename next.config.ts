@@ -146,7 +146,37 @@ const nextConfig: NextConfig = {
         headers: [{ key: "Cache-Control", value: "no-store" }],
       },
       {
-        source: "/:path((?!_next/static|_next/image|api).*)",
+        // The service worker script itself must never be cached.
+        //
+        // It was previously caught by the catch-all rule below, which
+        // gave it `s-maxage=300, stale-while-revalidate=86400` — so after
+        // a deploy the CDN could hand out the OLD worker for five
+        // minutes, and keep revalidating against a stale copy for a day.
+        // A worker that arrives late is an update prompt that arrives
+        // late, and during that window clients run the previous build's
+        // caching rules. Next's own PWA guide specifies exactly these two
+        // headers for `/sw.js`.
+        //
+        // `updateViaCache: "none"` at the registration site
+        // (`service-worker-manager.tsx`) closes the same hole on the
+        // browser side; this closes it at the edge.
+        source: "/sw.js",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "no-cache, no-store, must-revalidate",
+          },
+          {
+            key: "Content-Type",
+            value: "application/javascript; charset=utf-8",
+          },
+        ],
+      },
+      {
+        // `sw.js` is excluded here so the rule above is the only
+        // Cache-Control it gets — Next merges headers from every matching
+        // rule, so leaving it in would emit two conflicting values.
+        source: "/:path((?!_next/static|_next/image|api|sw\\.js).*)",
         headers: [
           {
             key: "Cache-Control",

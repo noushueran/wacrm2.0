@@ -7,7 +7,11 @@ import {
   buildQualifiedLeadPayload,
   type PushPayload,
 } from "./lib/pushPayload";
-import type { AccountRole } from "./lib/roles";
+import {
+  conversationInScope,
+  conversationScope,
+  type AccountRole,
+} from "./lib/roles";
 
 // ---- Client-facing: one device's subscription ------------------------
 
@@ -188,6 +192,28 @@ export const assembleDelivery = internalQuery({
     const contact = await ctx.db.get(conversation.contactId);
     const contactName = contact?.name ?? null;
 
+    // Unread conversations for the whole account, read ONCE and then
+    // filtered per recipient in memory. The count the badge shows is
+    // role-scoped (an agent and an owner see different totals for the same
+    // account), so it genuinely differs per recipient — but re-querying
+    // per recipient would put N index scans on the inbound-message hot
+    // path for a number that is decoration. One bounded range scan over
+    // `by_account_unread` (only rows with unreadCount > 0) covers all of
+    // them.
+    //
+    // This runs AFTER ingest has written the message and incremented
+    // `unreadCount`, so the count already includes the message that
+    // triggered this push — which is what the badge must show.
+    const unreadConversations = await ctx.db
+      .query("conversations")
+      .withIndex("by_account_unread", (q) =>
+        q.eq("accountId", args.accountId).gt("unreadCount", 0),
+      )
+      .collect();
+    const roleByUserId = new Map(
+      members.map((m) => [m.userId, m.role as AccountRole]),
+    );
+
     const jobs: { endpoint: string; p256dh: string; auth: string; payload: PushPayload }[] = [];
     for (const userId of recipients) {
       const prefs = await ctx.db
@@ -198,12 +224,29 @@ export const assembleDelivery = internalQuery({
         .first();
       if (prefs?.pushEnabled === false) continue;
 
+      // Omitted rather than defaulted to 0 when the recipient has no
+      // membership row to take a role from: `sw.js` leaves the badge
+      // untouched on a missing count, whereas a 0 would actively CLEAR a
+      // badge that may well be correct.
+      const role = roleByUserId.get(userId);
+      const unread =
+        role === undefined
+          ? undefined
+          : unreadConversations.filter((c) =>
+              conversationInScope(
+                conversationScope(role),
+                c.assignedToUserId,
+                userId,
+              ),
+            ).length;
+
       const payload = buildInboundPayload({
         contactName,
         contentType: args.contentType,
         text: args.text,
         conversationId: args.conversationId,
         hidePreview: prefs?.hidePreview ?? false,
+        unread,
       });
 
       const subs = await ctx.db

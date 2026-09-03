@@ -5,7 +5,7 @@ import { paginationOptsValidator } from "convex/server";
 import { insertNotification } from "./notifications";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
-import { conversationScope, canAccessConversation, canSeeContactPhone, canAssignToOthers } from "./lib/roles";
+import { conversationScope, conversationInScope, canAccessConversation, canSeeContactPhone, canAssignToOthers } from "./lib/roles";
 import type { AccountRole } from "./lib/roles";
 import { requireConversationAccess } from "./lib/conversationAccess";
 import { maskPhone } from "./lib/phone";
@@ -673,12 +673,13 @@ export const unreadTotal = accountQuery({
         q.eq("accountId", ctx.accountId).gt("unreadCount", 0),
       )
       .collect();
-    return unread.filter((c) => {
-      if (scope === "all") return true;
-      if (scope === "own_and_pool")
-        return c.assignedToUserId === ctx.userId || c.assignedToUserId === undefined;
-      return c.assignedToUserId === undefined; // viewer: pool only
-    }).length;
+    // Scoping lives in `conversationInScope` (convex/lib/roles.ts) rather
+    // than inline here, because `push.assembleDelivery` has to produce the
+    // identical number for the app-icon badge — see that predicate's own
+    // comment.
+    return unread.filter((c) =>
+      conversationInScope(scope, c.assignedToUserId, ctx.userId),
+    ).length;
   },
 });
 

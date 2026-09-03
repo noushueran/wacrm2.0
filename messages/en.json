@@ -195,6 +195,12 @@
       "restore": "Restore",
       "markUnreadFailed": "Couldn't mark this chat as unread"
     },
+    "connection": {
+      "offline": "You're offline. Messages you send will go out when you reconnect.",
+      "offlineWithQueued": "You're offline. {count, plural, one {# message is} other {# messages are}} waiting to send.",
+      "failed": "{count, plural, one {# message didn't send} other {# messages didn't send}}",
+      "retry": "Retry"
+    },
     "ownSpend": {
       "line": "This month: {amount} on {count} leads"
     },
@@ -1368,7 +1374,7 @@
   },
   "Reports": {
     "title": "Reports",
-    "subtitle": "Conversation volume, ad performance, response times, funnel, Meta billing and agent workload.",
+    "subtitle": "Conversation volume, ad performance, response times, funnel, Meta events, billing and agent workload.",
     "range": "{days} days",
     "exportCsv": "Export CSV",
     "tabs": {
@@ -1376,6 +1382,7 @@
       "ads": "Ads",
       "response": "Response",
       "funnel": "Funnel",
+      "events": "Events",
       "billing": "Billing",
       "activity": "Activity",
       "agents": "Agents"
@@ -1491,6 +1498,33 @@
         "convertedFromSqlRate": "Serious \u2192 Converted",
         "leadToCustomerRate": "Lead \u2192 customer"
       }
+    },
+    "events": {
+      "heading": "Meta dataset reconciliation",
+      "datasetLabel": "Dataset",
+      "lastSynced": "Last synced {when}",
+      "neverSynced": "Never synced",
+      "timezoneNote": "Days as Meta reports them ({tz})",
+      "timezoneUnknown": "Days in UTC — the dataset timezone is unknown",
+      "windowNote": "Complete days: {from} – {to}",
+      "windowWhy": "Meta's counts for a day are still settling when that day closes, so this tab reconciles only days that have fully closed. The other report tabs include today, so the same range setting covers a different window here.",
+      "openEventsManager": "Open in Events Manager",
+      "unavailable": "Meta counts unavailable — {reason}",
+      "coverageShort": "Meta counts unavailable for this range — the dataset sync has only read {covered}. Pick a shorter range, or wait for the next sync to reach further back.",
+      "coverageNone": "Meta counts unavailable for this range — the dataset sync has not recorded which days it has read. The next sync will record them.",
+      "colMilestone": "Milestone (ours)",
+      "colEvent": "Meta event",
+      "colReached": "Reached",
+      "colDelivered": "Delivered",
+      "colRecorded": "Recorded",
+      "colDelta": "Δ",
+      "reachedTooltip": "Leads that hit this milestone in our CRM, counted once each.",
+      "deliveredTooltip": "Events Meta accepted from us. The gap below Reached is ours.",
+      "recordedTooltip": "Events Meta's dataset holds. The gap below Delivered is Meta's.",
+      "internalOnly": "Not sent to Meta",
+      "unknown": "—",
+      "statusBreakdown": "Why the gap",
+      "empty": "No conversion events in this range."
     },
     "billing": {
       "note": "Meta reports billing categories and counts, not amounts. These are message and conversation volumes, not spend.",
@@ -2838,7 +2872,10 @@
     "installButton": "Install app",
     "iosInstallTitle": "Install on iPhone/iPad",
     "iosInstallBody": "Tap the Share icon, then \"Add to Home Screen\" to install and enable notifications.",
-    "dismiss": "Not now"
+    "dismiss": "Not now",
+    "updateTitle": "Update available",
+    "updateBody": "A new version is ready. Reload when you're not mid-message.",
+    "updateAction": "Reload"
   },
   "PushSettings": {
     "title": "Notifications",

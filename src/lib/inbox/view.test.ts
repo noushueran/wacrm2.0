@@ -7,6 +7,9 @@ import {
   conversationListArgs,
   conversationRowsToRender,
   conversationTabKey,
+  parseAssignmentTab,
+  historyActionForClose,
+  historyActionForOpen,
   INITIAL_MESSAGE_PAGE_SIZE,
   type AssignmentTab,
   type InboxLane,
@@ -280,5 +283,39 @@ describe("conversationTabKey", () => {
       for (const assignment of assignments) seen.add(conversationTabKey(lane, assignment));
     }
     expect(seen.size).toBe(lanes.length * assignments.length);
+  });
+});
+
+describe("historyActionForOpen", () => {
+  it("pushes when opening from the list, so hardware back returns to it", () => {
+    expect(historyActionForOpen(null)).toBe("push");
+  });
+
+  it("replaces when switching thread to thread, keeping chat-hopping out of the stack", () => {
+    expect(historyActionForOpen("conv_1")).toBe("replace");
+  });
+});
+
+describe("historyActionForClose", () => {
+  it("goes back when opening pushed an entry, so no dead ?c= entry is left behind", () => {
+    expect(historyActionForClose(true)).toBe("back");
+  });
+
+  it("rewrites the URL when there is nothing behind the thread to go back to", () => {
+    expect(historyActionForClose(false)).toBe("replace");
+  });
+});
+
+describe("parseAssignmentTab", () => {
+  it("reads the tab the home-screen shortcut asks for", () => {
+    expect(parseAssignmentTab("unassigned")).toBe("unassigned");
+    expect(parseAssignmentTab("mine")).toBe("mine");
+    expect(parseAssignmentTab("all")).toBe("all");
+  });
+
+  it("falls back to 'all' for anything a person could type wrong", () => {
+    for (const raw of [null, undefined, "", "Unassigned", "nope", "MINE"]) {
+      expect(parseAssignmentTab(raw)).toBe("all");
+    }
   });
 });

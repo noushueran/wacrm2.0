@@ -8,6 +8,7 @@ import { Header } from "@/components/layout/header";
 import { BottomNav } from "@/components/layout/bottom-nav";
 import { PresenceHeartbeat } from "@/components/presence/presence-heartbeat";
 import { ServiceWorkerManager } from "@/components/pwa/service-worker-manager";
+import { AppBadge } from "@/components/pwa/app-badge";
 import { InboxNotifier } from "@/components/pwa/inbox-notifier";
 import { InstallPrompt } from "@/components/pwa/install-prompt";
 import { RequireSection } from "@/components/auth/require-section";
@@ -60,6 +61,9 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
           signed in. Headless — renders nothing. */}
       <PresenceHeartbeat />
       <ServiceWorkerManager />
+      {/* Keeps the home-screen icon's unread count in step while a tab is
+          open. The closed-app case is handled in `public/sw.js`. */}
+      <AppBadge />
       <InboxNotifier />
       <Sidebar open={sidebarOpen} onClose={closeSidebar} />
       <div className="flex flex-1 flex-col overflow-hidden">

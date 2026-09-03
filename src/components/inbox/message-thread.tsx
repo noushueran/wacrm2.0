@@ -66,6 +66,14 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { MessageBubble } from "./message-bubble";
+import { ConnectionBanner } from "./connection-banner";
+import { useOnlineStatus } from "@/hooks/use-online-status";
+import { useOutbox } from "@/hooks/use-outbox";
+import {
+  entriesForConversation,
+  outboxEntryToMessage,
+  type OutboxEntry,
+} from "@/lib/inbox/outbox";
 import { MessageActions } from "./message-actions";
 import { MessageComposer, type SendMediaPayload } from "./message-composer";
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
@@ -362,7 +370,49 @@ export function MessageThread({
   // `usePaginatedQuery` above already re-renders with the new row the
   // moment it lands, so there's no separate optimistic-bubble state to
   // maintain here anymore (Phase 8, Task 4).
-  const messages = convexMessages;
+  // Queued sends, rendered as ordinary outbound bubbles after the
+  // server's messages. `api.send.send` is an ACTION, and Convex does not
+  // replay actions across a dropped socket the way it replays mutations
+  // — so without this a message typed on a bad connection was lost
+  // outright: textarea cleared, toast shown, text gone. The outbox owns
+  // it until the server confirms.
+  const sendMessage = useAction(api.send.send);
+  const online = useOnlineStatus();
+  const outbox = useOutbox(
+    useCallback(
+      (entry: OutboxEntry) =>
+        sendMessage({
+          conversationId: entry.conversationId as Id<"conversations">,
+          messageType: "text",
+          contentText: entry.text,
+          replyToMessageId: entry.replyToMessageId as
+            | Id<"messages">
+            | undefined,
+        }),
+      [sendMessage],
+    ),
+  );
+  const pendingEntries = useMemo(
+    () =>
+      conversation
+        ? entriesForConversation(outbox.entries, conversation.id)
+        : [],
+    [outbox.entries, conversation],
+  );
+  const failedCount = pendingEntries.filter((e) => e.failure).length;
+
+  // Appended, never merged in by timestamp: a pending message is by
+  // definition the newest thing in the thread, and `outboxEntryToMessage`
+  // gives it the shape the existing grouping and `MessageBubble` already
+  // handle (clock while sending, red cross once failed), so no rendering
+  // path below needs to know the outbox exists.
+  const messages = useMemo(
+    () =>
+      pendingEntries.length === 0
+        ? convexMessages
+        : [...convexMessages, ...pendingEntries.map(outboxEntryToMessage)],
+    [convexMessages, pendingEntries],
+  );
 
   // Reactions — reactive; Convex updates the pills automatically on
   // every set/remove, no optimistic snapshot/rollback needed.
@@ -560,28 +610,26 @@ export function MessageThread({
     }
   }, [messages]);
 
-  const sendMessage = useAction(api.send.send);
 
+  // Hands the message to the outbox instead of awaiting the action
+  // directly. The bubble therefore appears immediately and survives a
+  // failure (as a red cross plus the retry strip) instead of vanishing
+  // with a toast, and survives the OS killing the app.
+  //
+  // No try/catch and no toast: `enqueue` cannot reject, and the failure
+  // is now shown in the thread where the message is, which is both more
+  // visible than a toast and still there five minutes later.
   const handleSend = useCallback(
-    async (text: string, replyToId?: string) => {
+    (text: string, replyToId?: string) => {
       if (!conversation) return;
-
       setReplyTo(null);
-
-      try {
-        await sendMessage({
-          conversationId: conversation.id as Id<"conversations">,
-          messageType: "text",
-          contentText: text,
-          replyToMessageId: replyToId as Id<"messages"> | undefined,
-        });
-      } catch (err) {
-        console.error("Failed to send message:", err);
-        const reason = err instanceof Error ? err.message : "network error";
-        toast.error(`Failed to send: ${reason}`);
-      }
+      outbox.enqueue({
+        conversationId: conversation.id,
+        text,
+        replyToMessageId: replyToId,
+      });
     },
-    [conversation, sendMessage]
+    [conversation, outbox]
   );
 
   const handleSendMedia = useCallback(
@@ -1444,20 +1492,33 @@ export function MessageThread({
           t={t}
         />
       ) : (
-        <MessageComposer
-          conversationId={conversation.id}
-          sessionExpired={sessionInfo.expired}
-          onSend={handleSend}
-          onSendMedia={handleSendMedia}
-          onSendInteractive={handleSendInteractive}
-          onOpenTemplates={handleOpenTemplates}
-          replyTo={replyTo}
-          onClearReply={() => setReplyTo(null)}
-          // Scoped to the expired-session case on purpose: that is when an
-          // agent needs to know template re-engagement is free. The header
-          // badge carries the always-visible signal.
-          adFreeWindowLabel={sessionInfo.expired ? freeWindowRemaining : null}
-        />
+        <>
+          {/* Sits directly above the composer, outside the messages
+              scroll container, so it cannot scroll out of view — the same
+              placement rule DoNotContactBanner and AiThreadBanner follow.
+              Renders nothing when online with nothing queued. */}
+          <ConnectionBanner
+            online={online}
+            failedCount={failedCount}
+            onRetry={() => {
+              if (conversation) outbox.retryAll(conversation.id);
+            }}
+          />
+          <MessageComposer
+            conversationId={conversation.id}
+            sessionExpired={sessionInfo.expired}
+            onSend={handleSend}
+            onSendMedia={handleSendMedia}
+            onSendInteractive={handleSendInteractive}
+            onOpenTemplates={handleOpenTemplates}
+            replyTo={replyTo}
+            onClearReply={() => setReplyTo(null)}
+            // Scoped to the expired-session case on purpose: that is when an
+            // agent needs to know template re-engagement is free. The header
+            // badge carries the always-visible signal.
+            adFreeWindowLabel={sessionInfo.expired ? freeWindowRemaining : null}
+          />
+        </>
       )}
 
       <TemplatePicker

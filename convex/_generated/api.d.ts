@@ -125,6 +125,8 @@ import type * as lib_leadAnalysis_templatePicker from "../lib/leadAnalysis/templ
 import type * as lib_leadCharge from "../lib/leadCharge.js";
 import type * as lib_leadQuality from "../lib/leadQuality.js";
 import type * as lib_messageStats from "../lib/messageStats.js";
+import type * as lib_metaAudience from "../lib/metaAudience.js";
+import type * as lib_metaEventStats from "../lib/metaEventStats.js";
 import type * as lib_metaHash from "../lib/metaHash.js";
 import type * as lib_notes_gate from "../lib/notes/gate.js";
 import type * as lib_notes_signals from "../lib/notes/signals.js";
@@ -162,6 +164,8 @@ import type * as lib_whatsappEncryption from "../lib/whatsappEncryption.js";
 import type * as memberTags from "../memberTags.js";
 import type * as members from "../members.js";
 import type * as messages from "../messages.js";
+import type * as metaAudienceSync from "../metaAudienceSync.js";
+import type * as metaEventStats from "../metaEventStats.js";
 import type * as metaSend from "../metaSend.js";
 import type * as metaTemplates from "../metaTemplates.js";
 import type * as notifications from "../notifications.js";
@@ -314,6 +318,8 @@ declare const fullApi: ApiFromModules<{
   "lib/leadCharge": typeof lib_leadCharge;
   "lib/leadQuality": typeof lib_leadQuality;
   "lib/messageStats": typeof lib_messageStats;
+  "lib/metaAudience": typeof lib_metaAudience;
+  "lib/metaEventStats": typeof lib_metaEventStats;
   "lib/metaHash": typeof lib_metaHash;
   "lib/notes/gate": typeof lib_notes_gate;
   "lib/notes/signals": typeof lib_notes_signals;
@@ -351,6 +357,8 @@ declare const fullApi: ApiFromModules<{
   memberTags: typeof memberTags;
   members: typeof members;
   messages: typeof messages;
+  metaAudienceSync: typeof metaAudienceSync;
+  metaEventStats: typeof metaEventStats;
   metaSend: typeof metaSend;
   metaTemplates: typeof metaTemplates;
   notifications: typeof notifications;

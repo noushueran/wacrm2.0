@@ -51,6 +51,26 @@ test("a phone with no digits yields no match key", async () => {
   await expect(hashedPhone(null)).resolves.toBeUndefined();
 });
 
+// The floor is a REJECTION, not a formatting rule: a digest of "12345"
+// is a perfectly valid-looking match key that matches nobody, and Meta
+// reads a supplied-but-unmatchable key as evidence AGAINST match quality
+// rather than as a neutral absence. Normalization still reports the
+// digits it found — the gate is `hashedPhone`'s alone.
+test("a number too short to carry a country code yields no match key", async () => {
+  expect(normalizePhoneForMeta("12345")).toBe("12345");
+  await expect(hashedPhone("12345")).resolves.toBeUndefined();
+  // Exactly at the floor still hashes — the bound is inclusive.
+  await expect(hashedPhone("1234567")).resolves.toBe(await sha256Hex("1234567"));
+});
+
+// The floor is applied AFTER the leading-zero strip, so the trunk zero
+// cannot pad a 6-digit number over a 7-digit bound and smuggle in the
+// very digest the floor exists to reject.
+test("a trunk zero does not pad a short number over the floor", async () => {
+  expect(normalizePhoneForMeta("0123456")).toBe("123456");
+  await expect(hashedPhone("0123456")).resolves.toBeUndefined();
+});
+
 test("email is trimmed and lowercased, and nothing more", () => {
   expect(normalizeEmailForMeta("  John_Smith@Gmail.com ")).toBe(
     "john_smith@gmail.com",

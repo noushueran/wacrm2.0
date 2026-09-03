@@ -19,6 +19,11 @@ export const REPORT_TABS = [
   'ads',
   'response',
   'funnel',
+  // Windowed like its neighbours, and placed beside the funnel it reports
+  // on. Its query rebuilds the window from the DATASET's timezone rather
+  // than the viewer's — see `reports.metaEventReconciliation` — so the
+  // range control drives it through `rangeDays` alone.
+  'events',
   'billing',
   // Windowed like the five above, so it sits with them rather than beside
   // `activity` — the range picker genuinely drives it.

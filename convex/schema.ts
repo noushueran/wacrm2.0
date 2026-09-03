@@ -2676,6 +2676,91 @@ export default defineSchema({
     // rollup (campaigns.overview), window-bounded via `.gte("_creationTime")`.
     .index("by_account", ["accountId"]),
 
+  // Meta's OWN count of what dataset `META_CAPI_DATASET_ID` received, per
+  // day per event name — the third column of the Reports → Events tab.
+  //
+  // WHY THIS TABLE IS DAY-KEYED WHEN `messageHourlyStats` REFUSES TO BE.
+  // That table's header states the rule: a day-keyed rollup has to pick a
+  // timezone at WRITE time, and the reader's timezone is unknowable then,
+  // so buckets are hourly UTC and re-bucketed on read.
+  //
+  // This table cannot follow that rule, and the reason is a property of
+  // the SOURCE rather than a choice. Meta returns counts already bucketed
+  // into whole days in the dataset's business timezone. That boundary is
+  // baked in before we see the numbers; there are no sub-day counts to
+  // re-bucket. Storing a fabricated hourly split would invent precision
+  // Meta never gave us.
+  //
+  // The consequence is handled in `reports.metaEventReconciliation`: the
+  // Events tab pins ALL THREE columns to `metaDatasetSyncState`'s offset,
+  // never the viewer's. Our columns on local days against Meta's on Meta's
+  // days would manufacture a delta at every window edge that looks exactly
+  // like a delivery failure and is not — the same class of mismatch that
+  // made the 7-day Ads figure 22.7% high (see `funnelOverview`).
+  metaEventDailyStats: defineTable({
+    accountId: v.id("accounts"),
+    // Pinned on the row, so a dataset change cannot blend two datasets'
+    // history into one silently-wrong series.
+    datasetId: v.string(),
+    // "YYYY-MM-DD" in the DATASET's timezone — see above.
+    dayKey: v.string(),
+    // Meta's wire name: LeadSubmitted, QualifiedLead, Purchase, …
+    eventName: v.string(),
+    count: v.number(),
+    syncedAt: v.number(),
+  })
+    // One index, not two. With `accountId` + `datasetId` bound as
+    // equalities it serves the windowed read as a `dayKey` range; with
+    // `eventName` appended it serves the upsert's point lookup. A second
+    // index would be one more thing to keep in sync for no new capability.
+    .index("by_account_dataset_day_event", [
+      "accountId",
+      "datasetId",
+      "dayKey",
+      "eventName",
+    ]),
+
+  // One row per account: what the last dataset sync learned. Drives the
+  // Events tab's header strip AND its degradation — `available: false`
+  // with a `lastError` is what turns the Meta column into "—  <reason>"
+  // instead of a misleading zero.
+  //
+  // `tzOffsetMinutes` is FETCHED, never assumed. It follows the codebase
+  // convention (`localDayKeyFromMs`): local = ms - tzOffsetMinutes*60_000,
+  // so UTC+4 is -240. When it cannot be determined the sync records
+  // `available: false` rather than guessing, because a guessed offset
+  // misaligns every column on the page.
+  metaDatasetSyncState: defineTable({
+    accountId: v.id("accounts"),
+    datasetId: v.string(),
+    available: v.boolean(),
+    tzName: v.optional(v.string()),
+    tzOffsetMinutes: v.optional(v.number()),
+    lastSyncedAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    // The inclusive day-key bounds of the contiguous range this account's
+    // syncs have actually READ from Meta, in the dataset's timezone.
+    //
+    // These exist so an UNCOVERED window is reported as UNKNOWN rather
+    // than as zero, which is the whole feature's governing rule. The
+    // sync's routine window is a few trailing days; the range picker
+    // offers up to 90. Without these bounds `metaEventReconciliation`
+    // sums the days it happens to hold, `buildReconciliation`'s `?? 0`
+    // turns "never synced that day" into the number zero, and the tab
+    // alleges a delivery failure that never happened. `available: true`
+    // means the last read SUCCEEDED; it says nothing about how far back
+    // the reads reach, and only these two fields do.
+    //
+    // Contiguous by construction — every request starts at or before
+    // `coveredUntilDayKey` (see `syncDatasetStats`) — so the pair is a
+    // range with no holes in it, which is what makes a containment check
+    // on read sufficient. Absent on rows written before this field
+    // existed: absent means unknown, i.e. every window degrades until the
+    // next sync writes real bounds.
+    coveredSinceDayKey: v.optional(v.string()),
+    coveredUntilDayKey: v.optional(v.string()),
+  }).index("by_account", ["accountId"]),
+
   // Append-only funnel progress log (funnel Phase 2). One row per stage
   // ENTERED, for every conversation (incl. organic and the internal
   // `itinerary_created` stage). Powers the stepper (Phase 3) + funnel
@@ -3595,4 +3680,26 @@ export default defineSchema({
   })
     .index("by_account_status", ["accountId", "status"])
     .index("by_conversation", ["conversationId"]),
+
+  // Local mirror of what we believe the Meta customer-list audience holds.
+  //
+  // Meta's customer-list API is WRITE-ONLY — there is no endpoint that
+  // returns current membership — so a reconciler cannot diff against Meta
+  // and must remember what it sent. This table is that memory. It is a
+  // belief, not a fact: if it ever drifts, the repair is to clear the rows
+  // and let the next pass re-add everyone (adding a user Meta already
+  // holds is a no-op, so a full re-add is safe).
+  //
+  // `phoneHash` is the SHA-256 digest actually sent. Storing the digest
+  // rather than the number means a phone edit is detectable (hash differs)
+  // without keeping a second copy of the PII.
+  metaAudienceMembers: defineTable({
+    accountId: v.id("accounts"),
+    contactId: v.id("contacts"),
+    phoneHash: v.string(),
+    isMember: v.boolean(),
+    lastSyncedAt: v.number(),
+  })
+    .index("by_account_contact", ["accountId", "contactId"])
+    .index("by_account_member", ["accountId", "isMember"]),
 });
