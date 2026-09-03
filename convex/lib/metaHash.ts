@@ -75,16 +75,37 @@ export async function sha256Hex(input: string): Promise<string> {
 }
 
 /**
+ * Fewest digits a number could have and still carry a country code.
+ *
+ * A shorter string is not a phone number Meta could match to anyone, and
+ * hashing it produces a digest that looks like a supplied key while
+ * matching nobody — which drags Event Match Quality down rather than
+ * leaving it alone. So the floor is a REJECTION, not a formatting rule,
+ * and it lives beside the normalizer rather than inside it: normalization
+ * answers "what shape does Meta hash", this answers "is there anything
+ * worth hashing".
+ *
+ * The rule comes from the Amani deployment of this CRM, whose
+ * `normalizePhoneForMeta` folded it into normalization; this tree had the
+ * leading-zero strip and no floor, so each had one half.
+ */
+export const MIN_PHONE_DIGITS = 7;
+
+/**
  * The hashed `ph` value for a raw phone, or `undefined` when the number
- * carries no usable digits. `undefined` rather than "" so the caller can
- * spread it away and omit the key entirely — Meta reads an empty-string
- * match key as a present-but-unmatchable one.
+ * carries too few digits to match anyone. `undefined` rather than "" so
+ * the caller can spread it away and omit the key entirely — Meta reads an
+ * empty-string match key as a present-but-unmatchable one.
+ *
+ * Note the floor is applied AFTER normalization, so a trunk zero cannot
+ * pad a short number over the line.
  */
 export async function hashedPhone(
   phone: string | undefined | null,
 ): Promise<string | undefined> {
   const normalized = normalizePhoneForMeta(phone);
-  return normalized ? await sha256Hex(normalized) : undefined;
+  if (normalized.length < MIN_PHONE_DIGITS) return undefined;
+  return await sha256Hex(normalized);
 }
 
 /** The hashed `em` value for a raw email, or `undefined`. See `hashedPhone`. */

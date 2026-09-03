@@ -7,6 +7,12 @@
  */
 
 import type { FunnelStageKey } from "./funnel";
+// The digit floor is Meta's-rules territory, so it is defined once in
+// `lib/metaHash.ts` and re-exported here for the sync that pairs with this
+// module — two copies of "7" is how they drift apart.
+import { MIN_PHONE_DIGITS } from "./metaHash";
+
+export { MIN_PHONE_DIGITS };
 
 /**
  * Stages that take a contact OUT of the retargeting pool.
@@ -16,11 +22,6 @@ import type { FunnelStageKey } from "./funnel";
  * in FUNNEL_STAGES, not a signal to stop advertising to someone.
  */
 export const EXCLUDED_STAGES: readonly FunnelStageKey[] = ["purchased"] as const;
-
-/** Minimum digits for a number that could carry a country code. Mirrors
- *  `normalizePhoneForMeta` in `convex/lib/metaHash.ts` — a shorter
- *  string hashes to a digest that matches nobody. */
-export const MIN_PHONE_DIGITS = 7;
 
 export type MemberCandidate<TId extends string = string> = {
   contactId: TId;

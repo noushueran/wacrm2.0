@@ -87,8 +87,8 @@ export const collectDesired = internalQuery({
 // module was ported from, and it exports neither. Ours additionally strips
 // the trunk zero before hashing (see that module's header), so a UAE number
 // stored `0585824488` produces the digest Meta actually holds. It returns
-// "" rather than null for an unusable number and applies no minimum length,
-// so `hashPhone` below re-adds that guard explicitly.
+// "" rather than null for an unusable number, so `hashPhone` below adapts
+// the shape and applies the shared digit floor itself.
 import { sha256Hex, normalizePhoneForMeta } from "./lib/metaHash";
 
 /** Rows per Graph call. 300 proved workable in the 2026-09-02 backfill. */
