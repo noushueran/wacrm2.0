@@ -73,7 +73,7 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
             hides itself on /inbox (a full-bleed surface), so skip pb-20 there
             to avoid ~4rem of empty scroll space below the composer. */}
         <main
-          className={`flex-1 overflow-y-auto p-4 sm:p-6 lg:pb-6 ${
+          className={`flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6 lg:pb-6 ${
             pathname.startsWith("/inbox") ? "" : "pb-20"
           }`}
         >

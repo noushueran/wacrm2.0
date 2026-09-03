@@ -40,6 +40,25 @@ export default function manifest(): MetadataRoute.Manifest {
         icons: [{ src: "/icon-192.png", sizes: "192x192", type: "image/png" }],
       },
     ],
+    // Share INTO the CRM from any other app. An agent who gets a phone
+    // number, a link or a note elsewhere can push it straight into a
+    // customer's chat instead of copying it, switching apps, finding the
+    // conversation and pasting.
+    //
+    // GET with text params only, NOT a POST file share. Accepting files
+    // means a multipart POST the service worker has to intercept and
+    // stash before any React runs, plus an upload flow — and getting
+    // that half-right loses a customer's document somewhere between the
+    // share sheet and the chat. Text covers the phone-number and link
+    // cases today; files deserve their own change.
+    //
+    // Android and desktop Chrome honour this; iOS does not implement
+    // Web Share Target at all, so it is simply absent there.
+    share_target: {
+      action: "/share",
+      method: "GET",
+      params: { title: "title", text: "text", url: "url" },
+    },
     icons: [
       { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
       { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },

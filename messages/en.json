@@ -2866,6 +2866,15 @@
       "deleteFailed": "Couldn't delete the quick reply."
     }
   },
+  "Share": {
+    "title": "Share into a chat",
+    "body": "Pick the conversation to drop this into. It lands in the composer so you can edit before sending.",
+    "emptyBody": "Nothing was shared. Open the inbox and pick a chat instead.",
+    "searchPlaceholder": "Search name or number",
+    "noMatches": "No matching conversations",
+    "loading": "Loading conversations…",
+    "unknown": "Unknown"
+  },
   "Pwa": {
     "installTitle": "Install __BRAND_NAME__",
     "installBody": "Add the app to your device for faster access and notifications.",
