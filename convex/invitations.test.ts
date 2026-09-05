@@ -610,14 +610,14 @@ test("admin can invite a supervisor", async () => {
 // ============================================================
 // Regression: the "removed teammate can never be re-invited" trap.
 //
-// `members.remove` spins the removed user into a personal account as its
-// OWNER. Owner is admin+, so the moment they open the Pipelines page it
-// auto-seeds a "Sales Pipeline" (src/app/(dashboard)/pipelines/page.tsx).
-// When `pipelines` counted as domain data, that single auto-seeded row
-// made `redeem` throw ACCOUNT_HAS_DATA forever — and the modal's only
-// advice ("sign out and sign up with a different email") is impossible
-// for someone who has exactly one email address. Observed in production
-// on both deployments.
+// The Pipelines page auto-seeds a "Sales Pipeline" for any admin+ caller
+// who has none (src/app/(dashboard)/pipelines/page.tsx). When `pipelines`
+// counted as domain data, that single auto-seeded row made `redeem` throw
+// ACCOUNT_HAS_DATA forever — and the modal's only advice ("sign out and
+// sign up with a different email") is impossible for someone who has
+// exactly one email address. Observed in production on both deployments,
+// via `members.remove`, which used to hand every removed teammate a
+// personal account and make them its owner (it no longer does).
 //
 // A pipeline is an auto-seeded container with default stages and no user
 // content; a DEAL is the actual work. The guard counts deals instead.

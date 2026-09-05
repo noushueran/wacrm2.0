@@ -132,11 +132,37 @@ export const setRole = accountMutation({
 
 /**
  * Port of `remove_account_member` (018). Admin+ removes another member
- * from the caller's own account. The removed user is NOT deleted —
- * they keep their login/`users` row — instead they're spun up a fresh
- * personal account on the spot and reassigned to it as its owner,
- * mirroring `accounts.bootstrapAccount`'s own "one account, as owner"
- * shape. Returns the new account's id.
+ * from the caller's own account. The removed user is NOT deleted — they
+ * keep their login/`users` row — they are simply left belonging to no
+ * account at all.
+ *
+ * 018 (and this function until now) spun the removed user a fresh
+ * personal account and made them its owner. That looked harmless and was
+ * not. Owner is admin+, so the first time they opened the Pipelines page
+ * it auto-seeded a "Sales Pipeline" into that otherwise-empty shell
+ * (`src/app/(dashboard)/pipelines/page.tsx`), and any content at all in
+ * their own account made `invitations.redeem` refuse to move them —
+ * offering only "sign out and sign up with a different email", which is
+ * no help to someone who has one email address. Removing a teammate
+ * could therefore make them permanently impossible to re-invite. The
+ * shell account bought nothing to justify that: nobody wants a private
+ * one-person CRM as a consolation prize for being removed from the team.
+ *
+ * Leaving them membership-less instead lands them on `redeem`'s
+ * brand-new-invitee branch (`convex/invitations.ts` — "A brand-new
+ * invitee has NO membership yet"), which just creates the membership
+ * straight into the inviting account. Re-inviting a removed teammate is
+ * now the same clean path as inviting a stranger.
+ *
+ * `AuthProvider` used to re-mint the very shell this function stopped
+ * creating, via a silent `bootstrapAccount` backstop on any
+ * membership-less user; that backstop is gone (`src/hooks/use-auth.tsx`)
+ * and the dashboard renders an explicit "not a member of any workspace"
+ * screen instead. `bootstrapAccount` is now only ever reached from
+ * self-serve sign-up.
+ *
+ * Returns nothing — the old return (the new account's id) described an
+ * account that no longer gets created, and no caller read it.
  */
 export const remove = accountMutation({
   args: { userId: v.id("users") },
@@ -149,25 +175,6 @@ export const remove = accountMutation({
     }
 
     await ctx.db.delete(target._id);
-
-    // COALESCE(NULLIF(full_name, ''), email, 'My account') from 018 —
-    // `||` (not `??`) so an empty-string name falls through to email,
-    // same as SQL's NULLIF-then-COALESCE chain.
-    const targetUser = await ctx.db.get(args.userId);
-    const newAccountId = await ctx.db.insert("accounts", {
-      name: targetUser?.name || targetUser?.email || "My account",
-      defaultCurrency: "USD",
-      ownerUserId: args.userId,
-    });
-    await ctx.db.insert("memberships", {
-      userId: args.userId,
-      accountId: newAccountId,
-      role: "owner",
-      fullName: targetUser?.name,
-      email: targetUser?.email,
-    });
-
-    return newAccountId;
   },
 });
 
