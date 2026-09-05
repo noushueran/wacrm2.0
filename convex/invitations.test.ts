@@ -606,3 +606,124 @@ test("admin can invite a supervisor", async () => {
   const row = await t.run((ctx) => ctx.db.get(res.invitationId));
   expect(row?.role).toBe("supervisor");
 });
+
+// ============================================================
+// Regression: the "removed teammate can never be re-invited" trap.
+//
+// `members.remove` spins the removed user into a personal account as its
+// OWNER. Owner is admin+, so the moment they open the Pipelines page it
+// auto-seeds a "Sales Pipeline" (src/app/(dashboard)/pipelines/page.tsx).
+// When `pipelines` counted as domain data, that single auto-seeded row
+// made `redeem` throw ACCOUNT_HAS_DATA forever — and the modal's only
+// advice ("sign out and sign up with a different email") is impossible
+// for someone who has exactly one email address. Observed in production
+// on both deployments.
+//
+// A pipeline is an auto-seeded container with default stages and no user
+// content; a DEAL is the actual work. The guard counts deals instead.
+// ============================================================
+
+test("redeem succeeds when the removed teammate's shell account holds only an auto-seeded pipeline", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId: teamAccountId, asUser: asTeamOwner } = await seedOwner(t, {
+    name: "Target",
+    email: "target@example.com",
+  });
+  const created = await asTeamOwner.mutation(api.invitations.create, {
+    role: "agent",
+  });
+  const tokenHash = await hashInviteToken(created.token);
+
+  // The removed teammate, sitting in their own shell account, opens
+  // Pipelines once — the page auto-seeds exactly this.
+  const { userId: removedUserId, asUser: asRemoved } = await seedOwner(t, {
+    name: "Removed",
+    email: "removed@example.com",
+  });
+  await asRemoved.mutation(api.pipelines.create, { name: "Sales Pipeline" });
+
+  await expect(
+    asRemoved.mutation(api.invitations.redeem, { tokenHash }),
+  ).resolves.toBe(teamAccountId);
+
+  const membership = await t.run((ctx) =>
+    ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", removedUserId))
+      .first(),
+  );
+  expect(membership?.accountId).toBe(teamAccountId);
+  expect(membership?.role).toBe("agent");
+});
+
+test("redeem leaves no orphaned pipeline or stage rows behind in the deleted shell account", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asTeamOwner } = await seedOwner(t, {
+    name: "Target",
+    email: "target@example.com",
+  });
+  const created = await asTeamOwner.mutation(api.invitations.create, {
+    role: "agent",
+  });
+  const tokenHash = await hashInviteToken(created.token);
+
+  const { accountId: shellAccountId, asUser: asRemoved } = await seedOwner(t, {
+    name: "Removed",
+    email: "removed@example.com",
+  });
+  await asRemoved.mutation(api.pipelines.create, { name: "Sales Pipeline" });
+
+  await asRemoved.mutation(api.invitations.redeem, { tokenHash });
+
+  const leftovers = await t.run(async (ctx) => ({
+    account: await ctx.db.get(shellAccountId),
+    pipelines: await ctx.db
+      .query("pipelines")
+      .withIndex("by_account", (q) => q.eq("accountId", shellAccountId))
+      .collect(),
+    stages: await ctx.db
+      .query("pipelineStages")
+      .withIndex("by_account", (q) => q.eq("accountId", shellAccountId))
+      .collect(),
+  }));
+  expect(leftovers.account).toBeNull();
+  expect(leftovers.pipelines).toEqual([]);
+  expect(leftovers.stages).toEqual([]);
+});
+
+test("redeem still rejects when the caller's own account holds a real deal", async () => {
+  const t = convexTest(schema, modules);
+  const { asUser: asTeamOwner } = await seedOwner(t, {
+    name: "Target",
+    email: "target@example.com",
+  });
+  const created = await asTeamOwner.mutation(api.invitations.create, {
+    role: "agent",
+  });
+  const tokenHash = await hashInviteToken(created.token);
+
+  const { accountId: ownAccountId, userId: ownUserId, asUser: asOwner } =
+    await seedOwner(t, { name: "Femi", email: "femi@example.com" });
+  const pipelineId = await asOwner.mutation(api.pipelines.create, {
+    name: "Sales Pipeline",
+  });
+  await t.run(async (ctx) => {
+    const stage = await ctx.db
+      .query("pipelineStages")
+      .withIndex("by_pipeline", (q) => q.eq("pipelineId", pipelineId))
+      .first();
+    await ctx.db.insert("deals", {
+      accountId: ownAccountId,
+      createdByUserId: ownUserId,
+      pipelineId,
+      stageId: stage!._id,
+      title: "Dubai package",
+      value: 5000,
+      status: "open",
+    });
+  });
+
+  await expect(
+    asOwner.mutation(api.invitations.redeem, { tokenHash }),
+  ).rejects.toMatchObject({ data: { code: "ACCOUNT_HAS_DATA" } });
+});
