@@ -41,14 +41,36 @@ function clampExpiryDays(expiresInDays: number | undefined): number {
 
 /**
  * Every account-scoped table `redeem_invitation` (019) checks before
- * letting a caller abandon their current account — the same 11 tables
- * from that migration's `UNION ALL SELECT 1 FROM ... WHERE account_id =
+ * letting a caller abandon their current account — the same tables from
+ * that migration's `UNION ALL SELECT 1 FROM ... WHERE account_id =
  * v_old_account_id` existence check, translated 1:1 to Convex table
  * names (e.g. `message_templates` -> `messageTemplates`). Written as
- * 11 explicit, literally-named queries (not a loop over a table-name
+ * explicit, literally-named queries (not a loop over a table-name
  * array) so each one is unambiguous to audit and to typecheck — this
  * gates a security-relevant "would joining orphan real data?" decision,
  * so favors being tedious-but-obvious over being clever.
+ *
+ * ONE DELIBERATE DIVERGENCE from 019's table list: this counts `deals`,
+ * NOT `pipelines`. A pipeline is an auto-seeded CONTAINER, not user
+ * work — the Pipelines page seeds a "Sales Pipeline" with default stages
+ * for any admin+ caller who has none
+ * (`src/app/(dashboard)/pipelines/page.tsx`). `members.remove` spins a
+ * removed teammate into a personal account as its OWNER, which is
+ * admin+, so a single visit to that page wrote a `pipelines` row into
+ * their otherwise-empty shell account — and counting it here then made
+ * `redeem` throw `ACCOUNT_HAS_DATA` forever after. Since the /join
+ * modal's only recovery advice is "sign out and sign up with a different
+ * email", a teammate who has exactly one email address became
+ * permanently impossible to re-invite. That was not hypothetical: it
+ * stranded several removed-then-re-invited teammates across both
+ * production deployments, each shell account holding exactly one
+ * auto-seeded "Sales Pipeline" and nothing else.
+ *
+ * A `deals` row is what a pipeline actually holds, and nothing creates
+ * one implicitly — so it answers the question this guard is really
+ * asking ("is there work here that joining would orphan?") without the
+ * false positive. `redeem` deletes any leftover pipelines + stages along
+ * with the shell account, so nothing is orphaned either way.
  */
 async function accountHasDomainData(
   ctx: { db: MutationCtx["db"] },
@@ -60,7 +82,7 @@ async function accountHasDomainData(
     broadcast,
     automation,
     flow,
-    pipeline,
+    deal,
     messageTemplate,
     tag,
     customField,
@@ -87,8 +109,9 @@ async function accountHasDomainData(
       .query("flows")
       .withIndex("by_account", (q) => q.eq("accountId", accountId))
       .first(),
+    // `deals`, not `pipelines` — see this function's doc comment.
     ctx.db
-      .query("pipelines")
+      .query("deals")
       .withIndex("by_account", (q) => q.eq("accountId", accountId))
       .first(),
     ctx.db
@@ -119,7 +142,7 @@ async function accountHasDomainData(
     broadcast,
     automation,
     flow,
-    pipeline,
+    deal,
     messageTemplate,
     tag,
     customField,
@@ -417,8 +440,29 @@ export const redeem = mutation({
       acceptedByUserId: callerId,
     });
 
-    // Clean up the orphaned personal account — verified empty above,
-    // and no membership references it anymore (just moved away).
+    // Clean up the abandoned personal account — no membership references
+    // it anymore (just moved away). `accountHasDomainData` proved it holds
+    // no work, but "no work" is not "no rows": an auto-seeded pipeline and
+    // its default stages are explicitly tolerated by that guard (see its
+    // doc comment), so delete those here rather than leaving them pointing
+    // at an account id that is about to stop existing. Stages are deleted
+    // before their pipelines, and both before the account, so no row is
+    // ever left dangling mid-transaction.
+    const strandedStages = await ctx.db
+      .query("pipelineStages")
+      .withIndex("by_account", (q) => q.eq("accountId", oldAccountId))
+      .collect();
+    for (const stage of strandedStages) {
+      await ctx.db.delete(stage._id);
+    }
+    const strandedPipelines = await ctx.db
+      .query("pipelines")
+      .withIndex("by_account", (q) => q.eq("accountId", oldAccountId))
+      .collect();
+    for (const pipeline of strandedPipelines) {
+      await ctx.db.delete(pipeline._id);
+    }
+
     await ctx.db.delete(oldAccountId);
 
     return invitation.accountId;
