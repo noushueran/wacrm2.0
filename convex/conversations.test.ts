@@ -3869,9 +3869,9 @@ test("reassignAllFromUser ignores another account's identically-assigned threads
   const leaver = await seedTeammate(t, {
     accountId: owner.accountId, name: "Leaver", email: "leaver@example.com", role: "viewer",
   });
-  // The same user also carries threads on a SECOND account (the shape
-  // `members.remove` leaves behind, since a user can hold memberships in
-  // more than one account).
+  // The same user also carries threads on a SECOND account — a shape the
+  // schema permits (nothing makes `memberships` unique per user), so the
+  // query is pinned against it even though no current code path builds it.
   await t.run((ctx) =>
     ctx.db.insert("memberships", {
       userId: leaver, accountId: other.accountId, role: "viewer",

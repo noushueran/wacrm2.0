@@ -52,13 +52,49 @@ function SignupPageInner() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Set when sign-up itself succeeded but `bootstrapAccount` did not, so
+  // the visitor is authenticated with no account. Nothing bootstraps
+  // behind their back any more (the AuthProvider backstop is gone — see
+  // `src/hooks/use-auth.tsx`), so this page has to finish the job or the
+  // new user lands on the "not a member of any workspace" screen with no
+  // way forward. Re-submitting must NOT re-run `signIn`: their user
+  // already exists, so a second `flow: "signUp"` would fail as a
+  // duplicate. It retries the bootstrap alone.
+  const [bootstrapPending, setBootstrapPending] = useState(false);
 
   const { signIn } = useAuthActions();
   const bootstrapAccount = useMutation(api.accounts.bootstrapAccount);
 
+  /**
+   * Give the brand-new user their own account (owner) and continue to the
+   * dashboard. Idempotent, so retrying after a failure is safe.
+   */
+  const bootstrapAndContinue = async () => {
+    try {
+      await bootstrapAccount({});
+    } catch (err) {
+      console.error("[signup] bootstrapAccount failed:", err);
+      setError(
+        "Your account was created, but we couldn't finish setting up your workspace. Try again.",
+      );
+      setBootstrapPending(true);
+      setLoading(false);
+      return;
+    }
+    // Don't reset `loading` — we're navigating away.
+    router.push("/dashboard");
+  };
+
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    // Sign-up already happened; only the workspace setup is outstanding.
+    if (bootstrapPending) {
+      setLoading(true);
+      await bootstrapAndContinue();
+      return;
+    }
 
     if (password !== confirmPassword) {
       setError("Passwords do not match");
@@ -96,16 +132,7 @@ function SignupPageInner() {
       return;
     }
 
-    try {
-      // Give the brand-new user their own account (owner). Idempotent, and
-      // the dashboard's AuthProvider also bootstraps as a backstop.
-      await bootstrapAccount({});
-    } catch (err) {
-      console.error("[signup] bootstrapAccount failed:", err);
-    }
-
-    // Don't reset `loading` — we're navigating away.
-    router.push("/dashboard");
+    await bootstrapAndContinue();
   };
 
   return (
@@ -147,6 +174,7 @@ function SignupPageInner() {
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
                 required
+                disabled={bootstrapPending}
                 className="border-border bg-muted text-foreground placeholder:text-muted-foreground focus-visible:border-primary focus-visible:ring-primary/20"
               />
             </div>
@@ -162,6 +190,7 @@ function SignupPageInner() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                disabled={bootstrapPending}
                 className="border-border bg-muted text-foreground placeholder:text-muted-foreground focus-visible:border-primary focus-visible:ring-primary/20"
               />
             </div>
@@ -177,6 +206,7 @@ function SignupPageInner() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                disabled={bootstrapPending}
                 className="border-border bg-muted text-foreground placeholder:text-muted-foreground focus-visible:border-primary focus-visible:ring-primary/20"
               />
             </div>
@@ -192,6 +222,7 @@ function SignupPageInner() {
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 required
+                disabled={bootstrapPending}
                 className="border-border bg-muted text-foreground placeholder:text-muted-foreground focus-visible:border-primary focus-visible:ring-primary/20"
               />
             </div>
@@ -201,7 +232,13 @@ function SignupPageInner() {
               disabled={loading}
               className="mt-2 h-10 w-full bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
-              {loading ? "Creating account..." : "Create account"}
+              {bootstrapPending
+                ? loading
+                  ? "Finishing setup..."
+                  : "Finish setting up your workspace"
+                : loading
+                  ? "Creating account..."
+                  : "Create account"}
             </Button>
           </form>
 

@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 import { ConvexError } from "convex/values";
 import { api } from "./_generated/api";
 import schema from "./schema";
+import { hashInviteToken } from "./lib/inviteToken";
 import type { Id } from "./_generated/dataModel";
 import type { AccountRole } from "./lib/roles";
 
@@ -357,7 +358,7 @@ test("remove rejects a target from a different account", async () => {
   ).rejects.toMatchObject({ data: { code: "NOT_FOUND", entity: "member" } });
 });
 
-test("remove deletes the target's membership and gives them a fresh personal account", async () => {
+test("remove leaves the target with no membership and mints no account", async () => {
   const t = convexTest(schema, modules);
   const { accountId } = await seedOwner(t, {
     name: "Olga",
@@ -373,38 +374,60 @@ test("remove deletes the target's membership and gives them a fresh personal acc
     email: "casper@example.com",
     role: "agent",
   });
+  const accountsBefore = await t.run((ctx) => ctx.db.query("accounts").collect());
 
-  const newAccountId = await asAdmin.mutation(api.members.remove, {
-    userId: agentId,
-  });
+  await asAdmin.mutation(api.members.remove, { userId: agentId });
 
-  // The old membership (in the original account) is gone.
-  const oldMembership = await t.run((ctx) =>
-    ctx.db
-      .query("memberships")
-      .withIndex("by_user_account", (q) =>
-        q.eq("userId", agentId).eq("accountId", accountId),
-      )
-      .first(),
-  );
-  expect(oldMembership).toBeNull();
-
-  // A fresh personal account was created, owned by the ejected user.
-  const newAccount = await t.run((ctx) => ctx.db.get(newAccountId));
-  expect(newAccount).not.toBeNull();
-  expect(newAccount!.ownerUserId).toBe(agentId);
-  expect(newAccount!.name).toBe("Casper");
-
-  // Their only remaining membership is `owner` of the new account.
+  // They belong to nothing at all now — not the old account, not a new one.
   const memberships = await t.run((ctx) =>
     ctx.db
       .query("memberships")
       .withIndex("by_user", (q) => q.eq("userId", agentId))
       .collect(),
   );
-  expect(memberships).toHaveLength(1);
-  expect(memberships[0]!.accountId).toBe(newAccountId);
-  expect(memberships[0]!.role).toBe("owner");
+  expect(memberships).toEqual([]);
+
+  // And no shell account was minted on their way out.
+  const accountsAfter = await t.run((ctx) => ctx.db.query("accounts").collect());
+  expect(accountsAfter.map((a) => a._id).sort()).toEqual(
+    accountsBefore.map((a) => a._id).sort(),
+  );
+
+  // Their login survives — removal is not deletion.
+  expect(await t.run((ctx) => ctx.db.get(agentId))).not.toBeNull();
+});
+
+test("a removed member can immediately redeem a fresh invite back into the account", async () => {
+  const t = convexTest(schema, modules);
+  const { accountId, asUser: asOwner } = await seedOwner(t, {
+    name: "Olga",
+    email: "olga@example.com",
+  });
+  const { userId: agentId, asUser: asAgent } = await addMember(t, accountId, {
+    name: "Casper",
+    email: "casper@example.com",
+    role: "agent",
+  });
+
+  await asOwner.mutation(api.members.remove, { userId: agentId });
+
+  const created = await asOwner.mutation(api.invitations.create, {
+    role: "supervisor",
+  });
+  await expect(
+    asAgent.mutation(api.invitations.redeem, {
+      tokenHash: await hashInviteToken(created.token),
+    }),
+  ).resolves.toBe(accountId);
+
+  const membership = await t.run((ctx) =>
+    ctx.db
+      .query("memberships")
+      .withIndex("by_user", (q) => q.eq("userId", agentId))
+      .first(),
+  );
+  expect(membership?.accountId).toBe(accountId);
+  expect(membership?.role).toBe("supervisor");
 });
 
 test("admin can set a member's role to supervisor", async () => {

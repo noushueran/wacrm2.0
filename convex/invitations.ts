@@ -54,23 +54,28 @@ function clampExpiryDays(expiresInDays: number | undefined): number {
  * NOT `pipelines`. A pipeline is an auto-seeded CONTAINER, not user
  * work — the Pipelines page seeds a "Sales Pipeline" with default stages
  * for any admin+ caller who has none
- * (`src/app/(dashboard)/pipelines/page.tsx`). `members.remove` spins a
- * removed teammate into a personal account as its OWNER, which is
- * admin+, so a single visit to that page wrote a `pipelines` row into
- * their otherwise-empty shell account — and counting it here then made
- * `redeem` throw `ACCOUNT_HAS_DATA` forever after. Since the /join
- * modal's only recovery advice is "sign out and sign up with a different
- * email", a teammate who has exactly one email address became
- * permanently impossible to re-invite. That was not hypothetical: it
- * stranded several removed-then-re-invited teammates across both
- * production deployments, each shell account holding exactly one
- * auto-seeded "Sales Pipeline" and nothing else.
+ * (`src/app/(dashboard)/pipelines/page.tsx`). Counting that auto-seeded
+ * row here meant a single visit to that page could make `redeem` throw
+ * `ACCOUNT_HAS_DATA` forever after, and since the /join modal's only
+ * recovery advice is "sign out and sign up with a different email", a
+ * person who has exactly one email address became permanently impossible
+ * to invite. That was not hypothetical: it stranded several
+ * removed-then-re-invited teammates across both production deployments,
+ * each of their accounts holding exactly one auto-seeded "Sales Pipeline"
+ * and nothing else.
+ *
+ * `members.remove` used to be the main way people ended up in that
+ * position — it gave every removed teammate a personal account and made
+ * them its OWNER, which is admin+ — and it no longer does that (see its
+ * own doc comment). The divergence still stands on its own: the auto-seed
+ * fires for any admin+ caller, so a self-serve sign-up who later gets
+ * invited to a real team would hit exactly the same wall.
  *
  * A `deals` row is what a pipeline actually holds, and nothing creates
  * one implicitly — so it answers the question this guard is really
  * asking ("is there work here that joining would orphan?") without the
  * false positive. `redeem` deletes any leftover pipelines + stages along
- * with the shell account, so nothing is orphaned either way.
+ * with the abandoned account, so nothing is orphaned either way.
  */
 async function accountHasDomainData(
   ctx: { db: MutationCtx["db"] },
@@ -401,8 +406,8 @@ export const redeem = mutation({
     }
 
     // Safety: the caller must be the SOLE OWNER of their current
-    // account (i.e. a fresh personal account from bootstrap, or a
-    // prior `members.remove`). Any other state means they're either a
+    // account (i.e. their own account from self-serve sign-up).
+    // Any other state means they're either a
     // member of another shared account (joining a second would
     // silently orphan their access to the first) or the owner of an
     // account with teammates (they'd abandon their team to join the

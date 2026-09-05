@@ -12,13 +12,14 @@ import { AppBadge } from "@/components/pwa/app-badge";
 import { InboxNotifier } from "@/components/pwa/inbox-notifier";
 import { InstallPrompt } from "@/components/pwa/install-prompt";
 import { RequireSection } from "@/components/auth/require-section";
+import { NoWorkspace } from "@/components/auth/no-workspace";
 
 // Auth-gated dashboard shell. Extracted from the layout so the layout
 // itself can stay a server component and export metadata (noindex) —
 // client components can't export Next's metadata object.
 
 function DashboardShellInner({ children }: { children: React.ReactNode }) {
-  const { user, loading } = useAuth();
+  const { user, profile, profileLoading, loading, signOut } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
@@ -45,6 +46,25 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
   }
 
   if (!user) return null;
+
+  // Authenticated, but attached to no account. Reachable two ways now
+  // that nothing bootstraps an account behind the user's back (see
+  // `use-auth.tsx`): a teammate `members.remove` ejected, and an invitee
+  // who wandered here instead of opening their /join link. Both need the
+  // same thing — an invite link — and neither should be handed a private
+  // shell account, which is what the old silent bootstrap did.
+  //
+  // Rendering the dashboard for them instead would just spray `NO_ACCOUNT`
+  // errors: every `accountQuery`/`accountMutation` throws that for a
+  // membership-less caller (`convex/lib/auth.ts`).
+  //
+  // `profileLoading` gates this so the screen never flashes while `me` is
+  // still in flight; and because `me` is a live subscription, a member
+  // removed WHILE they have the app open lands here immediately rather
+  // than watching the UI fall apart around them.
+  if (!profileLoading && !profile) {
+    return <NoWorkspace email={user.email} onSignOut={signOut} />;
+  }
 
   return (
     // `pt-safe` keeps the header out from under the iOS status bar. The

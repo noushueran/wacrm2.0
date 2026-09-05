@@ -4,12 +4,10 @@ import {
   createContext,
   useCallback,
   useContext,
-  useEffect,
   useMemo,
-  useRef,
   type ReactNode,
 } from "react";
-import { useConvexAuth, useMutation, useQuery } from "convex/react";
+import { useConvexAuth, useQuery } from "convex/react";
 import { useAuthActions } from "@convex-dev/auth/react";
 import { api } from "../../convex/_generated/api";
 import { DEFAULT_CURRENCY } from "@/lib/currency";
@@ -154,29 +152,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // for a missing identity).
   const me = useQuery(api.accounts.me);
   const { signOut: convexSignOut } = useAuthActions();
-  const bootstrapAccount = useMutation(api.accounts.bootstrapAccount);
 
-  // First-login bootstrap: a brand-new Convex user is authenticated but
-  // has no membership yet (`me === null`). Give them their own account
-  // once — same idempotent call `/convex-demo` makes. `bootstrapAccount`
-  // is a documented no-op after the first success, and `me` flips to a
-  // real object reactively once it lands, so the guard below stops firing.
-  // Reset per session so a fresh sign-in re-arms it.
-  const didBootstrapRef = useRef(false);
-  useEffect(() => {
-    if (!isAuthenticated) {
-      didBootstrapRef.current = false;
-      return;
-    }
-    if (me === null && !didBootstrapRef.current) {
-      didBootstrapRef.current = true;
-      bootstrapAccount({}).catch((err) => {
-        // Leave the ref set so we don't hot-loop on a persistent failure;
-        // the sign-up page also bootstraps, so this is a backstop.
-        console.error("[AuthProvider] bootstrapAccount failed:", err);
-      });
-    }
-  }, [isAuthenticated, me, bootstrapAccount]);
+  // NO BOOTSTRAP BACKSTOP HERE, DELIBERATELY.
+  //
+  // This used to call `accounts.bootstrapAccount` for any authenticated
+  // user whose `me` came back `null`, on the theory that a membership-less
+  // user must be a brand-new sign-up who needs their own account. That
+  // theory stopped holding once `members.remove` left removed teammates
+  // membership-less on purpose (see its doc comment): the backstop would
+  // silently re-mint the very shell account that function no longer
+  // creates, the first time the removed person opened the app — and a
+  // shell account with anything in it makes `invitations.redeem` refuse
+  // to move them, so they could never be re-invited under their own email.
+  //
+  // `me === null` is now a legitimate, renderable state ("you are not a
+  // member of any workspace" — `DashboardShell`), not a gap to paper over.
+  // Self-serve sign-up bootstraps explicitly on the sign-up page, which is
+  // the only place an account is minted from.
 
   const loading = isLoading;
   // Only "loading a profile" once we know there IS a user to load one for.
