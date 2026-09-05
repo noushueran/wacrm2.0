@@ -9,22 +9,89 @@ import { SESSION_COOKIE_MAX_AGE_SECONDS } from "../convex/lib/sessionDuration";
 // Auth pages — a signed-in user has no business here.
 const isAuthPage = createRouteMatcher(["/login", "/signup", "/forgot-password"]);
 
-// Protected app surface — same set the old Supabase middleware guarded
-// (`protectedPaths`). `(.*)` also covers each section's nested routes.
-const isProtectedRoute = createRouteMatcher([
-  "/dashboard(.*)",
-  "/inbox(.*)",
-  "/contacts(.*)",
-  "/pipelines(.*)",
-  "/broadcasts(.*)",
+// Protected app surface — one entry per route segment under
+// `src/app/(dashboard)`, the signed-in app. `(.*)` also covers each
+// section's nested routes.
+//
+// Exported because this list drifted away from the directory once and
+// nothing noticed: seven segments were added under `(dashboard)` without
+// being added here, and production answered 200 to an anonymous GET on
+// every one of them (/agents, /campaigns, /flows, /lead-analysis,
+// /leads, /notifications, /reports — measured 2026-09-05). The pages
+// rendered their shell to a stranger; no test, type or lint rule
+// objected. `middleware.test.ts` now checks this list against the actual
+// directory listing, so the next route added has to be listed here too.
+export const PROTECTED_ROUTE_PATTERNS = [
+  "/agents(.*)",
   "/automations(.*)",
+  "/broadcasts(.*)",
+  "/campaigns(.*)",
+  "/contacts(.*)",
+  "/dashboard(.*)",
+  "/flows(.*)",
+  "/inbox(.*)",
+  "/lead-analysis(.*)",
+  "/leads(.*)",
+  "/notifications(.*)",
+  "/pipelines(.*)",
+  "/reports(.*)",
   "/settings(.*)",
   // The Web Share Target landing page. Not optional: it lives under
   // `(dashboard)` and so renders the app shell, and without this an
   // unauthenticated share got a 200 and a flash of chrome before the
   // client-side guard bounced it.
   "/share(.*)",
-]);
+];
+
+const isProtectedRoute = createRouteMatcher(PROTECTED_ROUTE_PATTERNS);
+
+/**
+ * How long the middleware will wait for Convex to say who the caller is.
+ *
+ * `convexAuth.isAuthenticated()` is an uncached round trip to the
+ * self-hosted Convex backend, and this middleware runs as a Netlify edge
+ * function with a hard execution ceiling. An *unbounded* await therefore
+ * does not degrade one request — it spends the whole edge budget, and
+ * Netlify discards our response in favour of its own "This edge function
+ * has crashed / the edge function timed out" page.
+ *
+ * Measured 2026-09-05, when the backend completed the TLS handshake and
+ * then never sent an HTTP response: every route served that Netlify page,
+ * `/login` included, so nobody could even reach the sign-in form. The
+ * outage was in Convex; the blackout was this await.
+ *
+ * 2.5s is well clear of a healthy check (single-digit ms) and well under
+ * the edge ceiling, so a backend that is merely slow still answers.
+ */
+const AUTH_CHECK_TIMEOUT_MS = 2_500;
+
+/**
+ * `isAuthenticated()`, bounded by the budget above.
+ *
+ * Fails CLOSED — both a timeout and a rejection count as "not signed in".
+ * The alternative, assuming a session we could not confirm, would hand
+ * the signed-in app to a stranger every time the backend hiccuped. Being
+ * bounced to /login while Convex is down is the honest outcome: the
+ * session cannot be verified, and no page in the app can load its data
+ * anyway.
+ */
+async function isAuthenticatedWithin(
+  isAuthenticated: () => Promise<boolean>,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      isAuthenticated(),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), AUTH_CHECK_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Non-webhook WhatsApp API routes that require a session (webhooks are
 // authenticated by Meta's signature, not our cookie).
@@ -59,7 +126,9 @@ export default convexAuthNextjsMiddleware(async (request, { convexAuth }) => {
   // reaching `isAuthenticated()`.
   if (!onAuthPage && !onProtectedRoute && !onProtectedApi && !onRoot) return;
 
-  const authed = await convexAuth.isAuthenticated();
+  const authed = await isAuthenticatedWithin(() =>
+    convexAuth.isAuthenticated(),
+  );
 
   // The root entry point. Decided here rather than in `app/page.tsx`,
   // which redirected to /dashboard unconditionally and so bounced a

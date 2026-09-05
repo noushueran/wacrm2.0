@@ -1,3 +1,5 @@
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest, NextResponse, type NextFetchEvent } from "next/server";
 
@@ -7,6 +9,13 @@ import { NextRequest, NextResponse, type NextFetchEvent } from "next/server";
 // by Convex Auth's own suite); here we mock the wrapper so we can unit-test
 // *our* routing decisions — who gets redirected where — in isolation.
 let mockAuthed = false;
+
+// When true, `isAuthenticated()` never settles — the shape of a Convex
+// backend that accepts the connection and then goes quiet.
+let mockAuthHangs = false;
+
+// When true, `isAuthenticated()` rejects — a backend that answers, badly.
+let mockAuthThrows = false;
 
 // How many times the handler asked `isAuthenticated()`. That call is an
 // uncached network round-trip to the Convex backend, so "did we ask at
@@ -35,6 +44,8 @@ vi.mock("@convex-dev/auth/nextjs/server", () => ({
         convexAuth: {
           isAuthenticated: async () => {
             authCallCount++;
+            if (mockAuthHangs) return new Promise<boolean>(() => {});
+            if (mockAuthThrows) throw new Error("convex unreachable");
             return mockAuthed;
           },
           getToken: async () => (mockAuthed ? "token" : undefined),
@@ -62,7 +73,9 @@ vi.mock("@convex-dev/auth/nextjs/server", () => ({
 }));
 
 // Imported after the mock is registered.
-const { default: middleware } = await import("./middleware");
+const { default: middleware, PROTECTED_ROUTE_PATTERNS } = await import(
+  "./middleware"
+);
 
 // The default export is typed as `NextMiddleware` (2 args, possibly-null
 // result). At runtime our mock ignores the event and always returns a
@@ -76,6 +89,8 @@ async function run(url: string) {
 
 beforeEach(() => {
   mockAuthed = false;
+  mockAuthHangs = false;
+  mockAuthThrows = false;
   authCallCount = 0;
 });
 
@@ -163,5 +178,75 @@ describe("middleware — skips the auth round-trip when the route cannot need it
     mockAuthed = true;
     await run("https://app.test/inbox");
     expect(authCallCount).toBe(1);
+  });
+});
+
+describe("middleware — every signed-in route is actually gated", () => {
+  // The matcher list and the `(dashboard)` directory drifted apart once:
+  // seven routes were added under `(dashboard)` without being added here,
+  // and production answered 200 to an anonymous GET on every one of them
+  // (/agents, /campaigns, /flows, /lead-analysis, /leads, /notifications,
+  // /reports — measured 2026-09-05). Nothing failed; the pages simply
+  // rendered their shell to a stranger. This is the guard.
+  const segments = readdirSync(join(__dirname, "app", "(dashboard)"), {
+    withFileTypes: true,
+  })
+    .filter((e) => e.isDirectory() && !e.name.startsWith("_"))
+    .map((e) => e.name);
+
+  it("found routes to check", () => {
+    // Guards the guard — an empty list would pass every case below.
+    expect(segments.length).toBeGreaterThan(10);
+  });
+
+  it.each(segments)("/%s is in PROTECTED_ROUTE_PATTERNS", (segment) => {
+    expect(
+      PROTECTED_ROUTE_PATTERNS,
+      `/${segment} lives under (dashboard) — the signed-in app — but no ` +
+        `matcher covers it, so middleware serves it to anyone.`,
+    ).toContain(`/${segment}(.*)`);
+  });
+
+  it.each(segments)("redirects a signed-out visitor off /%s", async (segment) => {
+    mockAuthed = false;
+    const res = await run(`https://app.test/${segment}`);
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
+  });
+});
+
+describe("middleware — survives a Convex backend that stops answering", () => {
+  // Measured 2026-09-05: `convex-api.holidayys.co` completed the TLS
+  // handshake and then never sent an HTTP response. Because this
+  // middleware awaited `isAuthenticated()` with no ceiling, it consumed
+  // the Netlify edge function's entire execution budget, and Netlify
+  // replaced EVERY page — /login included — with its own "This edge
+  // function has crashed / the edge function timed out" page. The site
+  // was unreachable, and the sign-in form with it.
+  it("does not hang on a protected route — sends the visitor to /login", async () => {
+    mockAuthHangs = true;
+    const res = await run("https://app.test/inbox");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
+  });
+
+  it("still serves /login itself", async () => {
+    mockAuthHangs = true;
+    const res = await run("https://app.test/login");
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  it("still resolves the root entry point", async () => {
+    mockAuthHangs = true;
+    const res = await run("https://app.test/");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
+  });
+
+  it("treats a backend that errors the same as one that is signed out", async () => {
+    mockAuthThrows = true;
+    const res = await run("https://app.test/inbox");
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login");
   });
 });
